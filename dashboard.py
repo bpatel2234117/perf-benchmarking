@@ -7,8 +7,13 @@ from datetime import datetime, timedelta
 import hashlib
 import base64
 import numpy as np
+import requests
+import os
+from textwrap import dedent
+import html
 from pathlib import Path
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
+from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
 
 # --- Configuration & Styling ---
 st.set_page_config(
@@ -28,6 +33,13 @@ LOGO_CANDIDATES = [
     Path(__file__).parent / "assets" / "BigID-next-1-5f6e8592-1d9f-4476-a5e4-b4c145ebf06e.png",
     Path("/Users/bpatel/.cursor/projects/Users-bpatel-AI-Scan-Performance-Benchmark/assets/BigID-next-1-5f6e8592-1d9f-4476-a5e4-b4c145ebf06e.png")
 ]
+DEFAULT_CLASSIFIERS_API_PATH = (
+    "/api/v1/all-classifications?skip=0&limit=600&requireTotalCount=true&"
+    "filter=%5B%7B%22field%22%3A%22enabled%22%2C%22value%22%3A%5Btrue%2Cnull%5D%2C%22operator%22%3A%22in%22%7D%2C"
+    "%7B%22field%22%3A%22type%22%2C%22value%22%3A%5B%22data%22%2C%22columnName%22%5D%2C%22operator%22%3A%22in%22%7D%5D"
+)
+INTERNAL_CLASSIFIERS_API_PATH = os.getenv("BIGID_CLASSIFIERS_API_PATH", DEFAULT_CLASSIFIERS_API_PATH).strip() or DEFAULT_CLASSIFIERS_API_PATH
+INTERNAL_ABOUT_API_PATH = os.getenv("BIGID_ABOUT_API_PATH", "/api/v1/about").strip() or "/api/v1/about"
 
 def get_logo_base64():
     for path in LOGO_CANDIDATES:
@@ -416,6 +428,25 @@ def get_data_source_types():
     except Exception:
         return []
 
+def ensure_build_templates_table():
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS build_templates (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    build_id INT,
+                    template_name VARCHAR(100),
+                    classifier_set TEXT,
+                    UNIQUE KEY uniq_build_template (build_id, template_name),
+                    FOREIGN KEY (build_id) REFERENCES builds(id)
+                )
+            """))
+            conn.commit()
+    except Exception:
+        pass
+
 def get_file_set_types(data_type=None):
     if not engine:
         return []
@@ -425,11 +456,21 @@ def get_file_set_types(data_type=None):
                 CREATE TABLE IF NOT EXISTS file_set_types (
                     id INT AUTO_INCREMENT PRIMARY KEY,
                     name VARCHAR(100) UNIQUE,
-                    data_type VARCHAR(50)
+                    data_type VARCHAR(50),
+                    total_files BIGINT,
+                    total_folders BIGINT,
+                    total_size_gb FLOAT
                 )
             """))
             try:
                 conn.execute(text("ALTER TABLE file_set_types ADD COLUMN data_type VARCHAR(50)"))
+                conn.commit()
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE file_set_types ADD COLUMN total_files BIGINT"))
+                conn.execute(text("ALTER TABLE file_set_types ADD COLUMN total_folders BIGINT"))
+                conn.execute(text("ALTER TABLE file_set_types ADD COLUMN total_size_gb FLOAT"))
                 conn.commit()
             except Exception:
                 pass
@@ -451,19 +492,894 @@ def get_file_set_types(data_type=None):
             conn.commit()
             if data_type:
                 rows = conn.execute(
-                    text("SELECT name FROM file_set_types WHERE data_type = :dt ORDER BY name"),
+                    text("SELECT name, total_files, total_folders, total_size_gb FROM file_set_types WHERE data_type = :dt ORDER BY name"),
                     {"dt": data_type}
                 ).fetchall()
             else:
-                rows = conn.execute(text("SELECT name FROM file_set_types ORDER BY name")).fetchall()
+                rows = conn.execute(text("SELECT name, total_files, total_folders, total_size_gb FROM file_set_types ORDER BY name")).fetchall()
             names = [r[0] for r in rows]
+            details = {r[0]: {"total_files": r[1], "total_folders": r[2], "total_size_gb": r[3]} for r in rows}
             if data_type == "Unstructured":
                 names = [n for n in names if "table" not in n.lower()]
             if data_type == "Structured":
                 names = [n for n in names if "file" not in n.lower() and "csv" not in n.lower()]
-            return names
+            return names, details
+    except Exception:
+        return [], {}
+
+def get_classifier_names():
+    if not engine:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT name FROM classifiers ORDER BY name")).fetchall()
+            return [r[0] for r in rows]
     except Exception:
         return []
+
+
+def ensure_test_environments_table():
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS test_environments (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    env_name VARCHAR(100) UNIQUE,
+                    base_url VARCHAR(500),
+                    version VARCHAR(100),
+                    auth_module_path VARCHAR(500),
+                    auth_function_name VARCHAR(100) DEFAULT 'Get_auth_token',
+                    classifiers_api_path VARCHAR(1200),
+                    is_active BOOLEAN DEFAULT TRUE
+                )
+            """))
+            try:
+                conn.execute(text("ALTER TABLE test_environments ADD COLUMN auth_function_name VARCHAR(100) DEFAULT 'Get_auth_token'"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE test_environments ADD COLUMN classifiers_api_path VARCHAR(1200)"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE test_environments MODIFY COLUMN classifiers_api_path VARCHAR(1200)"))
+            except Exception:
+                pass
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS test_environment_version_history (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    version_value VARCHAR(100),
+                    classifier_set_id INT NULL,
+                    changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    change_note VARCHAR(255),
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                )
+            """))
+            try:
+                conn.execute(text("ALTER TABLE test_environment_version_history ADD COLUMN classifier_set_id INT NULL"))
+            except Exception:
+                pass
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS classifier_sets (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    set_hash VARCHAR(64) UNIQUE,
+                    classifier_count INT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS classifier_set_members (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    set_id INT NOT NULL,
+                    classifier_id INT NOT NULL,
+                    UNIQUE KEY uniq_set_classifier (set_id, classifier_id),
+                    FOREIGN KEY (set_id) REFERENCES classifier_sets(id),
+                    FOREIGN KEY (classifier_id) REFERENCES classifiers(id)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS build_classifier_mappings (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    build_id INT NOT NULL,
+                    classifier_id INT NOT NULL,
+                    environment_id INT NULL,
+                    last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_build_classifier (build_id, classifier_id),
+                    FOREIGN KEY (build_id) REFERENCES builds(id),
+                    FOREIGN KEY (classifier_id) REFERENCES classifiers(id),
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                )
+            """))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def load_test_environments():
+    if not engine:
+        return pd.DataFrame()
+    ensure_test_environments_table()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
+                FROM test_environments
+                ORDER BY env_name
+            """)).fetchall()
+            cols = ["id", "env_name", "base_url", "version", "auth_module_path", "auth_function_name", "classifiers_api_path", "is_active"]
+            return pd.DataFrame(rows, columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
+def normalize_base_url(base_url):
+    if not base_url:
+        return ""
+    return str(base_url).strip().rstrip("/")
+
+
+def build_api_url(base_url, api_path):
+    base = normalize_base_url(base_url)
+    path = (api_path or "").strip()
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{base}{path}"
+
+
+def extract_token_from_result(result):
+    if isinstance(result, str):
+        return result.strip()
+    if isinstance(result, (list, tuple)) and result:
+        first = result[0]
+        if isinstance(first, str):
+            return first.strip()
+    if isinstance(result, dict):
+        for key in ["access_token", "token", "auth_token", "jwt", "id_token"]:
+            if key in result and result[key]:
+                return str(result[key]).strip()
+    return ""
+
+
+def extract_token_from_payload(payload):
+    if isinstance(payload, str):
+        return payload.strip()
+    if not isinstance(payload, dict):
+        return ""
+
+    # Direct token keys
+    for key in ["access_token", "token", "auth_token", "jwt", "id_token", "authorization"]:
+        if payload.get(key):
+            return str(payload.get(key)).strip()
+
+    # Nested structures often used by APIs
+    for outer_key in ["data", "result", "response"]:
+        obj = payload.get(outer_key)
+        if isinstance(obj, dict):
+            for key in ["access_token", "token", "auth_token", "jwt", "id_token", "authorization"]:
+                if obj.get(key):
+                    return str(obj.get(key)).strip()
+        elif isinstance(obj, str) and obj.strip():
+            return obj.strip()
+    return ""
+
+
+def fetch_auth_token_for_env(env_row):
+    if "auth_token_cache" not in st.session_state:
+        st.session_state["auth_token_cache"] = {}
+
+    base_url = normalize_base_url((env_row or {}).get("base_url"))
+    if not base_url:
+        raise RuntimeError("Base URL is required for auth token fetch.")
+    cached = st.session_state["auth_token_cache"].get(base_url)
+    if cached:
+        return cached
+
+    attempts = [
+        lambda: Get_auth_token(base_url, env_row),
+        lambda: Get_auth_token(base_url),
+        lambda: Get_auth_token()
+    ]
+    last_err = None
+    for call in attempts:
+        try:
+            token = extract_token_from_result(call())
+            if token:
+                st.session_state["auth_token_cache"][base_url] = token
+                return token
+        except TypeError as te:
+            last_err = te
+            continue
+        except Exception as ex:
+            last_err = ex
+            break
+
+    raise RuntimeError(f"Auth token fetch failed using project-local Get_auth_token: {last_err}")
+
+
+def extract_classifier_payload(payload):
+    """
+    Returns (classifier_names, total_count_from_api).
+    Supports the BigID response shape:
+    {"data": {"classifications": [...], "totalCount": 72}}
+    """
+    items = []
+    total_count = None
+
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            if isinstance(data_block.get("classifications"), list):
+                items = data_block.get("classifications")
+            if data_block.get("totalCount") is not None:
+                try:
+                    total_count = int(data_block.get("totalCount"))
+                except Exception:
+                    total_count = None
+
+        if not items:
+            for key in ["results", "items", "classifiers"]:
+                if isinstance(payload.get(key), list):
+                    items = payload.get(key)
+                    break
+
+    names = []
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, str):
+                n = item.strip()
+                if n:
+                    names.append(n)
+                continue
+            if isinstance(item, dict):
+                n = (
+                    item.get("classification_name")
+                    or item.get("name")
+                    or item.get("classifierName")
+                    or item.get("classifier_name")
+                    or item.get("title")
+                )
+                if n:
+                    names.append(str(n).strip())
+
+    unique = []
+    seen = set()
+    for n in names:
+        key = n.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(n)
+
+    return unique, total_count
+
+
+def fetch_classifiers_from_api(base_url, api_path, token):
+    url = build_api_url(base_url, api_path)
+    # BigID sample uses raw token in "authorization" header (not Bearer).
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+    resp = requests.get(url, headers=headers_raw, timeout=30)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, headers=headers_bearer, timeout=30)
+
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Classifiers API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for classifiers API.")
+
+    resp.raise_for_status()
+    payload = resp.json()
+    names, total_count = extract_classifier_payload(payload)
+    return names, total_count, url
+
+
+def fetch_classifiers_with_auth_retry(env_row):
+    """
+    Fetch classifiers in a smooth flow:
+    1) Try without auth (same pattern as version API).
+    2) If unauthorized, fetch token and retry.
+    3) If token seems expired, refresh once and retry.
+    """
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    api_path = env_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH
+
+    try:
+        return fetch_classifiers_from_api(base_url, api_path, "")
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_classifiers_from_api(base_url, api_path, token)
+
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            # Clear cached token and retry once with a fresh token
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_classifiers_from_api(base_url, api_path, fresh)
+        raise
+
+
+def fetch_core_version_from_api(base_url, token, about_api_path=None):
+    path = about_api_path or INTERNAL_ABOUT_API_PATH
+    url = build_api_url(base_url, path)
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+    resp = requests.get(url, headers=headers_raw, timeout=30)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, headers=headers_bearer, timeout=30)
+    resp.raise_for_status()
+
+    payload = resp.json()
+    raw_version = ""
+    if isinstance(payload, dict):
+        # Support multiple response shapes:
+        # 1) {"releaseVersion": "..."}
+        # 2) {"data": {"releaseVersion": "..."}}
+        # 3) {"data": {"about": {"releaseVersion": "..."}}}  <-- current BigID shape
+        raw_version = str(payload.get("releaseVersion") or "").strip()
+        if not raw_version:
+            data_block = payload.get("data")
+            if isinstance(data_block, dict):
+                raw_version = str(data_block.get("releaseVersion") or "").strip()
+                if not raw_version:
+                    about_block = data_block.get("about")
+                    if isinstance(about_block, dict):
+                        raw_version = str(about_block.get("releaseVersion") or "").strip()
+
+    clean_version = raw_version
+    if clean_version.lower().startswith("release-"):
+        clean_version = clean_version[len("release-"):].strip()
+
+    return clean_version, raw_version, url
+
+
+def record_environment_version(environment_id, env_name, new_version, classifier_set_id=None):
+    """
+    Save version snapshot only when changed from latest value.
+    Also updates current version in test_environments table.
+    Returns: (changed, previous_version)
+    """
+    if not engine or not environment_id:
+        return False, None
+
+    previous = None
+    previous_set_id = None
+    with engine.connect() as conn:
+        last = conn.execute(
+            text("""
+                SELECT version_value, classifier_set_id
+                FROM test_environment_version_history
+                WHERE environment_id = :eid
+                ORDER BY changed_at DESC, id DESC
+                LIMIT 1
+            """),
+            {"eid": int(environment_id)}
+        ).fetchone()
+        if last:
+            if last[0]:
+                previous = str(last[0])
+            previous_set_id = int(last[1]) if last[1] is not None else None
+
+        conn.execute(
+            text("UPDATE test_environments SET version = :v WHERE id = :eid"),
+            {"v": new_version or None, "eid": int(environment_id)}
+        )
+
+        new_set_id = int(classifier_set_id) if classifier_set_id is not None else None
+        version_changed = (previous != (new_version or None))
+        set_changed = (previous_set_id != new_set_id)
+        changed = version_changed or set_changed
+        if changed:
+            if version_changed:
+                note = f"{previous or 'None'} -> {new_version or 'None'}"
+            elif set_changed:
+                note = f"Classifier set updated (version {new_version or 'None'})"
+            else:
+                note = "No change"
+            conn.execute(
+                text("""
+                    INSERT INTO test_environment_version_history (environment_id, version_value, classifier_set_id, change_note)
+                    VALUES (:eid, :vv, :sid, :note)
+                """),
+                {"eid": int(environment_id), "vv": new_version or None, "sid": new_set_id, "note": note[:255]}
+            )
+        conn.commit()
+    return changed, previous
+
+
+def load_environment_version_history(environment_id):
+    if not engine or not environment_id:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT changed_at, version_value, change_note
+                    FROM test_environment_version_history
+                    WHERE environment_id = :eid
+                    ORDER BY changed_at DESC, id DESC
+                """),
+                {"eid": int(environment_id)}
+            ).fetchall()
+        return pd.DataFrame(rows, columns=["Changed At", "Version", "Change"])
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_all_environment_version_history():
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        te.id AS environment_id,
+                        te.env_name,
+                        h.changed_at,
+                        h.version_value,
+                        h.change_note,
+                        COALESCE(
+                            cs.classifier_count,
+                            (
+                                SELECT COUNT(DISTINCT bcm.classifier_id)
+                                FROM build_classifier_mappings bcm
+                                JOIN builds b ON b.id = bcm.build_id
+                                WHERE bcm.environment_id = te.id
+                                  AND b.version = h.version_value
+                            ),
+                            0
+                        ) AS classifier_count,
+                        (
+                            SELECT COALESCE(
+                                (
+                                    SELECT GROUP_CONCAT(DISTINCT c.name ORDER BY c.name SEPARATOR ', ')
+                                    FROM classifier_set_members csm
+                                    JOIN classifiers c ON c.id = csm.classifier_id
+                                    WHERE csm.set_id = h.classifier_set_id
+                                ),
+                                (
+                                    SELECT GROUP_CONCAT(DISTINCT c2.name ORDER BY c2.name SEPARATOR ', ')
+                                    FROM build_classifier_mappings bcm2
+                                    JOIN builds b2 ON b2.id = bcm2.build_id
+                                    JOIN classifiers c2 ON c2.id = bcm2.classifier_id
+                                    WHERE bcm2.environment_id = te.id
+                                      AND b2.version = h.version_value
+                                )
+                            )
+                        ) AS classifier_list
+                    FROM test_environment_version_history h
+                    JOIN test_environments te ON te.id = h.environment_id
+                    LEFT JOIN classifier_sets cs ON cs.id = h.classifier_set_id
+                    ORDER BY h.changed_at DESC, h.id DESC
+                """)
+            ).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "environment_id",
+                "Environment",
+                "Changed At",
+                "Version",
+                "Change",
+                "Classifier Count",
+                "Classifiers"
+            ]
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_latest_snapshot_meta(environment_id):
+    if not engine or environment_id is None:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT version_value, classifier_set_id
+                FROM test_environment_version_history
+                WHERE environment_id = :eid
+                ORDER BY changed_at DESC, id DESC
+                LIMIT 1
+            """), {"eid": int(environment_id)}).fetchone()
+            if not row:
+                return None
+            return {
+                "version_value": row[0],
+                "classifier_set_id": row[1]
+            }
+    except Exception:
+        return None
+
+
+def get_environment_current_version(environment_id):
+    if not engine or environment_id is None:
+        return ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT version FROM test_environments WHERE id = :eid LIMIT 1"),
+                {"eid": int(environment_id)}
+            ).fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+
+def load_version_snapshots():
+    """
+    Snapshot rows for version-wise classifier comparisons.
+    """
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    h.id AS snapshot_id,
+                    h.environment_id,
+                    te.env_name,
+                    h.version_value,
+                    h.classifier_set_id,
+                    h.changed_at,
+                    COALESCE(cs.classifier_count, 0) AS classifier_count
+                FROM test_environment_version_history h
+                JOIN test_environments te ON te.id = h.environment_id
+                LEFT JOIN classifier_sets cs ON cs.id = h.classifier_set_id
+                ORDER BY h.changed_at DESC, h.id DESC
+            """)).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "snapshot_id",
+                "environment_id",
+                "env_name",
+                "version_value",
+                "classifier_set_id",
+                "changed_at",
+                "classifier_count"
+            ]
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_build_version_classifier_stats():
+    """
+    Build-wise classifier counts per environment, based on normalized mappings.
+    """
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    te.id AS environment_id,
+                    te.env_name,
+                    b.version AS build_version,
+                    COUNT(DISTINCT bcm.classifier_id) AS classifier_count,
+                    MAX(bcm.last_synced_at) AS last_synced_at
+                FROM build_classifier_mappings bcm
+                JOIN builds b ON b.id = bcm.build_id
+                JOIN test_environments te ON te.id = bcm.environment_id
+                GROUP BY te.id, te.env_name, b.version
+                ORDER BY te.env_name, MAX(bcm.last_synced_at), b.version
+            """)).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=["environment_id", "env_name", "build_version", "classifier_count", "last_synced_at"]
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_environment_build_change_paths():
+    """
+    Returns environment_id -> build version path string.
+    Example: None -> 244.49 -> 245.4
+    """
+    if not engine:
+        return {}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT environment_id, version_value, changed_at, id
+                FROM test_environment_version_history
+                ORDER BY environment_id, changed_at, id
+            """)).fetchall()
+    except Exception:
+        return {}
+
+    by_env = {}
+    for env_id, ver, _ts, _id in rows:
+        if env_id not in by_env:
+            by_env[env_id] = []
+        v = str(ver or "").strip()
+        if not v:
+            continue
+        if not by_env[env_id] or by_env[env_id][-1] != v:
+            by_env[env_id].append(v)
+
+    paths = {}
+    for env_id, versions in by_env.items():
+        if versions:
+            paths[env_id] = "None -> " + " -> ".join(versions)
+        else:
+            paths[env_id] = "None"
+    return paths
+
+
+def load_current_environment_classifier_status():
+    """
+    Current (non-history) classifier status per environment at its current version.
+    """
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    te.id AS environment_id,
+                    te.env_name,
+                    te.base_url,
+                    te.version,
+                    te.is_active,
+                    COUNT(DISTINCT bcm.classifier_id) AS classifier_count,
+                    GROUP_CONCAT(DISTINCT c.name ORDER BY c.name SEPARATOR ', ') AS classifier_list
+                FROM test_environments te
+                LEFT JOIN builds b
+                    ON b.version = te.version
+                LEFT JOIN build_classifier_mappings bcm
+                    ON bcm.environment_id = te.id
+                   AND bcm.build_id = b.id
+                LEFT JOIN classifiers c
+                    ON c.id = bcm.classifier_id
+                GROUP BY te.id, te.env_name, te.base_url, te.version, te.is_active
+                ORDER BY te.env_name
+            """)).fetchall()
+        return pd.DataFrame(
+            rows,
+            columns=[
+                "environment_id",
+                "env_name",
+                "base_url",
+                "version",
+                "is_active",
+                "classifier_count",
+                "classifier_list"
+            ]
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def get_classifier_names_for_set(set_id):
+    if not engine or set_id is None:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT c.name
+                FROM classifier_set_members csm
+                JOIN classifiers c ON c.id = csm.classifier_id
+                WHERE csm.set_id = :sid
+                ORDER BY c.name
+            """), {"sid": int(set_id)}).fetchall()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception:
+        return []
+
+
+def get_classifier_names_for_env_version(environment_id, version_value):
+    if not engine or environment_id is None or not version_value:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT DISTINCT c.name
+                FROM build_classifier_mappings bcm
+                JOIN builds b ON b.id = bcm.build_id
+                JOIN classifiers c ON c.id = bcm.classifier_id
+                WHERE bcm.environment_id = :eid
+                  AND b.version = :ver
+                ORDER BY c.name
+            """), {"eid": int(environment_id), "ver": str(version_value)}).fetchall()
+        return [str(r[0]) for r in rows if r and r[0]]
+    except Exception:
+        return []
+
+
+def get_classifier_names_for_snapshot(snapshot_row):
+    """
+    Snapshot-aware classifier resolution with robust fallback:
+    1) classifier_set_id membership
+    2) env+version mapped classifier list
+    """
+    set_id = snapshot_row.get("classifier_set_id")
+    names = get_classifier_names_for_set(set_id) if set_id is not None else []
+    if names:
+        return names
+    return get_classifier_names_for_env_version(
+        snapshot_row.get("environment_id"),
+        snapshot_row.get("version_value")
+    )
+
+
+def save_classifiers_to_db(classifier_names):
+    if not engine:
+        return 0
+    inserted = 0
+    with engine.connect() as conn:
+        for name in classifier_names:
+            clean = str(name).strip()
+            if not clean:
+                continue
+            exists = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": clean}).fetchone()
+            if not exists:
+                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": clean})
+                inserted += 1
+        conn.commit()
+    return inserted
+
+
+def create_or_get_classifier_set(classifier_names):
+    """
+    Normalized classifier set storage:
+    - classifier_sets: unique set hash
+    - classifier_set_members: members for each set
+    Returns (set_id, classifier_count, new_classifiers_added)
+    """
+    if not engine:
+        return None, 0, 0
+
+    cleaned = []
+    seen = set()
+    for n in classifier_names or []:
+        c = str(n or "").strip()
+        if not c:
+            continue
+        key = c.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(c)
+
+    if not cleaned:
+        return None, 0, 0
+
+    new_classifiers = 0
+    with engine.connect() as conn:
+        classifier_ids = []
+        for name in sorted(cleaned, key=lambda x: x.lower()):
+            row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
+            if row:
+                classifier_ids.append(int(row[0]))
+            else:
+                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": name})
+                new_classifiers += 1
+                row2 = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
+                classifier_ids.append(int(row2[0]))
+
+        classifier_ids = sorted(set(classifier_ids))
+        set_hash = hashlib.md5(",".join(str(i) for i in classifier_ids).encode()).hexdigest()
+
+        set_row = conn.execute(text("SELECT id FROM classifier_sets WHERE set_hash = :h"), {"h": set_hash}).fetchone()
+        if set_row:
+            set_id = int(set_row[0])
+        else:
+            conn.execute(
+                text("INSERT INTO classifier_sets (set_hash, classifier_count) VALUES (:h, :c)"),
+                {"h": set_hash, "c": len(classifier_ids)}
+            )
+            set_id = int(conn.execute(text("SELECT id FROM classifier_sets WHERE set_hash = :h"), {"h": set_hash}).fetchone()[0])
+
+        for cid in classifier_ids:
+            conn.execute(
+                text("""
+                    INSERT IGNORE INTO classifier_set_members (set_id, classifier_id)
+                    VALUES (:s, :c)
+                """),
+                {"s": set_id, "c": cid}
+            )
+        conn.execute(
+            text("UPDATE classifier_sets SET classifier_count = :c WHERE id = :s"),
+            {"c": len(classifier_ids), "s": set_id}
+        )
+        conn.commit()
+    return set_id, len(cleaned), new_classifiers
+
+
+def sync_build_classifier_mappings(build_version, classifier_names, environment_id=None):
+    """
+    Normalize classifier storage:
+    - classifiers table keeps unique classifier names
+    - build_classifier_mappings keeps unique (build, classifier) links
+    """
+    if not engine:
+        return {"new_classifiers": 0, "new_links": 0, "total_links_for_build": 0, "build_id": None}
+
+    build_version = str(build_version or "").strip()
+    if not build_version:
+        return {"new_classifiers": 0, "new_links": 0, "total_links_for_build": 0, "build_id": None}
+
+    cleaned = []
+    seen = set()
+    for n in classifier_names or []:
+        c = str(n).strip()
+        if not c:
+            continue
+        k = c.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        cleaned.append(c)
+
+    if not cleaned:
+        return {"new_classifiers": 0, "new_links": 0, "total_links_for_build": 0, "build_id": None}
+
+    new_classifiers = 0
+    new_links = 0
+    with engine.connect() as conn:
+        build_id = get_or_create_id(conn, "builds", "version", build_version)
+        for name in cleaned:
+            row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
+            if row:
+                classifier_id = int(row[0])
+            else:
+                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": name})
+                new_classifiers += 1
+                classifier_id = int(conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()[0])
+
+            link = conn.execute(
+                text("SELECT id FROM build_classifier_mappings WHERE build_id = :b AND classifier_id = :c"),
+                {"b": int(build_id), "c": int(classifier_id)}
+            ).fetchone()
+            if link:
+                conn.execute(
+                    text("""
+                        UPDATE build_classifier_mappings
+                        SET environment_id = :e, last_synced_at = CURRENT_TIMESTAMP
+                        WHERE id = :id
+                    """),
+                    {"e": int(environment_id) if environment_id else None, "id": int(link[0])}
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
+                        VALUES (:b, :c, :e)
+                    """),
+                    {"b": int(build_id), "c": int(classifier_id), "e": int(environment_id) if environment_id else None}
+                )
+                new_links += 1
+
+        total_links = int(conn.execute(
+            text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b"),
+            {"b": int(build_id)}
+        ).fetchone()[0])
+        conn.commit()
+
+    return {
+        "new_classifiers": new_classifiers,
+        "new_links": new_links,
+        "total_links_for_build": total_links,
+        "build_id": build_id
+    }
 
 def page_add_benchmark():
     st.title("➕ Add New Benchmark Run")
@@ -479,19 +1395,23 @@ def page_add_benchmark():
     
     # 2. Classifier Info
     st.subheader("2. Classifiers")
-    classifier_input = st.text_input("Classifiers (comma-separated)", help="Example: PII, PCI, GDPR")
+    cl_c1, cl_c2 = st.columns(2)
+    template_name = cl_c1.selectbox(
+        "Template Name",
+        ["Data Source Scan", "Smart Scan", "Labeling Scan"],
+        index=0
+    )
+    classifier_input = cl_c2.text_input("Classifiers (comma-separated)", help="Example: PII, PCI, GDPR")
+    classifier_set = classifier_input
     
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
-    c3, c4, c5 = st.columns(3)
+    c3, c4, c5, c6 = st.columns(4)
     scan_count = c3.number_input("Scanner Count", min_value=1, value=5)
     thread_count = c4.number_input("Threads per Scanner", min_value=1, value=50)
     
-    st.caption("Feature Flags")
-    chk1, chk2, chk3 = st.columns(3)
-    is_acl = chk1.checkbox("ACL Enabled")
-    is_ocr = chk2.checkbox("OCR Enabled")
-    is_ff = chk3.checkbox("Structured Discovery FF")
+    is_acl = c5.checkbox("ACL Enabled")
+    is_ff = c6.checkbox("Structured Discovery FF")
     
     feature_flags = st.text_input("Additional Feature Flags (comma-separated)")
     comment = st.text_area("Configuration Comment (Optional)")
@@ -505,18 +1425,31 @@ def page_add_benchmark():
     ds_options = get_data_source_types()
     if not ds_options:
         ds_options = ["S3", "SMB", "MSSQL", "Oracle", "NFS", "Unknown"]
+    def reset_file_fields():
+        for k in ["file_set_structured", "file_set_unstructured", "total_rows", "total_columns", "total_files", "total_folders"]:
+            if k in st.session_state:
+                del st.session_state[k]
+
     c_ds, c_dt, c_fs = st.columns(3)
     with c_ds:
         ds_type_choice = st.selectbox("Data Source Type", ds_options + ["Other (custom)"])
     with c_dt:
-        data_type = st.selectbox("Data Type", ["Structured", "Unstructured", "Mixed"], key="data_type")
+        data_type = st.selectbox(
+            "Data Type",
+            ["Structured", "Unstructured", "Mixed"],
+            key="data_type",
+            on_change=reset_file_fields
+        )
+    fs_names, fs_details = get_file_set_types(data_type)
     with c_fs:
         if data_type == "Structured":
             fs_defaults = ["Small Tables", "Large Tables", "Mixed Tables"]
-            file_set_choice = st.selectbox("File Set Type", fs_defaults + ["Other (custom)"], key="file_set_structured")
+            fs_options = sorted(set(fs_names + fs_defaults))
+            file_set_choice = st.selectbox("File Set Type", fs_options + ["Other (custom)"], key="file_set_structured")
         else:
             fs_defaults = ["Small Files", "Large Files", "Mixed Files", "CSV Files"]
-            file_set_choice = st.selectbox("File Set Type", fs_defaults + ["Other (custom)"], key="file_set_unstructured")
+            fs_options = sorted(set(fs_names + fs_defaults))
+            file_set_choice = st.selectbox("File Set Type", fs_options + ["Other (custom)"], key="file_set_unstructured")
     custom_ds_type = None
     if ds_type_choice == "Other (custom)":
         custom_ds_type = st.text_input("Custom Data Source Type")
@@ -524,18 +1457,32 @@ def page_add_benchmark():
     custom_fs = st.text_input("Custom File Set Type", key="custom_file_set_type") if file_set_choice == "Other (custom)" else ""
     file_set_type = custom_fs.strip() if custom_fs.strip() else file_set_choice
 
-    r2_c1, r2_c2, r2_c3 = st.columns(3)
+    preset = fs_details.get(file_set_type, {})
+    avg_size = str(preset.get("avg_file_size") or "")
+    st.caption("File Set Type Details (auto-filled)")
     if data_type == "Structured":
-        total_files = r2_c1.number_input("Total Rows", min_value=0, step=1000, key="total_rows")
-        total_folders = r2_c2.number_input("Total Columns", min_value=0, step=10, key="total_columns")
+        details_row = {
+            "File Set Type": file_set_type,
+            "Total Rows": preset.get("total_files"),
+            "Total Columns": preset.get("total_folders"),
+            "Total Size (GB)": preset.get("total_size_gb"),
+            "Avg Row Size": avg_size
+        }
     else:
-        total_files = r2_c1.number_input("Total Files", min_value=0, step=1000, key="total_files")
-        total_folders = r2_c2.number_input("Total Folders", min_value=0, step=100, key="total_folders")
-    total_gb = r2_c3.number_input("Total Size (GB)", min_value=0.0, format="%.2f")
+        details_row = {
+            "File Set Type": file_set_type,
+            "Total Files": preset.get("total_files"),
+            "Total Folders": preset.get("total_folders"),
+            "Total Size (GB)": preset.get("total_size_gb"),
+            "Avg File Size": avg_size
+        }
+    st.table(pd.DataFrame([details_row]))
 
-    r3_c1, r3_c2 = st.columns(2)
-    total_catalog_items = r3_c1.number_input("Total Catalog Items", min_value=0, step=1000)
-    avg_size = r3_c2.text_input("Avg File Size (Text, e.g. '50kb')")
+    # Use values from selected file set details (no duplicate fields in UI)
+    total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
+    total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
+    total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
+    total_catalog_items = 0
 
     with st.form("add_benchmark_form"):
         st.markdown("#### Scan Timing")
@@ -546,8 +1493,8 @@ def page_add_benchmark():
         scan_start_time_str = t1_c1.text_input("Scan Start Time (HH:MM[:SS])", key="scan_start_time_str", placeholder="2:13:17")
         scan_end_date = t1_c2.date_input("Scan End Date", key="scan_end_date")
         scan_end_time_str = t1_c2.text_input("Scan End Time (HH:MM[:SS])", key="scan_end_time_str", placeholder="2:29:34")
-        enum_start_date = t1_c3.date_input("Enum Start Date", key="enum_start_date")
-        enum_start_time_str = t1_c3.text_input("Enum Start Time (HH:MM[:SS])", key="enum_start_time_str", placeholder="2:13:00")
+        t1_c3.text_input("Enum Start Date", value=str(scan_start_date), disabled=True)
+        t1_c3.text_input("Enum Start Time (HH:MM[:SS])", value=scan_start_time_str, disabled=True)
         enum_end_date = t1_c4.date_input("Enum End Date", key="enum_end_date")
         enum_end_time_str = t1_c4.text_input("Enum End Time (HH:MM[:SS])", key="enum_end_time_str", placeholder="2:29:00")
 
@@ -562,12 +1509,12 @@ def page_add_benchmark():
 
         scan_start_time = parse_time_value(scan_start_time_str)
         scan_end_time = parse_time_value(scan_end_time_str)
-        enum_start_time = parse_time_value(enum_start_time_str)
+        enum_start_time = parse_time_value(scan_start_time_str)
         enum_end_time = parse_time_value(enum_end_time_str)
 
         scan_start = datetime.combine(scan_start_date, scan_start_time) if scan_start_date and scan_start_time else None
         scan_end = datetime.combine(scan_end_date, scan_end_time) if scan_end_date and scan_end_time else None
-        enum_start = datetime.combine(enum_start_date, enum_start_time) if enum_start_date and enum_start_time else None
+        enum_start = datetime.combine(scan_start_date, enum_start_time) if scan_start_date and enum_start_time else None
         enum_end = datetime.combine(enum_end_date, enum_end_time) if enum_end_date and enum_end_time else None
 
         # Preview calculated scan duration
@@ -583,13 +1530,14 @@ def page_add_benchmark():
                 st.warning("Scan End Time must be after Scan Start Time.")
 
         st.subheader("5. Findings Files")
-        st.caption("Add multiple rows for classifier findings")
+        st.caption("Select a classifier and enter findings count. Add rows as needed.")
+        classifier_options = get_classifier_names()
         findings_df = st.data_editor(
-            pd.DataFrame([{"Classifier": "", "Findings": 0}]),
+            pd.DataFrame([{"Classifier": classifier_options[0] if classifier_options else "", "Findings": 0}]),
             num_rows="dynamic",
             use_container_width=True,
             column_config={
-                "Classifier": st.column_config.TextColumn("Classifier"),
+                "Classifier": st.column_config.SelectboxColumn("Classifier", options=classifier_options),
                 "Findings": st.column_config.NumberColumn("Findings", min_value=0, step=1)
             }
         )
@@ -642,6 +1590,20 @@ def page_add_benchmark():
                 with engine.connect() as conn:
                     # A. Insert Build
                     b_id = get_or_create_id(conn, "builds", "version", build_ver.strip())
+
+                    # Build template & classifier set (optional)
+                    ensure_build_templates_table()
+                    if template_name.strip() or classifier_set.strip():
+                        conn.execute(text("""
+                            INSERT INTO build_templates (build_id, template_name, classifier_set)
+                            VALUES (:bid, :tn, :cs)
+                            ON DUPLICATE KEY UPDATE classifier_set = VALUES(classifier_set)
+                        """), {
+                            "bid": b_id,
+                            "tn": template_name.strip() if template_name.strip() else "Default",
+                            "cs": classifier_set.strip()
+                        })
+                        conn.commit()
                     
                     # B. Insert Classifier(s)
                     classifier_list = [c.strip() for c in (classifier_input or "").split(",") if c.strip()]
@@ -735,6 +1697,587 @@ def page_add_benchmark():
                     
             except Exception as e:
                 st.error(f"Error saving to DB: {e}")
+
+def page_manage_classifiers():
+    st.title("🧩 Build Template Classifiers")
+    st.markdown("Manage build-wise template and comma-separated classifier sets.")
+
+    if not engine:
+        st.error("Database not connected.")
+        return
+
+    ensure_build_templates_table()
+
+    with engine.connect() as conn:
+        build_versions = [r[0] for r in conn.execute(text("SELECT version FROM builds ORDER BY version DESC")).fetchall()]
+
+    c1, c2 = st.columns(2)
+    build_version = c1.selectbox("Build Version", build_versions + ["Other (new build)"])
+    if build_version == "Other (new build)":
+        build_version = c1.text_input("New Build Version")
+    template_name = c2.selectbox("Template Name", ["Data Source Scan", "Smart Scan", "Labeling Scan", "Other"])
+    if template_name == "Other":
+        template_name = c2.text_input("Custom Template Name")
+
+    existing_set = ""
+    if build_version and template_name:
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("""
+                    SELECT bt.classifier_set
+                    FROM build_templates bt
+                    JOIN builds b ON bt.build_id = b.id
+                    WHERE b.version = :v AND bt.template_name = :t
+                    LIMIT 1
+                """), {"v": build_version.strip(), "t": template_name.strip()}).fetchone()
+                if row and row[0]:
+                    existing_set = row[0]
+        except Exception:
+            existing_set = ""
+
+    classifier_set = st.text_area("Classifiers (comma-separated)", value=existing_set, height=120)
+    submitted = st.button("Save Build Template Classifiers", type="primary")
+    if submitted:
+        if not build_version or not build_version.strip():
+            st.error("Build Version is required.")
+            return
+        if not template_name or not template_name.strip():
+            st.error("Template Name is required.")
+            return
+        try:
+            classifiers = [c.strip() for c in (classifier_set or "").split(",") if c.strip()]
+            with engine.connect() as conn:
+                b_id = get_or_create_id(conn, "builds", "version", build_version.strip())
+                ensure_build_templates_table()
+                conn.execute(text("""
+                    INSERT INTO build_templates (build_id, template_name, classifier_set)
+                    VALUES (:bid, :tn, :cs)
+                    ON DUPLICATE KEY UPDATE classifier_set = VALUES(classifier_set)
+                """), {"bid": b_id, "tn": template_name.strip(), "cs": ", ".join(classifiers)})
+                for cl in classifiers:
+                    get_or_create_id(conn, "classifiers", "name", cl)
+                conn.commit()
+            st.success("Build template classifiers saved.")
+        except Exception as e:
+            st.error(f"Error saving build template classifiers: {e}")
+
+
+def page_manage_test_environments():
+    st.title("🌐 Test Environment APIs")
+    st.markdown("Manage test environments and load classifiers from API.")
+    if st.session_state.get("env_action_msg"):
+        lvl = st.session_state.get("env_action_level", "info")
+        msg = st.session_state.get("env_action_msg")
+        if lvl == "success":
+            st.success(msg)
+        elif lvl == "warning":
+            st.warning(msg)
+        else:
+            st.info(msg)
+        # Keep message visible until next action overrides it.
+
+    if not engine:
+        st.error("Database not connected.")
+        return
+
+    ensure_test_environments_table()
+    env_df = load_test_environments()
+
+    st.subheader("1. Environment Details")
+    env_names = env_df["env_name"].tolist() if not env_df.empty else []
+    selected_env_name = st.selectbox("Existing Environment", ["Add New Environment"] + env_names)
+    selected_row = {}
+    if selected_env_name != "Add New Environment" and not env_df.empty:
+        selected = env_df[env_df["env_name"] == selected_env_name]
+        if not selected.empty:
+            selected_row = selected.iloc[0].to_dict()
+
+    # Initialize/edit form state per selected environment
+    selection_marker = f"{selected_env_name}|{selected_row.get('id', 'new')}"
+    if st.session_state.get("_env_form_selected_marker") != selection_marker:
+        st.session_state["_env_form_selected_marker"] = selection_marker
+        st.session_state["env_name_input"] = str(selected_row.get("env_name") or "")
+        st.session_state["env_version_input"] = str(selected_row.get("version") or "")
+        st.session_state["env_base_url_input"] = str(selected_row.get("base_url") or "")
+        _cred_env_name = str(selected_row.get("env_name") or "")
+        _saved_user, _saved_pass = get_saved_environment_credentials(_cred_env_name)
+        st.session_state["env_auth_username_input"] = _saved_user
+        st.session_state["env_auth_password_input"] = _saved_pass
+        st.session_state["_prev_base_url_for_version_sync"] = normalize_base_url(selected_row.get("base_url") or "")
+        st.session_state.pop("_auto_version_status", None)
+
+    c1, c2 = st.columns(2)
+    env_name = c1.text_input("Environment Name", key="env_name_input")
+    base_url = c2.text_input("Base URL", key="env_base_url_input", placeholder="https://test-env.example.com")
+
+    # Auto-fetch version when base URL changes (especially for first-time/new env entry)
+    normalized_base_url = normalize_base_url(base_url)
+    prev_base_url = st.session_state.get("_prev_base_url_for_version_sync", "")
+    if normalized_base_url != prev_base_url:
+        st.session_state["_prev_base_url_for_version_sync"] = normalized_base_url
+        if normalized_base_url:
+            temp_env = {"base_url": normalized_base_url, "env_name": env_name}
+            try:
+                token = ""
+                try:
+                    token = fetch_auth_token_for_env(temp_env)
+                except Exception:
+                    # /api/v1/about can work without auth in some envs.
+                    token = ""
+                clean_version, raw_version, _ = fetch_core_version_from_api(
+                    normalized_base_url, token, INTERNAL_ABOUT_API_PATH
+                )
+                if clean_version:
+                    st.session_state["env_version_input"] = clean_version
+                    st.session_state["_auto_version_status"] = (
+                        "success",
+                        f"Auto-detected core version: {clean_version} (raw: {raw_version})"
+                    )
+                else:
+                    st.session_state["_auto_version_status"] = (
+                        "warn",
+                        "Base URL changed, but releaseVersion was not found in /api/v1/about response."
+                    )
+            except Exception as ex:
+                st.session_state["_auto_version_status"] = (
+                    "warn",
+                    f"Base URL changed, but version auto-fetch failed: {ex}"
+                )
+
+    status = st.session_state.get("_auto_version_status")
+    if status:
+        level, msg = status
+        if level == "success":
+            st.success(msg)
+        else:
+            st.warning(msg)
+
+    c3, c4 = st.columns(2)
+    version = c3.text_input("Version", key="env_version_input")
+    auth_username = c4.text_input("Username (optional)", key="env_auth_username_input", help="If blank, defaults to bigid")
+    c5, _ = st.columns(2)
+    auth_password = c5.text_input("Password (optional)", key="env_auth_password_input", type="password", help="If blank, defaults to bigid111")
+    is_active = st.checkbox("Active", value=bool(selected_row.get("is_active", True)))
+
+    if st.button("Save Environment", type="primary"):
+        if not env_name.strip():
+            st.error("Environment Name is required.")
+        elif not base_url.strip():
+            st.error("Base URL is required.")
+        else:
+            try:
+                save_environment_credentials(env_name.strip(), auth_username, auth_password)
+                resolved_auth_module_path = str(selected_row.get("auth_module_path") or "").strip()
+                resolved_auth_function = str(selected_row.get("auth_function_name") or "Get_auth_token").strip()
+                resolved_api_path = str(selected_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH).strip()
+
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        INSERT INTO test_environments (env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active)
+                        VALUES (:n, :u, :v, :ap, :af, :cp, :ia)
+                        ON DUPLICATE KEY UPDATE
+                            base_url = VALUES(base_url),
+                            version = VALUES(version),
+                            auth_module_path = VALUES(auth_module_path),
+                            auth_function_name = VALUES(auth_function_name),
+                            classifiers_api_path = VALUES(classifiers_api_path),
+                            is_active = VALUES(is_active)
+                    """), {
+                        "n": env_name.strip(),
+                        "u": normalize_base_url(base_url),
+                        "v": version.strip() if version else None,
+                        "ap": resolved_auth_module_path or None,
+                        "af": resolved_auth_function or "Get_auth_token",
+                        "cp": resolved_api_path or DEFAULT_CLASSIFIERS_API_PATH,
+                        "ia": 1 if is_active else 0
+                    })
+                    conn.commit()
+
+                    saved = conn.execute(text("""
+                        SELECT id, env_name, base_url, version, classifiers_api_path
+                        FROM test_environments
+                        WHERE env_name = :n
+                        LIMIT 1
+                    """), {"n": env_name.strip()}).fetchone()
+
+                st.success("Environment saved.")
+
+                # Auto-sync classifiers to normalized build mapping on save
+                if saved:
+                    saved_row = {
+                        "id": saved[0],
+                        "env_name": saved[1],
+                        "base_url": saved[2],
+                        "version": saved[3],
+                        "classifiers_api_path": saved[4] or INTERNAL_CLASSIFIERS_API_PATH
+                    }
+                    token = ""
+                    try:
+                        token = fetch_auth_token_for_env(saved_row)
+                    except Exception:
+                        token = ""
+
+                    effective_version = str(saved_row.get("version") or "").strip()
+                    try:
+                        core_version, raw_version, _ = fetch_core_version_from_api(saved_row.get("base_url"), token, INTERNAL_ABOUT_API_PATH)
+                        if core_version:
+                            effective_version = core_version
+                            st.info(f"Core version detected: {core_version} (raw: {raw_version})")
+                    except Exception:
+                        pass
+
+                    try:
+                        classifier_names, total_count, _ = fetch_classifiers_with_auth_retry(saved_row)
+                        if classifier_names:
+                            set_id, set_size, _new_cls_from_set = create_or_get_classifier_set(classifier_names)
+                            record_environment_version(
+                                saved_row.get("id"),
+                                saved_row.get("env_name"),
+                                effective_version,
+                                classifier_set_id=set_id
+                            )
+                            sync_stats = sync_build_classifier_mappings(
+                                effective_version,
+                                classifier_names,
+                                environment_id=saved_row.get("id")
+                            )
+                            st.success(
+                                f"Classifier sync complete for build {effective_version or 'N/A'}: "
+                                f"{len(classifier_names)} fetched"
+                                f"{f' (totalCount={total_count})' if total_count is not None else ''}, "
+                                f"set size {set_size}, "
+                                f"{sync_stats['new_classifiers']} new classifiers, "
+                                f"{sync_stats['new_links']} new build links, "
+                                f"{sync_stats['total_links_for_build']} total mapped for build."
+                            )
+                        else:
+                            st.warning("Environment saved, but classifier API returned no names.")
+                    except Exception as ex:
+                        st.warning(f"Environment saved, but classifier sync failed: {ex}")
+
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"Error saving environment: {e}")
+
+    if not env_df.empty:
+        show_df = env_df.copy()
+        show_df["is_active"] = show_df["is_active"].apply(lambda x: bool(x))
+        build_paths = load_environment_build_change_paths()
+        def run_env_actions(fetch_row, do_sync=False, do_fetch=False):
+            env_name_val = str(fetch_row.get("env_name") or "").strip()
+            effective_version = str(fetch_row.get("version") or "").strip()
+            try:
+                # Ensure env-wise credentials exist in .env (defaults if not provided)
+                saved_u, saved_p = get_saved_environment_credentials(env_name_val)
+                save_environment_credentials(env_name_val, saved_u, saved_p)
+
+                data_changed = False
+                token = ""
+                try:
+                    token = fetch_auth_token_for_env(fetch_row)
+                except Exception:
+                    token = ""
+
+                if do_sync:
+                    clean_version, raw_version, about_url = fetch_core_version_from_api(
+                        fetch_row.get("base_url"), token, INTERNAL_ABOUT_API_PATH
+                    )
+                    if clean_version:
+                        # Hard guard: Sync must not mutate data when version is unchanged.
+                        previous_version = get_environment_current_version(fetch_row.get("id")) or str(fetch_row.get("version") or "").strip()
+                        effective_version = clean_version
+
+                        if clean_version != previous_version:
+                            st.success(f"[{env_name_val}] Core version changed: {previous_version or 'None'} -> {clean_version} (raw: {raw_version})")
+                            # Only fetch classifiers on sync when version changed.
+                            do_fetch = True
+                        else:
+                            st.session_state["env_action_level"] = "info"
+                            st.session_state["env_action_msg"] = f"[{env_name_val}] No version change ({clean_version}). Classifier sync skipped."
+                            st.info(st.session_state["env_action_msg"])
+                            return
+                    else:
+                        st.warning(f"[{env_name_val}] Could not read releaseVersion from API response. URL: {about_url}")
+
+                if do_fetch:
+                    classifier_names, total_count, api_url = fetch_classifiers_with_auth_retry(fetch_row)
+                    if not classifier_names:
+                        st.warning(f"[{env_name_val}] API call succeeded but no classifier names were found. URL: {api_url}")
+                    else:
+                        set_id, set_size, _new_cls_from_set = create_or_get_classifier_set(classifier_names)
+                        changed, previous = record_environment_version(
+                            fetch_row.get("id"),
+                            fetch_row.get("env_name"),
+                            effective_version,
+                            classifier_set_id=set_id
+                        )
+                        if changed:
+                            if str(previous or "") == str(effective_version or ""):
+                                st.info(f"[{env_name_val}] Classifier snapshot linked for version {effective_version}.")
+                            else:
+                                st.info(f"[{env_name_val}] Snapshot updated: {previous or 'None'} -> {effective_version}")
+                        sync_stats = sync_build_classifier_mappings(
+                            effective_version,
+                            classifier_names,
+                            environment_id=fetch_row.get("id")
+                        )
+                        data_changed = data_changed or changed or sync_stats["new_links"] > 0 or sync_stats["new_classifiers"] > 0
+                        st.success(
+                            f"[{env_name_val}] Classifier sync for build {effective_version or 'N/A'}: "
+                            f"{len(classifier_names)} fetched"
+                            f"{f' (totalCount={total_count})' if total_count is not None else ''}, "
+                            f"set size {set_size}, "
+                            f"{sync_stats['new_classifiers']} new classifiers, "
+                            f"{sync_stats['new_links']} new build links, "
+                            f"{sync_stats['total_links_for_build']} total mapped."
+                        )
+                        st.session_state["env_action_level"] = "success"
+                        st.session_state["env_action_msg"] = (
+                            f"[{env_name_val}] Sync done for version {effective_version}: "
+                            f"{len(classifier_names)} classifiers, {sync_stats['new_links']} new links."
+                        )
+                if data_changed:
+                    st.cache_data.clear()
+            except Exception as ex:
+                st.error(f"[{env_name_val}] Action failed: {ex}")
+                st.session_state["env_action_level"] = "warning"
+                st.session_state["env_action_msg"] = f"[{env_name_val}] Action failed: {ex}"
+
+        # Render a compact inline table-like layout with native buttons (no full page refresh)
+        h1, h2, h3, h4, h5, h6, h7 = st.columns([1.2, 3.2, 0.8, 0.7, 2.2, 1.1, 1.2])
+        h1.markdown("**env_name**")
+        h2.markdown("**base_url**")
+        h3.markdown("**version**")
+        h4.markdown("**is_active**")
+        h5.markdown("**Build Change Path**")
+        h6.markdown("**Sync Core Ver**")
+        h7.markdown("**Get Classifiers**")
+        st.divider()
+
+        for _, r in show_df.iterrows():
+            row_dict = r.to_dict()
+            row_dict["classifiers_api_path"] = str(row_dict.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH).strip()
+            c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 3.2, 0.8, 0.7, 2.2, 1.1, 1.2])
+            c1.write(str(row_dict.get("env_name") or ""))
+            c2.write(str(row_dict.get("base_url") or ""))
+            c3.write(str(row_dict.get("version") or ""))
+            c4.write("Yes" if bool(row_dict.get("is_active")) else "No")
+            env_id = row_dict.get("id")
+            path_text = build_paths.get(int(env_id), f"None -> {str(row_dict.get('version') or '').strip()}") if env_id is not None else f"None -> {str(row_dict.get('version') or '').strip()}"
+            c5.write(path_text)
+            c6.markdown(
+                """
+                <style>
+                div[data-testid="stButton"] > button[kind="secondary"] {
+                    min-width: 120px !important;
+                    padding: 0.35rem 0.75rem !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+            if c6.button("Sync Core Ver", key=f"sync_btn_{int(row_dict.get('id'))}"):
+                run_env_actions(row_dict, do_sync=True, do_fetch=False)
+            c7.markdown(
+                """
+                <style>
+                div[data-testid="stButton"] > button[kind="secondary"] {
+                    min-width: 120px !important;
+                    padding: 0.35rem 0.75rem !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+            if c7.button("Get Classifiers", key=f"fetch_btn_{int(row_dict.get('id'))}"):
+                run_env_actions(row_dict, do_sync=False, do_fetch=True)
+            st.divider()
+    else:
+        st.info("No environments found yet. Add one above.")
+
+    st.subheader("Current Environment Classifier Status")
+    status_df = load_current_environment_classifier_status()
+    if status_df.empty:
+        st.caption("No environment classifier status available yet.")
+    else:
+        display_df = status_df.copy().rename(columns={
+            "env_name": "Env",
+            "base_url": "URL",
+            "version": "Ver",
+            "is_active": "Active",
+            "classifier_count": "Cls Cnt",
+            "classifier_list": "Classifiers"
+        })
+
+        rows_html = []
+        for _, r in display_df.iterrows():
+            cls_raw = str(r.get("Classifiers") or "").strip()
+            if cls_raw:
+                cls_html = "<br>".join(html.escape(x.strip()) for x in cls_raw.split(",") if x.strip())
+            else:
+                cls_html = ""
+            cls_cnt_val = r.get("Cls Cnt")
+            if pd.isna(cls_cnt_val):
+                cls_cnt_text = ""
+            else:
+                cls_cnt_text = str(int(cls_cnt_val)) if str(cls_cnt_val).replace(".", "", 1).isdigit() else str(cls_cnt_val)
+            rows_html.append(
+                "<tr>"
+                f"<td>{html.escape(str(r.get('Env') or ''))}</td>"
+                f"<td>{html.escape(str(r.get('URL') or ''))}</td>"
+                f"<td>{html.escape(str(r.get('Ver') or ''))}</td>"
+                f"<td>{'Yes' if bool(r.get('Active')) else 'No'}</td>"
+                f"<td>{html.escape(cls_cnt_text)}</td>"
+                f"<td class='cls-wrap'>{cls_html}</td>"
+                "</tr>"
+            )
+
+        history_html = dedent(f"""
+        <style>
+          .env-history-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.9rem;
+          }}
+          .env-history-table th, .env-history-table td {{
+            border: 1px solid #e5e7eb;
+            padding: 6px 8px;
+            text-align: left;
+            vertical-align: top;
+          }}
+          .env-history-table th {{
+            background: #f8fafc;
+            font-weight: 600;
+          }}
+          .env-history-table .cls-wrap {{
+            white-space: normal;
+            word-break: break-word;
+            line-height: 1.35;
+            max-width: 620px;
+          }}
+        </style>
+        <table class="env-history-table">
+          <thead>
+            <tr>
+              <th>Env</th>
+              <th>URL</th>
+              <th>Ver</th>
+              <th>Active</th>
+              <th>Cls Cnt</th>
+              <th>Classifiers</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows_html)}
+          </tbody>
+        </table>
+        """)
+        st.markdown(history_html, unsafe_allow_html=True)
+
+
+def page_version_comparison():
+    st.title("🧬 Version Comparison")
+    st.markdown("Compare classifiers across different **build versions**.")
+
+    stats = load_build_version_classifier_stats()
+    if stats.empty:
+        st.info("No build-wise classifier data found yet. Run Sync/Get Classifiers first.")
+        return
+
+    # Line chart: number of classifiers over time
+    st.subheader("Classifier Count Trend")
+    env_options = sorted(stats["env_name"].dropna().astype(str).unique().tolist())
+    selected_envs = st.multiselect("Environment Filter", env_options, default=env_options[:1] if env_options else [])
+    trend_df = stats.copy()
+    if selected_envs:
+        trend_df = trend_df[trend_df["env_name"].isin(selected_envs)]
+    trend_df["build_version"] = trend_df["build_version"].astype(str).str.strip()
+    trend_df = trend_df[(trend_df["build_version"] != "") & (trend_df["build_version"].str.lower() != "nan")]
+    trend_df["last_synced_at"] = pd.to_datetime(trend_df["last_synced_at"], errors="coerce")
+    trend_df = trend_df.dropna(subset=["last_synced_at"])
+
+    def version_sort_key(v):
+        s = str(v or "").strip()
+        parts = s.split(".")
+        nums = []
+        for p in parts:
+            p = p.strip()
+            if p.isdigit():
+                nums.append(int(p))
+            else:
+                # keep non-numeric versions stable but after numeric
+                return (1, s.lower())
+        return (0, tuple(nums), s)
+
+    if not trend_df.empty:
+        ordered_builds = sorted(trend_df["build_version"].unique().tolist(), key=version_sort_key)
+        # Keep x-axis strictly categorical (string labels), never numeric.
+        trend_df["build_version_label"] = trend_df["build_version"].astype(str)
+        trend_df["build_version_label"] = pd.Categorical(
+            trend_df["build_version_label"],
+            categories=ordered_builds,
+            ordered=True
+        )
+        fig = px.line(
+            trend_df.sort_values(["build_version_label", "last_synced_at"]),
+            x="build_version_label",
+            y="classifier_count",
+            color="env_name",
+            markers=True,
+            title="Number of Classifiers by Build Version"
+        )
+        fig.update_xaxes(type="category", categoryorder="array", categoryarray=ordered_builds, title_text="Build Version")
+        fig.update_yaxes(title_text="Classifier Count")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.caption("No trend data available.")
+
+    st.divider()
+    st.subheader("Build-to-Build Comparison")
+    cmp_df = stats.copy()
+    if cmp_df.empty:
+        st.info("Need at least two build versions for comparison.")
+        return
+
+    selected_env = st.selectbox("Environment", env_options, key="build_cmp_env")
+    env_df = cmp_df[cmp_df["env_name"] == selected_env].copy()
+    build_versions = env_df["build_version"].dropna().astype(str).unique().tolist()
+    if len(build_versions) < 2:
+        st.info("Need at least two build versions in selected environment.")
+        return
+
+    c1, c2 = st.columns(2)
+    baseline_build = c1.selectbox("Baseline Build", build_versions, index=0, key="build_cmp_base")
+    candidate_build = c2.selectbox("Candidate Build", build_versions, index=1 if len(build_versions) > 1 else 0, key="build_cmp_cand")
+
+    env_id = int(env_df.iloc[0]["environment_id"])
+    base_set = set(get_classifier_names_for_env_version(env_id, baseline_build))
+    cand_set = set(get_classifier_names_for_env_version(env_id, candidate_build))
+
+    added = sorted(cand_set - base_set)
+    removed = sorted(base_set - cand_set)
+    common = sorted(base_set & cand_set)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Baseline Count", len(base_set))
+    m2.metric("Candidate Count", len(cand_set))
+    m3.metric("Added", len(added))
+    m4.metric("Removed", len(removed))
+
+    st.caption(
+        f"Comparing `{selected_env} {baseline_build}` vs `{selected_env} {candidate_build}`"
+    )
+
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        st.markdown("**Added in Candidate**")
+        st.dataframe(pd.DataFrame({"Classifier": added}) if added else pd.DataFrame({"Classifier": []}), use_container_width=True)
+    with t2:
+        st.markdown("**Removed from Baseline**")
+        st.dataframe(pd.DataFrame({"Classifier": removed}) if removed else pd.DataFrame({"Classifier": []}), use_container_width=True)
+    with t3:
+        st.markdown("**Common**")
+        st.dataframe(pd.DataFrame({"Classifier": common}) if common else pd.DataFrame({"Classifier": []}), use_container_width=True)
 
 # --- Build Analysis Page ---
 def page_build_analysis(df):
@@ -1587,7 +3130,10 @@ def main():
                 "ACL ON vs OLS (ACL ON)": "ACL ON vs OLS (ACL ON)",
                 "ACL OFF vs OLS (ACL OFF)": "ACL OFF vs OLS (ACL OFF)",
                 "Run Comparison Tool": "Comparison",
-                "Edit Records": "Edit Records"
+                "Edit Records": "Edit Records",
+                "Manage Classifiers": "Manage Classifiers",
+                "Manage Test Environments": "Manage Test Environments",
+                "Version Comparison": "Version Comparison"
             }
             if normalized in page_map:
                 st.session_state.current_page = page_map[normalized]
@@ -1818,6 +3364,9 @@ def main():
                 <a href="?page=Run+Comparison+Tool" target="_self" class="flyout-item"><span>🔄</span> <span>Run Head-to-Head</span></a>
                 <a href="?page=Add+New+Benchmark" target="_self" class="flyout-item"><span>➕</span> <span>Add New Data Record</span></a>
                 <a href="?page=Edit+Records" target="_self" class="flyout-item"><span>🛠️</span> <span>Edit Existing Records</span></a>
+                <a href="?page=Manage+Classifiers" target="_self" class="flyout-item"><span>🧩</span> <span>Manage Classifiers</span></a>
+                <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
+                <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
                 <div class="flyout-header" style="margin-top: 10px;">Archived / Disabled</div>
                 <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📁</span> <span>Overview Dashboard (Off)</span></a>
                 <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📉</span> <span>Build Analysis (Off)</span></a>
@@ -1871,6 +3420,12 @@ def main():
     elif page == "Edit Records":
         full_data = load_data(include_inactive=True)
         page_edit_benchmark(full_data)
+    elif page == "Manage Classifiers":
+        page_manage_classifiers()
+    elif page == "Manage Test Environments":
+        page_manage_test_environments()
+    elif page == "Version Comparison":
+        page_version_comparison()
 
 if __name__ == "__main__":
     main()
