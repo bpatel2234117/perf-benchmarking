@@ -4,3 +4,4 @@ plotly
 sqlalchemy
 pymysql
 openpyxl
+requests
