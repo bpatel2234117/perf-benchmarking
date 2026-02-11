@@ -142,7 +142,9 @@ def migrate_data(engine):
                 
                 # Classifiers
                 cl_col = next((c for c in df.columns if 'classifier' in str(c).lower()), None)
-                cl_name = str(row.get(cl_col, 'Default')) if cl_col else 'Default'
+                cl_name = str(row.get(cl_col, 'Default')).strip() if cl_col else 'Default'
+                if re.match(r'^\d+\s+Classifiers\s+from\s+Global\s+list$', cl_name, flags=re.IGNORECASE):
+                    cl_name = 'Default'
                 conn.execute(text("INSERT IGNORE INTO classifiers (name) VALUES (:n)"), {'n': cl_name})
                 cl_id = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {'n': cl_name}).fetchone()[0]
                 

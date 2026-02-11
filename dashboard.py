@@ -11,6 +11,7 @@ import requests
 import os
 from textwrap import dedent
 import html
+import re
 from pathlib import Path
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
@@ -518,6 +519,52 @@ def get_classifier_names():
         return []
 
 
+def get_classifier_names_for_build(build_version):
+    """
+    Return classifier names scoped to the provided build version only.
+    Priority:
+    1) Normalized mappings (build_classifier_mappings -> classifiers)
+    2) build_templates.classifier_set (comma-separated fallback)
+    """
+    build_version = str(build_version or "").strip()
+    if not engine or not build_version:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT DISTINCT c.name
+                FROM builds b
+                JOIN build_classifier_mappings bcm ON bcm.build_id = b.id
+                JOIN classifiers c ON c.id = bcm.classifier_id
+                WHERE b.version = :v
+                ORDER BY c.name
+            """), {"v": build_version}).fetchall()
+            names = [str(r[0]).strip() for r in rows if r and r[0]]
+            if names:
+                return names
+
+            # Fallback for builds saved via template-based classifier sets
+            tmpl_rows = conn.execute(text("""
+                SELECT bt.classifier_set
+                FROM builds b
+                JOIN build_templates bt ON bt.build_id = b.id
+                WHERE b.version = :v
+            """), {"v": build_version}).fetchall()
+
+            fallback = set()
+            for (classifier_set,) in tmpl_rows:
+                raw = str(classifier_set or "").strip()
+                if not raw:
+                    continue
+                for name in raw.split(","):
+                    n = name.strip()
+                    if n:
+                        fallback.add(n)
+            return sorted(fallback)
+    except Exception:
+        return []
+
+
 def ensure_test_environments_table():
     if not engine:
         return
@@ -587,12 +634,20 @@ def ensure_test_environments_table():
                     classifier_id INT NOT NULL,
                     environment_id INT NULL,
                     last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uniq_build_classifier (build_id, classifier_id),
+                    UNIQUE KEY uniq_build_classifier_env (build_id, classifier_id, environment_id),
                     FOREIGN KEY (build_id) REFERENCES builds(id),
                     FOREIGN KEY (classifier_id) REFERENCES classifiers(id),
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
                 )
             """))
+            try:
+                conn.execute(text("ALTER TABLE build_classifier_mappings DROP INDEX uniq_build_classifier"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE build_classifier_mappings ADD UNIQUE KEY uniq_build_classifier_env (build_id, classifier_id, environment_id)"))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass
@@ -850,7 +905,7 @@ def fetch_core_version_from_api(base_url, token, about_api_path=None):
 
 def record_environment_version(environment_id, env_name, new_version, classifier_set_id=None):
     """
-    Save version snapshot only when changed from latest value.
+    Save environment version history only when changed from latest value.
     Also updates current version in test_environments table.
     Returns: (changed, previous_version)
     """
@@ -940,8 +995,7 @@ def load_all_environment_version_history():
                                 SELECT COUNT(DISTINCT bcm.classifier_id)
                                 FROM build_classifier_mappings bcm
                                 JOIN builds b ON b.id = bcm.build_id
-                                WHERE bcm.environment_id = te.id
-                                  AND b.version = h.version_value
+                                WHERE b.version = h.version_value
                             ),
                             0
                         ) AS classifier_count,
@@ -958,8 +1012,7 @@ def load_all_environment_version_history():
                                     FROM build_classifier_mappings bcm2
                                     JOIN builds b2 ON b2.id = bcm2.build_id
                                     JOIN classifiers c2 ON c2.id = bcm2.classifier_id
-                                    WHERE bcm2.environment_id = te.id
-                                      AND b2.version = h.version_value
+                                    WHERE b2.version = h.version_value
                                 )
                             )
                         ) AS classifier_list
@@ -985,28 +1038,6 @@ def load_all_environment_version_history():
         return pd.DataFrame()
 
 
-def get_latest_snapshot_meta(environment_id):
-    if not engine or environment_id is None:
-        return None
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT version_value, classifier_set_id
-                FROM test_environment_version_history
-                WHERE environment_id = :eid
-                ORDER BY changed_at DESC, id DESC
-                LIMIT 1
-            """), {"eid": int(environment_id)}).fetchone()
-            if not row:
-                return None
-            return {
-                "version_value": row[0],
-                "classifier_set_id": row[1]
-            }
-    except Exception:
-        return None
-
-
 def get_environment_current_version(environment_id):
     if not engine or environment_id is None:
         return ""
@@ -1019,44 +1050,6 @@ def get_environment_current_version(environment_id):
         return str(row[0] or "").strip() if row else ""
     except Exception:
         return ""
-
-
-def load_version_snapshots():
-    """
-    Snapshot rows for version-wise classifier comparisons.
-    """
-    if not engine:
-        return pd.DataFrame()
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT
-                    h.id AS snapshot_id,
-                    h.environment_id,
-                    te.env_name,
-                    h.version_value,
-                    h.classifier_set_id,
-                    h.changed_at,
-                    COALESCE(cs.classifier_count, 0) AS classifier_count
-                FROM test_environment_version_history h
-                JOIN test_environments te ON te.id = h.environment_id
-                LEFT JOIN classifier_sets cs ON cs.id = h.classifier_set_id
-                ORDER BY h.changed_at DESC, h.id DESC
-            """)).fetchall()
-        return pd.DataFrame(
-            rows,
-            columns=[
-                "snapshot_id",
-                "environment_id",
-                "env_name",
-                "version_value",
-                "classifier_set_id",
-                "changed_at",
-                "classifier_count"
-            ]
-        )
-    except Exception:
-        return pd.DataFrame()
 
 
 def load_build_version_classifier_stats():
@@ -1145,8 +1138,7 @@ def load_current_environment_classifier_status():
                 LEFT JOIN builds b
                     ON b.version = te.version
                 LEFT JOIN build_classifier_mappings bcm
-                    ON bcm.environment_id = te.id
-                   AND bcm.build_id = b.id
+                    ON bcm.build_id = b.id
                 LEFT JOIN classifiers c
                     ON c.id = bcm.classifier_id
                 GROUP BY te.id, te.env_name, te.base_url, te.version, te.is_active
@@ -1204,22 +1196,6 @@ def get_classifier_names_for_env_version(environment_id, version_value):
         return []
 
 
-def get_classifier_names_for_snapshot(snapshot_row):
-    """
-    Snapshot-aware classifier resolution with robust fallback:
-    1) classifier_set_id membership
-    2) env+version mapped classifier list
-    """
-    set_id = snapshot_row.get("classifier_set_id")
-    names = get_classifier_names_for_set(set_id) if set_id is not None else []
-    if names:
-        return names
-    return get_classifier_names_for_env_version(
-        snapshot_row.get("environment_id"),
-        snapshot_row.get("version_value")
-    )
-
-
 def save_classifiers_to_db(classifier_names):
     if not engine:
         return 0
@@ -1227,7 +1203,7 @@ def save_classifiers_to_db(classifier_names):
     with engine.connect() as conn:
         for name in classifier_names:
             clean = str(name).strip()
-            if not clean:
+            if not clean or re.match(r"^\d+\s+Classifiers\s+from\s+Global\s+list$", clean, flags=re.IGNORECASE):
                 continue
             exists = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": clean}).fetchone()
             if not exists:
@@ -1251,7 +1227,7 @@ def create_or_get_classifier_set(classifier_names):
     seen = set()
     for n in classifier_names or []:
         c = str(n or "").strip()
-        if not c:
+        if not c or re.match(r"^\d+\s+Classifiers\s+from\s+Global\s+list$", c, flags=re.IGNORECASE):
             continue
         key = c.lower()
         if key in seen:
@@ -1321,7 +1297,7 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
     seen = set()
     for n in classifier_names or []:
         c = str(n).strip()
-        if not c:
+        if not c or re.match(r"^\d+\s+Classifiers\s+from\s+Global\s+list$", c, flags=re.IGNORECASE):
             continue
         k = c.lower()
         if k in seen:
@@ -1336,6 +1312,7 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
     new_links = 0
     with engine.connect() as conn:
         build_id = get_or_create_id(conn, "builds", "version", build_version)
+        env_id = int(environment_id) if environment_id is not None else None
         for name in cleaned:
             row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
             if row:
@@ -1345,18 +1322,33 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
                 new_classifiers += 1
                 classifier_id = int(conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()[0])
 
-            link = conn.execute(
-                text("SELECT id FROM build_classifier_mappings WHERE build_id = :b AND classifier_id = :c"),
-                {"b": int(build_id), "c": int(classifier_id)}
-            ).fetchone()
+            if env_id is None:
+                link = conn.execute(
+                    text("""
+                        SELECT id
+                        FROM build_classifier_mappings
+                        WHERE build_id = :b AND classifier_id = :c AND environment_id IS NULL
+                    """),
+                    {"b": int(build_id), "c": int(classifier_id)}
+                ).fetchone()
+            else:
+                link = conn.execute(
+                    text("""
+                        SELECT id
+                        FROM build_classifier_mappings
+                        WHERE build_id = :b AND classifier_id = :c AND environment_id = :e
+                    """),
+                    {"b": int(build_id), "c": int(classifier_id), "e": env_id}
+                ).fetchone()
+
             if link:
                 conn.execute(
                     text("""
                         UPDATE build_classifier_mappings
-                        SET environment_id = :e, last_synced_at = CURRENT_TIMESTAMP
+                        SET last_synced_at = CURRENT_TIMESTAMP
                         WHERE id = :id
                     """),
-                    {"e": int(environment_id) if environment_id else None, "id": int(link[0])}
+                    {"id": int(link[0])}
                 )
             else:
                 conn.execute(
@@ -1364,14 +1356,20 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
                         INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
                         VALUES (:b, :c, :e)
                     """),
-                    {"b": int(build_id), "c": int(classifier_id), "e": int(environment_id) if environment_id else None}
+                    {"b": int(build_id), "c": int(classifier_id), "e": env_id}
                 )
                 new_links += 1
 
-        total_links = int(conn.execute(
-            text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b"),
-            {"b": int(build_id)}
-        ).fetchone()[0])
+        if env_id is None:
+            total_links = int(conn.execute(
+                text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b"),
+                {"b": int(build_id)}
+            ).fetchone()[0])
+        else:
+            total_links = int(conn.execute(
+                text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b AND environment_id = :e"),
+                {"b": int(build_id), "e": env_id}
+            ).fetchone()[0])
         conn.commit()
 
     return {
@@ -1380,6 +1378,45 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
         "total_links_for_build": total_links,
         "build_id": build_id
     }
+
+
+def clone_build_mappings_to_environment(environment_id, build_version):
+    """
+    For same build version across different environments, clone existing build mappings
+    into this environment without calling classifier API.
+    """
+    if not engine or environment_id is None or not build_version:
+        return 0
+    inserted = 0
+    with engine.connect() as conn:
+        b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": str(build_version)}).fetchone()
+        if not b_row:
+            return 0
+        build_id = int(b_row[0])
+
+        src_rows = conn.execute(text("""
+            SELECT DISTINCT classifier_id
+            FROM build_classifier_mappings
+            WHERE build_id = :b
+              AND classifier_id IS NOT NULL
+        """), {"b": build_id}).fetchall()
+
+        for (classifier_id,) in src_rows:
+            exists = conn.execute(text("""
+                SELECT id
+                FROM build_classifier_mappings
+                WHERE build_id = :b AND classifier_id = :c AND environment_id = :e
+                LIMIT 1
+            """), {"b": build_id, "c": int(classifier_id), "e": int(environment_id)}).fetchone()
+            if exists:
+                continue
+            conn.execute(text("""
+                INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
+                VALUES (:b, :c, :e)
+            """), {"b": build_id, "c": int(classifier_id), "e": int(environment_id)})
+            inserted += 1
+        conn.commit()
+    return inserted
 
 def page_add_benchmark():
     st.title("➕ Add New Benchmark Run")
@@ -1531,7 +1568,11 @@ def page_add_benchmark():
 
         st.subheader("5. Findings Files")
         st.caption("Select a classifier and enter findings count. Add rows as needed.")
-        classifier_options = get_classifier_names()
+        classifier_options = get_classifier_names_for_build(build_ver)
+        if build_ver and not classifier_options:
+            st.info(f"No classifiers found for build `{build_ver.strip()}` yet. Sync/fetch classifiers for this build first.")
+        elif not build_ver.strip():
+            st.info("Enter Build Version to load build-specific classifiers.")
         findings_df = st.data_editor(
             pd.DataFrame([{"Classifier": classifier_options[0] if classifier_options else "", "Findings": 0}]),
             num_rows="dynamic",
@@ -1946,9 +1987,7 @@ def page_manage_test_environments():
                                 f"{len(classifier_names)} fetched"
                                 f"{f' (totalCount={total_count})' if total_count is not None else ''}, "
                                 f"set size {set_size}, "
-                                f"{sync_stats['new_classifiers']} new classifiers, "
-                                f"{sync_stats['new_links']} new build links, "
-                                f"{sync_stats['total_links_for_build']} total mapped for build."
+                                f"{sync_stats['total_links_for_build']} mapped for this environment."
                             )
                         else:
                             st.warning("Environment saved, but classifier API returned no names.")
@@ -1992,6 +2031,11 @@ def page_manage_test_environments():
                             # Only fetch classifiers on sync when version changed.
                             do_fetch = True
                         else:
+                            copied = clone_build_mappings_to_environment(fetch_row.get("id"), clean_version)
+                            if copied > 0:
+                                st.success(f"[{env_name_val}] Version unchanged ({clean_version}). Reused {copied} existing classifier mappings for this environment.")
+                                st.cache_data.clear()
+                                return
                             st.session_state["env_action_level"] = "info"
                             st.session_state["env_action_msg"] = f"[{env_name_val}] No version change ({clean_version}). Classifier sync skipped."
                             st.info(st.session_state["env_action_msg"])
@@ -2013,9 +2057,9 @@ def page_manage_test_environments():
                         )
                         if changed:
                             if str(previous or "") == str(effective_version or ""):
-                                st.info(f"[{env_name_val}] Classifier snapshot linked for version {effective_version}.")
+                                st.info(f"[{env_name_val}] Classifier set linked for build {effective_version}.")
                             else:
-                                st.info(f"[{env_name_val}] Snapshot updated: {previous or 'None'} -> {effective_version}")
+                                st.info(f"[{env_name_val}] Build version updated: {previous or 'None'} -> {effective_version}")
                         sync_stats = sync_build_classifier_mappings(
                             effective_version,
                             classifier_names,
@@ -2027,14 +2071,12 @@ def page_manage_test_environments():
                             f"{len(classifier_names)} fetched"
                             f"{f' (totalCount={total_count})' if total_count is not None else ''}, "
                             f"set size {set_size}, "
-                            f"{sync_stats['new_classifiers']} new classifiers, "
-                            f"{sync_stats['new_links']} new build links, "
-                            f"{sync_stats['total_links_for_build']} total mapped."
+                            f"{sync_stats['total_links_for_build']} mapped for this environment."
                         )
                         st.session_state["env_action_level"] = "success"
                         st.session_state["env_action_msg"] = (
                             f"[{env_name_val}] Sync done for version {effective_version}: "
-                            f"{len(classifier_names)} classifiers, {sync_stats['new_links']} new links."
+                            f"{len(classifier_names)} classifiers mapped for this environment."
                         )
                 if data_changed:
                     st.cache_data.clear()
