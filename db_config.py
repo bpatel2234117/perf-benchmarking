@@ -100,7 +100,7 @@ DDL_STATEMENTS = {
             classifier_id INT NOT NULL,
             environment_id INT NULL,
             last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uniq_build_classifier (build_id, classifier_id),
+            UNIQUE KEY uniq_build_classifier_env (build_id, classifier_id, environment_id),
             FOREIGN KEY (build_id) REFERENCES builds(id),
             FOREIGN KEY (classifier_id) REFERENCES classifiers(id),
             FOREIGN KEY (environment_id) REFERENCES test_environments(id)
