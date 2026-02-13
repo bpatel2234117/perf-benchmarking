@@ -4884,20 +4884,20 @@ def page_scan_status():
     scan_ids = [str(x).strip() for x in summary_df["Scan Id"].tolist() if str(x).strip()]
     active_map = get_scan_parent_active_map(scan_ids)
     summary_df.insert(0, "Active", summary_df["Scan Id"].map(lambda sid: active_map.get(str(sid), True)))
-    summary_df.insert(1, "Done", summary_df["Scan Id"].map(lambda sid: str(sid).strip().lower() in saved_ids))
     
-    # User request: Hide scans that are already Done
-    summary_df = summary_df[~summary_df["Done"]]
+    # Filter out completed scans (no need for Done column since they're hidden)
+    done_scan_ids = {str(sid).strip().lower() for sid in summary_df["Scan Id"] if str(sid).strip().lower() in saved_ids}
+    summary_df = summary_df[~summary_df["Scan Id"].apply(lambda sid: str(sid).strip().lower() in saved_ids)]
     
-    summary_df.insert(2, "Open", summary_df.apply(lambda r: f"?page=Add+New+Benchmark&scan_id={r['Scan Id']}" if str(r['Scan Id']).strip() and str(r['Scan Id']).strip().lower() not in saved_ids else "", axis=1))
-    summary_df.insert(3, "Sync", summary_df["Scan Id"].map(lambda sid: f"?page=Scan+Status&sync_scan_id={sid}" if str(sid).strip() else ""))
+    summary_df.insert(1, "Open", summary_df.apply(lambda r: f"?page=Add+New+Benchmark&scan_id={r['Scan Id']}" if str(r['Scan Id']).strip() else "", axis=1))
+    summary_df.insert(2, "Sync", summary_df["Scan Id"].map(lambda sid: f"?page=Scan+Status&sync_scan_id={sid}" if str(sid).strip() else ""))
 
     st.markdown("### Scan Summary")
     summary_column_order = [
         "Active",
-        "Done",
         "Open",
         "Sync",
+        "Scan Status",
         "Environment",
         "Scan Name",
         "Scan Id",
@@ -4905,7 +4905,6 @@ def page_scan_status():
         "Start Time",
         "End Time",
         "Template",
-        "Scan Status",
         "Data Sources",
         "Distinct Classification Attributes",
         "Classifier Attribute Names",
@@ -4918,15 +4917,31 @@ def page_scan_status():
         "Scan Time",
     ]
     summary_column_order = [c for c in summary_column_order if c in summary_df.columns]
+    
+    # Apply row styling based on Scan Status
+    def style_by_status(row):
+        status = str(row.get("Scan Status", "")).lower()
+        if "completedwithfailures" in status.replace(" ", ""):
+            return ['background-color: #ffe4cc'] * len(row)  # Light orange/amber
+        elif "completed" in status or "success" in status:
+            return ['background-color: #d4edda'] * len(row)  # Light green
+        elif "running" in status or "in progress" in status:
+            return ['background-color: #fff3cd'] * len(row)  # Light yellow
+        elif "failed" in status or "error" in status:
+            return ['background-color: #f8d7da'] * len(row)  # Light red
+        else:
+            return [''] * len(row)
+    
+    styled_df = summary_df.style.apply(style_by_status, axis=1)
+    
     edited_summary = st.data_editor(
-        summary_df,
+        styled_df,
         use_container_width=True,
         hide_index=True,
         num_rows="fixed",
         column_order=summary_column_order,
         column_config={
             "Active": st.column_config.CheckboxColumn("Active"),
-            "Done": st.column_config.CheckboxColumn("Done"),
             "Open": st.column_config.LinkColumn("Open", display_text="Open"),
             "Sync": st.column_config.LinkColumn("Sync", display_text="Sync"),
             "Environment": st.column_config.TextColumn("Environment"),
@@ -5502,12 +5517,14 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     # Filter for active rows (extra safety layer)
     plot_df = plot_df[plot_df['is_active'] == 1]
     
-    # Select all throughput columns + identifier columns
+    # Select columns in desired order: Data Throughput first, then File Throughput
     cols_to_show = [
-        'Build_Version', 'Scan_Type', 
-        'throughput_cluster_gb_hr', 'throughput_cluster_files_hr',
-        'throughput_scanner_gb_hr', 'throughput_scanner_files_hr',
-        'throughput_thread_gb_hr', 'throughput_thread_files_hr',
+        'Build_Version', 'Scan_Type',
+        # Data Throughput columns first
+        'throughput_cluster_gb_hr', 'throughput_scanner_gb_hr', 'throughput_thread_gb_hr',
+        # File Throughput columns second
+        'throughput_cluster_files_hr', 'throughput_scanner_files_hr', 'throughput_thread_files_hr',
+        # Configuration columns
         'scanner_count', 'thread_count', 'total_scan_hours'
     ]
     
@@ -5517,28 +5534,31 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         
     disp_df = plot_df[cols_to_show].copy()
     
-    # Define display names for columns
+    # Define clearer display names for columns (with line breaks for compact display)
     display_names = {
         "Build_Version": "Build",
-        "Scan_Type": "Scan Type",
-        "throughput_cluster_gb_hr": "Cluster GB/hr",
-        "throughput_cluster_files_hr": "Cluster Files/hr",
-        "throughput_scanner_gb_hr": "Scanner GB/hr",
-        "throughput_scanner_files_hr": "Scanner Files/hr",
-        "throughput_thread_gb_hr": "Thread GB/hr",
-        "throughput_thread_files_hr": "Thread Files/hr",
+        "Scan_Type": "Type",
+        # Data Throughput
+        "throughput_cluster_gb_hr": "Data Cluster<br>(GB/h)",
+        "throughput_scanner_gb_hr": "Data Scanner<br>(GB/h)",
+        "throughput_thread_gb_hr": "Data Thread<br>(GB/h)",
+        # File Throughput
+        "throughput_cluster_files_hr": "Files Cluster<br>(f/h)",
+        "throughput_scanner_files_hr": "Files Scanner<br>(f/h)",
+        "throughput_thread_files_hr": "Files Thread<br>(f/h)",
+        # Configuration
         "scanner_count": "Scanners",
         "thread_count": "Threads",
-        "total_scan_hours": "Scan Hours",
-        "is_feature_flags": "FF Enabled",
-        "is_acl": "ACL Enabled"
+        "total_scan_hours": "Hours",
+        "is_feature_flags": "FF",
+        "is_acl": "ACL"
     }
     
     # Rename columns and format numeric values for HTML display
     disp_df = disp_df.rename(columns=display_names)
     
     # Apply numeric formatting to the DataFrame
-    num_cols = ["Cluster GB/hr", "Scanner GB/hr", "Thread GB/hr", "Thread Files/hr", "Scan Hours"]
+    num_cols = ["Data Cluster<br>(GB/h)", "Data Scanner<br>(GB/h)", "Data Thread<br>(GB/h)", "Files Thread<br>(f/h)", "Hours"]
     def format_two_dec_round(val):
         if pd.isnull(val):
             return "N/A"
@@ -5551,7 +5571,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         if col in disp_df.columns:
             disp_df[col] = disp_df[col].apply(format_two_dec_round)
             
-    int_cols = ["Cluster Files/hr", "Scanner Files/hr", "Scanners", "Threads"]
+    int_cols = ["Files Cluster<br>(f/h)", "Files Scanner<br>(f/h)", "Scanners", "Threads"]
     for col in int_cols:
         if col in disp_df.columns:
             disp_df[col] = disp_df[col].apply(lambda x: f"{x:,.0f}" if pd.notnull(x) else "N/A")
@@ -5931,7 +5951,7 @@ def page_edit_benchmark(df):
 
 def render_centered_table(df):
     """Renders a scrollable HTML table. Styling is handled via global CSS."""
-    html = df.to_html(index=False, classes='centered-table')
+    html = df.to_html(index=False, classes='centered-table', escape=False)
     st.markdown(f'<div class="scroll-container">{html}</div>', unsafe_allow_html=True)
 
 
