@@ -9,6 +9,8 @@ import base64
 import numpy as np
 import requests
 import os
+import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
 import html
 import re
@@ -41,6 +43,8 @@ DEFAULT_CLASSIFIERS_API_PATH = (
 )
 INTERNAL_CLASSIFIERS_API_PATH = os.getenv("BIGID_CLASSIFIERS_API_PATH", DEFAULT_CLASSIFIERS_API_PATH).strip() or DEFAULT_CLASSIFIERS_API_PATH
 INTERNAL_ABOUT_API_PATH = os.getenv("BIGID_ABOUT_API_PATH", "/api/v1/about").strip() or "/api/v1/about"
+INTERNAL_PARENT_SCANS_API_PATH = os.getenv("BIGID_PARENT_SCANS_API_PATH", "/api/v1/scans/parent-scans").strip() or "/api/v1/scans/parent-scans"
+INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_API_PATH", "/api/v1/scans/insights/parent-scans").strip() or "/api/v1/scans/insights/parent-scans"
 
 def get_logo_base64():
     for path in LOGO_CANDIDATES:
@@ -868,6 +872,537 @@ def fetch_classifiers_with_auth_retry(env_row):
         raise
 
 
+def extract_parent_scans_payload(payload):
+    """
+    Returns (scan_items, total_count_from_api) for parent scans response.
+    """
+    items = []
+    total_count = None
+
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            for key in ["scanParents", "parentScans", "scans", "results", "items"]:
+                if isinstance(data_block.get(key), list):
+                    items = data_block.get(key)
+                    break
+            if data_block.get("totalCount") is not None:
+                try:
+                    total_count = int(data_block.get("totalCount"))
+                except Exception:
+                    total_count = None
+
+        if not items:
+            for key in ["scanParents", "parentScans", "scans", "results", "items"]:
+                if isinstance(payload.get(key), list):
+                    items = payload.get(key)
+                    break
+        if total_count is None and payload.get("totalCount") is not None:
+            try:
+                total_count = int(payload.get("totalCount"))
+            except Exception:
+                total_count = None
+
+    return items if isinstance(items, list) else [], total_count
+
+
+def fetch_parent_scans_from_api(base_url, token, states=None, skip=0, limit=200):
+    """
+    Fetch parent scans with optional state filter.
+    """
+    url = build_api_url(base_url, INTERNAL_PARENT_SCANS_API_PATH)
+    filter_items = [
+        {"field": "initiatedSource", "value": ["scans"], "operator": "in"}
+    ]
+    cleaned_states = [str(s).strip() for s in (states or []) if str(s).strip()]
+    if cleaned_states:
+        filter_items.insert(0, {"field": "state", "operator": "in", "value": cleaned_states})
+
+    params = {
+        "skip": int(skip),
+        "limit": int(limit),
+        "requireTotalCount": "true",
+        "filter": json.dumps(filter_items, separators=(",", ":")),
+        "sort": json.dumps([{"field": "_id", "order": "desc"}], separators=(",", ":"))
+    }
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+    resp = requests.get(url, params=params, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, params=params, headers=headers_bearer, timeout=45)
+
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scans API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scans API.")
+
+    resp.raise_for_status()
+    payload = resp.json()
+    items, total_count = extract_parent_scans_payload(payload)
+    return items, total_count, getattr(resp, "url", url)
+
+
+def fetch_parent_scans_with_auth_retry(env_row, states=None, skip=0, limit=200):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+
+    try:
+        return fetch_parent_scans_from_api(base_url, "", states=states, skip=skip, limit=limit)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_parent_scans_from_api(base_url, token, states=states, skip=skip, limit=limit)
+
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_parent_scans_from_api(base_url, fresh, states=states, skip=skip, limit=limit)
+
+        token = fetch_auth_token_for_env(env_row)
+        return fetch_parent_scans_from_api(base_url, token, states=states, skip=skip, limit=limit)
+
+
+def merge_parent_scan_items(running_items, completed_items):
+    """
+    Merge running + completed parent scans by scan id.
+    Completed payload wins for overlapping keys.
+    """
+    merged_map = {}
+    seq = 0
+    for item in (running_items or []):
+        if not isinstance(item, dict):
+            continue
+        scan_id = str(item.get("_id") or item.get("id") or "").strip()
+        key = scan_id or f"running::{seq}"
+        merged_map[key] = dict(item)
+        seq += 1
+    for item in (completed_items or []):
+        if not isinstance(item, dict):
+            continue
+        scan_id = str(item.get("_id") or item.get("id") or "").strip()
+        key = scan_id or f"completed::{seq}"
+        if key in merged_map:
+            merged_map[key] = {**merged_map[key], **item}
+        else:
+            merged_map[key] = dict(item)
+        seq += 1
+    return list(merged_map.values())
+
+
+def fetch_combined_parent_scans_for_env(env_row, running_states, completed_states, limit=200):
+    """
+    Fetch running+completed scans for one environment and return merged list.
+    """
+    running_items, running_total, _ = fetch_parent_scans_with_auth_retry(
+        env_row, states=running_states, skip=0, limit=int(limit)
+    )
+    completed_items, completed_total, _ = fetch_parent_scans_with_auth_retry(
+        env_row, states=completed_states, skip=0, limit=int(limit)
+    )
+    merged_items = merge_parent_scan_items(running_items, completed_items)
+    return {
+        "items": merged_items,
+        "running_total": running_total,
+        "completed_total": completed_total,
+    }
+
+
+def fetch_parent_scan_insight_from_api(base_url, scan_id, token):
+    """
+    Fetch insights for a specific parent scan id.
+    """
+    if not scan_id:
+        raise RuntimeError("scan_id is required for scan insights API.")
+    base_path = INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH.rstrip("/")
+    url = build_api_url(base_url, f"{base_path}/{scan_id}")
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+    resp = requests.get(url, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, headers=headers_bearer, timeout=45)
+
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scan insights API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scan insights API.")
+
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload, getattr(resp, "url", url)
+
+
+def fetch_parent_scan_insight_with_auth_retry(env_row, scan_id):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return fetch_parent_scan_insight_from_api(base_url, scan_id, "")
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_parent_scan_insight_from_api(base_url, scan_id, token)
+
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_parent_scan_insight_from_api(base_url, scan_id, fresh)
+
+        token = fetch_auth_token_for_env(env_row)
+        return fetch_parent_scan_insight_from_api(base_url, scan_id, token)
+
+
+def extract_scan_attributes_payload(payload):
+    """
+    Returns (items, total_count) for scan attributes response.
+    """
+    items = []
+    total_count = None
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        if isinstance(data_block, dict):
+            for key in [
+                "attributes",
+                "items",
+                "results",
+                "dataSourcesInsights",
+                "classifierAttributes",
+                "classificationAttributes",
+                "classificationsAttributes",
+                "scanAttributes",
+            ]:
+                if isinstance(data_block.get(key), list):
+                    items = data_block.get(key)
+                    break
+            if data_block.get("totalCount") is not None:
+                try:
+                    total_count = int(data_block.get("totalCount"))
+                except Exception:
+                    total_count = None
+        if not items:
+            for key in [
+                "attributes",
+                "items",
+                "results",
+                "dataSourcesInsights",
+                "classifierAttributes",
+                "classificationAttributes",
+                "classificationsAttributes",
+                "scanAttributes",
+            ]:
+                if isinstance(payload.get(key), list):
+                    items = payload.get(key)
+                    break
+        if total_count is None and payload.get("totalCount") is not None:
+            try:
+                total_count = int(payload.get("totalCount"))
+            except Exception:
+                total_count = None
+    return items if isinstance(items, list) else [], total_count
+
+
+def extract_new_removed_counts_from_attributes(payload):
+    """
+    Count new/removed classifier attributes from attributes payload.
+    """
+    root = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+    if not isinstance(root, dict):
+        root = {}
+
+    # Prefer server-provided aggregate counts when available.
+    for n_key, r_key in [
+        ("newCount", "removedCount"),
+        ("newlyAddedCount", "removedCount"),
+        ("new", "removed"),
+    ]:
+        if root.get(n_key) is not None and root.get(r_key) is not None:
+            try:
+                return int(root.get(n_key)), int(root.get(r_key))
+            except Exception:
+                pass
+
+    items, _ = extract_scan_attributes_payload(payload)
+    new_count = 0
+    removed_count = 0
+
+    def to_int_or_none(val):
+        try:
+            if val is None or val == "":
+                return None
+            return int(val)
+        except Exception:
+            return None
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_new = item.get("new")
+        raw_removed = item.get("removed")
+        new_val = to_int_or_none(raw_new)
+        removed_val = to_int_or_none(raw_removed)
+        is_new = bool(raw_new is True)
+        is_removed = bool(raw_removed is True)
+
+        change_type = str(
+            item.get("changeType")
+            or item.get("change")
+            or item.get("status")
+            or item.get("state")
+            or ""
+        ).strip().lower()
+        if change_type in {"new", "added", "newlyadded"}:
+            is_new = True
+        if change_type in {"removed", "deleted"}:
+            is_removed = True
+
+        if new_val is not None and new_val >= 0:
+            new_count += new_val
+        elif is_new:
+            new_count += 1
+
+        if removed_val is not None and removed_val >= 0:
+            removed_count += removed_val
+        elif is_removed:
+            removed_count += 1
+    return new_count, removed_count
+
+
+def fetch_parent_scan_attributes_from_api(base_url, scan_id, token, skip=0, limit=200):
+    """
+    Fetch per-scan classifier attributes delta page.
+    """
+    if not scan_id:
+        raise RuntimeError("scan_id is required for scan attributes API.")
+    base_path = INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH.rstrip("/")
+    url = build_api_url(base_url, f"{base_path}/{scan_id}/attributes")
+    params = {
+        "skip": int(skip),
+        "limit": int(limit),
+        "requireTotalCount": "true",
+        "sort": json.dumps([{"field": "new", "order": "desc"}], separators=(",", ":")),
+        "type": "classifier",
+    }
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+    resp = requests.get(url, params=params, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, params=params, headers=headers_bearer, timeout=45)
+
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scan attributes API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scan attributes API.")
+
+    resp.raise_for_status()
+    payload = resp.json()
+    return payload, getattr(resp, "url", url)
+
+
+def fetch_parent_scan_attribute_counts_with_auth_retry(env_row, scan_id, limit=200):
+    """
+    Fetch attribute pages and return aggregate new/removed counts.
+    """
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+
+    def collect_with_token(token):
+        skip = 0
+        all_items = []
+        total_count = None
+        sample_url = ""
+        # Hard cap pages to keep UI responsive.
+        for _ in range(20):
+            payload, url = fetch_parent_scan_attributes_from_api(
+                base_url, scan_id, token, skip=skip, limit=limit
+            )
+            sample_url = sample_url or url
+            items, page_total = extract_scan_attributes_payload(payload)
+            if total_count is None and page_total is not None:
+                total_count = int(page_total)
+            if items:
+                all_items.extend(items)
+            if not items:
+                break
+            skip += limit
+            if total_count is not None and skip >= total_count:
+                break
+        synthetic_payload = {"data": {"attributes": all_items}}
+        new_count, removed_count = extract_new_removed_counts_from_attributes(synthetic_payload)
+        return new_count, removed_count, synthetic_payload, sample_url
+
+    try:
+        return collect_with_token("")
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return collect_with_token(token)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return collect_with_token(fresh)
+        token = fetch_auth_token_for_env(env_row)
+        return collect_with_token(token)
+
+
+def resolve_scan_status_value(scan):
+    if not isinstance(scan, dict):
+        return ""
+    progress = scan.get("progress")
+    if isinstance(progress, dict):
+        state = str(progress.get("state") or "").strip()
+        if state:
+            return state
+    return str(scan.get("state") or scan.get("status") or "").strip()
+
+
+def parse_iso_datetime(dt_value):
+    s = str(dt_value or "").strip()
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+
+def format_scan_duration(started_at, completed_at):
+    start_dt = parse_iso_datetime(started_at)
+    end_dt = parse_iso_datetime(completed_at)
+    if not start_dt or not end_dt:
+        return ""
+    seconds = int((end_dt - start_dt).total_seconds())
+    if seconds < 0:
+        return ""
+    hh = seconds // 3600
+    mm = (seconds % 3600) // 60
+    ss = seconds % 60
+    return f"{hh:02d}:{mm:02d}:{ss:02d}"
+
+
+def extract_scan_insight_metrics(payload):
+    """
+    Extract requested fields from scan insight payload.
+    """
+    def deep_find(obj, target_keys):
+        keys = {str(k).lower() for k in target_keys}
+        stack = [obj]
+        seen = set()
+        while stack:
+            cur = stack.pop()
+            obj_id = id(cur)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if str(k).lower() in keys and v is not None:
+                        return v
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(cur, list):
+                for item in cur:
+                    if isinstance(item, (dict, list)):
+                        stack.append(item)
+        return None
+
+    root = payload if isinstance(payload, dict) else {}
+    data_block = root.get("data")
+    if isinstance(data_block, dict):
+        root = data_block
+
+    classifications = deep_find(root, ["classifications"])
+    if not isinstance(classifications, dict):
+        classifications = {}
+
+    newly_added = classifications.get("newlyAdded")
+    if newly_added is None:
+        newly_added = classifications.get("new")
+    if newly_added is None:
+        newly_added = classifications.get("added")
+    if newly_added is None:
+        newly_added = deep_find(root, ["newlyAdded", "new", "added"])
+
+    classifier_attribute_names = deep_find(root, ["classifierAttributeNames", "classifier_attribute_names"])
+    if classifier_attribute_names is None:
+        classifier_attribute_names = classifications.get("classifierAttributeNames")
+
+    if isinstance(newly_added, list):
+        distinct_classification_attributes = len({str(x).strip() for x in newly_added if str(x).strip()})
+    elif newly_added is None:
+        if isinstance(classifier_attribute_names, list):
+            distinct_classification_attributes = len({str(x).strip() for x in classifier_attribute_names if str(x).strip()})
+        else:
+            distinct_classification_attributes = ""
+    else:
+        try:
+            distinct_classification_attributes = int(newly_added)
+        except Exception:
+            distinct_classification_attributes = str(newly_added)
+
+    if isinstance(classifier_attribute_names, list):
+        classifier_attribute_names_text = ", ".join(sorted({str(x).strip() for x in classifier_attribute_names if str(x).strip()}))
+    elif classifier_attribute_names is None:
+        classifier_attribute_names_text = ""
+    else:
+        classifier_attribute_names_text = str(classifier_attribute_names)
+
+    total_classification = classifications.get("total")
+    if total_classification is None:
+        total_classification = classifications.get("totalCount")
+    if total_classification is None:
+        total_classification = deep_find(root, ["total", "totalCount"])
+
+    data_sources = deep_find(root, ["dataSources", "data_sources"])
+    data_source_names = []
+    if isinstance(data_sources, dict):
+        dsn = data_sources.get("dataSourceNames")
+        if isinstance(dsn, list):
+            data_source_names = [str(x).strip() for x in dsn if str(x).strip()]
+    if not data_source_names:
+        dsn2 = deep_find(root, ["dataSourceNames"])
+        if isinstance(dsn2, list):
+            data_source_names = [str(x).strip() for x in dsn2 if str(x).strip()]
+    data_source_names_text = ", ".join(sorted(set(data_source_names))) if data_source_names else ""
+
+    return {
+        "distinct_classification_attributes": distinct_classification_attributes,
+        "classifier_attribute_names": classifier_attribute_names_text,
+        "data_source_names": data_source_names_text,
+        "objects_with_pi": deep_find(root, ["objectsWithPi", "objects_with_pi", "objectsWithPI"]) or "",
+        "objects_scanned": deep_find(root, ["objectsScanned", "scannedObjects", "objects_scanned"]) or "",
+        "objects_enumerated": deep_find(root, ["objectsEnumerated", "enumeratedObjects", "objects_enumerated"]) or "",
+        "total_classification": total_classification if total_classification is not None else "",
+        "total_size_gb": deep_find(root, ["totalSize", "bytesScanned", "total_size_gb", "total_size"]) or "",
+    }
+
+
 def fetch_core_version_from_api(base_url, token, about_api_path=None):
     path = about_api_path or INTERNAL_ABOUT_API_PATH
     url = build_api_url(base_url, path)
@@ -1418,6 +1953,1505 @@ def clone_build_mappings_to_environment(environment_id, build_version):
         conn.commit()
     return inserted
 
+
+def ensure_scan_tracking_tables():
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_parents (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    scan_id VARCHAR(128) NOT NULL UNIQUE,
+                    environment_id INT NULL,
+                    scan_name VARCHAR(1000) NULL,
+                    scan_type VARCHAR(120) NULL,
+                    started_at VARCHAR(80) NULL,
+                    completed_at VARCHAR(80) NULL,
+                    template_name VARCHAR(255) NULL,
+                    scan_status VARCHAR(120) NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_insights (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    scan_id VARCHAR(128) NOT NULL UNIQUE,
+                    distinct_classification_attributes BIGINT NULL,
+                    classifier_attribute_names LONGTEXT NULL,
+                    data_source_names LONGTEXT NULL,
+                    objects_with_pi BIGINT NULL,
+                    objects_scanned BIGINT NULL,
+                    objects_enumerated BIGINT NULL,
+                    total_classification BIGINT NULL,
+                    new_attributes_count BIGINT NULL,
+                    removed_attributes_count BIGINT NULL,
+                    insight_payload LONGTEXT NULL,
+                    attributes_payload LONGTEXT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """))
+            try:
+                conn.execute(text("ALTER TABLE scan_insights ADD COLUMN total_size_gb FLOAT NULL"))
+                conn.commit()
+            except Exception:
+                pass
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_data_sources (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(500) NOT NULL UNIQUE
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_insight_data_source_map (
+                    scan_id VARCHAR(128) NOT NULL,
+                    data_source_id INT NOT NULL,
+                    PRIMARY KEY (scan_id, data_source_id),
+                    FOREIGN KEY (scan_id) REFERENCES scan_parents(scan_id),
+                    FOREIGN KEY (data_source_id) REFERENCES scan_data_sources(id)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_classifier_attributes (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(500) NOT NULL UNIQUE
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_insight_attribute_delta_map (
+                    scan_id VARCHAR(128) NOT NULL,
+                    attribute_id INT NOT NULL,
+                    is_new BOOLEAN DEFAULT FALSE,
+                    is_removed BOOLEAN DEFAULT FALSE,
+                    finding_count BIGINT NULL,
+                    attribute_value VARCHAR(500) NULL,
+                    new_count_value BIGINT NULL,
+                    removed_count_value BIGINT NULL,
+                    PRIMARY KEY (scan_id, attribute_id),
+                    FOREIGN KEY (scan_id) REFERENCES scan_parents(scan_id),
+                    FOREIGN KEY (attribute_id) REFERENCES scan_classifier_attributes(id)
+                )
+            """))
+            try:
+                conn.execute(text("ALTER TABLE scan_insight_attribute_delta_map ADD COLUMN finding_count BIGINT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE scan_insight_attribute_delta_map ADD COLUMN attribute_value VARCHAR(500) NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE scan_insight_attribute_delta_map ADD COLUMN new_count_value BIGINT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE scan_insight_attribute_delta_map ADD COLUMN removed_count_value BIGINT NULL"))
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def ensure_benchmark_findings_extended_columns():
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(text("ALTER TABLE benchmark_findings ADD COLUMN classifier_attribute VARCHAR(500) NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE benchmark_findings ADD COLUMN attribute_value VARCHAR(500) NULL"))
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def ensure_auto_scan_benchmarks_table():
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS auto_scan_benchmarks (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    scan_id VARCHAR(128) NOT NULL UNIQUE,
+                    environment_id INT NULL,
+                    build_version VARCHAR(100) NULL,
+                    run_date DATE NULL,
+                    scenario_type VARCHAR(100) NULL,
+                    scan_type VARCHAR(100) NULL,
+                    data_source_type VARCHAR(100) NULL,
+                    data_type VARCHAR(50) NULL,
+                    file_set_type VARCHAR(150) NULL,
+                    scan_start_time DATETIME NULL,
+                    scan_end_time DATETIME NULL,
+                    total_scan_hours FLOAT NULL,
+                    objects_with_pi BIGINT NULL,
+                    objects_scanned BIGINT NULL,
+                    objects_enumerated BIGINT NULL,
+                    total_classification BIGINT NULL,
+                    new_attributes BIGINT NULL,
+                    removed_attributes BIGINT NULL,
+                    classifier_attribute_names LONGTEXT NULL,
+                    scan_name VARCHAR(1000) NULL,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                )
+            """))
+            try:
+                conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_size_gb FLOAT NULL"))
+                conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_files BIGINT NULL"))
+                conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_folders BIGINT NULL"))
+                conn.commit()
+            except Exception:
+                pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _safe_int(val):
+    try:
+        if val is None or val == "":
+            return None
+        return int(val)
+    except Exception:
+        return None
+
+
+def _to_float_or_none(val):
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _safe_float(val):
+    try:
+        if val is None or val == "":
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def parse_build_version_from_text(text_value):
+    """
+    Parse build version from scan text (e.g. 244-59 -> 244.59, 246.2 -> 246.2).
+    Returns empty string when no reliable build pattern is found.
+    """
+    s = str(text_value or "")
+    # Support 244-5, 244.5, 2 244-5, etc.
+    m = re.search(r"\b(2\d{2})[\s\-\.]{1,2}(\d{1,3})\b", s)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
+    # Support 244.59.0
+    m_dot3 = re.search(r"\b(2\d{2})\.(\d{1,3})\.(\d{1,3})\b", s)
+    if m_dot3:
+        return f"{m_dot3.group(1)}.{m_dot3.group(2)}"
+    return ""
+
+
+def infer_scan_benchmark_shape(scan_name, data_source_type):
+    name = str(scan_name or "")
+    upper_name = name.upper()
+    ds = str(data_source_type or "").strip()
+    ds_upper = ds.upper()
+
+    if "CSV" in upper_name:
+        file_kind = "CSV Files"
+        data_type = "Unstructured"
+        scenario = "CSV File"
+    elif "LARGE FILE" in upper_name or "LARGE FILES" in upper_name or re.search(r"\bLARGE\b", upper_name):
+        file_kind = "Large Files"
+        data_type = "Unstructured"
+        scenario = "Large File"
+    elif "SMALL FILE" in upper_name or "SMALL FILES" in upper_name:
+        file_kind = "Small Files"
+        data_type = "Unstructured"
+        scenario = "Small File"
+    elif "MIXED" in upper_name:
+        if ds_upper in {"MSSQL", "MYSQL", "POSTGRES", "ORACLE"}:
+            file_kind = "Mixed Tables"
+            data_type = "Structured"
+        else:
+            file_kind = "Mixed Files"
+            data_type = "Mixed"
+        scenario = "Mixed File"
+    else:
+        if ds_upper in {"MSSQL", "MYSQL", "POSTGRES", "ORACLE"}:
+            file_kind = "Mixed Tables"
+            data_type = "Structured"
+        else:
+            file_kind = "Mixed Files"
+            data_type = "Mixed"
+        scenario = "Mixed File"
+
+    file_set_type = f"{ds} {file_kind}".strip() if ds else file_kind
+    return {
+        "data_type": data_type,
+        "scenario_type": scenario,
+        "file_set_type": file_set_type,
+    }
+
+
+def upsert_auto_scan_benchmark(scan_row, env_row, insight_metrics):
+    if not engine or not isinstance(scan_row, dict):
+        return
+    ensure_auto_scan_benchmarks_table()
+
+    scan_id = str(scan_row.get("_id") or scan_row.get("id") or "").strip()
+    if not scan_id:
+        return
+    scan_name = str(scan_row.get("name") or scan_row.get("scanName") or scan_row.get("displayName") or "").strip()
+    defaults = infer_add_benchmark_defaults_from_scan_name(scan_name)
+    shape = infer_scan_benchmark_shape(scan_name, defaults.get("data_source_type"))
+
+    start_raw = scan_row.get("startedAt") or scan_row.get("startTime") or scan_row.get("createdAt")
+    end_raw = scan_row.get("completedAt") or scan_row.get("endTime") or scan_row.get("endedAt")
+    start_dt = parse_iso_datetime(start_raw)
+    end_dt = parse_iso_datetime(end_raw)
+
+    total_scan_hours = None
+    if start_dt and end_dt:
+        delta_seconds = (end_dt - start_dt).total_seconds()
+        if delta_seconds >= 0:
+            total_scan_hours = float(delta_seconds / 3600.0)
+
+    run_date = start_dt.date() if start_dt else (end_dt.date() if end_dt else None)
+    raw_scan_type = str(scan_row.get("type") or "").strip().lower()
+    if raw_scan_type in {"incremental", "ols_scan", "ols", "incremental_scan"}:
+        scan_type = "OLS Scan"
+    elif raw_scan_type in {"full_scan", "full", "fullscan"}:
+        scan_type = "Full Scan"
+    elif str(defaults.get("scan_type") or "").strip() in {"OLS Scan", "Full Scan"}:
+        scan_type = str(defaults.get("scan_type"))
+    else:
+        scan_type = "OLS Scan"
+
+    try:
+        # Build version must come from scan identity, not from current env version.
+        # Falling back to env version collapses historical scans into one build.
+        resolved_build_version = str(defaults.get("build_version") or "").strip()
+        if not resolved_build_version:
+            resolved_build_version = parse_build_version_from_text(scan_name)
+
+        resolved_data_source_type = str(defaults.get("data_source_type") or "").strip()
+        if not resolved_data_source_type:
+            ds_names = str((insight_metrics or {}).get("data_source_names") or "").strip()
+            if ds_names:
+                resolved_data_source_type = ds_names.split(",")[0].strip()
+        if not resolved_data_source_type:
+            resolved_data_source_type = "Unknown"
+
+        resolved_scenario = str(shape.get("scenario_type") or defaults.get("scenario_type") or "").strip() or "Mixed File"
+        resolved_data_type = str(shape.get("data_type") or "").strip() or "Mixed"
+        resolved_file_set = str(shape.get("file_set_type") or "").strip()
+        if not resolved_file_set:
+            if str(resolved_data_source_type).upper() in {"MSSQL", "MYSQL", "POSTGRES", "ORACLE"}:
+                resolved_file_set = f"{resolved_data_source_type} Mixed Tables".strip()
+            else:
+                resolved_file_set = f"{resolved_data_source_type} Mixed Files".strip()
+
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO auto_scan_benchmarks (
+                    scan_id, environment_id, build_version, run_date, scenario_type, scan_type,
+                    data_source_type, data_type, file_set_type, scan_start_time, scan_end_time, total_scan_hours,
+                    total_size_gb, total_files, total_folders,
+                    objects_with_pi, objects_scanned, objects_enumerated, total_classification, new_attributes, removed_attributes,
+                    classifier_attribute_names, scan_name, is_active
+                ) VALUES (
+                    :sid, :eid, :bv, :rd, :scn, :st, :dst, :dt, :fst, :ss, :se, :tsh,
+                    :tgb, :tf, :tfo,
+                    :owp, :osc, :oen, :tcl, :nac, :rac, :can, :sn, TRUE
+                )
+                ON DUPLICATE KEY UPDATE
+                    environment_id = VALUES(environment_id),
+                    build_version = VALUES(build_version),
+                    run_date = VALUES(run_date),
+                    scenario_type = VALUES(scenario_type),
+                    scan_type = VALUES(scan_type),
+                    data_source_type = VALUES(data_source_type),
+                    data_type = VALUES(data_type),
+                    file_set_type = VALUES(file_set_type),
+                    scan_start_time = VALUES(scan_start_time),
+                    scan_end_time = VALUES(scan_end_time),
+                    total_scan_hours = VALUES(total_scan_hours),
+                    objects_with_pi = VALUES(objects_with_pi),
+                    objects_scanned = VALUES(objects_scanned),
+                    objects_enumerated = VALUES(objects_enumerated),
+                    total_classification = VALUES(total_classification),
+                    new_attributes = VALUES(new_attributes),
+                    removed_attributes = VALUES(removed_attributes),
+                    total_size_gb = VALUES(total_size_gb),
+                    total_files = VALUES(total_files),
+                    total_folders = VALUES(total_folders),
+                    classifier_attribute_names = VALUES(classifier_attribute_names),
+                    scan_name = VALUES(scan_name),
+                    updated_at = CURRENT_TIMESTAMP
+            """), {
+                "sid": scan_id,
+                "eid": _safe_int((env_row or {}).get("id")),
+                "bv": resolved_build_version or None,
+                "rd": run_date,
+                "scn": resolved_scenario or None,
+                "st": str(scan_type or "") or None,
+                "dst": resolved_data_source_type or None,
+                "dt": resolved_data_type or None,
+                "fst": resolved_file_set or None,
+                "ss": start_dt,
+                "se": end_dt,
+                "tsh": total_scan_hours,
+                "tgb": _to_float_or_none((insight_metrics or {}).get("total_size_gb")),
+                "tf": _safe_int((insight_metrics or {}).get("total_files")),
+                "tfo": _safe_int((insight_metrics or {}).get("total_folders")),
+                "owp": _safe_int((insight_metrics or {}).get("objects_with_pi")),
+                "osc": _safe_int((insight_metrics or {}).get("objects_scanned")),
+                "oen": _safe_int((insight_metrics or {}).get("objects_enumerated")),
+                "tcl": _safe_int((insight_metrics or {}).get("total_classification")),
+                "nac": _safe_int((insight_metrics or {}).get("new_attributes_count")),
+                "rac": _safe_int((insight_metrics or {}).get("removed_attributes_count")),
+                "can": str((insight_metrics or {}).get("classifier_attribute_names") or "") or None,
+                "sn": scan_name or None,
+            })
+            conn.commit()
+    except Exception:
+        pass
+
+
+def load_auto_scan_benchmarks_preview(environment_id, limit=200):
+    if not engine or environment_id is None:
+        return pd.DataFrame()
+    ensure_auto_scan_benchmarks_table()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    ab.scan_id,
+                    COALESCE(ab.build_version, '') AS build_version,
+                    ab.run_date,
+                    COALESCE(ab.scenario_type, '') AS scenario_type,
+                    COALESCE(ab.scan_type, '') AS scan_type,
+                    COALESCE(ab.data_source_type, '') AS data_source_type,
+                    COALESCE(ab.data_type, '') AS data_type,
+                    COALESCE(ab.file_set_type, '') AS file_set_type,
+                    ab.total_scan_hours,
+                    ab.objects_scanned,
+                    ab.total_classification,
+                    ab.new_attributes,
+                    ab.removed_attributes,
+                    ab.updated_at
+                FROM auto_scan_benchmarks ab
+                LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                WHERE ab.environment_id = :eid
+                  AND LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')
+                  AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
+                  AND LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'
+                ORDER BY ab.updated_at DESC
+                LIMIT :lim
+            """), {"eid": int(environment_id), "lim": int(limit)}).fetchall()
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "scan_id", "build_version", "run_date", "scenario_type", "scan_type",
+                "data_source_type", "data_type", "file_set_type", "total_scan_hours",
+                "objects_scanned", "total_classification", "new_attributes", "removed_attributes", "updated_at"
+            ]
+        )
+        df = df.fillna("")
+        # Keep count fields as whole numbers in preview table (no trailing .0).
+        for col in ["objects_scanned", "total_classification", "new_attributes", "removed_attributes"]:
+            if col in df.columns:
+                numeric = pd.to_numeric(df[col], errors="coerce")
+                df[col] = numeric.apply(lambda v: "" if pd.isna(v) else int(v))
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_auto_scan_benchmark_row(scan_id):
+    """
+    Load one auto trend row by scan id.
+    """
+    if not engine or not scan_id:
+        return {}
+    ensure_auto_scan_benchmarks_table()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    COALESCE(build_version, '') AS build_version,
+                    run_date,
+                    COALESCE(scenario_type, '') AS scenario_type,
+                    COALESCE(scan_type, '') AS scan_type,
+                    COALESCE(data_source_type, '') AS data_source_type,
+                    COALESCE(data_type, '') AS data_type,
+                    COALESCE(file_set_type, '') AS file_set_type,
+                    total_scan_hours,
+                    objects_scanned,
+                    total_classification,
+                    new_attributes,
+                    removed_attributes,
+                    updated_at
+                FROM auto_scan_benchmarks
+                WHERE scan_id = :sid
+                LIMIT 1
+            """), {"sid": str(scan_id)}).fetchone()
+        if not row:
+            return {}
+        result = {
+            "scan_id": row[0],
+            "build_version": row[1],
+            "run_date": row[2],
+            "scenario_type": row[3],
+            "scan_type": row[4],
+            "data_source_type": row[5],
+            "data_type": row[6],
+            "file_set_type": row[7],
+            "total_scan_hours": row[8],
+            "objects_scanned": row[9],
+            "total_classification": row[10],
+            "new_attributes": row[11],
+            "removed_attributes": row[12],
+            "updated_at": row[13],
+        }
+        for k in ["objects_scanned", "total_classification", "new_attributes", "removed_attributes"]:
+            try:
+                if result.get(k) is not None and result.get(k) != "":
+                    result[k] = int(result.get(k))
+            except Exception:
+                pass
+        return result
+    except Exception:
+        return {}
+
+def upsert_scan_parent_record(env_id, scan_row, resolved_status):
+    if not engine or not scan_row:
+        return
+    scan_id = str(scan_row.get("_id") or scan_row.get("id") or "").strip()
+    if not scan_id:
+        return
+    name = str(scan_row.get("name") or scan_row.get("scanName") or scan_row.get("displayName") or "").strip()
+    scan_type = str(scan_row.get("type") or "").strip()
+    started_at = str(scan_row.get("startedAt") or scan_row.get("startTime") or scan_row.get("createdAt") or "").strip()
+    completed_at = str(scan_row.get("completedAt") or scan_row.get("endTime") or scan_row.get("endedAt") or "").strip()
+    template_name = str(scan_row.get("scanTemplateName") or "").strip()
+    status = str(resolved_status or "").strip()
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO scan_parents (
+                    scan_id, environment_id, scan_name, scan_type, started_at, completed_at, template_name, scan_status, is_active
+                ) VALUES (:sid, :eid, :sn, :st, :sa, :ca, :tn, :ss, TRUE)
+                ON DUPLICATE KEY UPDATE
+                    environment_id = VALUES(environment_id),
+                    scan_name = VALUES(scan_name),
+                    scan_type = VALUES(scan_type),
+                    started_at = VALUES(started_at),
+                    completed_at = VALUES(completed_at),
+                    template_name = VALUES(template_name),
+                    scan_status = VALUES(scan_status),
+                    last_seen_at = CURRENT_TIMESTAMP
+            """), {
+                "sid": scan_id,
+                "eid": int(env_id) if env_id is not None else None,
+                "sn": name or None,
+                "st": scan_type or None,
+                "sa": started_at or None,
+                "ca": completed_at or None,
+                "tn": template_name or None,
+                "ss": status or None,
+            })
+            conn.commit()
+    except Exception:
+        pass
+
+
+def is_ignored_scan_name(scan_name):
+    name = str(scan_name or "").strip().lower()
+    if not name:
+        return False
+    return bool(re.match(r"^instant\s+scan\s+data", name))
+
+
+def get_scan_parent_active_map(scan_ids):
+    active_map = {}
+    if not engine:
+        return active_map
+    cleaned_ids = []
+    seen = set()
+    for scan_id in (scan_ids or []):
+        sid = str(scan_id or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        cleaned_ids.append(sid)
+    if not cleaned_ids:
+        return active_map
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT scan_id, is_active FROM scan_parents WHERE scan_id IN :ids")
+                .bindparams(bindparam("ids", expanding=True)),
+                {"ids": cleaned_ids},
+            ).fetchall()
+            for row in rows:
+                sid = str(row[0] or "").strip()
+                if sid:
+                    active_map[sid] = bool(row[1])
+    except Exception:
+        pass
+    return active_map
+
+
+def load_scan_parents_from_db(environment_id, status_view="All", limit=200):
+    if not engine or environment_id is None:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    scan_name,
+                    scan_type,
+                    started_at,
+                    completed_at,
+                    template_name,
+                    scan_status
+                FROM scan_parents
+                WHERE environment_id = :eid
+                  AND LOWER(COALESCE(scan_name, '')) NOT LIKE 'instant scan data%'
+                ORDER BY updated_at DESC
+                LIMIT :lim
+            """), {"eid": int(environment_id), "lim": int(limit)}).fetchall()
+    except Exception:
+        return []
+
+    running_states = {"Started", "Awaiting", "In Progress", "InProgress"}
+    completed_states = {"Failed", "CompletedWithFailures", "Completed"}
+    excluded_states = {"Stopped", "Aborted"}
+    items = []
+    for r in rows:
+        state = str(r[6] or "").strip()
+        if state in excluded_states:
+            continue
+        if status_view == "In Progress" and state not in running_states:
+            continue
+        if status_view == "Completed" and state not in completed_states:
+            continue
+        items.append({
+            "_id": str(r[0] or "").strip(),
+            "name": str(r[1] or "").strip(),
+            "type": str(r[2] or "").strip(),
+            "startedAt": str(r[3] or "").strip(),
+            "completedAt": str(r[4] or "").strip(),
+            "scanTemplateName": str(r[5] or "").strip(),
+            "state": state,
+        })
+    return items
+
+
+def load_scan_parents_for_environments(environment_ids, status_view="All", limit=500):
+    if not engine:
+        return []
+    cleaned_ids = []
+    seen = set()
+    for env_id in (environment_ids or []):
+        try:
+            eid = int(env_id)
+        except Exception:
+            continue
+        if eid in seen:
+            continue
+        seen.add(eid)
+        cleaned_ids.append(eid)
+    if not cleaned_ids:
+        return []
+
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    sp.scan_id,
+                    sp.scan_name,
+                    sp.scan_type,
+                    sp.started_at,
+                    sp.completed_at,
+                    sp.template_name,
+                    sp.scan_status,
+                    sp.environment_id,
+                    te.env_name
+                FROM scan_parents sp
+                LEFT JOIN test_environments te ON te.id = sp.environment_id
+                WHERE sp.environment_id IN :env_ids
+                  AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
+                ORDER BY sp.updated_at DESC
+                LIMIT :lim
+            """).bindparams(bindparam("env_ids", expanding=True)), {"env_ids": cleaned_ids, "lim": int(limit)}).fetchall()
+    except Exception:
+        return []
+
+    running_states = {"Started", "Awaiting", "In Progress", "InProgress"}
+    completed_states = {"Failed", "CompletedWithFailures", "Completed"}
+    excluded_states = {"Stopped", "Aborted"}
+    items = []
+    for r in rows:
+        state = str(r[6] or "").strip()
+        if state in excluded_states:
+            continue
+        if status_view == "In Progress" and state not in running_states:
+            continue
+        if status_view == "Completed" and state not in completed_states:
+            continue
+        items.append({
+            "_id": str(r[0] or "").strip(),
+            "name": str(r[1] or "").strip(),
+            "type": str(r[2] or "").strip(),
+            "startedAt": str(r[3] or "").strip(),
+            "completedAt": str(r[4] or "").strip(),
+            "scanTemplateName": str(r[5] or "").strip(),
+            "state": state,
+            "environment_id": r[7],
+            "environment_name": str(r[8] or "").strip(),
+        })
+    return items
+
+
+def set_scan_parent_active(scan_id, is_active):
+    if not engine or not scan_id:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE scan_parents SET is_active = :a WHERE scan_id = :sid"),
+                {"a": bool(is_active), "sid": str(scan_id)}
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_saved_benchmark_scan_ids():
+    """
+    Returns a set of scan_ids that have already been converted to manual benchmarks.
+    """
+    if not engine:
+        return set()
+    saved_ids = set()
+    try:
+        with engine.connect() as conn:
+            # Check benchmarks (manual) - scan_id column should exist now
+            try:
+                col_check = conn.execute(text("SHOW COLUMNS FROM benchmarks LIKE 'scan_id'")).fetchone()
+                if col_check:
+                    rows_manual = conn.execute(text("SELECT DISTINCT scan_id FROM benchmarks WHERE scan_id IS NOT NULL")).fetchall()
+                    for r in rows_manual:
+                        if r[0]:
+                            saved_ids.add(str(r[0]).strip().lower())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return saved_ids
+
+
+def load_scan_insight_from_db(scan_id):
+    if not engine or not scan_id:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT
+                    distinct_classification_attributes,
+                    objects_with_pi,
+                    objects_scanned,
+                    objects_enumerated,
+                    total_classification,
+                    new_attributes_count,
+                    removed_attributes_count,
+                    total_size_gb
+                FROM scan_insights
+                WHERE scan_id = :sid
+                LIMIT 1
+            """), {"sid": str(scan_id)}).fetchone()
+            if not row:
+                return None
+
+            ds_rows = conn.execute(text("""
+                SELECT d.name
+                FROM scan_insight_data_source_map m
+                JOIN scan_data_sources d ON d.id = m.data_source_id
+                WHERE m.scan_id = :sid
+                ORDER BY d.name
+            """), {"sid": str(scan_id)}).fetchall()
+            data_source_names = ", ".join(str(r[0]) for r in ds_rows if r and r[0])
+
+            attr_rows = conn.execute(text("""
+                SELECT a.name
+                FROM scan_insight_attribute_delta_map m
+                JOIN scan_classifier_attributes a ON a.id = m.attribute_id
+                WHERE m.scan_id = :sid
+                ORDER BY a.name
+            """), {"sid": str(scan_id)}).fetchall()
+            classifier_attribute_names = ", ".join(str(r[0]) for r in attr_rows if r and r[0])
+
+            delta_counts = conn.execute(text("""
+                SELECT
+                    COALESCE(SUM(CASE
+                        WHEN new_count_value IS NOT NULL THEN new_count_value
+                        WHEN is_new = TRUE THEN 1 ELSE 0 END), 0) AS new_count,
+                    COALESCE(SUM(CASE
+                        WHEN removed_count_value IS NOT NULL THEN removed_count_value
+                        WHEN is_removed = TRUE THEN 1 ELSE 0 END), 0) AS removed_count
+                FROM scan_insight_attribute_delta_map
+                WHERE scan_id = :sid
+            """), {"sid": str(scan_id)}).fetchone()
+            map_new_count = int(delta_counts[0]) if delta_counts and delta_counts[0] is not None else 0
+            map_removed_count = int(delta_counts[1]) if delta_counts and delta_counts[1] is not None else 0
+
+            return {
+                "distinct_classification_attributes": row[0] if row[0] is not None else "",
+                "classifier_attribute_names": classifier_attribute_names,
+                "data_source_names": data_source_names,
+                "objects_with_pi": row[1] if row[1] is not None else "",
+                "objects_scanned": row[2] if row[2] is not None else "",
+                "objects_enumerated": row[3] if row[3] is not None else "",
+                "total_classification": row[4] if row[4] is not None else "",
+                "new_attributes_count": map_new_count if map_new_count else (row[5] if row[5] is not None else ""),
+                "removed_attributes_count": map_removed_count if map_removed_count else (row[6] if row[6] is not None else ""),
+            }
+    except Exception:
+        return None
+
+
+def load_scan_insight_map_for_scan_ids(scan_ids):
+    """
+    Batch-load scan insight metrics for many scan ids in one query.
+    """
+    result = {}
+    cleaned_ids = []
+    seen = set()
+    for scan_id in (scan_ids or []):
+        sid = str(scan_id or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        cleaned_ids.append(sid)
+    if not engine or not cleaned_ids:
+        return result
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    distinct_classification_attributes,
+                    classifier_attribute_names,
+                    data_source_names,
+                    objects_with_pi,
+                    objects_scanned,
+                    objects_enumerated,
+                    total_classification,
+                    new_attributes_count,
+                    removed_attributes_count
+                FROM scan_insights
+                WHERE scan_id IN :ids
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+        for r in rows:
+            sid = str(r[0] or "").strip()
+            if not sid:
+                continue
+            result[sid] = {
+                "distinct_classification_attributes": r[1] if r[1] is not None else "",
+                "classifier_attribute_names": str(r[2] or "").strip(),
+                "data_source_names": str(r[3] or "").strip(),
+                "objects_with_pi": r[4] if r[4] is not None else "",
+                "objects_scanned": r[5] if r[5] is not None else "",
+                "objects_enumerated": r[6] if r[6] is not None else "",
+                "total_classification": r[7] if r[7] is not None else "",
+                "new_attributes_count": r[8] if r[8] is not None else "",
+                "removed_attributes_count": r[9] if r[9] is not None else "",
+            }
+    except Exception:
+        return {}
+    return result
+
+
+def load_scan_detail_completeness_map(scan_ids):
+    """
+    Return {scan_id: bool} indicating whether both insight and attributes are persisted.
+    """
+    completeness = {}
+    cleaned_ids = []
+    seen = set()
+    for scan_id in (scan_ids or []):
+        sid = str(scan_id or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        cleaned_ids.append(sid)
+        completeness[sid] = False
+
+    if not engine or not cleaned_ids:
+        return completeness
+
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            insight_rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    distinct_classification_attributes,
+                    objects_with_pi,
+                    objects_scanned,
+                    objects_enumerated,
+                    total_classification,
+                    new_attributes_count,
+                    removed_attributes_count,
+                    insight_payload,
+                    attributes_payload
+                FROM scan_insights
+                WHERE scan_id IN :ids
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+
+            attr_rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    COUNT(*) AS cnt,
+                    SUM(CASE
+                        WHEN COALESCE(new_count_value, 0) > 0
+                          OR COALESCE(removed_count_value, 0) > 0
+                          OR COALESCE(finding_count, 0) > 0
+                          OR COALESCE(attribute_value, '') <> ''
+                        THEN 1 ELSE 0 END) AS signal_cnt
+                FROM scan_insight_attribute_delta_map
+                WHERE scan_id IN :ids
+                GROUP BY scan_id
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+            attr_count_map = {str(r[0]): int(r[1] or 0) for r in attr_rows if r and r[0]}
+            attr_signal_map = {str(r[0]): int(r[2] or 0) for r in attr_rows if r and r[0]}
+
+            def has_real_attributes_payload(raw_payload):
+                txt = str(raw_payload or "").strip()
+                if not txt:
+                    return False
+                try:
+                    obj = json.loads(txt)
+                except Exception:
+                    return False
+                items, total_count = extract_scan_attributes_payload(obj if isinstance(obj, dict) else {})
+                if items:
+                    return True
+                try:
+                    return int(total_count or 0) > 0
+                except Exception:
+                    return False
+
+            def has_real_insight_payload(raw_payload):
+                txt = str(raw_payload or "").strip()
+                if not txt:
+                    return False
+                try:
+                    obj = json.loads(txt)
+                except Exception:
+                    return False
+                if not isinstance(obj, dict):
+                    return False
+                # Any non-empty object is considered real insight payload.
+                return bool(obj)
+
+            for r in insight_rows:
+                sid = str(r[0] or "").strip()
+                if not sid:
+                    continue
+                metric_values = [r[1], r[2], r[3], r[4], r[5], r[6], r[7]]
+                has_metric_data = any(v is not None for v in metric_values)
+                has_insight_payload = has_real_insight_payload(r[8])
+                has_attributes_payload = has_real_attributes_payload(r[9])
+                has_attr_rows = int(attr_count_map.get(sid, 0)) > 0
+                has_attr_signal = int(attr_signal_map.get(sid, 0)) > 0
+                has_insight = has_metric_data or has_insight_payload
+                has_attributes = has_attributes_payload or has_attr_signal
+                completeness[sid] = bool(has_insight and has_attributes)
+    except Exception:
+        return completeness
+
+    return completeness
+
+
+def upsert_scan_insight_record(scan_id, metrics, insight_payload=None, attributes_payload=None):
+    if not engine or not scan_id:
+        return
+
+    def to_int_or_none(v):
+        if v is None or v == "":
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                INSERT INTO scan_insights (
+                    scan_id,
+                    distinct_classification_attributes,
+                    classifier_attribute_names,
+                    data_source_names,
+                    objects_with_pi,
+                    objects_scanned,
+                    objects_enumerated,
+                    total_classification,
+                    new_attributes_count,
+                    removed_attributes_count,
+                    total_size_gb,
+                    insight_payload,
+                    attributes_payload
+                ) VALUES (
+                    :sid, :dca, :can, :dsn, :owp, :osc, :oen, :tcl, :nac, :rac, :tgb, :ip, :ap
+                )
+                ON DUPLICATE KEY UPDATE
+                    distinct_classification_attributes = VALUES(distinct_classification_attributes),
+                    classifier_attribute_names = VALUES(classifier_attribute_names),
+                    data_source_names = VALUES(data_source_names),
+                    objects_with_pi = VALUES(objects_with_pi),
+                    objects_scanned = VALUES(objects_scanned),
+                    objects_enumerated = VALUES(objects_enumerated),
+                    total_classification = VALUES(total_classification),
+                    new_attributes_count = VALUES(new_attributes_count),
+                    removed_attributes_count = VALUES(removed_attributes_count),
+                    total_size_gb = VALUES(total_size_gb),
+                    insight_payload = VALUES(insight_payload),
+                    attributes_payload = VALUES(attributes_payload),
+                    updated_at = CURRENT_TIMESTAMP
+            """), {
+                "sid": str(scan_id),
+                "dca": to_int_or_none(metrics.get("distinct_classification_attributes")),
+                "can": str(metrics.get("classifier_attribute_names") or "") or None,
+                "dsn": str(metrics.get("data_source_names") or "") or None,
+                "owp": to_int_or_none(metrics.get("objects_with_pi")),
+                "osc": to_int_or_none(metrics.get("objects_scanned")),
+                "oen": to_int_or_none(metrics.get("objects_enumerated")),
+                "tcl": to_int_or_none(metrics.get("total_classification")),
+                "nac": to_int_or_none(metrics.get("new_attributes_count")),
+                "rac": to_int_or_none(metrics.get("removed_attributes_count")),
+                "ip": json.dumps(insight_payload, ensure_ascii=False) if insight_payload is not None else None,
+                "ap": json.dumps(attributes_payload, ensure_ascii=False) if attributes_payload is not None else None,
+            })
+
+            # Normalize data sources into dictionary + map tables.
+            ds_text = str(metrics.get("data_source_names") or "").strip()
+            data_source_names = sorted({x.strip() for x in ds_text.split(",") if x and x.strip()})
+            conn.execute(text("DELETE FROM scan_insight_data_source_map WHERE scan_id = :sid"), {"sid": str(scan_id)})
+            for name in data_source_names:
+                conn.execute(text("INSERT IGNORE INTO scan_data_sources (name) VALUES (:n)"), {"n": name})
+                ds_row = conn.execute(text("SELECT id FROM scan_data_sources WHERE name = :n LIMIT 1"), {"n": name}).fetchone()
+                if ds_row:
+                    conn.execute(text("""
+                        INSERT IGNORE INTO scan_insight_data_source_map (scan_id, data_source_id)
+                        VALUES (:sid, :did)
+                    """), {"sid": str(scan_id), "did": int(ds_row[0])})
+
+            # Normalize classifier attributes + delta flags into dictionary + map tables.
+            attr_map = {}
+
+            attrs_payload = attributes_payload if isinstance(attributes_payload, dict) else {}
+            attr_items, _ = extract_scan_attributes_payload(attrs_payload)
+
+            def try_int(val):
+                try:
+                    if val is None or val == "":
+                        return None
+                    return int(val)
+                except Exception:
+                    return None
+
+            for item in attr_items:
+                if not isinstance(item, dict):
+                    continue
+                attr_name = str(
+                    item.get("name")
+                    or item.get("_id")
+                    or item.get("attributeName")
+                    or item.get("classifierAttributeName")
+                    or item.get("classifier_name")
+                    or item.get("title")
+                    or ""
+                ).strip()
+                if not attr_name:
+                    continue
+                current = attr_map.get(attr_name, {
+                    "is_new": False,
+                    "is_removed": False,
+                    "finding_count": None,
+                    "attribute_value": "",
+                    "new_count_value": 0,
+                    "removed_count_value": 0,
+                })
+                raw_new = item.get("new")
+                raw_removed = item.get("removed")
+                is_new = bool(raw_new is True)
+                is_removed = bool(raw_removed is True)
+                new_cnt_val = try_int(raw_new)
+                removed_cnt_val = try_int(raw_removed)
+                if new_cnt_val is not None and new_cnt_val > 0:
+                    is_new = True
+                if removed_cnt_val is not None and removed_cnt_val > 0:
+                    is_removed = True
+                finding_count = (
+                    try_int(item.get("findingCount"))
+                    or try_int(item.get("findings"))
+                    or try_int(item.get("count"))
+                    or try_int(item.get("total"))
+                    or try_int(item.get("totalCount"))
+                    or try_int(item.get("objectsWithPi"))
+                    or try_int(item.get("objectsCount"))
+                )
+                attribute_value = str(
+                    item.get("value")
+                    or item.get("attributeValue")
+                    or item.get("deltaValue")
+                    or item.get("changeValue")
+                    or item.get("displayValue")
+                    or ""
+                ).strip()
+                change_type = str(
+                    item.get("changeType")
+                    or item.get("change")
+                    or item.get("status")
+                    or item.get("state")
+                    or ""
+                ).strip().lower()
+                if change_type in {"new", "added", "newlyadded"}:
+                    is_new = True
+                if change_type in {"removed", "deleted"}:
+                    is_removed = True
+                current["is_new"] = bool(current.get("is_new") or is_new)
+                current["is_removed"] = bool(current.get("is_removed") or is_removed)
+                if new_cnt_val is not None:
+                    current["new_count_value"] = max(int(current.get("new_count_value") or 0), int(new_cnt_val))
+                elif is_new and int(current.get("new_count_value") or 0) == 0:
+                    current["new_count_value"] = 1
+                if removed_cnt_val is not None:
+                    current["removed_count_value"] = max(int(current.get("removed_count_value") or 0), int(removed_cnt_val))
+                elif is_removed and int(current.get("removed_count_value") or 0) == 0:
+                    current["removed_count_value"] = 1
+                if finding_count is not None:
+                    prev_fc = current.get("finding_count")
+                    current["finding_count"] = finding_count if prev_fc is None else max(int(prev_fc), int(finding_count))
+                if attribute_value:
+                    current["attribute_value"] = attribute_value
+                if not attribute_value:
+                    if int(current.get("new_count_value") or 0) > 0 and int(current.get("removed_count_value") or 0) > 0:
+                        current["attribute_value"] = "New, Removed"
+                    elif int(current.get("new_count_value") or 0) > 0:
+                        current["attribute_value"] = "New"
+                    elif int(current.get("removed_count_value") or 0) > 0:
+                        current["attribute_value"] = "Removed"
+                if current.get("finding_count") is None:
+                    current["finding_count"] = int(current.get("new_count_value") or 0) + int(current.get("removed_count_value") or 0)
+                attr_map[attr_name] = current
+
+            conn.execute(text("DELETE FROM scan_insight_attribute_delta_map WHERE scan_id = :sid"), {"sid": str(scan_id)})
+            for attr_name, flags in attr_map.items():
+                conn.execute(text("INSERT IGNORE INTO scan_classifier_attributes (name) VALUES (:n)"), {"n": attr_name})
+                attr_row = conn.execute(text("SELECT id FROM scan_classifier_attributes WHERE name = :n LIMIT 1"), {"n": attr_name}).fetchone()
+                if attr_row:
+                    conn.execute(text("""
+                        INSERT INTO scan_insight_attribute_delta_map
+                        (scan_id, attribute_id, is_new, is_removed, finding_count, attribute_value, new_count_value, removed_count_value)
+                        VALUES (:sid, :aid, :is_new, :is_removed, :fc, :av, :ncv, :rcv)
+                        ON DUPLICATE KEY UPDATE
+                            is_new = VALUES(is_new),
+                            is_removed = VALUES(is_removed),
+                            finding_count = VALUES(finding_count),
+                            attribute_value = VALUES(attribute_value),
+                            new_count_value = VALUES(new_count_value),
+                            removed_count_value = VALUES(removed_count_value)
+                    """), {
+                        "sid": str(scan_id),
+                        "aid": int(attr_row[0]),
+                        "is_new": bool(flags.get("is_new")),
+                        "is_removed": bool(flags.get("is_removed")),
+                        "fc": flags.get("finding_count"),
+                        "av": str(flags.get("attribute_value") or "") or None,
+                        "ncv": int(flags.get("new_count_value") or 0),
+                        "rcv": int(flags.get("removed_count_value") or 0),
+                    })
+            conn.commit()
+    except Exception:
+        pass
+
+
+def infer_add_benchmark_defaults_from_scan_name(scan_name):
+    name = str(scan_name or "")
+    upper_name = name.upper()
+
+    has_small_file = "SMALL FILES" in upper_name or "SMALL FILE" in upper_name
+    has_large_file = "LARGE FILES" in upper_name or "LARGE FILE" in upper_name
+    has_csv_file = "CSV FILES" in upper_name or "CSV FILE" in upper_name
+    has_with_aci = ("WITH ACI" in upper_name or "ACL" in upper_name) and "NO ACL" not in upper_name
+    has_no_ols = "NO OLS" in upper_name
+    has_struct_disc = "STRUCT DISC" in upper_name or "STRUCTURE DISCOVERY" in upper_name
+
+    build_version = parse_build_version_from_text(name)
+
+    data_source_type = ""
+    if re.search(r"\bMSSQL\b|\bMS SQL\b", upper_name):
+        data_source_type = "MSSQL"
+    elif re.search(r"\bMYSQL\b|\bMY SQL\b", upper_name):
+        data_source_type = "MySQL"
+    elif re.search(r"\bPOSTGRESQL\b|\bPOSTGRES\b", upper_name):
+        data_source_type = "Postgres"
+    elif re.search(r"\bSMB\b", upper_name):
+        data_source_type = "SMB"
+    elif re.search(r"\bS3\b", upper_name):
+        data_source_type = "S3"
+    elif re.search(r"\bORACLE\b", upper_name):
+        data_source_type = "Oracle"
+    elif re.search(r"\bNFS\b", upper_name):
+        data_source_type = "NFS"
+
+    scenario_type = ""
+    if has_small_file: scenario_type = "Small Files"
+    elif has_large_file: scenario_type = "Large Files"
+    elif has_csv_file: scenario_type = "CSV Files"
+
+    file_set_type = ""
+    if has_small_file: file_set_type = "Small Files"
+    elif has_large_file: file_set_type = "Large Files"
+    elif has_csv_file: file_set_type = "CSV Files"
+
+    return {
+        "build_version": build_version,
+        "scenario_type": scenario_type,
+        "file_set_type": file_set_type,
+        "is_acl": has_with_aci,
+        "scan_type": "OLS Scan" if "OLS" in upper_name and "NO OLS" not in upper_name else "Full Scan",
+        "is_ff": has_struct_disc,
+        "is_ocr": False,
+        "data_source_type": data_source_type,
+    }
+
+
+def get_scan_name_from_db(scan_id):
+    if not engine or not scan_id:
+        return ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT scan_name FROM scan_parents WHERE scan_id = :sid LIMIT 1"),
+                {"sid": str(scan_id)}
+            ).fetchone()
+            return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+
+def get_scan_parent_details_from_db(scan_id):
+    if not engine or not scan_id:
+        return {}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT started_at, completed_at, scan_name
+                FROM scan_parents
+                WHERE scan_id = :sid
+                LIMIT 1
+            """), {"sid": str(scan_id)}).fetchone()
+            if not row:
+                return {}
+            return {
+                "started_at": str(row[0] or "").strip(),
+                "completed_at": str(row[1] or "").strip(),
+                "scan_name": str(row[2] or "").strip(),
+            }
+    except Exception:
+        return {}
+
+
+def get_environment_row_for_scan_id(scan_id):
+    if not engine or not scan_id:
+        return None
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT te.id, te.env_name, te.base_url, te.version, te.classifiers_api_path, te.is_active
+                FROM scan_parents sp
+                JOIN test_environments te ON te.id = sp.environment_id
+                WHERE sp.scan_id = :sid
+                LIMIT 1
+            """), {"sid": str(scan_id)}).fetchone()
+            if not row:
+                return None
+            return {
+                "id": row[0],
+                "env_name": row[1],
+                "base_url": row[2],
+                "version": row[3],
+                "classifiers_api_path": row[4],
+                "is_active": row[5],
+            }
+    except Exception:
+        return None
+
+
+def sync_single_scan_insight(scan_id, env_row):
+    """
+    Force-sync one scan insight + attributes and upsert normalized records.
+    """
+    if not scan_id or not env_row:
+        return False
+    try:
+        insight_payload, _ = fetch_parent_scan_insight_with_auth_retry(env_row, scan_id)
+        new_cnt, removed_cnt, attrs_payload, _ = fetch_parent_scan_attribute_counts_with_auth_retry(
+            env_row, scan_id, limit=200
+        )
+        metrics = extract_scan_insight_metrics(insight_payload if isinstance(insight_payload, dict) else {})
+        metrics["new_attributes_count"] = new_cnt
+        metrics["removed_attributes_count"] = removed_cnt
+        upsert_scan_insight_record(
+            scan_id,
+            metrics,
+            insight_payload=insight_payload if isinstance(insight_payload, dict) else None,
+            attributes_payload=attrs_payload if isinstance(attrs_payload, dict) else None,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def auto_sync_scan_items(env_row, scan_items, max_workers=6, only_missing_details=False, max_to_sync=None):
+    """
+    Auto-sync insights/attributes for all eligible scans in parallel.
+    Excludes scans in states Stopped/Aborted.
+    """
+    if not scan_items:
+        return {"attempted": 0, "synced": 0, "failed": 0, "skipped_existing": 0, "pending_after_batch": 0}
+
+    excluded = {"stopped", "aborted"}
+    candidates = []
+    candidate_state_map = {}
+    seen = set()
+    for scan in scan_items:
+        if not isinstance(scan, dict):
+            continue
+        sid = str(scan.get("_id") or scan.get("id") or "").strip()
+        if not sid or sid in seen:
+            continue
+        scan_name = str(scan.get("name") or scan.get("scanName") or scan.get("displayName") or "").strip()
+        if is_ignored_scan_name(scan_name):
+            continue
+        state = resolve_scan_status_value(scan).strip().lower()
+        if state in excluded:
+            continue
+        seen.add(sid)
+        candidates.append(sid)
+        candidate_state_map[sid] = state
+
+    if not candidates:
+        return {"attempted": 0, "synced": 0, "failed": 0, "skipped_existing": 0, "pending_after_batch": 0}
+
+    to_sync = []
+    skipped_existing = 0
+    pending_after_batch = 0
+    if only_missing_details:
+        detail_map = load_scan_detail_completeness_map(candidates)
+        all_missing = []
+        running_like_states = {"started", "awaiting", "in progress", "inprogress"}
+        for sid in candidates:
+            state_norm = str(candidate_state_map.get(sid) or "").strip().lower()
+            # Keep running scans fresh even when detail rows already exist.
+            if state_norm in running_like_states:
+                all_missing.append(sid)
+                continue
+            if detail_map.get(sid):
+                skipped_existing += 1
+            else:
+                all_missing.append(sid)
+        if max_to_sync is not None:
+            try:
+                batch_size = max(1, int(max_to_sync))
+            except Exception:
+                batch_size = len(all_missing)
+            to_sync = all_missing[:batch_size]
+            pending_after_batch = max(0, len(all_missing) - len(to_sync))
+        else:
+            to_sync = all_missing
+    else:
+        to_sync = list(candidates)
+
+    if not to_sync:
+        return {
+            "attempted": 0,
+            "synced": 0,
+            "failed": 0,
+            "skipped_existing": skipped_existing,
+            "pending_after_batch": pending_after_batch,
+        }
+
+    synced = 0
+    failed = 0
+    workers = max(1, min(int(max_workers), 10))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(sync_single_scan_insight, sid, env_row): sid for sid in to_sync}
+        for fut in as_completed(futures):
+            try:
+                ok = bool(fut.result())
+                if ok:
+                    synced += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+    return {
+        "attempted": len(to_sync),
+        "synced": synced,
+        "failed": failed,
+        "skipped_existing": skipped_existing,
+        "pending_after_batch": pending_after_batch,
+    }
+
+
+def upsert_auto_trend_rows_from_scans(env_row, scan_items):
+    """
+    Update auto trend table from already-stored DB insight rows.
+    This runs during sync flow, not during table rendering.
+    """
+    if not scan_items:
+        return 0
+    updated = 0
+    for scan in (scan_items or []):
+        if not isinstance(scan, dict):
+            continue
+        scan_name = str(scan.get("name") or scan.get("scanName") or scan.get("displayName") or "").strip()
+        if is_ignored_scan_name(scan_name):
+            continue
+        state = resolve_scan_status_value(scan).strip().lower()
+        if state in {"stopped", "aborted"}:
+            continue
+        sid = str(scan.get("_id") or scan.get("id") or "").strip()
+        if not sid:
+            continue
+        metrics = {
+            "distinct_classification_attributes": "",
+            "classifier_attribute_names": "",
+            "data_source_names": "",
+            "objects_with_pi": "",
+            "objects_scanned": "",
+            "objects_enumerated": "",
+            "total_classification": "",
+            "new_attributes_count": "",
+            "removed_attributes_count": "",
+        }
+        db_metrics = load_scan_insight_from_db(sid)
+        if db_metrics:
+            metrics.update(db_metrics)
+        upsert_auto_scan_benchmark(scan, env_row, metrics)
+        updated += 1
+    return updated
+
+
+def get_scan_attribute_findings_prefill(scan_id):
+    """
+    Build findings-row prefill from normalized scan attribute delta tables.
+    """
+    if not engine or not scan_id:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT a.name, m.is_new, m.is_removed, m.finding_count, m.attribute_value, m.new_count_value, m.removed_count_value
+                FROM scan_insight_attribute_delta_map m
+                JOIN scan_classifier_attributes a ON a.id = m.attribute_id
+                WHERE m.scan_id = :sid
+                ORDER BY a.name
+            """), {"sid": str(scan_id)}).fetchall()
+    except Exception:
+        return []
+
+    # If DB rows are missing or only zero values, force one-shot API sync and retry.
+    has_non_zero = any(
+        ((r[5] or 0) and int(r[5]) > 0) or ((r[6] or 0) and int(r[6]) > 0) or ((r[3] or 0) and int(r[3]) > 0)
+        for r in rows
+        if r is not None
+    )
+    if (not rows or not has_non_zero) and scan_id:
+        env_row = get_environment_row_for_scan_id(scan_id)
+        if env_row and sync_single_scan_insight(scan_id, env_row):
+            try:
+                with engine.connect() as conn:
+                    rows = conn.execute(text("""
+                        SELECT a.name, m.is_new, m.is_removed, m.finding_count, m.attribute_value, m.new_count_value, m.removed_count_value
+                        FROM scan_insight_attribute_delta_map m
+                        JOIN scan_classifier_attributes a ON a.id = m.attribute_id
+                        WHERE m.scan_id = :sid
+                        ORDER BY a.name
+                    """), {"sid": str(scan_id)}).fetchall()
+            except Exception:
+                rows = rows or []
+
+    prefill_rows = []
+    for attr_name, is_new, is_removed, finding_count, stored_value, new_count_value, removed_count_value in rows:
+        label = ""
+        if bool(is_new) and bool(is_removed):
+            label = "New, Removed"
+        elif bool(is_new):
+            label = "New"
+        elif bool(is_removed):
+            label = "Removed"
+        if str(stored_value or "").strip():
+            label = str(stored_value or "").strip()
+        try:
+            new_cnt = int(new_count_value) if new_count_value is not None else 0
+        except Exception:
+            new_cnt = 0
+        try:
+            rem_cnt = int(removed_count_value) if removed_count_value is not None else 0
+        except Exception:
+            rem_cnt = 0
+        if new_cnt > 0:
+            prefill_rows.append({
+                "Classifier Attribute": str(attr_name or "").strip(),
+                "Attribute Value": "New",
+                "Findings": new_cnt
+            })
+        if rem_cnt > 0:
+            prefill_rows.append({
+                "Classifier Attribute": str(attr_name or "").strip(),
+                "Attribute Value": "Removed",
+                "Findings": rem_cnt
+            })
+        if new_cnt == 0 and rem_cnt == 0:
+            try:
+                findings_count_val = int(finding_count) if finding_count is not None else 0
+            except Exception:
+                findings_count_val = 0
+            prefill_rows.append({
+                "Classifier Attribute": str(attr_name or "").strip(),
+                "Attribute Value": label,
+                "Findings": findings_count_val
+            })
+    return prefill_rows
+
+
 def page_add_benchmark():
     st.title("➕ Add New Benchmark Run")
     st.markdown("Enter details below. This will populate the **normalized** tables (`builds`, `configs`, `classifiers`, `benchmarks`).")
@@ -1425,10 +3459,69 @@ def page_add_benchmark():
         st.success("✅ Benchmark saved successfully.")
         st.session_state["benchmark_saved"] = False
 
+    # Optional prefill from Scan Status page
+    prefill = {
+        "build_version": "",
+        "scenario_type": "",
+        "file_set_type": "",
+        "is_acl": False,
+        "scan_type": "OLS Scan",
+        "is_ff": False,
+        "is_ocr": False,
+    }
+    scan_prefill_id = ""
+    scan_prefill_name = ""
+    try:
+        qp = st.query_params
+        scan_prefill_id = str(qp.get("scan_id", "") or "").strip()
+        if scan_prefill_id:
+            scan_prefill_name = get_scan_name_from_db(scan_prefill_id)
+            if scan_prefill_name:
+                prefill = infer_add_benchmark_defaults_from_scan_name(scan_prefill_name)
+    except Exception:
+        pass
+    if scan_prefill_id and st.session_state.get("_last_scan_prefill_id") != scan_prefill_id:
+        parent_meta = get_scan_parent_details_from_db(scan_prefill_id)
+        started_dt = parse_iso_datetime(parent_meta.get("started_at"))
+        completed_dt = parse_iso_datetime(parent_meta.get("completed_at"))
+        prefill_findings = get_scan_attribute_findings_prefill(scan_prefill_id)
+
+        st.session_state["add_build_ver"] = str(prefill.get("build_version") or "")
+        st.session_state["add_scenario_type"] = str(prefill.get("scenario_type") or "")
+        st.session_state["add_scan_type"] = str(prefill.get("scan_type") or "OLS Scan")
+        st.session_state["add_is_acl"] = bool(prefill.get("is_acl"))
+        st.session_state["add_is_ff"] = bool(prefill.get("is_ff"))
+        ds_prefill = str(prefill.get("data_source_type") or "").strip()
+        ds_options_prefill = get_data_source_types() or ["S3", "SMB", "MSSQL", "Oracle", "NFS", "Unknown"]
+        if ds_prefill and ds_prefill in ds_options_prefill:
+            st.session_state["add_ds_type_choice"] = ds_prefill
+            st.session_state["add_custom_ds_type"] = ""
+        elif ds_prefill:
+            st.session_state["add_ds_type_choice"] = "Other (custom)"
+            st.session_state["add_custom_ds_type"] = ds_prefill
+        if str(prefill.get("file_set_type") or "").strip().lower() == "small file":
+            st.session_state["data_type"] = "Unstructured"
+            st.session_state["file_set_unstructured"] = "Small Files"
+            st.session_state["custom_file_set_type"] = "Small File"
+        if started_dt:
+            st.session_state["scan_start_date"] = started_dt.date()
+            st.session_state["scan_start_time_str"] = started_dt.strftime("%H:%M:%S")
+        if completed_dt:
+            st.session_state["scan_end_date"] = completed_dt.date()
+            st.session_state["scan_end_time_str"] = completed_dt.strftime("%H:%M:%S")
+            st.session_state["enum_end_date"] = completed_dt.date()
+            st.session_state["enum_end_time_str"] = completed_dt.strftime("%H:%M:%S")
+        st.session_state["findings_prefill_rows"] = prefill_findings
+        if "findings_editor" in st.session_state:
+            del st.session_state["findings_editor"]
+        st.session_state["_last_scan_prefill_id"] = scan_prefill_id
+    if scan_prefill_id:
+        st.caption(f"Prefill source scan id: `{scan_prefill_id}`" + (f" | name: `{scan_prefill_name}`" if scan_prefill_name else ""))
+
     # 1. Build Info
     st.subheader("1. Build Information")
     c1, c2 = st.columns(2)
-    build_ver = c1.text_input("Build Version (e.g. 218.117)", help="Required")
+    build_ver = c1.text_input("Build Version (e.g. 218.117)", help="Required", key="add_build_ver")
     
     # 2. Classifier Info
     st.subheader("2. Classifiers")
@@ -1447,8 +3540,8 @@ def page_add_benchmark():
     scan_count = c3.number_input("Scanner Count", min_value=1, value=5)
     thread_count = c4.number_input("Threads per Scanner", min_value=1, value=50)
     
-    is_acl = c5.checkbox("ACL Enabled")
-    is_ff = c6.checkbox("Structured Discovery FF")
+    is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
+    is_ff = c6.checkbox("Structured Discovery FF", key="add_is_ff")
     
     feature_flags = st.text_input("Additional Feature Flags (comma-separated)")
     comment = st.text_area("Configuration Comment (Optional)")
@@ -1457,8 +3550,11 @@ def page_add_benchmark():
     st.subheader("4. Run Metrics")
     r1_c1, r1_c2, r1_c3 = st.columns(3)
     run_date = r1_c1.date_input("Run Date")
-    scenario_type = r1_c2.text_input("Scenario Type", help="Describe the scenario being tested")
-    scan_type = r1_c3.selectbox("Scan Type", ["Full Scan", "Differential Scan", "OLS Scan", "Incremental Scan", "Other"])
+    scenario_type = r1_c2.text_input("Scenario Type", help="Describe the scenario being tested", key="add_scenario_type")
+    scan_type_options = ["Full Scan", "Differential Scan", "OLS Scan", "Incremental Scan", "Other"]
+    if st.session_state.get("add_scan_type") not in scan_type_options:
+        st.session_state["add_scan_type"] = "OLS Scan"
+    scan_type = r1_c3.selectbox("Scan Type", scan_type_options, key="add_scan_type")
     ds_options = get_data_source_types()
     if not ds_options:
         ds_options = ["S3", "SMB", "MSSQL", "Oracle", "NFS", "Unknown"]
@@ -1469,11 +3565,29 @@ def page_add_benchmark():
 
     c_ds, c_dt, c_fs = st.columns(3)
     with c_ds:
-        ds_type_choice = st.selectbox("Data Source Type", ds_options + ["Other (custom)"])
+        ds_all_options = ds_options + ["Other (custom)"]
+        if "add_ds_type_choice" not in st.session_state or st.session_state.get("add_ds_type_choice") not in ds_all_options:
+            st.session_state["add_ds_type_choice"] = ds_all_options[0]
+        ds_type_choice = st.selectbox("Data Source Type", ds_all_options, key="add_ds_type_choice")
+        custom_ds_type = None
+        if ds_type_choice == "Other (custom)":
+            custom_ds_type = st.text_input("Custom Data Source Type", key="add_custom_ds_type")
+        ds_type = custom_ds_type.strip() if custom_ds_type else ds_type_choice
+        ds_clean = str(ds_type or "").strip()
     with c_dt:
+        prefill_fs_raw = str(prefill.get("file_set_type") or "").strip().lower()
+        if prefill_fs_raw in ["small file", "large file", "csv file", "small files", "large files", "csv files"]:
+            default_data_type = "Unstructured"
+        elif ds_clean.upper() in ["SMB", "S3", "NFS"]:
+            default_data_type = "Unstructured"
+        else:
+            default_data_type = "Structured"
+        
+        default_data_type_idx = ["Structured", "Unstructured", "Mixed"].index(default_data_type) if default_data_type in ["Structured", "Unstructured", "Mixed"] else 0
         data_type = st.selectbox(
             "Data Type",
             ["Structured", "Unstructured", "Mixed"],
+            index=default_data_type_idx,
             key="data_type",
             on_change=reset_file_fields
         )
@@ -1481,20 +3595,123 @@ def page_add_benchmark():
     with c_fs:
         if data_type == "Structured":
             fs_defaults = ["Small Tables", "Large Tables", "Mixed Tables"]
-            fs_options = sorted(set(fs_names + fs_defaults))
-            file_set_choice = st.selectbox("File Set Type", fs_options + ["Other (custom)"], key="file_set_structured")
+            fs_raw_options = sorted(set(fs_names + fs_defaults))
+            fs_display_options = [
+                (raw if ds_clean and raw.lower().startswith(ds_clean.lower() + " ") else (f"{ds_clean} {raw}".strip() if ds_clean else raw))
+                for raw in fs_raw_options
+            ] + ["Other (custom)"]
+            
+            # Stable indexing for Structured
+            current_val = st.session_state.get("file_set_structured")
+            if current_val in fs_display_options:
+                default_fs_idx = fs_display_options.index(current_val)
+            else:
+                default_fs_idx = 0
+            
+            file_set_choice = st.selectbox("File Set Type", fs_display_options, index=default_fs_idx, key="file_set_structured")
         else:
             fs_defaults = ["Small Files", "Large Files", "Mixed Files", "CSV Files"]
-            fs_options = sorted(set(fs_names + fs_defaults))
-            file_set_choice = st.selectbox("File Set Type", fs_options + ["Other (custom)"], key="file_set_unstructured")
-    custom_ds_type = None
-    if ds_type_choice == "Other (custom)":
-        custom_ds_type = st.text_input("Custom Data Source Type")
-    ds_type = custom_ds_type.strip() if custom_ds_type else ds_type_choice
-    custom_fs = st.text_input("Custom File Set Type", key="custom_file_set_type") if file_set_choice == "Other (custom)" else ""
-    file_set_type = custom_fs.strip() if custom_fs.strip() else file_set_choice
+            fs_raw_options = sorted(set(fs_names + fs_defaults))
+            fs_display_options = [
+                (raw if ds_clean and raw.lower().startswith(ds_clean.lower() + " ") else (f"{ds_clean} {raw}".strip() if ds_clean else raw))
+                for raw in fs_raw_options
+            ] + ["Other (custom)"]
+            prefill_fs = str(prefill.get("file_set_type") or "").strip().lower()
+            
+            # Map prefill keywords to display names
+            keyword_map = {
+                "small file": "Small Files",
+                "large file": "Large Files",
+                "csv file": "CSV Files",
+                "small files": "Small Files",
+                "large files": "Large Files",
+                "csv files": "CSV Files"
+            }
+            target_raw = keyword_map.get(prefill_fs)
+            preferred_target = f"{ds_clean} {target_raw}".strip() if ds_clean and target_raw else (target_raw if target_raw else None)
+            
+            # 1. Check if user already has a selection in session state
+            current_val = st.session_state.get("file_set_unstructured")
+            if current_val in fs_display_options:
+                default_fs_idx = fs_display_options.index(current_val)
+            # 2. Otherwise use prefill
+            elif preferred_target and preferred_target in fs_display_options:
+                default_fs_idx = fs_display_options.index(preferred_target)
+            elif preferred_target and "Other (custom)" in fs_display_options:
+                default_fs_idx = fs_display_options.index("Other (custom)")
+            else:
+                default_fs_idx = 0
 
-    preset = fs_details.get(file_set_type, {})
+            file_set_choice = st.selectbox("File Set Type", fs_display_options, index=default_fs_idx, key="file_set_unstructured")
+    custom_fs_default = "Small File" if str(prefill.get("file_set_type") or "").strip().lower() == "small file" else ""
+    custom_fs = st.text_input("Custom File Set Type", key="custom_file_set_type", value=custom_fs_default) if file_set_choice == "Other (custom)" else ""
+    file_set_type_raw = custom_fs.strip() if custom_fs.strip() else file_set_choice
+    if file_set_choice != "Other (custom)" and ds_clean and file_set_type_raw.lower().startswith(ds_clean.lower() + " "):
+        file_set_type_raw = file_set_type_raw[len(ds_clean):].strip()
+    if ds_clean and file_set_type_raw:
+        if file_set_type_raw.lower().startswith(ds_clean.lower() + " "):
+            file_set_type = file_set_type_raw
+        else:
+            file_set_type = f"{ds_clean} {file_set_type_raw}"
+    else:
+        file_set_type = file_set_type_raw
+
+    def resolve_file_set_preset(details_map, ds_name, raw_name, display_name, combined_name):
+        if not isinstance(details_map, dict) or not details_map:
+            return {}
+
+        def strip_ds(v):
+            s = str(v or "").strip()
+            if ds_name and s.lower().startswith(ds_name.lower() + " "):
+                s = s[len(ds_name):].strip()
+            return s
+
+        raw_name = str(raw_name or "").strip()
+        display_name = str(display_name or "").strip()
+        combined_name = str(combined_name or "").strip()
+        ds_name = str(ds_name or "").strip()
+
+        candidates = [
+            raw_name,
+            display_name,
+            combined_name,
+            strip_ds(raw_name),
+            strip_ds(display_name),
+            strip_ds(combined_name),
+        ]
+        if ds_name and raw_name:
+            candidates.append(f"{ds_name} {raw_name}")
+
+        # 1) Exact match candidates
+        for c in candidates:
+            if c in details_map:
+                return details_map.get(c) or {}
+
+        # 2) Case-insensitive key match
+        lowered = {str(k).strip().lower(): k for k in details_map.keys()}
+        for c in candidates:
+            lk = str(c).strip().lower()
+            if lk in lowered:
+                return details_map.get(lowered[lk]) or {}
+
+        # 3) Normalized match after removing datasource prefix on both sides
+        for c in candidates:
+            c_norm = strip_ds(c).lower()
+            if not c_norm:
+                continue
+            for k in details_map.keys():
+                if strip_ds(k).lower() == c_norm:
+                    return details_map.get(k) or {}
+
+        return {}
+
+    preset = resolve_file_set_preset(
+        fs_details,
+        ds_clean,
+        file_set_type_raw,
+        file_set_choice,
+        file_set_type,
+    )
     avg_size = str(preset.get("avg_file_size") or "")
     st.caption("File Set Type Details (auto-filled)")
     if data_type == "Structured":
@@ -1567,31 +3784,41 @@ def page_add_benchmark():
                 st.warning("Scan End Time must be after Scan Start Time.")
 
         st.subheader("5. Findings Files")
-        st.caption("Select a classifier and enter findings count. Add rows as needed.")
+        st.caption("Add classifier attribute/value and findings count. Add rows as needed.")
         classifier_options = get_classifier_names_for_build(build_ver)
         if build_ver and not classifier_options:
             st.info(f"No classifiers found for build `{build_ver.strip()}` yet. Sync/fetch classifiers for this build first.")
         elif not build_ver.strip():
             st.info("Enter Build Version to load build-specific classifiers.")
+        default_findings_rows = st.session_state.get("findings_prefill_rows")
+        if not isinstance(default_findings_rows, list) or not default_findings_rows:
+            default_findings_rows = [{
+                "Classifier Attribute": "",
+                "Attribute Value": "",
+                "Findings": 0
+            }]
         findings_df = st.data_editor(
-            pd.DataFrame([{"Classifier": classifier_options[0] if classifier_options else "", "Findings": 0}]),
+            pd.DataFrame(default_findings_rows),
             num_rows="dynamic",
             use_container_width=True,
+            key="findings_editor",
             column_config={
-                "Classifier": st.column_config.SelectboxColumn("Classifier", options=classifier_options),
+                "Classifier Attribute": st.column_config.TextColumn("Classifier Attribute"),
+                "Attribute Value": st.column_config.TextColumn("Attribute Value"),
                 "Findings": st.column_config.NumberColumn("Findings", min_value=0, step=1)
             }
         )
         findings = []
         for _, row in findings_df.iterrows():
-            name = str(row.get("Classifier", "")).strip()
+            attr_name = str(row.get("Classifier Attribute", "")).strip()
+            attr_value = str(row.get("Attribute Value", "")).strip()
             count = row.get("Findings", None)
-            if name:
+            if attr_name or attr_value:
                 try:
                     count_val = int(count) if count is not None else 0
                 except Exception:
                     count_val = 0
-                findings.append((name, count_val))
+                findings.append((attr_name, attr_value, count_val))
 
         submitted = st.form_submit_button("💾 Save Benchmark Run", type="primary")
         
@@ -1607,6 +3834,7 @@ def page_add_benchmark():
                 return
                 
             try:
+                is_ocr = False
                 # Calculate durations in hours
                 scan_duration = (scan_end - scan_start).total_seconds() / 3600
                 enum_duration = (enum_end - enum_start).total_seconds() / 3600 if enum_start and enum_end else 0
@@ -1691,21 +3919,29 @@ def page_add_benchmark():
                         except Exception:
                             pass
 
-                    ins_bench = text("""
-                        INSERT INTO benchmarks 
-                        (build_id, config_id, classifier_id, classifier_list, run_date, scenario_type, scan_type, data_source_type, data_type, file_set_type,
-                         total_files, total_folders, total_size_gb, total_catalog_items, avg_file_size, 
-                         scan_start_time, scan_end_time, enum_start_time, enum_end_time,
-                         total_scan_hours, enumeration_hours,
-                         throughput_cluster_gb_hr, throughput_scanner_gb_hr, throughput_thread_gb_hr,
-                         throughput_cluster_files_hr, throughput_scanner_files_hr, throughput_thread_files_hr)
-                        VALUES (:bid, :cid, :clid, :clist, :dt, :scn, :st, :dst, :dtype, :fstype,
-                                :tf, :tfo, :tgb, :tci, :asz,
-                                :ss, :se, :es, :ee, :tsh, :eh,
-                                :tpcgb, :tpsgb, :tptgb, :tpcf, :tpsf, :tptf)
-                    """)
-                    
-                    result = conn.execute(ins_bench, {
+                    # Attempt to check if scan_id column exists for INSERT
+                    has_scan_id_col = False
+                    try:
+                        col_check = conn.execute(text("SHOW COLUMNS FROM benchmarks LIKE 'scan_id'")).fetchone()
+                        has_scan_id_col = bool(col_check)
+                    except Exception:
+                        pass
+
+                    cols_list = [
+                        "build_id", "config_id", "classifier_id", "classifier_list", "run_date", "scenario_type", "scan_type", "data_source_type", "data_type", "file_set_type",
+                        "total_files", "total_folders", "total_size_gb", "total_catalog_items", "avg_file_size", 
+                        "scan_start_time", "scan_end_time", "enum_start_time", "enum_end_time",
+                        "total_scan_hours", "enumeration_hours",
+                        "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
+                        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr"
+                    ]
+                    vals_placeholders = [
+                        ":bid", ":cid", ":clid", ":clist", ":dt", ":scn", ":st", ":dst", ":dtype", ":fstype",
+                        ":tf", ":tfo", ":tgb", ":tci", ":asz",
+                        ":ss", ":se", ":es", ":ee", ":tsh", ":eh",
+                        ":tpcgb", ":tpsgb", ":tptgb", ":tpcf", ":tpsf", ":tptf"
+                    ]
+                    params_dict = {
                         'bid': b_id, 'cid': conf_id, 'clid': c_id,
                         'clist': classifier_list_str,
                         'dt': str(run_date), 'scn': scenario_type, 'st': scan_type, 'dst': ds_type, 'dtype': data_type, 'fstype': file_set_type,
@@ -1715,16 +3951,36 @@ def page_add_benchmark():
                         'tsh': scan_duration, 'eh': enum_duration,
                         'tpcgb': tp_cluster_gb, 'tpsgb': tp_scanner_gb, 'tptgb': tp_thread_gb,
                         'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files
-                    })
+                    }
+
+                    if has_scan_id_col:
+                        cols_list.append("scan_id")
+                        vals_placeholders.append(":sid")
+                        params_dict['sid'] = scan_prefill_id if scan_prefill_id else None
+
+                    ins_bench = text(f"""
+                        INSERT INTO benchmarks 
+                        ({', '.join(cols_list)})
+                        VALUES ({', '.join(vals_placeholders)})
+                    """)
+                    
+                    result = conn.execute(ins_bench, params_dict)
                     bench_id = result.lastrowid
                     
                     if findings and bench_id:
+                        ensure_benchmark_findings_extended_columns()
                         ins_findings = text("""
-                            INSERT INTO benchmark_findings (benchmark_id, classifier_name, finding_count)
-                            VALUES (:bid, :cname, :cnt)
+                            INSERT INTO benchmark_findings (benchmark_id, classifier_name, classifier_attribute, attribute_value, finding_count)
+                            VALUES (:bid, :cname, :attr, :aval, :cnt)
                         """)
-                        for cname, cnt in findings:
-                            conn.execute(ins_findings, {'bid': bench_id, 'cname': cname, 'cnt': cnt})
+                        for attr, aval, cnt in findings:
+                            conn.execute(ins_findings, {
+                                'bid': bench_id,
+                                'cname': attr or "",
+                                'attr': attr or None,
+                                'aval': aval or None,
+                                'cnt': cnt
+                            })
                     conn.commit()
                     
                     st.success(f"✅ Successfully added Benchmark run for Build {build_ver}!")
@@ -2321,6 +4577,414 @@ def page_version_comparison():
         st.markdown("**Common**")
         st.dataframe(pd.DataFrame({"Classifier": common}) if common else pd.DataFrame({"Classifier": []}), use_container_width=True)
 
+
+def page_scan_status():
+    st.title("🛰️ Scan Status")
+    st.caption("Combines in-progress and completed parent scans, merged by `_id`.")
+
+    ensure_scan_tracking_tables()
+    ensure_auto_scan_benchmarks_table()
+
+    env_df = load_test_environments()
+    if env_df.empty:
+        st.info("No test environments found. Add one in `Manage Test Environments` first.")
+        return
+
+    work_df = env_df.copy()
+    work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
+    work_df = work_df.sort_values(by=["is_active", "env_name"], ascending=[False, True]).reset_index(drop=True)
+
+    labels = [
+        f"{row.env_name} ({'active' if row.is_active else 'inactive'}) - {row.base_url or 'no-base-url'}"
+        for row in work_df.itertuples()
+    ]
+    selected_label = st.selectbox("Environment", labels, index=0)
+    selected_idx = labels.index(selected_label)
+    selected_env = work_df.iloc[selected_idx].to_dict()
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
+    status_view = c1.radio("Show", ["All", "In Progress", "Completed"], horizontal=True)
+    limit = c2.number_input("Limit per API", min_value=10, max_value=1000, value=200, step=10)
+    refresh = c3.button("Refresh Scans", type="primary", use_container_width=True)
+    load_insights = True
+
+    running_states = ["Started", "Awaiting", "In Progress", "InProgress"]
+    completed_states = ["Failed", "CompletedWithFailures", "Completed"]
+
+    active_envs = [
+        row._asdict()
+        for row in work_df.itertuples()
+        if bool(row.is_active)
+    ]
+    sync_batch_per_env = 20
+    auto_batch_per_env = 8
+    auto_sync_interval_seconds = 300
+    active_env_ids = [int(r.get("id")) for r in active_envs if r.get("id") is not None]
+    preloaded_db_items = load_scan_parents_for_environments(
+        active_env_ids,
+        status_view="All",
+        limit=max(int(limit) * max(1, len(active_env_ids)), 500),
+    ) if active_env_ids else []
+    now_epoch = datetime.now().timestamp()
+    last_auto_sync_epoch = float(st.session_state.get("scan_status_last_auto_sync_epoch", 0.0) or 0.0)
+    # Smooth UX: if we already have DB rows, do not block page load with auto API sync.
+    should_auto_sync = bool(
+        refresh
+        or ((not preloaded_db_items) and ((now_epoch - last_auto_sync_epoch) >= auto_sync_interval_seconds))
+    )
+
+    per_env_scan_cache = st.session_state.setdefault("scan_status_per_env_items", {})
+    per_env_totals_cache = st.session_state.setdefault("scan_status_per_env_totals", {})
+    if should_auto_sync and active_envs:
+        if refresh:
+            envs_to_sync = list(active_envs)
+            status_msg = st.info("Fetching scan details from active environments...")
+            progress = st.progress(0, text=f"Syncing active environments... 0/{len(envs_to_sync)}")
+            batch_size = sync_batch_per_env
+        else:
+            rr_index = int(st.session_state.get("scan_status_rr_env_index", 0) or 0)
+            envs_to_sync = [active_envs[rr_index % len(active_envs)]]
+            st.session_state["scan_status_rr_env_index"] = (rr_index + 1) % max(1, len(active_envs))
+            status_msg = st.info("Background sync running for one environment...")
+            progress = None
+            batch_size = auto_batch_per_env
+        env_sync_summary = []
+        total_synced = 0
+        total_attempted = 0
+        total_failed = 0
+        total_skipped = 0
+        total_pending = 0
+        for idx, env_row in enumerate(envs_to_sync, start=1):
+            env_name = str(env_row.get("env_name") or f"env-{idx}")
+            try:
+                status_msg.info(f"[{env_name}] Getting scan details...")
+                env_result = fetch_combined_parent_scans_for_env(
+                    env_row,
+                    running_states=running_states,
+                    completed_states=completed_states,
+                    limit=int(limit),
+                )
+                merged_items = env_result.get("items", []) or []
+                for scan in merged_items:
+                    if not isinstance(scan, dict):
+                        continue
+                    scan_name = str(scan.get("name") or scan.get("scanName") or scan.get("displayName") or "").strip()
+                    if is_ignored_scan_name(scan_name):
+                        continue
+                    upsert_scan_parent_record(env_row.get("id"), scan, resolve_scan_status_value(scan))
+
+                status_msg.info(f"[{env_name}] Syncing missing scan insights (batch {batch_size})...")
+                sync_stats = auto_sync_scan_items(
+                    env_row,
+                    merged_items,
+                    max_workers=8,
+                    only_missing_details=True,
+                    max_to_sync=batch_size,
+                )
+                trend_updates = upsert_auto_trend_rows_from_scans(env_row, merged_items)
+                total_synced += int(sync_stats.get("synced") or 0)
+                total_attempted += int(sync_stats.get("attempted") or 0)
+                total_failed += int(sync_stats.get("failed") or 0)
+                total_skipped += int(sync_stats.get("skipped_existing") or 0)
+                total_pending += int(sync_stats.get("pending_after_batch") or 0)
+                per_env_scan_cache[str(env_row.get("id"))] = merged_items
+                per_env_totals_cache[str(env_row.get("id"))] = {
+                    "running_total": env_result.get("running_total"),
+                    "completed_total": env_result.get("completed_total"),
+                }
+                env_sync_summary.append(
+                    f"{env_name}: scans={len(merged_items)}, synced={sync_stats.get('synced', 0)}, "
+                    f"skipped={sync_stats.get('skipped_existing', 0)}, pending={sync_stats.get('pending_after_batch', 0)}, "
+                    f"trend={trend_updates}, failed={sync_stats.get('failed', 0)}"
+                )
+            except Exception as ex:
+                env_sync_summary.append(f"{env_name}: failed ({ex})")
+            if progress is not None:
+                progress.progress(
+                    int((idx / max(1, len(envs_to_sync))) * 100),
+                    text=f"Syncing active environments... {idx}/{len(envs_to_sync)}",
+                )
+
+        st.session_state["scan_status_last_auto_sync_epoch"] = now_epoch
+        st.session_state["scan_status_last_auto_sync_human"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if progress is not None:
+            progress.empty()
+        status_msg.success(
+            "Active environment sync completed. "
+            f"Insight API calls={total_attempted}, synced={total_synced}, "
+            f"skipped existing={total_skipped}"
+            + (f", pending next batches={total_pending}" if total_pending else "")
+            + (f", failed={total_failed}" if total_failed else "")
+        )
+        if env_sync_summary:
+            st.caption(" | ".join(env_sync_summary))
+    elif not active_envs:
+        st.warning("No active environments found. Activate at least one environment to auto-sync scans.")
+    else:
+        last_human = str(st.session_state.get("scan_status_last_auto_sync_human") or "").strip()
+        st.caption(
+            "Using DB cache for scan insights. "
+            + (f"Last auto-sync at {last_human}." if last_human else "Auto-sync will run shortly.")
+        )
+
+    items = preloaded_db_items if preloaded_db_items else load_scan_parents_for_environments(
+        active_env_ids,
+        status_view="All",
+        limit=max(int(limit) * max(1, len(active_env_ids)), 500),
+    )
+    running_total = None
+    completed_total = None
+    try:
+        running_total = sum(
+            int((per_env_totals_cache.get(str(eid), {}) or {}).get("running_total") or 0)
+            for eid in active_env_ids
+        )
+        completed_total = sum(
+            int((per_env_totals_cache.get(str(eid), {}) or {}).get("completed_total") or 0)
+            for eid in active_env_ids
+        )
+    except Exception:
+        running_total = None
+        completed_total = None
+    loaded_at = str(st.session_state.get("scan_status_last_auto_sync_human") or "").strip()
+
+    st.caption(
+        f"Loaded {len(items)} scans across active environments"
+        + (f" | running totalCount={running_total}" if running_total is not None else "")
+        + (f" | completed totalCount={completed_total}" if completed_total is not None else "")
+        + (f" | last sync at {loaded_at}" if loaded_at else "")
+    )
+
+    # Row-level manual sync via query param from table link.
+    try:
+        sync_scan_id = str(st.query_params.get("sync_scan_id", "") or "").strip()
+    except Exception:
+        sync_scan_id = ""
+    if sync_scan_id:
+        sync_msg = st.info(f"Syncing scan insights for `{sync_scan_id}` ...")
+        try:
+            target_env_row = get_environment_row_for_scan_id(sync_scan_id) or selected_env
+            insight_payload, _insight_url = fetch_parent_scan_insight_with_auth_retry(target_env_row, sync_scan_id)
+            new_cnt, removed_cnt, attrs_payload, _attrs_url = fetch_parent_scan_attribute_counts_with_auth_retry(
+                target_env_row, sync_scan_id, limit=200
+            )
+            insight_metrics = extract_scan_insight_metrics(insight_payload if isinstance(insight_payload, dict) else {})
+            insight_metrics["new_attributes_count"] = new_cnt
+            insight_metrics["removed_attributes_count"] = removed_cnt
+            upsert_scan_insight_record(
+                sync_scan_id,
+                insight_metrics,
+                insight_payload=insight_payload if isinstance(insight_payload, dict) else None,
+                attributes_payload=attrs_payload if isinstance(attrs_payload, dict) else None,
+            )
+            sync_msg.success(f"Synced scan `{sync_scan_id}` successfully.")
+        except Exception as ex:
+            sync_msg.error(f"Failed to sync scan `{sync_scan_id}`: {ex}")
+        # Remove one-shot param so it doesn't re-run on every rerender.
+        try:
+            del st.query_params["sync_scan_id"]
+        except Exception:
+            pass
+
+    if not items:
+        st.info("No scans found in DB for active environments yet.")
+        return
+
+    env_by_id = {}
+    for er in active_envs:
+        try:
+            env_by_id[int(er.get("id"))] = er
+        except Exception:
+            continue
+
+    scan_ids_all = []
+    for scan in items:
+        if not isinstance(scan, dict):
+            continue
+        sid = str(scan.get("_id") or scan.get("id") or "").strip()
+        if sid:
+            scan_ids_all.append(sid)
+    db_insight_map = load_scan_insight_map_for_scan_ids(scan_ids_all) if load_insights else {}
+    saved_ids = get_saved_benchmark_scan_ids()
+
+    summary_rows = []
+    for scan in items:
+        if not isinstance(scan, dict):
+            continue
+        state = resolve_scan_status_value(scan)
+        scan_id = str(scan.get("_id") or scan.get("id") or "").strip()
+        scan_env_name = str(scan.get("environment_name") or "").strip()
+        scan_env_id = scan.get("environment_id")
+        try:
+            scan_env_row = env_by_id.get(int(scan_env_id)) if scan_env_id is not None else None
+        except Exception:
+            scan_env_row = None
+
+        if status_view == "In Progress" and state not in running_states:
+            continue
+        if status_view == "Completed" and state not in completed_states:
+            continue
+
+        insight_metrics = {
+            "distinct_classification_attributes": "",
+            "classifier_attribute_names": "",
+            "data_source_names": "",
+            "objects_with_pi": "",
+            "objects_scanned": "",
+            "objects_enumerated": "",
+            "total_classification": "",
+            "new_attributes_count": "",
+            "removed_attributes_count": "",
+        }
+
+        if load_insights and scan_id:
+            db_metrics = db_insight_map.get(scan_id)
+            if db_metrics:
+                insight_metrics.update({
+                    "distinct_classification_attributes": db_metrics.get("distinct_classification_attributes", ""),
+                    "classifier_attribute_names": db_metrics.get("classifier_attribute_names", ""),
+                    "data_source_names": db_metrics.get("data_source_names", ""),
+                    "objects_with_pi": db_metrics.get("objects_with_pi", ""),
+                    "objects_scanned": db_metrics.get("objects_scanned", ""),
+                    "objects_enumerated": db_metrics.get("objects_enumerated", ""),
+                    "total_classification": db_metrics.get("total_classification", ""),
+                    "new_attributes_count": db_metrics.get("new_attributes_count", ""),
+                    "removed_attributes_count": db_metrics.get("removed_attributes_count", ""),
+                })
+
+        started_at = scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt")
+        completed_at = scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt")
+
+        summary_rows.append({
+            "Environment": scan_env_name or str((scan_env_row or {}).get("env_name") or selected_env.get("env_name") or ""),
+            "Scan Name": scan.get("name") or scan.get("scanName") or scan.get("displayName") or "",
+            "Scan Id": scan_id,
+            "Scan Type": scan.get("type") or "",
+            "Start Time": started_at or "",
+            "End Time": completed_at or "",
+            "Template": scan.get("scanTemplateName") or "",
+            "Scan Status": state or "Unknown",
+            "Data Sources": insight_metrics["data_source_names"],
+            "Distinct Classification Attributes": insight_metrics["distinct_classification_attributes"],
+            "Classifier Attribute Names": insight_metrics["classifier_attribute_names"],
+            "Objects With Pi": insight_metrics["objects_with_pi"],
+            "Objects Scanned": insight_metrics["objects_scanned"],
+            "Objects Enumerated": insight_metrics["objects_enumerated"],
+            "Total Classification": insight_metrics["total_classification"],
+            "New Attributes": insight_metrics["new_attributes_count"],
+            "Removed Attributes": insight_metrics["removed_attributes_count"],
+            "Scan Time": format_scan_duration(started_at, completed_at),
+        })
+
+    summary_df = pd.DataFrame(summary_rows)
+    if summary_df.empty:
+        st.info(f"No scans match `{status_view}` in combined results.")
+        return
+
+    scan_ids = [str(x).strip() for x in summary_df["Scan Id"].tolist() if str(x).strip()]
+    active_map = get_scan_parent_active_map(scan_ids)
+    summary_df.insert(0, "Active", summary_df["Scan Id"].map(lambda sid: active_map.get(str(sid), True)))
+    summary_df.insert(1, "Done", summary_df["Scan Id"].map(lambda sid: str(sid).strip().lower() in saved_ids))
+    
+    # User request: Hide scans that are already Done
+    summary_df = summary_df[~summary_df["Done"]]
+    
+    summary_df.insert(2, "Open", summary_df.apply(lambda r: f"?page=Add+New+Benchmark&scan_id={r['Scan Id']}" if str(r['Scan Id']).strip() and str(r['Scan Id']).strip().lower() not in saved_ids else "", axis=1))
+    summary_df.insert(3, "Sync", summary_df["Scan Id"].map(lambda sid: f"?page=Scan+Status&sync_scan_id={sid}" if str(sid).strip() else ""))
+
+    st.markdown("### Scan Summary")
+    summary_column_order = [
+        "Active",
+        "Done",
+        "Open",
+        "Sync",
+        "Environment",
+        "Scan Name",
+        "Scan Id",
+        "Scan Type",
+        "Start Time",
+        "End Time",
+        "Template",
+        "Scan Status",
+        "Data Sources",
+        "Distinct Classification Attributes",
+        "Classifier Attribute Names",
+        "Objects With Pi",
+        "Objects Scanned",
+        "Objects Enumerated",
+        "Total Classification",
+        "New Attributes",
+        "Removed Attributes",
+        "Scan Time",
+    ]
+    summary_column_order = [c for c in summary_column_order if c in summary_df.columns]
+    edited_summary = st.data_editor(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        column_order=summary_column_order,
+        column_config={
+            "Active": st.column_config.CheckboxColumn("Active"),
+            "Done": st.column_config.CheckboxColumn("Done"),
+            "Open": st.column_config.LinkColumn("Open", display_text="Open"),
+            "Sync": st.column_config.LinkColumn("Sync", display_text="Sync"),
+            "Environment": st.column_config.TextColumn("Environment"),
+        },
+        disabled=[c for c in summary_df.columns if c not in ["Active"]]
+    )
+    try:
+        for _, r in edited_summary.iterrows():
+            sid = str(r.get("Scan Id") or "").strip()
+            if not sid:
+                continue
+            old_val = bool(active_map.get(sid, True))
+            new_val = bool(r.get("Active"))
+            if new_val != old_val:
+                set_scan_parent_active(sid, new_val)
+                active_map[sid] = new_val
+    except Exception:
+        pass
+    with st.expander("Auto Trend Rows (from scans)", expanded=False):
+        preview_df = load_auto_scan_benchmarks_preview(selected_env.get("id"), limit=300)
+        if preview_df.empty:
+            st.caption("No auto trend rows yet.")
+        else:
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### Scan Details")
+    shown = 0
+    for scan in items:
+        if not isinstance(scan, dict):
+            continue
+        state = resolve_scan_status_value(scan)
+        if status_view == "In Progress" and state not in running_states:
+            continue
+        if status_view == "Completed" and state not in completed_states:
+            continue
+        shown += 1
+        scan_id = scan.get("_id") or scan.get("id") or "N/A"
+        name = scan.get("name") or scan.get("scanName") or "Unnamed Scan"
+        with st.expander(f"{shown}. {name} | {state or 'Unknown'} | {scan_id}", expanded=False):
+            trend_row = load_auto_scan_benchmark_row(scan_id)
+            if trend_row:
+                st.caption("Auto trend details for this scan")
+                st.dataframe(pd.DataFrame([trend_row]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Auto trend row not available yet for this scan.")
+            attr_rows = get_scan_attribute_findings_prefill(scan_id)
+            if attr_rows:
+                st.caption("New/Removed classifier attributes for this scan")
+                st.dataframe(
+                    pd.DataFrame(attr_rows, columns=["Classifier Attribute", "Attribute Value", "Findings"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.caption("No attribute-level findings available for this scan yet.")
+            st.caption("Raw scan payload")
+            st.json(scan)
+
 # --- Build Analysis Page ---
 def page_build_analysis(df):
     st.markdown("## 🔍 Build Depth-Analysis")
@@ -2515,7 +5179,7 @@ def page_comparison(df):
     # helper for n/a values
     fmt_h = lambda x: f"{x:.2f}h" if x and not pd.isna(x) else "N/A"
     fmt_f = lambda x: f"{x:,.0f}" if x and not pd.isna(x) else "N/A"
-    fmt_g = lambda x: f"{x:.2f}GB" if x and not pd.isna(x) else "N/A"
+    fmt_g = lambda x: f"{x}GB" if x and not pd.isna(x) else "N/A"
 
     conf_df = pd.DataFrame({
         "Metric / Setting": [
@@ -2591,8 +5255,8 @@ def page_comparison(df):
     
     # Total Size
     k4.metric("Total Size (GB)", 
-              f"{rb['Total_Size_GB']:.2f}" if rb['Total_Size_GB'] else "N/A",
-              f"{(rb['Total_Size_GB'] or 0) - (ra['Total_Size_GB'] or 0):+.2f}")
+              f"{rb['Total_Size_GB']}" if rb['Total_Size_GB'] else "N/A",
+              f"{(rb['Total_Size_GB'] or 0) - (ra['Total_Size_GB'] or 0):+}")
     
     # Line charts for baseline vs candidate
     st.markdown("### Performance Trend (Baseline vs Candidate)")
@@ -2622,14 +5286,14 @@ def page_comparison(df):
             f"{tp_a:.2f}",
             f"{files_a:,.0f}",
             f"{ra['Total_Files']:,.0f}" if ra['Total_Files'] else "N/A",
-            f"{ra['Total_Size_GB']:.2f}" if ra['Total_Size_GB'] else "N/A",
+            f"{ra['Total_Size_GB']}" if ra['Total_Size_GB'] else "N/A",
             f"{ra.get('total_scan_hours', 0):.2f}" if pd.notnull(ra.get('total_scan_hours', None)) else "N/A"
         ],
         "Candidate": [
             f"{tp_b:.2f}",
             f"{files_b:,.0f}",
             f"{rb['Total_Files']:,.0f}" if rb['Total_Files'] else "N/A",
-            f"{rb['Total_Size_GB']:.2f}" if rb['Total_Size_GB'] else "N/A",
+            f"{rb['Total_Size_GB']}" if rb['Total_Size_GB'] else "N/A",
             f"{rb.get('total_scan_hours', 0):.2f}" if pd.notnull(rb.get('total_scan_hours', None)) else "N/A"
         ]
     })
@@ -2670,7 +5334,7 @@ def page_comparison(df):
         st.info("ℹ️ **Performance is comparable** (within 5% difference)")
 
 # --- Trend Analysis (Multi-Build Comparison) ---
-def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None, compare_by=None, acl_filter=None, ff_filter=None):
+def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None, compare_by=None, acl_filter=None, ff_filter=None, show_standard_filters=True):
     st.markdown(f"## 📈 {title}")
     st.write("") # Added space before filters
     
@@ -2681,7 +5345,8 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     # Base filtering
     df_filtered = df.copy()
     if file_set_filter:
-        df_filtered = df_filtered[df_filtered['file_set_type'] == file_set_filter]
+        # Use partial match (case-insensitive) to capture "SMB Large Files", "S3 Large Files", etc.
+        df_filtered = df_filtered[df_filtered['file_set_type'].astype(str).str.contains(file_set_filter, case=False, na=False)]
     if scan_type_filter:
         df_filtered = df_filtered[df_filtered['Scan_Type'] == scan_type_filter]
         # Fallback: some data uses Scenario_Type to indicate OLS
@@ -2699,7 +5364,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     # st.markdown(f"### Performance Trends: {title}") # Removed duplicate title
     
     # If we are NOT comparing, show the standard filters
-    if not compare_by:
+    if show_standard_filters and not compare_by:
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             available_ds = sorted(df_filtered['Data_Source_Type'].unique())
@@ -2894,6 +5559,166 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     render_centered_table(disp_df)
 
 
+def load_auto_trend_dataset():
+    if not engine:
+        return pd.DataFrame()
+    ensure_auto_scan_benchmarks_table()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    ab.scan_id,
+                    COALESCE(te.env_name, '') AS environment_name,
+                    COALESCE(ab.build_version, '') AS build_version,
+                    ab.run_date,
+                    COALESCE(ab.scenario_type, '') AS scenario_type,
+                    COALESCE(ab.scan_type, '') AS scan_type,
+                    COALESCE(ab.data_source_type, '') AS data_source_type,
+                    COALESCE(ab.data_type, '') AS data_type,
+                    COALESCE(ab.file_set_type, '') AS file_set_type,
+                    ab.total_scan_hours,
+                    ab.total_size_gb,
+                    ab.total_files,
+                    ab.objects_scanned,
+                    ab.total_classification,
+                    ab.new_attributes,
+                    ab.removed_attributes,
+                    ab.updated_at
+                FROM auto_scan_benchmarks ab
+                LEFT JOIN test_environments te ON te.id = ab.environment_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                WHERE LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')
+                  AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
+                  AND LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'
+                ORDER BY ab.run_date DESC, ab.updated_at DESC
+            """)).fetchall()
+        cols = [
+            "scan_id", "environment_name", "build_version", "run_date", "scenario_type",
+            "scan_type", "data_source_type", "data_type", "file_set_type", "total_scan_hours",
+            "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", 
+            "new_attributes", "removed_attributes", "updated_at"
+        ]
+        df = pd.DataFrame(rows, columns=cols)
+        if df.empty:
+            return df
+        df["run_date"] = pd.to_datetime(df["run_date"], errors="coerce")
+        for col in ["total_scan_hours", "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", "new_attributes", "removed_attributes"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_auto_trend_as_manual_like_df():
+    auto_df = load_auto_trend_dataset()
+    if auto_df.empty:
+        return pd.DataFrame()
+
+    size_map = {}
+    if engine:
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text("SELECT name, total_size_gb FROM file_set_types")).fetchall()
+                for name, size in rows:
+                    key = str(name or "").strip().lower()
+                    if not key:
+                        continue
+                    try:
+                        size_map[key] = float(size) if size is not None else None
+                    except Exception:
+                        size_map[key] = None
+        except Exception:
+            size_map = {}
+
+    out = auto_df.copy()
+    out["id"] = out["scan_id"]
+    out["raw_file_set_type"] = out["file_set_type"].astype(str)
+    out["Build_Version"] = out["build_version"].astype(str)
+    out["Date"] = pd.to_datetime(out["run_date"], errors="coerce")
+    out["Scan_Type"] = out["scan_type"].astype(str)
+    out["Data_Source_Type"] = out["data_source_type"].astype(str)
+    out["Data_Type"] = out["data_type"].astype(str)
+
+    def normalize_file_set(v):
+        s = str(v or "")
+        u = s.upper()
+        if "SMALL FILES" in u:
+            return "Small Files"
+        if "LARGE FILES" in u:
+            return "Large Files"
+        if "MIXED" in u:
+            return "Mixed Files"
+        return s
+
+    out["file_set_type"] = out["file_set_type"].apply(normalize_file_set)
+    
+    # Use table values if present, otherwise use mapping
+    out["Total_Files"] = out["total_files_table"].fillna(pd.to_numeric(out["objects_scanned"], errors="coerce"))
+    out["Total_Folders"] = pd.NA
+    out["Total_Catalog_Items"] = pd.to_numeric(out["total_classification"], errors="coerce")
+    out["total_scan_hours"] = pd.to_numeric(out["total_scan_hours"], errors="coerce")
+    out["is_active"] = 1
+    out["is_acl"] = 0
+    out["is_ocr"] = 0
+    out["is_feature_flags"] = 0
+    out["scanner_count"] = pd.NA
+    out["thread_count"] = pd.NA
+
+    # Size logic: table size first, then mapping fallback
+    out["Total_Size_GB"] = out["total_size_gb_table"]
+    missing_size = out["Total_Size_GB"].isna()
+    if missing_size.any():
+        out.loc[missing_size, "Total_Size_GB"] = out.loc[missing_size, "raw_file_set_type"].astype(str).str.strip().str.lower().map(size_map)
+    
+    missing_size = out["Total_Size_GB"].isna()
+    if missing_size.any():
+        out.loc[missing_size, "Total_Size_GB"] = out.loc[missing_size, "file_set_type"].astype(str).str.strip().str.lower().map(size_map)
+        
+    missing_size = out["Total_Size_GB"].isna()
+    if missing_size.any():
+        ds_key = out.loc[missing_size, "Data_Source_Type"].astype(str).str.strip().str.lower()
+        fs_key = out.loc[missing_size, "file_set_type"].astype(str).str.strip().str.lower()
+        combo = (ds_key + " " + fs_key).str.strip().str.lower()
+        out.loc[missing_size, "Total_Size_GB"] = combo.map(size_map)
+
+    out["avg_file_size"] = pd.NA
+    out["Scenario_Type"] = out["scenario_type"].astype(str)
+
+    hours = pd.to_numeric(out["total_scan_hours"], errors="coerce")
+    files = pd.to_numeric(out["Total_Files"], errors="coerce")
+    size_gb = pd.to_numeric(out["Total_Size_GB"], errors="coerce")
+    out["throughput_cluster_files_hr"] = files / hours
+    out["throughput_cluster_gb_hr"] = size_gb / hours
+
+    # Relax filtering for build version but keep hours requirement
+    out = out[(hours.notna()) & (hours > 0)]
+    out["Build_Version"] = out["Build_Version"].apply(lambda x: x if str(x).strip() else "Unknown")
+    return out
+
+
+def render_auto_trend_analysis(title, file_set_keyword=None, scan_type_filter=None):
+    auto_like = load_auto_trend_as_manual_like_df()
+    if auto_like.empty:
+        st.markdown(f"## 📈 {title}")
+        st.warning("No usable auto-scan rows for trend analysis yet.")
+        return
+
+    target_file_set = None
+    kw = str(file_set_keyword or "").strip().lower()
+    if kw.startswith("small"):
+        target_file_set = "Small Files"
+    elif kw.startswith("large"):
+        target_file_set = "Large Files"
+
+    render_trend_analysis(
+        auto_like,
+        title,
+        file_set_filter=target_file_set,
+        scan_type_filter=scan_type_filter,
+        show_standard_filters=False,
+    )
+
+
 def page_edit_benchmark(df):
     st.markdown("## 🛠️ Record Management Console")
     if df.empty:
@@ -2978,7 +5803,7 @@ def page_edit_benchmark(df):
             "Date": st.column_config.DateColumn("Run Date"),
             "Total_Files": st.column_config.NumberColumn("Total Files", min_value=0, step=1000),
             "Total_Folders": st.column_config.NumberColumn("Total Folders", min_value=0, step=100),
-            "Total_Size_GB": st.column_config.NumberColumn("Total Size (GB)", min_value=0.0, step=0.1, format="%.2f"),
+            "Total_Size_GB": st.column_config.NumberColumn("Total Size (GB)", min_value=0.0, step=0.1),
             "Total_Catalog_Items": st.column_config.NumberColumn("Total Catalog Items", min_value=0, step=1000),
             "total_scan_hours": st.column_config.NumberColumn("Scan Hours", min_value=0.0, step=0.1, format="%.2f"),
             "throughput_cluster_gb_hr": st.column_config.NumberColumn("Cluster GB/hr", min_value=0.0, step=0.1, format="%.2f"),
@@ -3041,37 +5866,60 @@ def page_edit_benchmark(df):
                     run_date_val = pd.to_datetime(row.get('Date'), errors='coerce')
                     run_date_str = str(run_date_val.date()) if pd.notnull(run_date_val) else None
 
-                    upd_bench = text("""
-                        UPDATE benchmarks 
-                        SET run_date = :rd, scenario_type = :scn, scan_type = :st, data_source_type = :dst, data_type = :dtype,
-                            file_set_type = :fst, total_files = :tf, total_folders = :tfo, total_size_gb = :tgb,
-                            total_catalog_items = :tci, avg_file_size = :avg,
-                            throughput_cluster_gb_hr = :tpcg, throughput_scanner_gb_hr = :tpsg, throughput_thread_gb_hr = :tptg,
-                            throughput_cluster_files_hr = :tpcf, throughput_scanner_files_hr = :tpsf, throughput_thread_files_hr = :tptf,
-                            is_active = :act
-                        WHERE id = :bid
-                    """)
-                    conn.execute(upd_bench, {
-                        'rd': run_date_str,
-                        'scn': clean_value(row.get('Scenario_Type')),
-                        'st': clean_value(row.get('Scan_Type')),
-                        'dst': clean_value(row.get('Data_Source_Type')),
-                        'dtype': clean_value(row.get('Data_Type')),
-                        'fst': clean_value(row.get('file_set_type')),
-                        'tf': clean_value(row.get('Total_Files')),
-                        'tfo': clean_value(row.get('Total_Folders')),
-                        'tgb': clean_value(row.get('Total_Size_GB')),
-                        'tci': clean_value(row.get('Total_Catalog_Items')),
-                        'avg': clean_value(row.get('avg_file_size')),
-                        'tpcg': clean_value(row.get('throughput_cluster_gb_hr')),
-                        'tpsg': clean_value(row.get('throughput_scanner_gb_hr')),
-                        'tptg': clean_value(row.get('throughput_thread_gb_hr')),
-                        'tpcf': clean_value(row.get('throughput_cluster_files_hr')),
-                        'tpsf': clean_value(row.get('throughput_scanner_files_hr')),
-                        'tptf': clean_value(row.get('throughput_thread_files_hr')),
-                        'act': 1 if bool(row.get('is_active')) else 0,
-                        'bid': row_id
-                    })
+                    is_auto = "scan_id" in updated.columns or (isinstance(row_id, str) and "-" in str(row_id))
+                    
+                    if is_auto:
+                        upd_stmt = text("""
+                            UPDATE auto_scan_benchmarks 
+                            SET scenario_type = :scn, scan_type = :st, data_source_type = :dst, data_type = :dtype,
+                                file_set_type = :fst, total_files = :tf, total_folders = :tfo, total_size_gb = :tgb,
+                                total_classification = :tcl
+                            WHERE scan_id = :sid
+                        """)
+                        conn.execute(upd_stmt, {
+                            'scn': clean_value(row.get('Scenario_Type')),
+                            'st': clean_value(row.get('Scan_Type')),
+                            'dst': clean_value(row.get('Data_Source_Type')),
+                            'dtype': clean_value(row.get('Data_Type')),
+                            'fst': clean_value(row.get('file_set_type')),
+                            'tf': clean_value(row.get('Total_Files')),
+                            'tfo': clean_value(row.get('Total_Folders')),
+                            'tgb': clean_value(row.get('Total_Size_GB')),
+                            'tcl': clean_value(row.get('Total_Catalog_Items')),
+                            'sid': row_id
+                        })
+                    else:
+                        upd_bench = text("""
+                            UPDATE benchmarks 
+                            SET run_date = :rd, scenario_type = :scn, scan_type = :st, data_source_type = :dst, data_type = :dtype,
+                                file_set_type = :fst, total_files = :tf, total_folders = :tfo, total_size_gb = :tgb,
+                                total_catalog_items = :tci, avg_file_size = :avg,
+                                throughput_cluster_gb_hr = :tpcg, throughput_scanner_gb_hr = :tpsg, throughput_thread_gb_hr = :tptg,
+                                throughput_cluster_files_hr = :tpcf, throughput_scanner_files_hr = :tpsf, throughput_thread_files_hr = :tptf,
+                                is_active = :act
+                            WHERE id = :bid
+                        """)
+                        conn.execute(upd_bench, {
+                            'rd': run_date_str,
+                            'scn': clean_value(row.get('Scenario_Type')),
+                            'st': clean_value(row.get('Scan_Type')),
+                            'dst': clean_value(row.get('Data_Source_Type')),
+                            'dtype': clean_value(row.get('Data_Type')),
+                            'fst': clean_value(row.get('file_set_type')),
+                            'tf': clean_value(row.get('Total_Files')),
+                            'tfo': clean_value(row.get('Total_Folders')),
+                            'tgb': clean_value(row.get('Total_Size_GB')),
+                            'tci': clean_value(row.get('Total_Catalog_Items')),
+                            'avg': clean_value(row.get('avg_file_size')),
+                            'tpcg': clean_value(row.get('throughput_cluster_gb_hr')),
+                            'tpsg': clean_value(row.get('throughput_scanner_gb_hr')),
+                            'tptg': clean_value(row.get('throughput_thread_gb_hr')),
+                            'tpcf': clean_value(row.get('throughput_cluster_files_hr')),
+                            'tpsf': clean_value(row.get('throughput_scanner_files_hr')),
+                            'tptf': clean_value(row.get('throughput_thread_files_hr')),
+                            'act': 1 if bool(row.get('is_active')) else 0,
+                            'bid': row_id
+                        })
                 conn.commit()
 
             st.success("Table changes saved.")
@@ -3166,6 +6014,12 @@ def main():
                 "Large Files OLS Trend": "Large Files OLS Trend",
                 "Small Files OLS Trend Analysis": "Small Files OLS Trend",
                 "Large Files OLS Trend Analysis": "Large Files OLS Trend",
+                "Auto Small Files Trend Analysis": "Auto Small Files Trend Analysis",
+                "Auto Large Files Trend Analysis": "Auto Large Files Trend Analysis",
+                "Auto Small Files OLS Trend": "Auto Small Files OLS Trend",
+                "Auto Large Files OLS Trend": "Auto Large Files OLS Trend",
+                "Auto Small Files OLS Trend Analysis": "Auto Small Files OLS Trend",
+                "Auto Large Files OLS Trend Analysis": "Auto Large Files OLS Trend",
                 "OLS vs Full Scan (Small)": "OLS vs Full Scan (Small)",
                 "OLS vs Full Scan (Large)": "OLS vs Full Scan (Large)",
                 "Discover File FF On vs Off": "Discover File FF On vs Off",
@@ -3175,7 +6029,8 @@ def main():
                 "Edit Records": "Edit Records",
                 "Manage Classifiers": "Manage Classifiers",
                 "Manage Test Environments": "Manage Test Environments",
-                "Version Comparison": "Version Comparison"
+                "Version Comparison": "Version Comparison",
+                "Scan Status": "Scan Status"
             }
             if normalized in page_map:
                 st.session_state.current_page = page_map[normalized]
@@ -3384,6 +6239,11 @@ def main():
                 <a href="?page=Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📦</span> <span>Large Files Trend</span></a>
                 <a href="?page=Small+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Small Files OLS</span></a>
                 <a href="?page=Large+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Large Files OLS</span></a>
+                <div class="flyout-header" style="margin-top: 8px;">Auto Trend (Scan Table)</div>
+                <a href="?page=Auto+Small+Files+Trend+Analysis" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Small Files Trend</span></a>
+                <a href="?page=Auto+Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Large Files Trend</span></a>
+                <a href="?page=Auto+Small+Files+OLS+Trend" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Small Files OLS</span></a>
+                <a href="?page=Auto+Large+Files+OLS+Trend" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Large Files OLS</span></a>
             </div>
         </div>
 
@@ -3409,6 +6269,7 @@ def main():
                 <a href="?page=Manage+Classifiers" target="_self" class="flyout-item"><span>🧩</span> <span>Manage Classifiers</span></a>
                 <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
                 <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
+                <a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>
                 <div class="flyout-header" style="margin-top: 10px;">Archived / Disabled</div>
                 <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📁</span> <span>Overview Dashboard (Off)</span></a>
                 <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📉</span> <span>Build Analysis (Off)</span></a>
@@ -3441,6 +6302,14 @@ def main():
         render_trend_analysis(data, "Small Files OLS Trend Analysis", file_set_filter="Small Files", scan_type_filter="OLS Scan")
     elif page == "Large Files OLS Trend":
         render_trend_analysis(data, "Large Files OLS Trend Analysis", file_set_filter="Large Files", scan_type_filter="OLS Scan")
+    elif page == "Auto Small Files Trend Analysis":
+        render_auto_trend_analysis("Auto Small Files Trend Analysis", file_set_keyword="Small Files")
+    elif page == "Auto Large Files Trend Analysis":
+        render_auto_trend_analysis("Auto Large Files Trend Analysis", file_set_keyword="Large Files")
+    elif page == "Auto Small Files OLS Trend":
+        render_auto_trend_analysis("Auto Small Files OLS Trend", file_set_keyword="Small Files", scan_type_filter="OLS Scan")
+    elif page == "Auto Large Files OLS Trend":
+        render_auto_trend_analysis("Auto Large Files OLS Trend", file_set_keyword="Large Files", scan_type_filter="OLS Scan")
     
     # Specialized Comparisons
     elif page == "OLS vs Full Scan (Small)":
@@ -3460,14 +6329,21 @@ def main():
     elif page == "Add New Benchmark": 
         page_add_benchmark()
     elif page == "Edit Records":
-        full_data = load_data(include_inactive=True)
-        page_edit_benchmark(full_data)
+        mode = st.radio("Record Type", ["Manual Benchmarks", "Auto Scans"], horizontal=True)
+        if mode == "Manual Benchmarks":
+            full_data = load_data(include_inactive=True)
+            page_edit_benchmark(full_data)
+        else:
+            full_data = load_auto_trend_as_manual_like_df()
+            page_edit_benchmark(full_data)
     elif page == "Manage Classifiers":
         page_manage_classifiers()
     elif page == "Manage Test Environments":
         page_manage_test_environments()
     elif page == "Version Comparison":
         page_version_comparison()
+    elif page == "Scan Status":
+        page_scan_status()
 
 if __name__ == "__main__":
     main()
