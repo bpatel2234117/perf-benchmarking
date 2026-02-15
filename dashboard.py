@@ -5068,10 +5068,11 @@ def page_scan_status():
     selected_idx = labels.index(selected_label)
     selected_env = work_df.iloc[selected_idx].to_dict()
 
-    c1, c2, c3 = st.columns([1.2, 1.2, 1.0])
+    c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.0, 1.0])
     status_view = c1.radio("Show", ["All", "In Progress", "Completed"], horizontal=True)
     limit = c2.number_input("Limit per API", min_value=10, max_value=1000, value=200, step=10)
     refresh = c3.button("Reload from DB", type="primary", use_container_width=True)
+    manual_resync = c4.button("Manual Re-sync (API)", use_container_width=True)
     load_insights = True
 
     running_states = ["Started", "Awaiting", "In Progress", "InProgress", "Running"]
@@ -5096,6 +5097,46 @@ def page_scan_status():
     last_auto_sync_epoch = float(st.session_state.get("scan_status_last_auto_sync_epoch", 0.0) or 0.0)
     # DB-only view. Tracker is the only updater.
     should_auto_sync = False
+
+    # Manual API re-sync (event-driven). This updates scan_parents in DB for selected environment.
+    # We keep it light: just refresh scan list/status; deep insight snapshotting remains per-scan.
+    if manual_resync:
+        with st.spinner("Re-syncing scan list from API (writing to DB)..."):
+            try:
+                res = fetch_combined_parent_scans_for_env(selected_env, running_states, completed_states, limit=int(limit))
+                api_items = res.get("items") if isinstance(res, dict) else []
+                running_total_api = res.get("running_total") if isinstance(res, dict) else None
+                completed_total_api = res.get("completed_total") if isinstance(res, dict) else None
+
+                upserted = 0
+                for scan in (api_items or []):
+                    if not isinstance(scan, dict):
+                        continue
+                    sid = str(scan.get("_id") or scan.get("id") or "").strip()
+                    if not sid:
+                        continue
+                    status = resolve_scan_status_value(scan)
+                    upsert_scan_parent_record(selected_env.get("id"), scan, status)
+                    upserted += 1
+
+                # Update totals cache for caption.
+                try:
+                    per_env_totals_cache[str(int(selected_env.get("id")))] = {
+                        "running_total": int(running_total_api) if running_total_api is not None else None,
+                        "completed_total": int(completed_total_api) if completed_total_api is not None else None,
+                    }
+                except Exception:
+                    pass
+                st.session_state["scan_status_last_auto_sync_human"] = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+                st.success(f"Manual re-sync complete. Upserted {upserted} scans into DB.")
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Manual re-sync failed: {ex}")
 
     # Note: we intentionally do NOT force auto-refresh here.
     # Continuous tracking without a browser is handled by `tracker.py`.
