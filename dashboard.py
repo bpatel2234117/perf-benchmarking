@@ -47,6 +47,9 @@ INTERNAL_CLASSIFIERS_API_PATH = os.getenv("BIGID_CLASSIFIERS_API_PATH", DEFAULT_
 INTERNAL_ABOUT_API_PATH = os.getenv("BIGID_ABOUT_API_PATH", "/api/v1/about").strip() or "/api/v1/about"
 INTERNAL_PARENT_SCANS_API_PATH = os.getenv("BIGID_PARENT_SCANS_API_PATH", "/api/v1/scans/parent-scans").strip() or "/api/v1/scans/parent-scans"
 INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_API_PATH", "/api/v1/scans/insights/parent-scans").strip() or "/api/v1/scans/insights/parent-scans"
+INTERNAL_SCANNER_GROUPS_API_PATH = os.getenv("BIGID_SCANNER_GROUPS_API_PATH", "/api/v1/scanner-groups").strip() or "/api/v1/scanner-groups"
+INTERNAL_DS_CONNECTIONS_API_PATH = os.getenv("BIGID_DS_CONNECTIONS_API_PATH", "/api/v1/ds_connections").strip() or "/api/v1/ds_connections"
+INTERNAL_DS_CONNECTION_TEST_API_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
 
 def get_logo_base64():
     for path in LOGO_CANDIDATES:
@@ -1353,6 +1356,187 @@ def fetch_parent_scan_attribute_counts_with_auth_retry(env_row, scan_id, limit=2
             return collect_with_token(fresh)
         token = fetch_auth_token_for_env(env_row)
         return collect_with_token(token)
+
+
+def _redact_secrets(obj):
+    """
+    Recursively redacts secret-like keys in dict/list payloads so we can safely display API responses.
+    """
+    secret_keys = {
+        "authorization",
+        "token",
+        "access_token",
+        "id_token",
+        "password",
+        "password_enc",
+        "secret",
+        "client_secret",
+    }
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            lk = str(k).lower()
+            if lk in secret_keys:
+                out[k] = "***redacted***"
+            else:
+                out[k] = _redact_secrets(v)
+        return out
+    if isinstance(obj, list):
+        return [_redact_secrets(x) for x in obj]
+    return obj
+
+
+def extract_scanner_groups_payload(payload):
+    """
+    Returns (items, total_count) for scanner groups response.
+    """
+    items = []
+    total_count = None
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        root = data_block if isinstance(data_block, dict) else payload
+        for key in ["scannerGroups", "scanner_groups", "groups", "items", "results"]:
+            val = root.get(key)
+            if isinstance(val, list):
+                items = [x for x in val if isinstance(x, dict)]
+                break
+        if root.get("totalCount") is not None:
+            try:
+                total_count = int(root.get("totalCount"))
+            except Exception:
+                total_count = None
+    return items, total_count
+
+
+def fetch_scanner_groups_from_api(base_url, token):
+    url = build_api_url(base_url, INTERNAL_SCANNER_GROUPS_API_PATH)
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.get(url, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, headers=headers_bearer, timeout=45)
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scanner groups API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scanner groups API.")
+    resp.raise_for_status()
+    payload = resp.json()
+    items, total_count = extract_scanner_groups_payload(payload)
+    return items, total_count, getattr(resp, "url", url)
+
+
+def fetch_scanner_groups_with_auth_retry(env_row):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return fetch_scanner_groups_from_api(base_url, "")
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_scanner_groups_from_api(base_url, token)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_scanner_groups_from_api(base_url, fresh)
+        token = fetch_auth_token_for_env(env_row)
+        return fetch_scanner_groups_from_api(base_url, token)
+
+
+def put_ds_connection_from_api(base_url, ds_name, token, payload):
+    from urllib.parse import quote
+
+    name = str(ds_name or "").strip()
+    if not name:
+        raise RuntimeError("ds_name is required")
+    base_path = INTERNAL_DS_CONNECTIONS_API_PATH.rstrip("/")
+    url = build_api_url(base_url, f"{base_path}/{quote(name, safe='')}")
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.put(url, headers=headers_raw, json=payload, timeout=60)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.put(url, headers=headers_bearer, json=payload, timeout=60)
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "DS connections API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for DS connections API.")
+    resp.raise_for_status()
+    out = resp.json()
+    return out, getattr(resp, "url", url)
+
+
+def put_ds_connection_with_auth_retry(env_row, ds_name, payload):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return put_ds_connection_from_api(base_url, ds_name, "", payload)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return put_ds_connection_from_api(base_url, ds_name, token, payload)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return put_ds_connection_from_api(base_url, ds_name, fresh, payload)
+        token = fetch_auth_token_for_env(env_row)
+        return put_ds_connection_from_api(base_url, ds_name, token, payload)
+
+
+def post_ds_connection_test_from_api(base_url, broadcast_event, token, payload):
+    url = build_api_url(base_url, INTERNAL_DS_CONNECTION_TEST_API_PATH)
+    params = {"broadcastEvent": str(broadcast_event or "").strip()} if broadcast_event else {}
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.post(url, params=params, headers=headers_raw, json=payload, timeout=120)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.post(url, params=params, headers=headers_bearer, json=payload, timeout=120)
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "DS connection test API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for DS connection test API.")
+    resp.raise_for_status()
+    out = resp.json()
+    return out, getattr(resp, "url", url)
+
+
+def post_ds_connection_test_with_auth_retry(env_row, broadcast_event, payload):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return post_ds_connection_test_from_api(base_url, broadcast_event, "", payload)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return post_ds_connection_test_from_api(base_url, broadcast_event, token, payload)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return post_ds_connection_test_from_api(base_url, broadcast_event, fresh, payload)
+        token = fetch_auth_token_for_env(env_row)
+        return post_ds_connection_test_from_api(base_url, broadcast_event, token, payload)
 
 
 def resolve_scan_status_value(scan):
@@ -6844,6 +7028,194 @@ def page_scan_progress():
         st.query_params["page"] = "Scan Status"
         st.rerun()
 
+
+def page_create_data_source():
+    """
+    Wizard-like tool:
+    1) Get scanner groups
+    2) Create/update DS connection
+    3) Test connection
+    """
+    st.title("🧩 Create Data Source + Test Connection")
+    st.caption("Creates/updates a BigID DS connection and runs the Test Connection API.")
+
+    env_df = load_test_environments()
+    if env_df.empty:
+        st.info("No test environments found. Add one in `Manage Test Environments` first.")
+        return
+
+    work_df = env_df.copy()
+    work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
+    work_df = work_df.sort_values(by=["is_active", "env_name"], ascending=[False, True]).reset_index(drop=True)
+    labels = [
+        f"{row.env_name} ({'active' if row.is_active else 'inactive'}) - {row.base_url or 'no-base-url'}"
+        for row in work_df.itertuples()
+    ]
+    selected_label = st.selectbox("Environment", labels, index=0)
+    selected_env = work_df.iloc[labels.index(selected_label)].to_dict()
+
+    st.markdown("**Step 1: Fetch scanner groups**")
+    if st.button("Get scanner groups", type="primary"):
+        with st.spinner("Fetching scanner groups..."):
+            try:
+                items, _total, url = fetch_scanner_groups_with_auth_retry(selected_env)
+                st.session_state["scanner_groups_last"] = items or []
+                st.session_state["scanner_groups_last_url"] = url
+                st.success(f"Loaded {len(items or [])} scanner groups.")
+            except Exception as ex:
+                st.error(f"Failed to fetch scanner groups: {ex}")
+
+    groups = st.session_state.get("scanner_groups_last") or []
+    group_names = []
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        nm = str(g.get("name") or g.get("scanner_group") or g.get("id") or g.get("_id") or "").strip()
+        if nm:
+            group_names.append(nm)
+    group_names = sorted(set(group_names)) or ["default"]
+    scanner_group = st.selectbox("Scanner group", group_names, index=0)
+
+    st.divider()
+    st.markdown("**Step 2: Create/Update DS connection**")
+    with st.form("create_ds_form"):
+        ds_name = st.text_input("Data source name", value="")
+        ds_type = st.selectbox("DS type", ["smb_v2", "smb", "s3", "nfs", "sharepoint"], index=0)
+        resource_address = st.text_input("Resource address / host", value="")
+        auth_username = st.text_input("Username", value="")
+        auth_password = st.text_input("Password (plain)", value="", type="password")
+        auth_password_enc = st.text_input("Password Enc (optional)", value="", type="password")
+
+        st.caption("SMB filters (used when DS type is smb_v2)")
+        container_name = st.text_input("Container / share name (e.g. millions_files)", value="")
+        sub_path = st.text_input("Sub-path (e.g. benchmark_test_data/...)", value="")
+
+        parsing_threads = st.number_input("Number of parsing threads", min_value=1, max_value=200, value=10, step=1)
+        enable_lite_mode = st.checkbox("Enable lite mode", value=True)
+        submit = st.form_submit_button("Create/Update DS")
+
+    if submit:
+        if not ds_name.strip():
+            st.error("Data source name is required.")
+        elif not resource_address.strip():
+            st.error("Resource address is required.")
+        else:
+            # Build ds_connection payload (minimal, aligned to the cURL shape you shared).
+            auth_props = {
+                "@authenticationType": "basicAuthentication",
+                "username": str(auth_username or "").strip(),
+                "password_enc": (str(auth_password_enc or "").strip() or None),
+            }
+            if str(auth_password or "").strip():
+                # Some environments accept plain password; keep as best-effort (never displayed).
+                auth_props["password"] = str(auth_password)
+
+            ds_conn = {
+                "name": str(ds_name).strip(),
+                "enabled": "yes",
+                "tags": [],
+                "type": str(ds_type).strip(),
+                "resourceProperties": {"resourceAddress": str(resource_address).strip()},
+                "authStrategy": "basicAuthentication",
+                "authenticationProperties": auth_props,
+                "stopOnEnumerationFailure": False,
+                "scanner_group": str(scanner_group).strip() or "default",
+                "numberOfParsingThreads": str(int(parsing_threads)),
+                "classification_is_enabled": True,
+                "enableLiteMode": bool(enable_lite_mode),
+            }
+
+            # SMB-specific knobs (safe no-ops for other DS types)
+            if str(ds_type).strip() == "smb_v2":
+                ds_conn.update({
+                    "typeRequestProperties": {
+                        "@requestType": "unstructureRequestProperties",
+                        "enableStructuredFilesDiscovery": False,
+                        "maxArchiveSizeInMbToExtract": 100,
+                        "extractArchives": False,
+                    },
+                    "containerizedFilterType": "containerizedSpecificNameFilter",
+                    "containerizedFilter": {
+                        "@containerizedFilterType": "containerizedSpecificNameFilter",
+                        "specificNameFilters": {
+                            "containerUseCase": {"useCase": "INCLUDE", "name": str(container_name or "").strip()},
+                            "subContainerUseCase": {"name": str(sub_path or "").strip()},
+                        },
+                    },
+                })
+
+            payload = {"ds_connection": ds_conn, "isSavedAsDraft": False}
+
+            with st.spinner("Calling DS create/update API..."):
+                try:
+                    out, url = put_ds_connection_with_auth_retry(selected_env, ds_name, payload)
+                    st.session_state["last_ds_payload"] = payload
+                    st.session_state["last_ds_name"] = ds_name
+                    st.session_state["last_ds_env"] = selected_env
+                    # Try to capture password_enc from response for test connection.
+                    try:
+                        resp_conn = (out or {}).get("data", {}).get("ds_connection") or (out or {}).get("ds_connection") or {}
+                        resp_auth = resp_conn.get("authenticationProperties") if isinstance(resp_conn.get("authenticationProperties"), dict) else {}
+                        resp_enc = resp_auth.get("password_enc")
+                        if resp_enc and not auth_password_enc:
+                            st.session_state["last_ds_password_enc"] = str(resp_enc)
+                    except Exception:
+                        pass
+                    st.success("DS connection saved.")
+                    st.caption(f"API: `{url}`")
+                    st.json(_redact_secrets(out))
+                except Exception as ex:
+                    st.error(f"DS create/update failed: {ex}")
+
+    st.divider()
+    st.markdown("**Step 3: Test connection**")
+    last_ds_name = str(st.session_state.get("last_ds_name") or "").strip()
+    if not last_ds_name:
+        st.caption("Create/update a DS first to enable Test Connection.")
+        return
+
+    from uuid import uuid4
+    default_broadcast = f"{last_ds_name}-test-connection-complete-{uuid4()}"
+    broadcast_event = st.text_input("broadcastEvent", value=default_broadcast)
+
+    if st.button("Run Test Connection"):
+        env_row = st.session_state.get("last_ds_env") or selected_env
+        payload = st.session_state.get("last_ds_payload") or {}
+
+        # If we learned password_enc from create response, prefer it for test payload.
+        try:
+            enc = str(st.session_state.get("last_ds_password_enc") or "").strip()
+            if enc:
+                payload = dict(payload)
+                ds_conn = dict((payload.get("ds_connection") or {}))
+                auth = dict((ds_conn.get("authenticationProperties") or {}))
+                auth["password_enc"] = enc
+                # Do not send plain password on test call
+                auth.pop("password", None)
+                ds_conn["authenticationProperties"] = auth
+                payload["ds_connection"] = ds_conn
+        except Exception:
+            pass
+
+        # BigID often expects top-level broadcastEvent too.
+        try:
+            payload = dict(payload)
+            payload["broadcastEvent"] = str(broadcast_event).strip()
+            payload.setdefault("isNewSessionToken", False)
+            payload.setdefault("isFirstAttempt", False)
+        except Exception:
+            pass
+
+        with st.spinner("Calling test connection API..."):
+            try:
+                out, url = post_ds_connection_test_with_auth_retry(env_row, broadcast_event, payload)
+                st.success("Test connection request submitted.")
+                st.caption(f"API: `{url}`")
+                st.json(_redact_secrets(out))
+            except Exception as ex:
+                st.error(f"Test connection failed: {ex}")
+
+
 def render_centered_table(df):
     """Renders a scrollable HTML table. Styling is handled via global CSS."""
     html = df.to_html(index=False, classes='centered-table', escape=False)
@@ -6939,6 +7311,7 @@ def main():
                 "Manage Classifiers": "Manage Classifiers",
                 "Manage Test Environments": "Manage Test Environments",
                 "Version Comparison": "Version Comparison",
+                "Create Data Source": "Create Data Source",
                 "Scan Status": "Scan Status",
                 "Scan Progress": "Scan Progress"
             }
@@ -7174,6 +7547,7 @@ def main():
                 <a href="?page=Manage+Classifiers" target="_self" class="flyout-item"><span>🧩</span> <span>Manage Classifiers</span></a>
                 <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
                 <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
+                <a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>
                 <a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>
                 <a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>
                 <div class="flyout-header" style="margin-top: 10px;">Archived / Disabled</div>
@@ -7248,6 +7622,8 @@ def main():
         page_manage_test_environments()
     elif page == "Version Comparison":
         page_version_comparison()
+    elif page == "Create Data Source":
+        page_create_data_source()
     elif page == "Scan Status":
         page_scan_status()
     elif page == "Scan Progress":
