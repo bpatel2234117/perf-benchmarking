@@ -6602,7 +6602,7 @@ def page_scan_progress():
                 y=plot_df.get("completed_parts", 0),
                 mode="lines+markers",
                 name="Parts Completed",
-                line=dict(color="#10B981", width=3),
+                line=dict(color="#10B981", width=3),  # green
                 marker=dict(color="#10B981", size=7),
             ),
             secondary_y=False,
@@ -6613,7 +6613,7 @@ def page_scan_progress():
                 y=plot_df.get("total_parts_scanned", 0),
                 mode="lines+markers",
                 name="Parts Total",
-                line=dict(color="#3B82F6", width=2),
+                line=dict(color="#3B82F6", width=2),  # blue
                 marker=dict(color="#3B82F6", size=7),
             ),
             secondary_y=False,
@@ -6624,7 +6624,7 @@ def page_scan_progress():
                 y=plot_df.get("failed_parts", 0),
                 mode="lines+markers",
                 name="Parts Failed",
-                line=dict(color="#EF4444", width=2),
+                line=dict(color="#EF4444", width=2),  # red
                 marker=dict(color="#EF4444", size=7),
             ),
             secondary_y=False,
@@ -6635,8 +6635,8 @@ def page_scan_progress():
                 y=plot_df.get("objects_scanned", 0),
                 mode="lines+markers",
                 name="Objects Scanned",
-                line=dict(color="#22C55E", width=3),
-                marker=dict(color="#22C55E", size=7),
+                line=dict(color="#8B5CF6", width=3),  # purple
+                marker=dict(color="#8B5CF6", size=7),
             ),
             secondary_y=True,
         )
@@ -6646,8 +6646,8 @@ def page_scan_progress():
                 y=plot_df.get("objects_failed", 0),
                 mode="lines+markers",
                 name="Objects Failed",
-                line=dict(color="#DC2626", width=2),
-                marker=dict(color="#DC2626", size=7),
+                line=dict(color="#F97316", width=2),  # orange
+                marker=dict(color="#F97316", size=7),
             ),
             secondary_y=True,
         )
