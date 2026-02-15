@@ -6601,7 +6601,7 @@ def page_scan_progress():
                 x=plot_df["captured_at_utc"],
                 y=plot_df.get("completed_parts", 0),
                 mode="lines+markers",
-                name="Parts Completed",
+                name="Parts Completed (count)",
                 line=dict(color="#10B981", width=3),  # green
                 marker=dict(color="#10B981", size=7),
             ),
@@ -6612,7 +6612,7 @@ def page_scan_progress():
                 x=plot_df["captured_at_utc"],
                 y=plot_df.get("total_parts_scanned", 0),
                 mode="lines+markers",
-                name="Parts Total",
+                name="Parts Total (count)",
                 line=dict(color="#3B82F6", width=2),  # blue
                 marker=dict(color="#3B82F6", size=7),
             ),
@@ -6623,7 +6623,7 @@ def page_scan_progress():
                 x=plot_df["captured_at_utc"],
                 y=plot_df.get("failed_parts", 0),
                 mode="lines+markers",
-                name="Parts Failed",
+                name="Parts Failed (count)",
                 line=dict(color="#EF4444", width=2),  # red
                 marker=dict(color="#EF4444", size=7),
             ),
@@ -6634,8 +6634,8 @@ def page_scan_progress():
                 x=plot_df["captured_at_utc"],
                 y=plot_df.get("objects_scanned", 0),
                 mode="lines+markers",
-                name="Objects Scanned",
-                line=dict(color="#8B5CF6", width=3),  # purple
+                name="Objects Scanned (count)",
+                line=dict(color="#8B5CF6", width=3, dash="dot"),  # purple dotted
                 marker=dict(color="#8B5CF6", size=7),
             ),
             secondary_y=True,
@@ -6645,8 +6645,8 @@ def page_scan_progress():
                 x=plot_df["captured_at_utc"],
                 y=plot_df.get("objects_failed", 0),
                 mode="lines+markers",
-                name="Objects Failed",
-                line=dict(color="#F97316", width=2),  # orange
+                name="Objects Failed (count)",
+                line=dict(color="#F97316", width=2, dash="dot"),  # orange dotted
                 marker=dict(color="#F97316", size=7),
             ),
             secondary_y=True,
@@ -6654,7 +6654,11 @@ def page_scan_progress():
         fig.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)  # 10 minutes
         fig.update_yaxes(title_text="Parts (count)", rangemode="tozero", secondary_y=False)
         fig.update_yaxes(title_text="Objects (count)", rangemode="tozero", secondary_y=True)
-        fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=30, b=10),
+            legend=dict(orientation="h"),
+            hovermode="x unified",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
