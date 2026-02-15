@@ -15,6 +15,7 @@ import os
 import sys
 import time
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -32,8 +33,10 @@ def _pid_is_running(pid: int) -> bool:
         if os.name != "nt":
             os.kill(pid, 0)
             return True
-        # On Windows, os.kill(pid, 0) is not reliable; best-effort: assume running.
-        return True
+        # On Windows, check tasklist output.
+        out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], stderr=subprocess.STDOUT)
+        s = out.decode("utf-8", errors="ignore").lower()
+        return str(pid) in s
     except Exception:
         return False
 
@@ -70,10 +73,15 @@ def _get_heartbeat_age_minutes(engine, tracker_name: str) -> Optional[float]:
             ).fetchone()
         if not row or not row[0]:
             return None
-        # row[0] is a datetime from DB driver
+        # row[0] is a datetime from DB driver. Treat naive timestamps as UTC.
         last = row[0]
-        age_sec = max(0.0, _now_epoch() - last.timestamp())
-        return age_sec / 60.0
+        now_utc = datetime.now(timezone.utc)
+        if getattr(last, "tzinfo", None) is None:
+            last_utc = last.replace(tzinfo=timezone.utc)
+        else:
+            last_utc = last.astimezone(timezone.utc)
+        age_sec = (now_utc - last_utc).total_seconds()
+        return max(0.0, age_sec) / 60.0
     except Exception:
         return None
 

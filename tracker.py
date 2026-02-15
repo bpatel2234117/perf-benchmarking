@@ -335,7 +335,13 @@ def _request_get(url: str, token: str, params: Optional[Dict[str, Any]] = None) 
     return resp
 
 
-def fetch_parent_scans(base_url: str, token: str, states: Optional[List[str]] = None, limit: int = 200) -> List[Dict[str, Any]]:
+def fetch_parent_scans(
+    base_url: str,
+    token: str,
+    states: Optional[List[str]] = None,
+    limit: int = 200,
+    skip: int = 0,
+) -> List[Dict[str, Any]]:
     url = build_api_url(base_url, PARENT_SCANS_PATH)
     filter_items = []
     # Some environments don't use initiatedSource="scans" and filtering can hide scans.
@@ -346,7 +352,7 @@ def fetch_parent_scans(base_url: str, token: str, states: Optional[List[str]] = 
     if cleaned_states:
         filter_items.insert(0, {"field": "state", "operator": "in", "value": cleaned_states})
     params = {
-        "skip": 0,
+        "skip": int(skip),
         "limit": int(limit),
         "requireTotalCount": "true",
         "filter": json.dumps(filter_items, separators=(",", ":")),
@@ -835,15 +841,34 @@ def _last_progress_state(engine, scan_id: str) -> str:
         return ""
 
 
-def track_once(engine) -> Tuple[int, int]:
+def track_once(engine) -> Dict[str, Any]:
+    """
+    One tracker cycle.
+
+    Key design goals:
+    - Always prefer tracking *running* scans quickly (so we don't miss 10-min slots).
+    - Avoid slow attribute-delta fetches unless needed.
+    - Provide actionable counters for heartbeat diagnostics.
+    """
     envs = load_active_environments(engine)
-    tracked_scans = 0
-    total_running = 0
-    env_failures = 0
-    attempted_insights = 0
 
     # Cache tokens per base_url for this cycle
     token_cache: Dict[str, str] = {}
+
+    # Metrics
+    metrics: Dict[str, Any] = {
+        "envs": len(envs),
+        "env_failures": 0,
+        "running_scans_seen": 0,
+        "db_running_seen": 0,
+        "attempted_insights": 0,
+        "snapshots_ok": 0,
+        "fail_auth": 0,
+        "fail_parent_scans": 0,
+        "fail_insights": 0,
+        "fail_write": 0,
+        "fail_attrs": 0,
+    }
 
     def get_token_for_env(env_row: Dict[str, Any]) -> str:
         base_url = str(env_row.get("base_url") or "").strip()
@@ -856,36 +881,62 @@ def track_once(engine) -> Tuple[int, int]:
         token_cache[key] = tok
         return tok
 
-    def process_scan(base_url: str, env_row: Dict[str, Any], scan_id: str, scan_name: str) -> bool:
-        nonlocal attempted_insights
-        try:
-            token = get_token_for_env(env_row)
-        except Exception:
-            return False
-        try:
-            attempted_insights += 1
-            insight = fetch_scan_insights(base_url, scan_id, token)
-        except Exception:
-            # retry once with fresh token
-            try:
-                token_cache.pop(base_url.rstrip("/"), None)
-                token2 = get_token_for_env(env_row)
-                attempted_insights += 1
-                insight = fetch_scan_insights(base_url, scan_id, token2)
-            except Exception:
-                return False
+    def _scan_row_from_insights(scan_id: str, insight_payload: Dict[str, Any]) -> Tuple[Dict[str, Any], str, str]:
+        si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
+        if not si and isinstance(insight_payload, dict):
+            si = insight_payload
+        sp = si.get("scanProfile") if isinstance(si.get("scanProfile"), dict) else {}
+        prog = sp.get("progress") if isinstance(sp.get("progress"), dict) else {}
+        state = str(si.get("state") or prog.get("state") or "").strip()
+        name = str(sp.get("name") or "").strip()
+        scan_row = {
+            "_id": str(scan_id),
+            "name": name,
+            "type": str(sp.get("type") or "").strip(),
+            "startedAt": sp.get("startedAt") or sp.get("updatedAt"),
+            "completedAt": sp.get("completedAt"),
+            "scanTemplateName": str(sp.get("scanTemplateName") or "").strip(),
+            "state": state,
+        }
+        return scan_row, state, name
 
+    def _needs_attribute_deltas(scan_id: str) -> bool:
         try:
-            upsert_scan_progress_record(engine, env_row.get("id"), scan_id, scan_name, insight)
-            upsert_scan_insights_record(engine, scan_id, insight)
-            try:
-                attrs = fetch_scan_classifier_attributes(base_url, scan_id, get_token_for_env(env_row))
-                upsert_scan_attribute_deltas(engine, scan_id, attrs)
-            except Exception:
-                pass
-            return True
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT classifier_attribute_names FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                    {"sid": str(scan_id)},
+                ).fetchone()
+            v = str(row[0] or "").strip() if row else ""
+            return not bool(v)
         except Exception:
-            return False
+            return True
+
+    def _fetch_running_parent_scans(base_url: str, token: str) -> List[Dict[str, Any]]:
+        all_items: List[Dict[str, Any]] = []
+        skip = 0
+        limit = 500
+        for _ in range(6):  # cap pages to keep cycle bounded
+            page = fetch_parent_scans(base_url, token, states=RUNNING_STATES, limit=limit, skip=skip)
+            if not page:
+                break
+            all_items.extend(page)
+            if len(page) < limit:
+                break
+            skip += limit
+        return all_items
+
+    # Build active env maps (used by DB-running safety net)
+    env_by_id: Dict[Any, Dict[str, Any]] = {e.get("id"): e for e in envs if isinstance(e, dict)}
+    env_by_base: Dict[str, Dict[str, Any]] = {
+        str(e.get("base_url") or "").strip().rstrip("/"): e
+        for e in envs
+        if isinstance(e, dict) and str(e.get("base_url") or "").strip()
+    }
+
+    # Discover running scans via API (fast path)
+    jobs: List[Tuple[str, Dict[str, Any], str, str]] = []
+    seen_scan_ids: set[str] = set()
 
     for env in envs:
         base_url = str(env.get("base_url") or "").strip()
@@ -897,19 +948,20 @@ def track_once(engine) -> Tuple[int, int]:
         try:
             token = get_token_for_env(env)
         except Exception as ex:
-            env_failures += 1
+            metrics["env_failures"] += 1
+            metrics["fail_auth"] += 1
             print(f"[{_now_utc_naive().isoformat()}Z] env={env_name} auth_failed: {ex}", flush=True)
             continue
 
         try:
-            # Pull both running + terminal so we can capture the final state row too.
-            scans = fetch_parent_scans(base_url, token, states=(RUNNING_STATES + TERMINAL_STATES), limit=500)
+            scans = _fetch_running_parent_scans(base_url, token)
         except Exception as ex:
-            env_failures += 1
+            metrics["env_failures"] += 1
+            metrics["fail_parent_scans"] += 1
             print(f"[{_now_utc_naive().isoformat()}Z] env={env_name} parent_scans_failed: {ex}", flush=True)
             continue
 
-        total_running += len(scans)
+        metrics["running_scans_seen"] += len(scans)
 
         for scan in scans:
             if not isinstance(scan, dict):
@@ -919,53 +971,103 @@ def track_once(engine) -> Tuple[int, int]:
             scan_name = str(scan.get("name") or scan.get("scanName") or scan.get("displayName") or "").strip()
             if not scan_id:
                 continue
-
+            seen_scan_ids.add(scan_id)
             try:
                 upsert_scan_parent_record(engine, env_id, scan, status)
             except Exception:
                 pass
-
-            # Only record terminal snapshots once (when we transition into terminal).
-            if _is_terminal_state(status):
-                if _is_terminal_state(_last_progress_state(engine, scan_id)):
-                    continue
-            elif not _is_running_state(status):
+            if not _is_running_state(status):
                 continue
+            jobs.append((base_url, env, scan_id, scan_name))
 
-            if process_scan(base_url, env, scan_id, scan_name):
-                tracked_scans += 1
-
-    # DB-driven safety net: ensure every scan marked running in DB gets updated,
-    # even if it was missed by the parent-scans list call.
+    # DB-driven safety net: keep tracking scans that DB believes are still running
     db_running = load_running_scan_env_rows(engine)
-    if db_running:
-        # Build minimal env rows and process concurrently (kept modest).
-        def env_row_for_db(r: Dict[str, Any]) -> Dict[str, Any]:
-            return {"id": r.get("environment_id"), "env_name": r.get("env_name"), "base_url": r.get("base_url")}
+    metrics["db_running_seen"] = len(db_running)
+    for r in db_running:
+        sid = str(r.get("scan_id") or "").strip()
+        if not sid or sid in seen_scan_ids:
+            continue
+        base = str(r.get("base_url") or "").strip().rstrip("/")
+        env_row = env_by_id.get(r.get("environment_id")) or env_by_base.get(base) or {
+            "id": r.get("environment_id"),
+            "env_name": r.get("env_name"),
+            "base_url": r.get("base_url"),
+        }
+        jobs.append((str(env_row.get("base_url") or "").strip(), env_row, sid, str(r.get("scan_name") or "")))
+        seen_scan_ids.add(sid)
 
-        with ThreadPoolExecutor(max_workers=6) as ex:
-            futs = []
-            for r in db_running:
-                sid = str(r.get("scan_id") or "").strip()
-                if not sid:
-                    continue
-                env_row = env_row_for_db(r)
-                base_url = str(env_row.get("base_url") or "").strip()
-                futs.append(ex.submit(process_scan, base_url, env_row, sid, str(r.get("scan_name") or "")))
+    def process_scan(job: Tuple[str, Dict[str, Any], str, str]) -> Tuple[bool, str, int]:
+        base_url, env_row, scan_id, scan_name = job
+        if not base_url or not scan_id:
+            return False, "bad_job", 0
+        try:
+            token = get_token_for_env(env_row)
+        except Exception:
+            return False, "auth", 0
+
+        # Insights fetch with one retry (fresh token)
+        try:
+            insight = fetch_scan_insights(base_url, scan_id, token)
+            attempted = 1
+        except Exception:
+            try:
+                token_cache.pop(base_url.rstrip("/"), None)
+                token2 = get_token_for_env(env_row)
+                insight = fetch_scan_insights(base_url, scan_id, token2)
+                attempted = 2
+            except Exception:
+                return False, "insights", 2
+
+        try:
+            # Use insights payload to keep scan_parents status accurate (running -> terminal, etc.)
+            scan_row, state, insight_name = _scan_row_from_insights(scan_id, insight)
+            try:
+                upsert_scan_parent_record(engine, env_row.get("id"), scan_row, state)
+            except Exception:
+                pass
+
+            # Snapshot row (slot-aligned) + normalized insights summary
+            upsert_scan_progress_record(engine, env_row.get("id"), scan_id, scan_name or insight_name, insight)
+            upsert_scan_insights_record(engine, scan_id, insight)
+
+            # Attribute delta fetch can be slow; only do it when useful.
+            try:
+                if _is_terminal_state(state) or _needs_attribute_deltas(scan_id):
+                    attrs = fetch_scan_classifier_attributes(base_url, scan_id, get_token_for_env(env_row))
+                    upsert_scan_attribute_deltas(engine, scan_id, attrs)
+            except Exception:
+                return True, "ok_attrs_failed", attempted
+
+            return True, "ok", attempted
+        except Exception:
+            return False, "write", attempted
+
+    # Process jobs concurrently to keep cycle under 10 minutes
+    if jobs:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = [ex.submit(process_scan, j) for j in jobs]
             for f in as_completed(futs):
                 try:
-                    if f.result():
-                        tracked_scans += 1
+                    ok, reason, attempted = f.result()
+                except Exception:
+                    ok, reason, attempted = False, "unknown", 0
+                try:
+                    metrics["attempted_insights"] += int(attempted or 0)
                 except Exception:
                     pass
+                if ok:
+                    metrics["snapshots_ok"] += 1
+                    if reason == "ok_attrs_failed":
+                        metrics["fail_attrs"] += 1
+                else:
+                    if reason == "auth":
+                        metrics["fail_auth"] += 1
+                    elif reason == "insights":
+                        metrics["fail_insights"] += 1
+                    elif reason == "write":
+                        metrics["fail_write"] += 1
 
-    # Heartbeat message should still update even if no scans were tracked.
-    try:
-        msg = f"envs={len(envs)} env_failures={env_failures} scans_seen={total_running} attempted_insights={attempted_insights} snapshots={tracked_scans}"
-        _hb_update(engine, status="ok", message=msg)
-    except Exception:
-        pass
-    return total_running, tracked_scans
+    return metrics
 
 
 def run_for_scan_id(engine, scan_id: str, verbose: bool = True) -> bool:
@@ -1071,19 +1173,32 @@ def main() -> int:
         started = _now_utc_naive()
         _hb_update(engine, status="running", message="cycle_start", started=started)
         try:
-            total_running, tracked = track_once(engine)
+            m = track_once(engine) or {}
             status = "ok"
-            msg = f"cycle_done running={total_running} snapshots={tracked}"
+            msg = (
+                "cycle_done "
+                f"envs={m.get('envs', 0)} "
+                f"env_failures={m.get('env_failures', 0)} "
+                f"running_scans_seen={m.get('running_scans_seen', 0)} "
+                f"db_running_seen={m.get('db_running_seen', 0)} "
+                f"attempted_insights={m.get('attempted_insights', 0)} "
+                f"snapshots_ok={m.get('snapshots_ok', 0)} "
+                f"fail_auth={m.get('fail_auth', 0)} "
+                f"fail_parent_scans={m.get('fail_parent_scans', 0)} "
+                f"fail_insights={m.get('fail_insights', 0)} "
+                f"fail_write={m.get('fail_write', 0)} "
+                f"fail_attrs={m.get('fail_attrs', 0)}"
+            )
         except Exception as ex:
             status = "error"
-            total_running, tracked = 0, 0
+            m = {}
             msg = f"cycle_failed {ex}"
         finished = _now_utc_naive()
         _hb_update(engine, status=status, message=msg, finished=finished)
         elapsed = (finished - started).total_seconds()
         if not args.quiet:
             print(
-                f"[{_now_utc_naive().isoformat()}Z] cycle_done running={total_running} snapshots={tracked} elapsed_s={int(elapsed)}",
+                f"[{_now_utc_naive().isoformat()}Z] {msg} elapsed_s={int(elapsed)}",
                 flush=True,
             )
         if args.once:

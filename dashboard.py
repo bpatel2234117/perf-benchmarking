@@ -6580,33 +6580,41 @@ def page_scan_progress():
     except Exception:
         pass
 
-    # Process progress %
+    # Progress charts (DB-only)
     try:
         # Treat captured_at as UTC (MySQL TIMESTAMP may come back localized)
         df["captured_at"] = pd.to_datetime(df["captured_at"], errors="coerce", utc=True)
     except Exception:
         pass
-    # Parts progress %
-    df["Parts Progress %"] = (df["completed_parts"] / df["total_parts_scanned"].replace(0, 1)) * 100
-    # "Objects progress" (no true denominator in API), so we chart objects_scanned as a progress curve (count).
 
     c1, c2 = st.columns(2)
     with c1:
-        st.subheader("Parts + Objects (Progress & Failures)")
+        st.subheader("Parts + Objects (Totals)")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
 
-        # Plotly: dual axis (percent vs counts)
+        # Plotly: dual axis (parts counts vs objects counts)
         from plotly.subplots import make_subplots
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(
             go.Scatter(
                 x=plot_df["captured_at_utc"],
-                y=plot_df["Parts Progress %"],
+                y=plot_df.get("completed_parts", 0),
                 mode="lines+markers",
-                name="Parts Progress (%)",
+                name="Parts Completed",
                 line=dict(color="#10B981", width=3),
                 marker=dict(color="#10B981", size=7),
+            ),
+            secondary_y=False,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["captured_at_utc"],
+                y=plot_df.get("total_parts_scanned", 0),
+                mode="lines+markers",
+                name="Parts Total",
+                line=dict(color="#3B82F6", width=2),
+                marker=dict(color="#3B82F6", size=7),
             ),
             secondary_y=False,
         )
@@ -6619,7 +6627,7 @@ def page_scan_progress():
                 line=dict(color="#EF4444", width=2),
                 marker=dict(color="#EF4444", size=7),
             ),
-            secondary_y=True,
+            secondary_y=False,
         )
         fig.add_trace(
             go.Scatter(
@@ -6644,8 +6652,8 @@ def page_scan_progress():
             secondary_y=True,
         )
         fig.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)  # 10 minutes
-        fig.update_yaxes(title_text="Progress (%)", rangemode="tozero", secondary_y=False)
-        fig.update_yaxes(title_text="Count", rangemode="tozero", secondary_y=True)
+        fig.update_yaxes(title_text="Parts (count)", rangemode="tozero", secondary_y=False)
+        fig.update_yaxes(title_text="Objects (count)", rangemode="tozero", secondary_y=True)
         fig.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
         st.plotly_chart(fig, use_container_width=True)
 
