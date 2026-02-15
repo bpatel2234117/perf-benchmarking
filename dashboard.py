@@ -2258,6 +2258,23 @@ def ensure_scan_progress_table():
                 conn.execute(text("ALTER TABLE scan_progress ADD COLUMN objects_with_pi BIGINT DEFAULT 0"))
             except Exception:
                 pass
+            # Best-effort: de-dupe and enforce unique slot per (scan_id, captured_at_utc)
+            try:
+                conn.execute(text("""
+                    DELETE sp1 FROM scan_progress sp1
+                    JOIN scan_progress sp2
+                      ON sp1.scan_id = sp2.scan_id
+                     AND sp1.captured_at_utc IS NOT NULL
+                     AND sp2.captured_at_utc IS NOT NULL
+                     AND sp1.captured_at_utc = sp2.captured_at_utc
+                     AND sp1.id < sp2.id
+                """))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE scan_progress ADD UNIQUE KEY uniq_scan_slot (scan_id, captured_at_utc)"))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass
@@ -2587,7 +2604,7 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload):
     Saves a snapshot of current scan progress to the scan_progress table.
     """
     if not engine or not scan_id:
-        return
+        return {"ok": False, "error": "missing_engine_or_scan_id"}
     
     # Extract metrics from payload. BigID response is usually { "data": { "scanInsights": { ... } } }
     si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
@@ -2650,6 +2667,22 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload):
                 ) VALUES (
                     :ts, :cau, :sid, :sname, :eid, :sst, :cs, :fs, :tsc, :cp, :fp, :tp, :tc, :nc, :fr, :os, :of, :owp
                 )
+                ON DUPLICATE KEY UPDATE
+                    scan_name = VALUES(scan_name),
+                    environment_id = VALUES(environment_id),
+                    scan_state = VALUES(scan_state),
+                    completed_sub_scans = VALUES(completed_sub_scans),
+                    failed_sub_scans = VALUES(failed_sub_scans),
+                    total_sub_scans = VALUES(total_sub_scans),
+                    completed_parts = VALUES(completed_parts),
+                    failed_parts = VALUES(failed_parts),
+                    total_parts_scanned = VALUES(total_parts_scanned),
+                    total_classifications = VALUES(total_classifications),
+                    newly_added_classifications = VALUES(newly_added_classifications),
+                    false_removed_classifications = VALUES(false_removed_classifications),
+                    objects_scanned = VALUES(objects_scanned),
+                    objects_failed = VALUES(objects_failed),
+                    objects_with_pi = VALUES(objects_with_pi)
             """), {
                 # Keep legacy TIMESTAMP populated too, but rely on captured_at_utc for plots.
                 "ts": captured_at_utc,
@@ -2662,8 +2695,9 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload):
                 "os": objects_scanned, "of": objects_failed, "owp": objects_with_pi
             })
             conn.commit()
-    except Exception:
-        pass
+        return {"ok": True, "captured_at_utc": captured_at_utc, "scan_state": scan_state}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex)}
 
 
 def _resolve_env_row_for_scan_progress(scan_id):
@@ -6468,7 +6502,12 @@ def page_scan_progress():
                         scan_name = db_name
 
                     # Snapshot row (scan_progress)
-                    upsert_scan_progress_record(sync_env_row.get("id"), str(scan_id), scan_name or db_name or "", insight_payload)
+                    write_res = upsert_scan_progress_record(sync_env_row.get("id"), str(scan_id), scan_name or db_name or "", insight_payload)
+                    if not (isinstance(write_res, dict) and write_res.get("ok")):
+                        st.error(f"Snapshot write failed: {str(write_res.get('error') if isinstance(write_res, dict) else write_res)}")
+                    else:
+                        cau = write_res.get("captured_at_utc")
+                        st.caption(f"Wrote snapshot slot: `{str(cau)}`")
 
                     # Full normalized scan_insights + attributes delta map (for Add New Benchmark prefill)
                     sync_single_scan_insight(str(scan_id), sync_env_row)
@@ -6587,15 +6626,14 @@ def page_scan_progress():
     except Exception:
         pass
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("Parts + Objects (Totals)")
+        st.subheader("Parts (Totals)")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
 
-        # Plotly: dual axis (parts counts vs objects counts)
-        from plotly.subplots import make_subplots
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        # Plotly: parts only
+        fig = go.Figure()
         fig.add_trace(
             go.Scatter(
                 x=plot_df["captured_at_utc"],
@@ -6604,8 +6642,7 @@ def page_scan_progress():
                 name="Parts Completed (count)",
                 line=dict(color="#10B981", width=3),  # green
                 marker=dict(color="#10B981", size=7),
-            ),
-            secondary_y=False,
+            )
         )
         fig.add_trace(
             go.Scatter(
@@ -6615,8 +6652,7 @@ def page_scan_progress():
                 name="Parts Total (count)",
                 line=dict(color="#3B82F6", width=2),  # blue
                 marker=dict(color="#3B82F6", size=7),
-            ),
-            secondary_y=False,
+            )
         )
         fig.add_trace(
             go.Scatter(
@@ -6626,34 +6662,10 @@ def page_scan_progress():
                 name="Parts Failed (count)",
                 line=dict(color="#EF4444", width=2),  # red
                 marker=dict(color="#EF4444", size=7),
-            ),
-            secondary_y=False,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df["captured_at_utc"],
-                y=plot_df.get("objects_scanned", 0),
-                mode="lines+markers",
-                name="Objects Scanned (count)",
-                line=dict(color="#8B5CF6", width=3, dash="dot"),  # purple dotted
-                marker=dict(color="#8B5CF6", size=7),
-            ),
-            secondary_y=True,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df["captured_at_utc"],
-                y=plot_df.get("objects_failed", 0),
-                mode="lines+markers",
-                name="Objects Failed (count)",
-                line=dict(color="#F97316", width=2, dash="dot"),  # orange dotted
-                marker=dict(color="#F97316", size=7),
-            ),
-            secondary_y=True,
+            )
         )
         fig.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)  # 10 minutes
-        fig.update_yaxes(title_text="Parts (count)", rangemode="tozero", secondary_y=False)
-        fig.update_yaxes(title_text="Objects (count)", rangemode="tozero", secondary_y=True)
+        fig.update_yaxes(title_text="Count", rangemode="tozero")
         fig.update_layout(
             margin=dict(l=10, r=10, t=30, b=10),
             legend=dict(orientation="h"),
@@ -6662,34 +6674,54 @@ def page_scan_progress():
         st.plotly_chart(fig, use_container_width=True)
 
     with c2:
-        st.subheader("ObjectsWithPi + Classifications")
+        st.subheader("Objects (Totals)")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
+            x=plot_df["captured_at_utc"], y=plot_df.get("objects_scanned", 0),
+            mode="lines+markers", name="Objects Scanned (count)",
+            line=dict(color="#8B5CF6", width=3), marker=dict(color="#8B5CF6", size=7),
+        ))
+        fig2.add_trace(go.Scatter(
+            x=plot_df["captured_at_utc"], y=plot_df.get("objects_failed", 0),
+            mode="lines+markers", name="Objects Failed (count)",
+            line=dict(color="#F97316", width=2), marker=dict(color="#F97316", size=7),
+        ))
+        fig2.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
+        fig2.update_yaxes(title_text="Count", rangemode="tozero")
+        fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    with c3:
+        st.subheader("ObjectsWithPi + Classifications")
+        plot_df = df.copy()
+        plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
+        fig3 = go.Figure()
+        fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_with_pi", 0),
             mode="lines+markers", name="objectsWithPi",
             line=dict(color="#10B981", width=3), marker=dict(color="#10B981", size=7),
         ))
-        fig2.add_trace(go.Scatter(
+        fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("total_classifications", 0),
             mode="lines+markers", name="classifications.total",
             line=dict(color="#3B82F6", width=3), marker=dict(color="#3B82F6", size=7),
         ))
-        fig2.add_trace(go.Scatter(
+        fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("newly_added_classifications", 0),
             mode="lines+markers", name="classifications.newlyAdded",
             line=dict(color="#6366F1", width=2), marker=dict(color="#6366F1", size=7),
         ))
-        fig2.add_trace(go.Scatter(
+        fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("false_removed_classifications", 0),
             mode="lines+markers", name="classifications.falseRemoved",
             line=dict(color="#EF4444", width=2), marker=dict(color="#EF4444", size=7),
         ))
-        fig2.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
-        fig2.update_yaxes(title_text="Count", rangemode="tozero")
-        fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
-        st.plotly_chart(fig2, use_container_width=True)
+        fig3.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
+        fig3.update_yaxes(title_text="Count", rangemode="tozero")
+        fig3.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
+        st.plotly_chart(fig3, use_container_width=True)
 
     st.subheader("Raw Progress Data")
     # Show newest first (includes scan_state, so terminal updates show here)
