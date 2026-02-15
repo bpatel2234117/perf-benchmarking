@@ -6827,12 +6827,6 @@ def main():
                 "Large Files OLS Trend": "Large Files OLS Trend",
                 "Small Files OLS Trend Analysis": "Small Files OLS Trend",
                 "Large Files OLS Trend Analysis": "Large Files OLS Trend",
-                "Auto Small Files Trend Analysis": "Auto Small Files Trend Analysis",
-                "Auto Large Files Trend Analysis": "Auto Large Files Trend Analysis",
-                "Auto Small Files OLS Trend": "Auto Small Files OLS Trend",
-                "Auto Large Files OLS Trend": "Auto Large Files OLS Trend",
-                "Auto Small Files OLS Trend Analysis": "Auto Small Files OLS Trend",
-                "Auto Large Files OLS Trend Analysis": "Auto Large Files OLS Trend",
                 "OLS vs Full Scan (Small)": "OLS vs Full Scan (Small)",
                 "OLS vs Full Scan (Large)": "OLS vs Full Scan (Large)",
                 "Discover File FF On vs Off": "Discover File FF On vs Off",
@@ -7053,11 +7047,6 @@ def main():
                 <a href="?page=Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📦</span> <span>Large Files Trend</span></a>
                 <a href="?page=Small+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Small Files OLS</span></a>
                 <a href="?page=Large+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Large Files OLS</span></a>
-                <div class="flyout-header" style="margin-top: 8px;">Auto Trend (Scan Table)</div>
-                <a href="?page=Auto+Small+Files+Trend+Analysis" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Small Files Trend</span></a>
-                <a href="?page=Auto+Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Large Files Trend</span></a>
-                <a href="?page=Auto+Small+Files+OLS+Trend" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Small Files OLS</span></a>
-                <a href="?page=Auto+Large+Files+OLS+Trend" target="_self" class="flyout-item"><span>🤖</span> <span>Auto Large Files OLS</span></a>
             </div>
         </div>
 
