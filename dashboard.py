@@ -2599,7 +2599,7 @@ def load_auto_scan_benchmark_row(scan_id):
     except Exception:
         return {}
 
-def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload):
+def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, align_10min: bool = True):
     """
     Saves a snapshot of current scan progress to the scan_progress table.
     """
@@ -2645,13 +2645,18 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload):
     objects_with_pi = _to_int(data_sources.get("objectsWithPi") or 0)
 
     try:
-        # Use explicit UTC time; align to 10-minute marks (11:10, 11:20, ...)
+        # Use explicit UTC time.
+        # - Auto tracker snapshots: align to 10-minute marks (11:10, 11:20, ...)
+        # - Manual snapshots: record current time (not slot-aligned)
         now_utc = datetime.utcnow()
-        captured_at_utc = now_utc.replace(
-            minute=(now_utc.minute // 10) * 10,
-            second=0,
-            microsecond=0,
-        )
+        if bool(align_10min):
+            captured_at_utc = now_utc.replace(
+                minute=(now_utc.minute // 10) * 10,
+                second=0,
+                microsecond=0,
+            )
+        else:
+            captured_at_utc = now_utc.replace(microsecond=0)
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO scan_progress (
@@ -6502,7 +6507,13 @@ def page_scan_progress():
                         scan_name = db_name
 
                     # Snapshot row (scan_progress)
-                    write_res = upsert_scan_progress_record(sync_env_row.get("id"), str(scan_id), scan_name or db_name or "", insight_payload)
+                    write_res = upsert_scan_progress_record(
+                        sync_env_row.get("id"),
+                        str(scan_id),
+                        scan_name or db_name or "",
+                        insight_payload,
+                        align_10min=False,  # manual sync should record current time (not 10-min slot)
+                    )
                     if not (isinstance(write_res, dict) and write_res.get("ok")):
                         st.error(f"Snapshot write failed: {str(write_res.get('error') if isinstance(write_res, dict) else write_res)}")
                     else:
