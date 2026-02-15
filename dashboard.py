@@ -5075,6 +5075,13 @@ def page_scan_status():
     manual_resync = c4.button("Manual Re-sync (API)", use_container_width=True)
     load_insights = True
 
+    if refresh:
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+
     running_states = ["Started", "Awaiting", "In Progress", "InProgress", "Running"]
     completed_states = ["Failed", "CompletedWithFailures", "Completed"]
 
@@ -5227,6 +5234,7 @@ def page_scan_status():
         sid = str(scan.get("_id") or scan.get("id") or "").strip()
         if sid:
             scan_ids_all.append(sid)
+    latest_progress_state_map = load_latest_scan_progress_state_map(scan_ids_all)
     db_insight_map = load_scan_insight_map_for_scan_ids(scan_ids_all) if load_insights else {}
     saved_ids = get_saved_benchmark_scan_ids()
 
@@ -5242,6 +5250,19 @@ def page_scan_status():
             scan_env_row = env_by_id.get(int(scan_env_id)) if scan_env_id is not None else None
         except Exception:
             scan_env_row = None
+
+        # If scan_parents still says "running" but scan_progress latest state is terminal, trust scan_progress.
+        try:
+            p_state = str((latest_progress_state_map or {}).get(scan_id) or "").strip()
+            if p_state and (p_state in completed_states) and (state in running_states):
+                state = p_state
+                # Backfill scan_parents for consistency (best-effort).
+                try:
+                    upsert_scan_parent_record(scan_env_id or selected_env.get("id"), scan, state)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         if status_view == "In Progress" and state not in running_states:
             continue
@@ -6428,6 +6449,46 @@ def load_scan_progress_history(scan_id):
             return df
     except Exception:
         return pd.DataFrame()
+
+
+def load_latest_scan_progress_state_map(scan_ids):
+    """
+    Returns {scan_id: latest scan_state from scan_progress}.
+    This helps keep Scan Status correct when scan_parents lags.
+    """
+    if not engine:
+        return {}
+    cleaned = []
+    seen = set()
+    for sid in (scan_ids or []):
+        s = str(sid or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        cleaned.append(s)
+    if not cleaned:
+        return {}
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT scan_id, COALESCE(captured_at_utc, timestamp) AS captured_at, scan_state
+                    FROM scan_progress
+                    WHERE scan_id IN :ids
+                    ORDER BY COALESCE(captured_at_utc, timestamp) DESC, id DESC
+                """).bindparams(bindparam("ids", expanding=True)),
+                {"ids": cleaned},
+            ).fetchall()
+        out = {}
+        for r in rows:
+            sid = str(r[0] or "").strip()
+            if not sid or sid in out:
+                continue
+            out[sid] = str(r[2] or "").strip()
+        return out
+    except Exception:
+        return {}
 
 def page_scan_progress():
     st.title("📈 Scan Progress Details")
