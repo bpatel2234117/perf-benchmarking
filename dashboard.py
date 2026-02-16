@@ -7186,11 +7186,9 @@ def page_scan_progress():
                     extra.append(f"parts progress is only {pct_parts:.1f}% (parts not complete)")
                 if stall_minutes is not None and stall_minutes >= 30:
                     extra.append(f"no object-count increase for ~{stall_minutes:.0f} minutes")
-                if expected_total_files:
-                    extra.append("expected total_files may be wrong/stale OR objects_scanned is not the true completion signal")
                 msg = "Scan shows ~100% of expected files but is still InProgress."
                 if extra:
-                    msg += " Likely: " + "; ".join(extra) + "."
+                    msg += " Observations: " + "; ".join(extra) + "."
                 st.error(msg)
         except Exception:
             pass
