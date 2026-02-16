@@ -7108,6 +7108,8 @@ def page_scan_progress():
     flags = []
     stall_minutes = None
     last_change_at = None
+    completion_lag_minutes = None
+    completion_lag_summary = ""
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
@@ -7140,6 +7142,92 @@ def page_scan_progress():
     except Exception:
         pass
 
+    # Completion lag analysis:
+    # If we reached 100% scanned objects / parts but the scan stayed InProgress for a long time,
+    # highlight the lag between "work done" and "state flipped".
+    try:
+        def _compact_state_local(s):
+            return str(s or "").strip().lower().replace(" ", "")
+
+        terminal_states_local = {
+            "completed", "completedwithfailures", "failed", "stopped", "aborted", "cancelled", "canceled"
+        }
+
+        if not df_ai.empty:
+            df_lag = df_ai.copy()
+            df_lag["t"] = pd.to_datetime(df_lag["captured_at_actual"], errors="coerce", utc=True)
+            df_lag["state_c"] = df_lag["scan_state"].apply(_compact_state_local) if "scan_state" in df_lag.columns else ""
+
+            # First time we reached expected totals (objects)
+            t_reach_files = None
+            if expected_total_files and expected_total_files > 0 and "objects_scanned" in df_lag.columns:
+                df_lag["objects_scanned_num"] = pd.to_numeric(df_lag["objects_scanned"], errors="coerce")
+                reach_rows = df_lag[(df_lag["objects_scanned_num"] >= float(expected_total_files)) & df_lag["t"].notna()]
+                if not reach_rows.empty:
+                    t_reach_files = reach_rows.iloc[0]["t"]
+
+            # First time parts appear complete (parts)
+            t_reach_parts = None
+            if "completed_parts" in df_lag.columns and "total_parts_scanned" in df_lag.columns:
+                df_lag["completed_parts_num"] = pd.to_numeric(df_lag["completed_parts"], errors="coerce")
+                df_lag["total_parts_num"] = pd.to_numeric(df_lag["total_parts_scanned"], errors="coerce")
+                reach_p = df_lag[(df_lag["total_parts_num"] > 0) & (df_lag["completed_parts_num"] >= df_lag["total_parts_num"]) & df_lag["t"].notna()]
+                if not reach_p.empty:
+                    t_reach_parts = reach_p.iloc[0]["t"]
+
+            # First terminal state time
+            t_terminal = None
+            term_rows = df_lag[(df_lag["state_c"].isin(terminal_states_local)) & df_lag["t"].notna()]
+            if not term_rows.empty:
+                t_terminal = term_rows.iloc[0]["t"]
+
+            # Define "reached 100%" time as max of the available reach times (when both are satisfied).
+            reach_candidates = [x for x in [t_reach_files, t_reach_parts] if x is not None and pd.notnull(x)]
+            t_reach = max(reach_candidates) if reach_candidates else None
+
+            if t_reach is not None and t_terminal is not None and pd.notnull(t_terminal) and t_terminal > t_reach:
+                completion_lag_minutes = (t_terminal - t_reach).total_seconds() / 60.0
+
+                # What changed during lag?
+                lag_slice = df_lag[(df_lag["t"] >= t_reach) & (df_lag["t"] <= t_terminal)].copy()
+                obs = []
+                try:
+                    if "objects_scanned_num" in lag_slice.columns and lag_slice["objects_scanned_num"].notna().any():
+                        d = float(lag_slice["objects_scanned_num"].max() - lag_slice["objects_scanned_num"].min())
+                        if d == 0:
+                            obs.append("objects scanned stayed flat")
+                        else:
+                            obs.append(f"objects scanned still changed by {int(d):,}")
+                except Exception:
+                    pass
+                try:
+                    if "state_c" in lag_slice.columns and lag_slice["state_c"].nunique(dropna=True) <= 1:
+                        obs.append("state stayed InProgress")
+                except Exception:
+                    pass
+
+                # Render summary (UTC)
+                try:
+                    reach_s = pd.to_datetime(t_reach).strftime("%Y-%m-%d %H:%M UTC")
+                    term_s = pd.to_datetime(t_terminal).strftime("%Y-%m-%d %H:%M UTC")
+                except Exception:
+                    reach_s = str(t_reach)
+                    term_s = str(t_terminal)
+
+                if completion_lag_minutes >= 60:
+                    lag_s = f"{completion_lag_minutes/60.0:.1f} hours"
+                else:
+                    lag_s = f"{completion_lag_minutes:.0f} minutes"
+
+                completion_lag_summary = (
+                    f"Reached 100% scanning at `{reach_s}` but did not become terminal until `{term_s}` "
+                    f"(lag: **{lag_s}**)"
+                    + (f"; during lag: {', '.join(obs)}." if obs else ".")
+                )
+    except Exception:
+        completion_lag_minutes = None
+        completion_lag_summary = ""
+
     # Narrative (LLM-style, but local/deterministic)
     try:
         bits = []
@@ -7164,6 +7252,8 @@ def page_scan_progress():
                 bits.append(f"ETA (rough): **{eta_minutes:.0f} minutes**.")
         if cur_state:
             bits.append(f"Latest state: `{cur_state}`.")
+        if completion_lag_summary:
+            bits.append(f"Completion lag: {completion_lag_summary}.")
         if flags:
             bits.append("Flags: " + "; ".join([f"`{x}`" for x in flags]))
         narrative = " ".join(bits)
@@ -7183,6 +7273,15 @@ def page_scan_progress():
             m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
         else:
             m4.metric("Throughput (obj/min)", "N/A")
+
+        # Highlight completion lag (the issue you mentioned: scan hit 100% but status took hours to flip)
+        try:
+            if completion_lag_summary and completion_lag_minutes is not None and completion_lag_minutes >= 30:
+                st.error(f"Status update lag detected: {completion_lag_summary}.")
+            elif completion_lag_summary:
+                st.warning(f"Status update lag: {completion_lag_summary}.")
+        except Exception:
+            pass
 
         # Red warning when files show 100% but scan still running
         try:
