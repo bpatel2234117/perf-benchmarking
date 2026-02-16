@@ -6957,9 +6957,12 @@ def page_scan_progress():
             show_date = getattr(x_min, "date", None) and getattr(x_max, "date", None) and (x_min.date() != x_max.date())
         except Exception:
             show_date = False
-        fmt = "%m-%d %H:%M" if show_date else "%H:%M"
         try:
-            tick_text = [pd.to_datetime(x).strftime(fmt) for x in xs]
+            if show_date:
+                # Two-line labels fit better in 3-column layout
+                tick_text = [pd.to_datetime(x).strftime("%m-%d<br>%H:%M") for x in xs]
+            else:
+                tick_text = [pd.to_datetime(x).strftime("%H:%M") for x in xs]
         except Exception:
             tick_text = [str(x) for x in xs]
         fig_obj.update_xaxes(
@@ -6967,7 +6970,9 @@ def page_scan_progress():
             tickmode="array",
             tickvals=xs,
             ticktext=tick_text,
-            tickangle=-35,
+            tickangle=0,
+            tickfont=dict(size=10),
+            automargin=True,
         )
 
     with c1:
@@ -7011,8 +7016,8 @@ def page_scan_progress():
         _apply_snapshot_ticks(fig, plot_df["captured_at_utc"])
         fig.update_yaxes(title_text="Count", rangemode="tozero")
         fig.update_layout(
-            margin=dict(l=10, r=10, t=30, b=10),
-            legend=dict(orientation="h"),
+            margin=dict(l=10, r=10, t=30, b=70),
+            legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
             hovermode="x unified",
         )
         st.plotly_chart(fig, width="stretch")
@@ -7035,7 +7040,11 @@ def page_scan_progress():
         ))
         _apply_snapshot_ticks(fig2, plot_df["captured_at_utc"])
         fig2.update_yaxes(title_text="Count", rangemode="tozero")
-        fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
+        fig2.update_layout(
+            margin=dict(l=10, r=10, t=30, b=70),
+            legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
+            hovermode="x unified",
+        )
         st.plotly_chart(fig2, width="stretch")
 
     with c3:
@@ -7066,7 +7075,11 @@ def page_scan_progress():
         ))
         _apply_snapshot_ticks(fig3, plot_df["captured_at_utc"])
         fig3.update_yaxes(title_text="Count", rangemode="tozero")
-        fig3.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
+        fig3.update_layout(
+            margin=dict(l=10, r=10, t=30, b=70),
+            legend=dict(orientation="h", yanchor="top", y=-0.25, xanchor="left", x=0),
+            hovermode="x unified",
+        )
         st.plotly_chart(fig3, width="stretch")
 
     st.subheader("Raw Progress Data")
