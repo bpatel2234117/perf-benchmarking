@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
 import html
 import re
+import textwrap
 from pathlib import Path
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
@@ -50,6 +51,12 @@ INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_A
 INTERNAL_SCANNER_GROUPS_API_PATH = os.getenv("BIGID_SCANNER_GROUPS_API_PATH", "/api/v1/scanner-groups").strip() or "/api/v1/scanner-groups"
 INTERNAL_DS_CONNECTIONS_API_PATH = os.getenv("BIGID_DS_CONNECTIONS_API_PATH", "/api/v1/ds_connections").strip() or "/api/v1/ds_connections"
 INTERNAL_DS_CONNECTION_TEST_API_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
+
+# Local LLM (optional): Ollama or OpenAI-compatible server
+LOCAL_LLM_PROVIDER = os.getenv("LOCAL_LLM_PROVIDER", "").strip().lower()  # "ollama" | "openai"
+LOCAL_LLM_BASE_URL = os.getenv("LOCAL_LLM_BASE_URL", "").strip()          # e.g. http://localhost:11434 or http://localhost:1234
+LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "").strip()                # e.g. llama3.1:8b
+LOCAL_LLM_API_KEY = os.getenv("LOCAL_LLM_API_KEY", "").strip()            # only for OpenAI-compatible servers if needed
 
 def get_logo_base64():
     for path in LOGO_CANDIDATES:
@@ -1384,6 +1391,71 @@ def _redact_secrets(obj):
     if isinstance(obj, list):
         return [_redact_secrets(x) for x in obj]
     return obj
+
+
+def _local_llm_is_configured() -> bool:
+    if LOCAL_LLM_PROVIDER in {"ollama", "openai"} and LOCAL_LLM_BASE_URL and LOCAL_LLM_MODEL:
+        return True
+    return False
+
+
+def generate_local_llm_analysis(system_prompt: str, user_prompt: str, timeout_s: int = 45) -> str:
+    """
+    Best-effort local LLM call.
+    Supports:
+    - Ollama: POST {base}/api/chat
+    - OpenAI-compatible: POST {base}/v1/chat/completions
+    Returns markdown-ish text or "" on failure.
+    Never raises.
+    """
+    try:
+        provider = (LOCAL_LLM_PROVIDER or "").strip().lower()
+        base = (LOCAL_LLM_BASE_URL or "").strip().rstrip("/")
+        model = (LOCAL_LLM_MODEL or "").strip()
+        if not provider or not base or not model:
+            return ""
+
+        if provider == "ollama":
+            url = f"{base}/api/chat"
+            payload = {
+                "model": model,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": str(system_prompt or "")},
+                    {"role": "user", "content": str(user_prompt or "")},
+                ],
+            }
+            resp = requests.post(url, json=payload, timeout=int(timeout_s))
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            msg = (data.get("message") or {}) if isinstance(data, dict) else {}
+            return str(msg.get("content") or "").strip()
+
+        if provider == "openai":
+            url = f"{base}/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if LOCAL_LLM_API_KEY:
+                headers["Authorization"] = f"Bearer {LOCAL_LLM_API_KEY}"
+            payload = {
+                "model": model,
+                "temperature": 0.2,
+                "messages": [
+                    {"role": "system", "content": str(system_prompt or "")},
+                    {"role": "user", "content": str(user_prompt or "")},
+                ],
+            }
+            resp = requests.post(url, headers=headers, json=payload, timeout=int(timeout_s))
+            resp.raise_for_status()
+            data = resp.json() if resp.content else {}
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if isinstance(choices, list) and choices:
+                msg = (choices[0] or {}).get("message") or {}
+                return str(msg.get("content") or "").strip()
+            return ""
+
+        return ""
+    except Exception:
+        return ""
 
 
 def extract_scanner_groups_payload(payload):
@@ -7273,6 +7345,54 @@ def page_scan_progress():
             m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
         else:
             m4.metric("Throughput (obj/min)", "N/A")
+
+        # Optional Local LLM narrative (Windows-ready later)
+        llm_enabled = st.toggle("Generate LLM narrative (local)", value=False, help="Uses LOCAL_LLM_* env vars when configured.")
+        if llm_enabled:
+            if not _local_llm_is_configured():
+                st.warning("Local LLM not configured. Set LOCAL_LLM_PROVIDER, LOCAL_LLM_BASE_URL, and LOCAL_LLM_MODEL.")
+            else:
+                # Build a compact, factual prompt from computed metrics (no secrets).
+                try:
+                    sys_p = (
+                        "You are an analyst for BigID scan progress. "
+                        "Explain what is happening in the scan based on the metrics. "
+                        "Be concise, factual, and actionable. Do not invent numbers."
+                    )
+                    u_p = textwrap.dedent(f"""
+                    Scan name: {scan_name_for_ai}
+                    Scan id: {scan_id}
+                    Latest state: {cur_state}
+
+                    Expected totals (file_set_types):
+                    - lookup_key: {lookup_key or 'N/A'}
+                    - expected_total_files: {expected_total_files if expected_total_files is not None else 'N/A'}
+
+                    Latest snapshot:
+                    - objects_scanned: {cur_objects}
+                    - parts: {cur_parts_done}/{cur_parts_total}
+                    - failed_parts: {cur_failed_parts}
+                    - pct_files: {pct_files if pct_files is not None else 'N/A'}
+                    - pct_parts: {pct_parts if pct_parts is not None else 'N/A'}
+                    - files_per_min: {files_per_min if files_per_min is not None else 'N/A'}
+                    - eta_minutes: {eta_minutes if eta_minutes is not None else 'N/A'}
+                    - stall_minutes: {stall_minutes if stall_minutes is not None else 'N/A'}
+
+                    Completion lag (if detected): {completion_lag_summary or 'N/A'}
+                    Flags: {', '.join(flags) if flags else 'None'}
+
+                    Write:
+                    - 3 bullet executive summary
+                    - Then a short paragraph explaining likely phase (scanning vs classification/finalization)
+                    - Then 3 next checks/actions
+                    """).strip()
+                    llm_text = generate_local_llm_analysis(sys_p, u_p)
+                    if llm_text:
+                        st.markdown(llm_text)
+                    else:
+                        st.warning("Local LLM call returned empty output (or failed).")
+                except Exception as ex:
+                    st.warning(f"LLM narrative failed: {ex}")
 
         # Highlight completion lag (the issue you mentioned: scan hit 100% but status took hours to flip)
         try:
