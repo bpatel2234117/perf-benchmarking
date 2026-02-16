@@ -3774,6 +3774,66 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name):
     }
 
 
+def resolve_expected_totals_for_scan(scan_name: str) -> dict:
+    """
+    Uses file_set_types table (folder/bucket ground truth) to estimate expected totals for a scan.
+    Returns:
+      {
+        "data_source_type": "S3"/"SMB"/...,
+        "file_set_type": "Small Files"/"Large Files"/...,
+        "lookup_key": "S3 Large Files" (if matched) or "Large Files"/...,
+        "expected_total_files": int|None,
+        "expected_total_folders": int|None,
+        "expected_total_size_gb": float|None,
+      }
+    """
+    inferred = infer_add_benchmark_defaults_from_scan_name(scan_name)
+    ds = str((inferred or {}).get("data_source_type") or "").strip()
+    fs = str((inferred or {}).get("file_set_type") or "").strip()
+
+    names, details = get_file_set_types(data_type=None)
+    details = details or {}
+
+    candidates = []
+    if ds and fs:
+        candidates.append(f"{ds} {fs}")
+    if fs:
+        candidates.append(fs)
+
+    chosen = ""
+    for k in candidates:
+        if k in details:
+            chosen = k
+            break
+
+    d = details.get(chosen) if chosen else None
+    exp_files = d.get("total_files") if isinstance(d, dict) else None
+    exp_folders = d.get("total_folders") if isinstance(d, dict) else None
+    exp_size = d.get("total_size_gb") if isinstance(d, dict) else None
+
+    try:
+        exp_files = int(exp_files) if exp_files is not None else None
+    except Exception:
+        exp_files = None
+    try:
+        exp_folders = int(exp_folders) if exp_folders is not None else None
+    except Exception:
+        exp_folders = None
+    try:
+        exp_size = float(exp_size) if exp_size is not None else None
+    except Exception:
+        exp_size = None
+
+    return {
+        "data_source_type": ds,
+        "file_set_type": fs,
+        "lookup_key": chosen,
+        "expected_total_files": exp_files,
+        "expected_total_folders": exp_folders,
+        "expected_total_size_gb": exp_size,
+    }
+
+
 def get_scan_name_from_db(scan_id):
     if not engine or not scan_id:
         return ""
@@ -6954,6 +7014,153 @@ def page_scan_progress():
         df["captured_at_actual"] = pd.to_datetime(df["captured_at_actual"], errors="coerce", utc=True)
     except Exception:
         pass
+
+    # ---------- AI Analysis (stats + narrative) ----------
+    try:
+        # Normalize numeric columns
+        for col in [
+            "completed_parts",
+            "failed_parts",
+            "total_parts_scanned",
+            "objects_scanned",
+            "objects_failed",
+            "objects_with_pi",
+            "total_classifications",
+            "newly_added_classifications",
+            "false_removed_classifications",
+        ]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+    except Exception:
+        pass
+
+    try:
+        scan_name_for_ai = display_name or db_name or ""
+        exp = resolve_expected_totals_for_scan(scan_name_for_ai)
+        expected_total_files = exp.get("expected_total_files")
+        lookup_key = exp.get("lookup_key") or ""
+    except Exception:
+        expected_total_files = None
+        lookup_key = ""
+        exp = {}
+
+    try:
+        df_ai = df.dropna(subset=["captured_at_actual"]).copy()
+        df_ai = df_ai.sort_values("captured_at_actual")
+        last = df_ai.iloc[-1] if not df_ai.empty else None
+    except Exception:
+        df_ai = df.copy()
+        last = df_ai.iloc[-1] if not df_ai.empty else None
+
+    def _safe_num(v, default=None):
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    # Core current values
+    cur_objects = int(_safe_num(last.get("objects_scanned"), 0)) if last is not None else 0
+    cur_parts_done = int(_safe_num(last.get("completed_parts"), 0)) if last is not None else 0
+    cur_parts_total = int(_safe_num(last.get("total_parts_scanned"), 0)) if last is not None else 0
+    cur_failed_parts = int(_safe_num(last.get("failed_parts"), 0)) if last is not None else 0
+    cur_state = str(last.get("scan_state") or "").strip() if last is not None else ""
+
+    pct_files = None
+    if expected_total_files and expected_total_files > 0:
+        pct_files = min(100.0, max(0.0, (cur_objects / expected_total_files) * 100.0))
+
+    pct_parts = None
+    if cur_parts_total and cur_parts_total > 0:
+        pct_parts = min(100.0, max(0.0, (cur_parts_done / cur_parts_total) * 100.0))
+
+    # Rates (use last 3 deltas when possible)
+    files_per_min = None
+    parts_per_min = None
+    eta_minutes = None
+    try:
+        if len(df_ai) >= 2:
+            tail = df_ai.tail(3)
+            t0 = pd.to_datetime(tail.iloc[0]["captured_at_actual"], utc=True)
+            t1 = pd.to_datetime(tail.iloc[-1]["captured_at_actual"], utc=True)
+            dt_min = max(1e-6, (t1 - t0).total_seconds() / 60.0)
+            d_files = _safe_num(tail.iloc[-1].get("objects_scanned"), 0) - _safe_num(tail.iloc[0].get("objects_scanned"), 0)
+            d_parts = _safe_num(tail.iloc[-1].get("completed_parts"), 0) - _safe_num(tail.iloc[0].get("completed_parts"), 0)
+            files_per_min = d_files / dt_min if d_files is not None else None
+            parts_per_min = d_parts / dt_min if d_parts is not None else None
+
+            if expected_total_files and expected_total_files > 0 and files_per_min and files_per_min > 0:
+                remaining = max(0.0, float(expected_total_files) - float(cur_objects))
+                eta_minutes = remaining / files_per_min
+    except Exception:
+        pass
+
+    # Health flags
+    flags = []
+    try:
+        if len(df_ai) >= 3:
+            a = df_ai.iloc[-3]
+            b = df_ai.iloc[-1]
+            if int(_safe_num(a.get("objects_scanned"), 0)) == int(_safe_num(b.get("objects_scanned"), 0)) and int(_safe_num(a.get("completed_parts"), 0)) == int(_safe_num(b.get("completed_parts"), 0)):
+                flags.append("No progress change across last snapshots (possible stall).")
+        if cur_failed_parts > 0:
+            flags.append(f"Failed parts present: {cur_failed_parts}.")
+        if expected_total_files and cur_objects > expected_total_files:
+            flags.append("Objects scanned exceeds expected total (check file_set_types total_files).")
+    except Exception:
+        pass
+
+    # Narrative (LLM-style, but local/deterministic)
+    try:
+        bits = []
+        ds = str(exp.get("data_source_type") or "").strip()
+        fs = str(exp.get("file_set_type") or "").strip()
+        if ds or fs:
+            bits.append(f"Scan looks like `{ds} {fs}` based on scan name.")
+        if lookup_key and expected_total_files:
+            bits.append(f"Ground-truth total files from `file_set_types` (`{lookup_key}`): **{expected_total_files:,}**.")
+        if pct_files is not None:
+            bits.append(f"Current objects scanned: **{cur_objects:,}** (**{pct_files:.1f}%** of expected).")
+        else:
+            bits.append(f"Current objects scanned: **{cur_objects:,}** (expected total not found in `file_set_types`).")
+        if pct_parts is not None:
+            bits.append(f"Parts completed: **{cur_parts_done:,} / {cur_parts_total:,}** (**{pct_parts:.1f}%**).")
+        if files_per_min is not None and files_per_min >= 0:
+            bits.append(f"Recent throughput: **{files_per_min:,.0f} objects/min**.")
+        if eta_minutes is not None and eta_minutes >= 0:
+            if eta_minutes >= 120:
+                bits.append(f"ETA (rough): **{eta_minutes/60.0:.1f} hours**.")
+            else:
+                bits.append(f"ETA (rough): **{eta_minutes:.0f} minutes**.")
+        if cur_state:
+            bits.append(f"Latest state: `{cur_state}`.")
+        if flags:
+            bits.append("Flags: " + "; ".join([f"`{x}`" for x in flags]))
+        narrative = " ".join(bits)
+    except Exception:
+        narrative = ""
+
+    with st.expander("🧠 AI Analysis (stats + narrative)", expanded=True):
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Objects scanned", f"{cur_objects:,}")
+        if expected_total_files:
+            m2.metric("Expected total files", f"{expected_total_files:,}")
+            m3.metric("% complete (files)", f"{(pct_files or 0):.1f}%")
+        else:
+            m2.metric("Expected total files", "N/A")
+            m3.metric("% complete (files)", "N/A")
+        if files_per_min is not None:
+            m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
+        else:
+            m4.metric("Throughput (obj/min)", "N/A")
+
+        if narrative:
+            st.markdown(narrative)
+        if lookup_key and not expected_total_files:
+            st.caption(f"Note: `file_set_types` has `{lookup_key}` but total_files is empty. Fill it to enable % complete/ETA.")
+        if not lookup_key:
+            st.caption("Note: Could not match scan to a `file_set_types` row. Add one like `S3 Large Files` with total_files.")
 
     c1, c2, c3 = st.columns(3)
     def _apply_snapshot_ticks(fig_obj, x_vals):
