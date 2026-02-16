@@ -6968,14 +6968,22 @@ def page_scan_progress():
         st.caption(f"Latest snapshots: {joined}")
 
     # Single consolidated warning (avoid duplicate warnings)
+    # Only warn for running scans. For terminal scans, no new snapshots are expected.
     try:
-        if isinstance(age_min, (int, float)) and age_min >= 25:
+        latest_state_for_scan = ""
+        try:
+            latest_state_for_scan = str(
+                df.sort_values("captured_at_actual", ascending=True).iloc[-1].get("scan_state") if not df.empty else ""
+            ).strip()
+        except Exception:
+            latest_state_for_scan = ""
+        if isinstance(age_min, (int, float)) and age_min >= 25 and (not _is_terminal_state(latest_state_for_scan)):
             extra = ""
             if isinstance(g_age, (int, float)):
                 extra = f" (DB-wide latest age: {g_age:.1f} min)"
             st.warning(
                 "Tracker looks stale for this scan (no new snapshots in 25+ minutes). "
-                "If you expect updates every 10 minutes, the tracker is likely not running or is failing."
+                "If you expect updates every 10 minutes while the scan is running, the tracker is likely not running or is failing."
                 + extra
             )
     except Exception:
@@ -7186,7 +7194,21 @@ def page_scan_progress():
                     extra.append(f"parts progress is only {pct_parts:.1f}% (parts not complete)")
                 if stall_minutes is not None and stall_minutes >= 30:
                     extra.append(f"no object-count increase for ~{stall_minutes:.0f} minutes")
-                msg = "Scan shows ~100% of expected files but is still InProgress."
+                # Add classification/finalization diagnosis (no speculation about expected totals being wrong).
+                try:
+                    if len(df_ai) >= 3:
+                        t = df_ai.tail(3)
+                        d_pi = _safe_num(t.iloc[-1].get("objects_with_pi"), 0) - _safe_num(t.iloc[0].get("objects_with_pi"), 0)
+                        d_new = _safe_num(t.iloc[-1].get("newly_added_classifications"), 0) - _safe_num(t.iloc[0].get("newly_added_classifications"), 0)
+                        d_totc = _safe_num(t.iloc[-1].get("total_classifications"), 0) - _safe_num(t.iloc[0].get("total_classifications"), 0)
+                        if (d_pi and d_pi != 0) or (d_new and d_new != 0) or (d_totc and d_totc != 0):
+                            extra.append("classification/findings counters are still changing (post-processing still running)")
+                        else:
+                            extra.append("classification/findings counters are flat (likely finalization/state update lag)")
+                except Exception:
+                    pass
+
+                msg = "Objects scanned reached ~100% of expected total, but the scan is still InProgress."
                 if extra:
                     msg += " Observations: " + "; ".join(extra) + "."
                 st.error(msg)
