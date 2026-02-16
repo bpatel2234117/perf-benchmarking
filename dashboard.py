@@ -6951,15 +6951,20 @@ def page_scan_progress():
             xs = []
         if not xs:
             return
-        # Ensure chronological order.
+
+        # Normalize to pandas timestamps for stable formatting/ordering
+        try:
+            xs = [pd.to_datetime(x) for x in xs]
+        except Exception:
+            pass
         try:
             xs = sorted(xs)
         except Exception:
             pass
+
         # Pick up to N evenly spaced tick labels (always include first+last).
         max_ticks = 6
         if len(xs) > max_ticks:
-            # indices like [0, ..., last]
             try:
                 import numpy as _np
                 idx = _np.linspace(0, len(xs) - 1, num=max_ticks)
@@ -6967,28 +6972,35 @@ def page_scan_progress():
                 xs = [xs[i] for i in idx]
             except Exception:
                 xs = [xs[0], xs[-1]]
+
         try:
             x_min = min(xs)
             x_max = max(xs)
             show_date = getattr(x_min, "date", None) and getattr(x_max, "date", None) and (x_min.date() != x_max.date())
         except Exception:
             show_date = False
+
+        # Use string tickvals so Plotly doesn't drop labels in tight layouts
+        # (datetime tickvals can still be auto-thinned in small subplots).
         try:
             if show_date:
-                # Two-line labels fit better in 3-column layout
                 tick_text = [pd.to_datetime(x).strftime("%m-%d<br>%H:%M") for x in xs]
             else:
                 tick_text = [pd.to_datetime(x).strftime("%H:%M") for x in xs]
+            tick_vals = [pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S") for x in xs]
         except Exception:
             tick_text = [str(x) for x in xs]
+            tick_vals = [str(x) for x in xs]
+
         fig_obj.update_xaxes(
             title_text="UTC time",
             tickmode="array",
-            tickvals=xs,
+            tickvals=tick_vals,
             ticktext=tick_text,
             tickangle=0,
             tickfont=dict(size=10),
             automargin=True,
+            ticklabeloverflow="allow",
         )
 
     with c1:
