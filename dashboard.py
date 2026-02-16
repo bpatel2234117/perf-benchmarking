@@ -396,7 +396,7 @@ def page_overview(df):
             df_sorted = filtered_df.sort_values('Build_Version')
             fig = px.line(df_sorted, x='Build_Version', y='throughput_cluster_gb_hr', color='Data_Source_Type',
                           markers=True, title="Throughput (GB/hr) by Version")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     with c2:
         st.subheader("Throughput vs Content")
@@ -410,7 +410,7 @@ def page_overview(df):
                               size='Total_Size_GB', color='Data_Source_Type',
                               hover_data=['Build_Version', 'Classifier_Name'],
                               title="Throughput vs Total Files (Size = Total GB)")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
 import hashlib
 
@@ -2715,12 +2715,16 @@ def load_auto_scan_benchmarks_preview(environment_id, limit=200):
                 "objects_scanned", "total_classification", "new_attributes", "removed_attributes", "updated_at"
             ]
         )
-        df = df.fillna("")
-        # Keep count fields as whole numbers in preview table (no trailing .0).
-        for col in ["objects_scanned", "total_classification", "new_attributes", "removed_attributes"]:
+        # Arrow-safe dtypes: don't mix ints with '' strings.
+        numeric_cols = ["objects_scanned", "total_classification", "new_attributes", "removed_attributes"]
+        for col in numeric_cols:
             if col in df.columns:
-                numeric = pd.to_numeric(df[col], errors="coerce")
-                df[col] = numeric.apply(lambda v: "" if pd.isna(v) else int(v))
+                df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+        # Fill non-numeric columns for nicer display
+        for col in df.columns:
+            if col in numeric_cols:
+                continue
+            df[col] = df[col].fillna("")
         return df
     except Exception:
         return pd.DataFrame()
@@ -4446,7 +4450,7 @@ def page_add_benchmark():
         findings_df = st.data_editor(
             pd.DataFrame(default_findings_rows),
             num_rows="dynamic",
-            use_container_width=True,
+            width="stretch",
             key="findings_editor",
             column_config={
                 "Classifier Attribute": classifier_attr_col,
@@ -5172,7 +5176,7 @@ def page_version_comparison():
         )
         fig.update_xaxes(type="category", categoryorder="array", categoryarray=ordered_builds, title_text="Build Version")
         fig.update_yaxes(title_text="Classifier Count")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.caption("No trend data available.")
 
@@ -5215,13 +5219,13 @@ def page_version_comparison():
     t1, t2, t3 = st.columns(3)
     with t1:
         st.markdown("**Added in Candidate**")
-        st.dataframe(pd.DataFrame({"Classifier": added}) if added else pd.DataFrame({"Classifier": []}), use_container_width=True)
+        st.dataframe(pd.DataFrame({"Classifier": added}) if added else pd.DataFrame({"Classifier": []}), width="stretch")
     with t2:
         st.markdown("**Removed from Baseline**")
-        st.dataframe(pd.DataFrame({"Classifier": removed}) if removed else pd.DataFrame({"Classifier": []}), use_container_width=True)
+        st.dataframe(pd.DataFrame({"Classifier": removed}) if removed else pd.DataFrame({"Classifier": []}), width="stretch")
     with t3:
         st.markdown("**Common**")
-        st.dataframe(pd.DataFrame({"Classifier": common}) if common else pd.DataFrame({"Classifier": []}), use_container_width=True)
+        st.dataframe(pd.DataFrame({"Classifier": common}) if common else pd.DataFrame({"Classifier": []}), width="stretch")
 
 
 def page_scan_status():
@@ -5506,6 +5510,19 @@ def page_scan_status():
         st.info(f"No scans match `{status_view}` in combined results.")
         return
 
+    # Arrow-safe numeric columns (avoid mixing '' strings with ints).
+    for col in [
+        "Distinct Classification Attributes",
+        "Objects With Pi",
+        "Objects Scanned",
+        "Objects Enumerated",
+        "Total Classification",
+        "New Attributes",
+        "Removed Attributes",
+    ]:
+        if col in summary_df.columns:
+            summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce").astype("Int64")
+
     scan_ids = [str(x).strip() for x in summary_df["Scan Id"].tolist() if str(x).strip()]
     active_map = get_scan_parent_active_map(scan_ids)
     summary_df.insert(0, "Active", summary_df["Scan Id"].map(lambda sid: active_map.get(str(sid), True)))
@@ -5545,7 +5562,7 @@ def page_scan_status():
                 }
                 for s in items
             ])
-            st.dataframe(debug_df, use_container_width=True)
+            st.dataframe(debug_df, width="stretch")
         else:
             st.write("Items list is empty.")
 
@@ -5594,7 +5611,7 @@ def page_scan_status():
     
     edited_summary = st.data_editor(
         styled_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         column_order=summary_column_order,
@@ -5624,7 +5641,7 @@ def page_scan_status():
         if preview_df.empty:
             st.caption("No auto trend rows yet.")
         else:
-            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+            st.dataframe(preview_df, width="stretch", hide_index=True)
 
     st.markdown("### Scan Details")
     shown = 0
@@ -5643,7 +5660,7 @@ def page_scan_status():
             trend_row = load_auto_scan_benchmark_row(scan_id)
             if trend_row:
                 st.caption("Auto trend details for this scan")
-                st.dataframe(pd.DataFrame([trend_row]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame([trend_row]), width="stretch", hide_index=True)
             else:
                 st.caption("Auto trend row not available yet for this scan.")
             attr_rows = get_scan_attribute_findings_prefill(scan_id)
@@ -5651,7 +5668,7 @@ def page_scan_status():
                 st.caption("New/Removed classifier attributes for this scan")
                 st.dataframe(
                     pd.DataFrame(attr_rows, columns=["Classifier Attribute", "Attribute Value", "Findings"]),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             else:
@@ -5707,7 +5724,7 @@ def page_build_analysis(df):
         st.subheader("Performance by Scan Type")
         fig = px.bar(build_df, x='Scan_Type', y='throughput_cluster_gb_hr', color='File_Set_Type',
                      barmode='group', title="Throughput (GB/hr) per Scan Category")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
         
     with c2:
         st.subheader("Scanner Scaling Efficiency")
@@ -5715,7 +5732,7 @@ def page_build_analysis(df):
         fig2 = px.scatter(build_df, x='scanner_count', y='throughput_cluster_gb_hr', 
                           size='Total_Size_GB', color='Scan_Type',
                           title="Throughput vs Scanners (Size = Volume)")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
         
     st.subheader("Individual Run Details")
     detail_df = build_df[['Scan_Type', 'Data_Source_Type', 'File_Set_Type', 'throughput_cluster_gb_hr', 'scanner_count', 'thread_count', 'is_acl']].copy()
@@ -5942,7 +5959,7 @@ def page_comparison(df):
         })
         fig_line_gb = px.line(line_df, x="Configuration", y="GB/hr", markers=True, title="Data Throughput (GB/hr)")
         fig_line_gb.update_traces(line=dict(color="#8B5CF6", width=3))
-        st.plotly_chart(fig_line_gb, use_container_width=True)
+        st.plotly_chart(fig_line_gb, width="stretch")
     with l2:
         line_df_f = pd.DataFrame({
             "Configuration": ["Baseline", "Candidate"],
@@ -5950,7 +5967,7 @@ def page_comparison(df):
         })
         fig_line_f = px.line(line_df_f, x="Configuration", y="Files/hr", markers=True, title="File Throughput (Files/hr)")
         fig_line_f.update_traces(line=dict(color="#10B981", width=3))
-        st.plotly_chart(fig_line_f, use_container_width=True)
+        st.plotly_chart(fig_line_f, width="stretch")
 
     # Summary table
     st.markdown("### Summary Table")
@@ -5971,7 +5988,7 @@ def page_comparison(df):
             f"{rb.get('total_scan_hours', 0):.2f}" if pd.notnull(rb.get('total_scan_hours', None)) else "N/A"
         ]
     })
-    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, width="stretch", hide_index=True)
     
     # 3. Visual Comparison Charts
     st.markdown("### Visual Comparison")
@@ -5989,14 +6006,14 @@ def page_comparison(df):
                      title="Data Throughput Comparison",
                      color='Configuration',
                      color_discrete_sequence=['#8B5CF6', '#6366F1'])
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width="stretch")
     
     with chart_col2:
         fig2 = px.bar(chart_data, x='Configuration', y='Files/hr', 
                      title="File Throughput Comparison",
                      color='Configuration',
                      color_discrete_sequence=['#8B5CF6', '#6366F1'])
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
     
     # Winner determination
     st.divider()
@@ -6106,7 +6123,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         
         fig1.update_layout(title="Data Throughput Trend (GB/hr)", xaxis_title="Build Version", yaxis_title="GB/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig1.update_xaxes(type='category', categoryorder='category ascending')
-        st.plotly_chart(fig1, use_container_width=True)
+        st.plotly_chart(fig1, width="stretch")
 
     with t_col2:
         fig2 = go.Figure()
@@ -6126,7 +6143,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         
         fig2.update_layout(title="File Throughput Trend (files/hr)", xaxis_title="Build Version", yaxis_title="Files/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig2.update_xaxes(type='category', categoryorder='category ascending')
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     # Grouped Bar Charts - Restore these
     st.markdown("### Throughput Comparison (Grouped Bar Charts)")
@@ -6150,7 +6167,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_gb_hr'], name='Per Thread', marker_color='#A78BFA'))
         
         fig3.update_layout(title="Data Throughput Comparison", barmode='group', xaxis={'type': 'category', 'categoryorder': 'category ascending'}, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
     with b_col2:
         fig4 = go.Figure()
@@ -6169,7 +6186,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_files_hr'], name='Per Thread', marker_color='#6EE7B7'))
         
         fig4.update_layout(title="File Throughput Comparison", barmode='group', xaxis={'type': 'category', 'categoryorder': 'category ascending'}, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-        st.plotly_chart(fig4, use_container_width=True)
+        st.plotly_chart(fig4, width="stretch")
 
     # Detailed Table
     st.markdown("### Summary Data")
@@ -6473,7 +6490,7 @@ def page_edit_benchmark(df):
 
     edited_df = st.data_editor(
         table_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         disabled=[c for c in disabled_cols if c in table_df.columns],
@@ -6967,7 +6984,7 @@ def page_scan_progress():
             legend=dict(orientation="h"),
             hovermode="x unified",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with c2:
         st.subheader("Objects (Totals)")
@@ -6987,7 +7004,7 @@ def page_scan_progress():
         fig2.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
         fig2.update_yaxes(title_text="Count", rangemode="tozero")
         fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
-        st.plotly_chart(fig2, use_container_width=True)
+        st.plotly_chart(fig2, width="stretch")
 
     with c3:
         st.subheader("ObjectsWithPi + Classifications")
@@ -7017,7 +7034,7 @@ def page_scan_progress():
         fig3.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
         fig3.update_yaxes(title_text="Count", rangemode="tozero")
         fig3.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
-        st.plotly_chart(fig3, use_container_width=True)
+        st.plotly_chart(fig3, width="stretch")
 
     st.subheader("Raw Progress Data")
     # Show newest first (includes scan_state, so terminal updates show here)
@@ -7029,7 +7046,7 @@ def page_scan_progress():
         })
     except Exception:
         pass
-    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=False), use_container_width=True)
+    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=False), width="stretch")
     
     if st.button("Back to Scan Status"):
         st.query_params["page"] = "Scan Status"
