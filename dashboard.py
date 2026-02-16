@@ -6943,7 +6943,7 @@ def page_scan_progress():
     def _apply_snapshot_ticks(fig_obj, x_vals):
         """
         Avoid dense dtick labels across multi-hour/day gaps.
-        Show ticks only at actual snapshot times.
+        Show a small set of snapshot times (evenly spaced).
         """
         try:
             xs = [x for x in list(x_vals) if x is not None and str(x) != "NaT"]
@@ -6951,13 +6951,22 @@ def page_scan_progress():
             xs = []
         if not xs:
             return
-        # Ensure chronological order. For small history, show all ticks; for large history, show first+last only.
+        # Ensure chronological order.
         try:
             xs = sorted(xs)
         except Exception:
             pass
-        if len(xs) > 6:
-            xs = [xs[0], xs[-1]]
+        # Pick up to N evenly spaced tick labels (always include first+last).
+        max_ticks = 6
+        if len(xs) > max_ticks:
+            # indices like [0, ..., last]
+            try:
+                import numpy as _np
+                idx = _np.linspace(0, len(xs) - 1, num=max_ticks)
+                idx = sorted({int(round(i)) for i in idx})
+                xs = [xs[i] for i in idx]
+            except Exception:
+                xs = [xs[0], xs[-1]]
         try:
             x_min = min(xs)
             x_max = max(xs)
