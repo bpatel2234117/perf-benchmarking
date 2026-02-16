@@ -6940,10 +6940,41 @@ def page_scan_progress():
         pass
 
     c1, c2, c3 = st.columns(3)
+    def _apply_snapshot_ticks(fig_obj, x_vals):
+        """
+        Avoid dense dtick labels across multi-hour/day gaps.
+        Show ticks only at actual snapshot times.
+        """
+        try:
+            xs = [x for x in list(x_vals) if x is not None and str(x) != "NaT"]
+        except Exception:
+            xs = []
+        if not xs:
+            return
+        try:
+            x_min = min(xs)
+            x_max = max(xs)
+            show_date = getattr(x_min, "date", None) and getattr(x_max, "date", None) and (x_min.date() != x_max.date())
+        except Exception:
+            show_date = False
+        fmt = "%m-%d %H:%M" if show_date else "%H:%M"
+        try:
+            tick_text = [pd.to_datetime(x).strftime(fmt) for x in xs]
+        except Exception:
+            tick_text = [str(x) for x in xs]
+        fig_obj.update_xaxes(
+            title_text="UTC time",
+            tickmode="array",
+            tickvals=xs,
+            ticktext=tick_text,
+            tickangle=-35,
+        )
+
     with c1:
         st.subheader("Parts (Totals)")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df = plot_df.sort_values("captured_at_utc")
 
         # Plotly: parts only
         fig = go.Figure()
@@ -6977,7 +7008,7 @@ def page_scan_progress():
                 marker=dict(color="#EF4444", size=7),
             )
         )
-        fig.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)  # 10 minutes
+        _apply_snapshot_ticks(fig, plot_df["captured_at_utc"])
         fig.update_yaxes(title_text="Count", rangemode="tozero")
         fig.update_layout(
             margin=dict(l=10, r=10, t=30, b=10),
@@ -6990,6 +7021,7 @@ def page_scan_progress():
         st.subheader("Objects (Totals)")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df = plot_df.sort_values("captured_at_utc")
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_scanned", 0),
@@ -7001,7 +7033,7 @@ def page_scan_progress():
             mode="lines+markers", name="Objects Failed (count)",
             line=dict(color="#F97316", width=2), marker=dict(color="#F97316", size=7),
         ))
-        fig2.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
+        _apply_snapshot_ticks(fig2, plot_df["captured_at_utc"])
         fig2.update_yaxes(title_text="Count", rangemode="tozero")
         fig2.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
         st.plotly_chart(fig2, width="stretch")
@@ -7010,6 +7042,7 @@ def page_scan_progress():
         st.subheader("ObjectsWithPi + Classifications")
         plot_df = df.copy()
         plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df = plot_df.sort_values("captured_at_utc")
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_with_pi", 0),
@@ -7031,7 +7064,7 @@ def page_scan_progress():
             mode="lines+markers", name="classifications.falseRemoved",
             line=dict(color="#EF4444", width=2), marker=dict(color="#EF4444", size=7),
         ))
-        fig3.update_xaxes(title_text="UTC time", tickformat="%H:%M", dtick=600000)
+        _apply_snapshot_ticks(fig3, plot_df["captured_at_utc"])
         fig3.update_yaxes(title_text="Count", rangemode="tozero")
         fig3.update_layout(margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"), hovermode="x unified")
         st.plotly_chart(fig3, width="stretch")
