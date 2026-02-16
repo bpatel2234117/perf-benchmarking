@@ -7098,12 +7098,33 @@ def page_scan_progress():
 
     # Health flags
     flags = []
+    stall_minutes = None
+    last_change_at = None
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
             b = df_ai.iloc[-1]
             if int(_safe_num(a.get("objects_scanned"), 0)) == int(_safe_num(b.get("objects_scanned"), 0)) and int(_safe_num(a.get("completed_parts"), 0)) == int(_safe_num(b.get("completed_parts"), 0)):
                 flags.append("No progress change across last snapshots (possible stall).")
+        # Find last time objects_scanned changed (for stall age)
+        if len(df_ai) >= 2 and "objects_scanned" in df_ai.columns:
+            prev = None
+            for i in range(len(df_ai) - 1, -1, -1):
+                v = int(_safe_num(df_ai.iloc[i].get("objects_scanned"), 0) or 0)
+                if prev is None:
+                    prev = v
+                    continue
+                if v != prev:
+                    last_change_at = df_ai.iloc[i + 1].get("captured_at_actual")
+                    break
+            if last_change_at is None:
+                last_change_at = df_ai.iloc[0].get("captured_at_actual")
+            try:
+                now_utc = pd.Timestamp.utcnow()
+                lc = pd.to_datetime(last_change_at, utc=True)
+                stall_minutes = max(0.0, (now_utc - lc).total_seconds() / 60.0) if pd.notnull(lc) else None
+            except Exception:
+                stall_minutes = None
         if cur_failed_parts > 0:
             flags.append(f"Failed parts present: {cur_failed_parts}.")
         if expected_total_files and cur_objects > expected_total_files:
@@ -7154,6 +7175,25 @@ def page_scan_progress():
             m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
         else:
             m4.metric("Throughput (obj/min)", "N/A")
+
+        # Red warning when files show 100% but scan still running
+        try:
+            running_states_local = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending"}
+            is_running = str(cur_state or "").strip().lower().replace(" ", "") in {s.replace(" ", "") for s in running_states_local}
+            if is_running and pct_files is not None and pct_files >= 99.9:
+                extra = []
+                if pct_parts is not None and pct_parts < 99.9:
+                    extra.append(f"parts progress is only {pct_parts:.1f}% (parts not complete)")
+                if stall_minutes is not None and stall_minutes >= 30:
+                    extra.append(f"no object-count increase for ~{stall_minutes:.0f} minutes")
+                if expected_total_files:
+                    extra.append("expected total_files may be wrong/stale OR objects_scanned is not the true completion signal")
+                msg = "Scan shows ~100% of expected files but is still InProgress."
+                if extra:
+                    msg += " Likely: " + "; ".join(extra) + "."
+                st.error(msg)
+        except Exception:
+            pass
 
         if narrative:
             st.markdown(narrative)
