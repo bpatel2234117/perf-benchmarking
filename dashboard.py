@@ -2844,7 +2844,6 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
         with engine.connect() as conn:
             conn.execute(text("""
                 INSERT INTO scan_progress (
-                    timestamp,
                     captured_at_utc,
                     scan_id, scan_name, environment_id,
                     scan_state,
@@ -2854,7 +2853,7 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
                     false_removed_classifications,
                     objects_scanned, objects_failed, objects_with_pi
                 ) VALUES (
-                    :ts, :cau, :sid, :sname, :eid, :sst, :cs, :fs, :tsc, :cp, :fp, :tp, :tc, :nc, :fr, :os, :of, :owp
+                    :cau, :sid, :sname, :eid, :sst, :cs, :fs, :tsc, :cp, :fp, :tp, :tc, :nc, :fr, :os, :of, :owp
                 )
                 ON DUPLICATE KEY UPDATE
                     scan_name = VALUES(scan_name),
@@ -2873,8 +2872,6 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
                     objects_failed = VALUES(objects_failed),
                     objects_with_pi = VALUES(objects_with_pi)
             """), {
-                # Keep legacy TIMESTAMP populated too, but rely on captured_at_utc for plots.
-                "ts": captured_at_utc,
                 "cau": captured_at_utc,
                 "sid": scan_id, "sname": scan_name, "eid": env_id,
                 "sst": scan_state,
@@ -6617,7 +6614,8 @@ def load_scan_progress_history(scan_id):
         return pd.DataFrame()
     query = text("""
         SELECT
-               COALESCE(captured_at_utc, timestamp) AS captured_at,
+               timestamp AS captured_at_actual,
+               captured_at_utc AS captured_at_slot_utc,
                scan_state,
                completed_parts, failed_parts, total_parts_scanned,
                objects_scanned, objects_failed,
@@ -6834,7 +6832,8 @@ def page_scan_progress():
 
     # Tracker health (DB-only): show last snapshot time and staleness.
     try:
-        last_ts = pd.to_datetime(df["captured_at"], errors="coerce", utc=True).max()
+        # Use slot time for "are we getting 10-min snapshots?"
+        last_ts = pd.to_datetime(df["captured_at_slot_utc"], errors="coerce", utc=True).max()
     except Exception:
         last_ts = None
     try:
@@ -6918,8 +6917,8 @@ def page_scan_progress():
 
     # Progress charts (DB-only)
     try:
-        # Treat captured_at as UTC (MySQL TIMESTAMP may come back localized)
-        df["captured_at"] = pd.to_datetime(df["captured_at"], errors="coerce", utc=True)
+        df["captured_at_slot_utc"] = pd.to_datetime(df["captured_at_slot_utc"], errors="coerce", utc=True)
+        df["captured_at_actual"] = pd.to_datetime(df["captured_at_actual"], errors="coerce", utc=True)
     except Exception:
         pass
 
@@ -6927,7 +6926,7 @@ def page_scan_progress():
     with c1:
         st.subheader("Parts (Totals)")
         plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
 
         # Plotly: parts only
         fig = go.Figure()
@@ -6973,7 +6972,7 @@ def page_scan_progress():
     with c2:
         st.subheader("Objects (Totals)")
         plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_scanned", 0),
@@ -6993,7 +6992,7 @@ def page_scan_progress():
     with c3:
         st.subheader("ObjectsWithPi + Classifications")
         plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at"].dt.tz_convert("UTC").dt.tz_localize(None)
+        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_with_pi", 0),
@@ -7022,7 +7021,15 @@ def page_scan_progress():
 
     st.subheader("Raw Progress Data")
     # Show newest first (includes scan_state, so terminal updates show here)
-    st.dataframe(df.sort_values("captured_at", ascending=False), use_container_width=True)
+    show_df = df.copy()
+    try:
+        show_df = show_df.rename(columns={
+            "captured_at_actual": "captured_at_actual_utc",
+            "captured_at_slot_utc": "captured_at_slot_utc",
+        })
+    except Exception:
+        pass
+    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=False), use_container_width=True)
     
     if st.button("Back to Scan Status"):
         st.query_params["page"] = "Scan Status"

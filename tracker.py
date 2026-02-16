@@ -258,7 +258,9 @@ def ensure_scan_progress_table(engine) -> None:
                 DELETE sp1 FROM scan_progress sp1
                 JOIN scan_progress sp2
                   ON sp1.scan_id = sp2.scan_id
-                 AND COALESCE(sp1.captured_at_utc, sp1.timestamp) = COALESCE(sp2.captured_at_utc, sp2.timestamp)
+                 AND sp1.captured_at_utc IS NOT NULL
+                 AND sp2.captured_at_utc IS NOT NULL
+                 AND sp1.captured_at_utc = sp2.captured_at_utc
                  AND sp1.id < sp2.id
             """))
             conn.commit()
@@ -558,7 +560,7 @@ def upsert_scan_progress_record(engine, env_id: Any, scan_id: str, scan_name: st
         conn.execute(
             text("""
                 INSERT INTO scan_progress (
-                    timestamp, captured_at_utc,
+                    captured_at_utc,
                     scan_id, scan_name, environment_id,
                     scan_state,
                     completed_sub_scans, failed_sub_scans, total_sub_scans,
@@ -566,7 +568,7 @@ def upsert_scan_progress_record(engine, env_id: Any, scan_id: str, scan_name: st
                     total_classifications, newly_added_classifications, false_removed_classifications,
                     objects_scanned, objects_failed, objects_with_pi
                 ) VALUES (
-                    :ts, :cau,
+                    :cau,
                     :sid, :sname, :eid,
                     :sst,
                     :cs, :fs, :tsc,
@@ -592,7 +594,6 @@ def upsert_scan_progress_record(engine, env_id: Any, scan_id: str, scan_name: st
                     objects_with_pi = VALUES(objects_with_pi)
             """),
             {
-                "ts": captured_at_utc,
                 "cau": captured_at_utc,
                 "sid": scan_id,
                 "sname": str(scan_name or "")[:1000] or None,
