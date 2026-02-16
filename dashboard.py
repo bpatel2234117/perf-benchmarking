@@ -5751,6 +5751,14 @@ def page_comparison(df):
     st.markdown("### Select Comparison Criteria")
     st.caption("Compare two different configurations across multiple dimensions")
     
+    def _uniq_sorted(vals):
+        try:
+            out = [str(x) for x in pd.Series(vals).dropna().unique().tolist()]
+        except Exception:
+            out = [str(x) for x in (vals or [])]
+        out = [x.strip() for x in out if str(x).strip()]
+        return sorted(set(out))
+
     # Two columns for A vs B selection
     c1, c2 = st.columns(2)
     
@@ -5758,19 +5766,23 @@ def page_comparison(df):
         st.markdown("#### 🅰️ Baseline Configuration")
         # keep explicit values visible (after selections)
         
-        ver_a = st.selectbox("Build Version", df['Build_Version'].unique(), key='v_a')
+        ver_a_options = _uniq_sorted(df.get("Build_Version"))
+        ver_a = st.selectbox("Build Version", ver_a_options, key='v_a')
         
         # Get available options based on version A
-        df_a_filtered = df[df['Build_Version'] == ver_a]
+        df_a_filtered = df[df['Build_Version'].astype(str) == str(ver_a)].copy()
         
-        ds_a = st.selectbox("Data Source", sorted(df['Data_Source_Type'].unique()), key='d_a')
-        df_a_filtered = df_a_filtered[df_a_filtered['Data_Source_Type'] == ds_a]
+        ds_a_options = _uniq_sorted(df_a_filtered.get("Data_Source_Type"))
+        ds_a = st.selectbox("Data Source", ds_a_options, key='d_a')
+        df_a_filtered = df_a_filtered[df_a_filtered['Data_Source_Type'].astype(str) == str(ds_a)]
         
-        scan_a = st.selectbox("Scan Type", df_a_filtered['Scan_Type'].unique(), key='s_a')
-        df_a_filtered = df_a_filtered[df_a_filtered['Scan_Type'] == scan_a]
+        scan_a_options = _uniq_sorted(df_a_filtered.get("Scan_Type"))
+        scan_a = st.selectbox("Scan Type", scan_a_options, key='s_a')
+        df_a_filtered = df_a_filtered[df_a_filtered['Scan_Type'].astype(str) == str(scan_a)]
 
-        fs_a = st.selectbox("File Set Type", df['file_set_type'].unique(), key='fs_a')
-        df_a_filtered = df_a_filtered[df_a_filtered['file_set_type'] == fs_a]
+        fs_a_options = _uniq_sorted(df_a_filtered.get("file_set_type"))
+        fs_a = st.selectbox("File Set Type", fs_a_options, key='fs_a')
+        df_a_filtered = df_a_filtered[df_a_filtered['file_set_type'].astype(str) == str(fs_a)]
         
         # Configuration flags
         st.caption("Configuration Flags (Optional)")
@@ -5783,19 +5795,23 @@ def page_comparison(df):
         st.markdown("#### 🅱️ Candidate Configuration")
         # keep explicit values visible (after selections)
         
-        ver_b = st.selectbox("Build Version", df['Build_Version'].unique(), key='v_b', 
-                            index=min(1, len(df['Build_Version'].unique())-1))
+        ver_b_options = ver_a_options
+        ver_b_default_idx = min(1, max(0, len(ver_b_options) - 1))
+        ver_b = st.selectbox("Build Version", ver_b_options, key='v_b', index=ver_b_default_idx)
         
-        df_b_filtered = df[df['Build_Version'] == ver_b]
+        df_b_filtered = df[df['Build_Version'].astype(str) == str(ver_b)].copy()
         
-        ds_b = st.selectbox("Data Source", sorted(df['Data_Source_Type'].unique()), key='d_b')
-        df_b_filtered = df_b_filtered[df_b_filtered['Data_Source_Type'] == ds_b]
+        ds_b_options = _uniq_sorted(df_b_filtered.get("Data_Source_Type"))
+        ds_b = st.selectbox("Data Source", ds_b_options, key='d_b')
+        df_b_filtered = df_b_filtered[df_b_filtered['Data_Source_Type'].astype(str) == str(ds_b)]
         
-        scan_b = st.selectbox("Scan Type", df_b_filtered['Scan_Type'].unique(), key='s_b')
-        df_b_filtered = df_b_filtered[df_b_filtered['Scan_Type'] == scan_b]
+        scan_b_options = _uniq_sorted(df_b_filtered.get("Scan_Type"))
+        scan_b = st.selectbox("Scan Type", scan_b_options, key='s_b')
+        df_b_filtered = df_b_filtered[df_b_filtered['Scan_Type'].astype(str) == str(scan_b)]
 
-        fs_b = st.selectbox("File Set Type", df['file_set_type'].unique(), key='fs_b')
-        df_b_filtered = df_b_filtered[df_b_filtered['file_set_type'] == fs_b]
+        fs_b_options = _uniq_sorted(df_b_filtered.get("file_set_type"))
+        fs_b = st.selectbox("File Set Type", fs_b_options, key='fs_b')
+        df_b_filtered = df_b_filtered[df_b_filtered['file_set_type'].astype(str) == str(fs_b)]
         
         st.caption("Configuration Flags (Optional)")
         acl_b = st.selectbox("ACL Filter", ["All", "ACL On", "ACL Off"], key='acl_b')
@@ -5804,8 +5820,8 @@ def page_comparison(df):
         # keep explicit values visible
 
     # Apply filters
-    run_a = df[(df['Build_Version'] == ver_a) & (df['Data_Source_Type'] == ds_a) & (df['Scan_Type'] == scan_a) & (df['file_set_type'] == fs_a)]
-    run_b = df[(df['Build_Version'] == ver_b) & (df['Data_Source_Type'] == ds_b) & (df['Scan_Type'] == scan_b) & (df['file_set_type'] == fs_b)]
+    run_a = df_a_filtered.copy()
+    run_b = df_b_filtered.copy()
     
     def apply_flag_filter(df_in, col, choice):
         if choice.endswith("On"):
