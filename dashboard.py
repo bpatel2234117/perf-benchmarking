@@ -6951,6 +6951,13 @@ def page_scan_progress():
             xs = []
         if not xs:
             return
+        # Ensure chronological order and show only first/last ticks to avoid overlap in 3-column layout.
+        try:
+            xs = sorted(xs)
+        except Exception:
+            pass
+        if len(xs) > 2:
+            xs = [xs[0], xs[-1]]
         try:
             x_min = min(xs)
             x_max = max(xs)
