@@ -19,7 +19,11 @@ import textwrap
 from pathlib import Path
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
-from tracker_autostart import ensure_tracker_running
+try:
+    # Optional: auto-start tracker when available (same folder as dashboard.py).
+    from tracker_autostart import ensure_tracker_running  # type: ignore
+except Exception:
+    ensure_tracker_running = None
 
 # --- Configuration & Styling ---
 st.set_page_config(
@@ -252,7 +256,8 @@ engine = get_engine()
 # Can be disabled via DISABLE_TRACKER_AUTOSTART=1.
 try:
     if engine:
-        ensure_tracker_running(engine)
+        if callable(ensure_tracker_running):
+            ensure_tracker_running(engine)
 except Exception:
     pass
 
