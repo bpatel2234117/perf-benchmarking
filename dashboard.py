@@ -6283,7 +6283,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         pass
 
     # Charts
-    t_col1, t_col2 = st.columns(2)
+    t_col1, t_col2, t_col3 = st.columns(3)
     
     with t_col1:
         fig1 = go.Figure()
@@ -6324,6 +6324,56 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         fig2.update_layout(title="File Throughput Trend (files/hr)", xaxis_title="Build Version", yaxis_title="Files/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig2.update_xaxes(type='category', categoryorder='category ascending')
         st.plotly_chart(fig2, width="stretch")
+
+    with t_col3:
+        figc = go.Figure()
+        # Prefer manual benchmark field Total_Catalog_Items if present
+        y_col = "Total_Catalog_Items" if "Total_Catalog_Items" in plot_df.columns else None
+        if y_col:
+            try:
+                plot_df[y_col] = pd.to_numeric(plot_df[y_col], errors="coerce")
+            except Exception:
+                pass
+        if y_col and plot_df[y_col].notna().any():
+            if compare_by:
+                categories = plot_df[compare_by].unique()
+                colors = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6']
+                for i, cat in enumerate(categories):
+                    cat_df = plot_df[plot_df[compare_by] == cat]
+                    name = f"{cat}"
+                    if compare_by == 'is_feature_flags': name = "FF ON" if cat else "FF OFF"
+                    if compare_by == 'is_acl': name = "ACL ON" if cat else "ACL OFF"
+                    figc.add_trace(
+                        go.Scatter(
+                            x=cat_df['Build_Version'],
+                            y=cat_df[y_col],
+                            mode='lines+markers',
+                            name=name,
+                            line=dict(color=colors[i % len(colors)], width=3),
+                        )
+                    )
+            else:
+                figc.add_trace(
+                    go.Scatter(
+                        x=plot_df['Build_Version'],
+                        y=plot_df[y_col],
+                        mode='lines+markers',
+                        name='Total',
+                        line=dict(color='#3B82F6', width=4),
+                        marker=dict(size=10),
+                    )
+                )
+            figc.update_layout(
+                title="Classification Trend (Total Items)",
+                xaxis_title="Build Version",
+                yaxis_title="Count",
+                hovermode='x unified',
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            figc.update_xaxes(type='category', categoryorder='category ascending')
+            st.plotly_chart(figc, width="stretch")
+        else:
+            st.caption("Classification Trend: no `Total_Catalog_Items` data available for these filters.")
 
     # Grouped Bar Charts - Restore these
     st.markdown("### Throughput Comparison (Grouped Bar Charts)")
