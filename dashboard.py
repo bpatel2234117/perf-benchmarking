@@ -7141,7 +7141,7 @@ def page_scan_progress():
     except Exception:
         pass
 
-    # ---------- AI Analysis (stats + narrative) ----------
+    # ---------- Analysis (stats + narrative) ----------
     try:
         # Normalize numeric columns
         for col in [
@@ -7193,10 +7193,6 @@ def page_scan_progress():
     cur_failed_parts = int(_safe_num(last.get("failed_parts"), 0)) if last is not None else 0
     cur_state = str(last.get("scan_state") or "").strip() if last is not None else ""
 
-    pct_files = None
-    if expected_total_files and expected_total_files > 0:
-        pct_files = min(100.0, max(0.0, (cur_objects / expected_total_files) * 100.0))
-
     pct_parts = None
     if cur_parts_total and cur_parts_total > 0:
         pct_parts = min(100.0, max(0.0, (cur_parts_done / cur_parts_total) * 100.0))
@@ -7215,10 +7211,6 @@ def page_scan_progress():
             d_parts = _safe_num(tail.iloc[-1].get("completed_parts"), 0) - _safe_num(tail.iloc[0].get("completed_parts"), 0)
             files_per_min = d_files / dt_min if d_files is not None else None
             parts_per_min = d_parts / dt_min if d_parts is not None else None
-
-            if expected_total_files and expected_total_files > 0 and files_per_min and files_per_min > 0:
-                remaining = max(0.0, float(expected_total_files) - float(cur_objects))
-                eta_minutes = remaining / files_per_min
     except Exception:
         pass
 
@@ -7228,12 +7220,22 @@ def page_scan_progress():
     last_change_at = None
     completion_lag_minutes = None
     completion_lag_summary = ""
+    false_removed_delta = None
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
             b = df_ai.iloc[-1]
             if int(_safe_num(a.get("objects_scanned"), 0)) == int(_safe_num(b.get("objects_scanned"), 0)) and int(_safe_num(a.get("completed_parts"), 0)) == int(_safe_num(b.get("completed_parts"), 0)):
                 flags.append("No progress change across last snapshots (possible stall).")
+            # falseRemoved delta over last window
+            try:
+                fr0 = _safe_num(a.get("false_removed_classifications"), 0) or 0
+                fr1 = _safe_num(b.get("false_removed_classifications"), 0) or 0
+                false_removed_delta = int(fr1 - fr0)
+                if false_removed_delta > 0:
+                    flags.append(f"falseRemoved classifications increased by {false_removed_delta}.")
+            except Exception:
+                pass
         # Find last time objects_scanned changed (for stall age)
         if len(df_ai) >= 2 and "objects_scanned" in df_ai.columns:
             prev = None
@@ -7255,8 +7257,6 @@ def page_scan_progress():
                 stall_minutes = None
         if cur_failed_parts > 0:
             flags.append(f"Failed parts present: {cur_failed_parts}.")
-        if expected_total_files and cur_objects > expected_total_files:
-            flags.append("Objects scanned exceeds expected total (check file_set_types total_files).")
     except Exception:
         pass
 
@@ -7353,21 +7353,11 @@ def page_scan_progress():
         fs = str(exp.get("file_set_type") or "").strip()
         if ds or fs:
             bits.append(f"Scan looks like `{ds} {fs}` based on scan name.")
-        if lookup_key and expected_total_files:
-            bits.append(f"Ground-truth total files from `file_set_types` (`{lookup_key}`): **{expected_total_files:,}**.")
-        if pct_files is not None:
-            bits.append(f"Current objects scanned: **{cur_objects:,}** (**{pct_files:.1f}%** of expected).")
-        else:
-            bits.append(f"Current objects scanned: **{cur_objects:,}** (expected total not found in `file_set_types`).")
+        bits.append(f"Current objects scanned: **{cur_objects:,}**.")
         if pct_parts is not None:
             bits.append(f"Parts completed: **{cur_parts_done:,} / {cur_parts_total:,}** (**{pct_parts:.1f}%**).")
         if files_per_min is not None and files_per_min >= 0:
             bits.append(f"Recent throughput: **{files_per_min:,.0f} objects/min**.")
-        if eta_minutes is not None and eta_minutes >= 0:
-            if eta_minutes >= 120:
-                bits.append(f"ETA (rough): **{eta_minutes/60.0:.1f} hours**.")
-            else:
-                bits.append(f"ETA (rough): **{eta_minutes:.0f} minutes**.")
         if cur_state:
             bits.append(f"Latest state: `{cur_state}`.")
         if completion_lag_summary:
@@ -7378,19 +7368,15 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
-    with st.expander("🧠 AI Analysis (stats + narrative)", expanded=True):
+    with st.expander("🧠 Analysis (stats + narrative)", expanded=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Objects scanned", f"{cur_objects:,}")
-        if expected_total_files:
-            m2.metric("Expected total files", f"{expected_total_files:,}")
-            m3.metric("% complete (files)", f"{(pct_files or 0):.1f}%")
+        m2.metric("Parts progress", f"{(pct_parts or 0):.1f}%" if pct_parts is not None else "N/A")
+        m3.metric("Failed parts", f"{cur_failed_parts:,}")
+        if false_removed_delta is not None:
+            m4.metric("falseRemoved (Δ)", f"{false_removed_delta:+,}")
         else:
-            m2.metric("Expected total files", "N/A")
-            m3.metric("% complete (files)", "N/A")
-        if files_per_min is not None:
-            m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
-        else:
-            m4.metric("Throughput (obj/min)", "N/A")
+            m4.metric("falseRemoved (Δ)", "N/A")
 
         # Optional Local LLM narrative (Windows-ready later)
         llm_enabled = st.toggle("Generate LLM narrative (local)", value=False, help="Uses LOCAL_LLM_* env vars when configured.")
@@ -7410,19 +7396,15 @@ def page_scan_progress():
                     Scan id: {scan_id}
                     Latest state: {cur_state}
 
-                    Expected totals (file_set_types):
-                    - lookup_key: {lookup_key or 'N/A'}
-                    - expected_total_files: {expected_total_files if expected_total_files is not None else 'N/A'}
-
                     Latest snapshot:
                     - objects_scanned: {cur_objects}
                     - parts: {cur_parts_done}/{cur_parts_total}
                     - failed_parts: {cur_failed_parts}
-                    - pct_files: {pct_files if pct_files is not None else 'N/A'}
                     - pct_parts: {pct_parts if pct_parts is not None else 'N/A'}
                     - files_per_min: {files_per_min if files_per_min is not None else 'N/A'}
                     - eta_minutes: {eta_minutes if eta_minutes is not None else 'N/A'}
                     - stall_minutes: {stall_minutes if stall_minutes is not None else 'N/A'}
+                    - false_removed_delta: {false_removed_delta if false_removed_delta is not None else 'N/A'}
 
                     Completion lag (if detected): {completion_lag_summary or 'N/A'}
                     Flags: {', '.join(flags) if flags else 'None'}
@@ -7449,11 +7431,18 @@ def page_scan_progress():
         except Exception:
             pass
 
-        # Red warning when files show 100% but scan still running
+        # Red warning when scan appears done but still running
         try:
             running_states_local = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending"}
             is_running = str(cur_state or "").strip().lower().replace(" ", "") in {s.replace(" ", "") for s in running_states_local}
-            if is_running and pct_files is not None and pct_files >= 99.9:
+            # Without expected totals, fall back to parts completion + stall signal.
+            likely_done_but_running = False
+            if pct_parts is not None and pct_parts >= 99.9:
+                likely_done_but_running = True
+            if stall_minutes is not None and stall_minutes >= 30 and files_per_min is not None and abs(files_per_min) < 1e-9:
+                likely_done_but_running = True
+
+            if is_running and likely_done_but_running:
                 extra = []
                 if pct_parts is not None and pct_parts < 99.9:
                     extra.append(f"parts progress is only {pct_parts:.1f}% (parts not complete)")
@@ -7473,7 +7462,7 @@ def page_scan_progress():
                 except Exception:
                     pass
 
-                msg = "Objects scanned reached ~100% of expected total, but the scan is still InProgress."
+                msg = "Scan looks finished (no scanning progress), but state is still InProgress."
                 if extra:
                     msg += " Observations: " + "; ".join(extra) + "."
                 st.error(msg)
@@ -7482,10 +7471,6 @@ def page_scan_progress():
 
         if narrative:
             st.markdown(narrative)
-        if lookup_key and not expected_total_files:
-            st.caption(f"Note: `file_set_types` has `{lookup_key}` but total_files is empty. Fill it to enable % complete/ETA.")
-        if not lookup_key:
-            st.caption("Note: Could not match scan to a `file_set_types` row. Add one like `S3 Large Files` with total_files.")
 
     c1, c2, c3 = st.columns(3)
     def _apply_snapshot_ticks(fig_obj, x_vals):
