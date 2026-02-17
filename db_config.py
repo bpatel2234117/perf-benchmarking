@@ -151,6 +151,8 @@ DDL_STATEMENTS = {
             throughput_scanner_files_hr FLOAT,
             throughput_thread_files_hr FLOAT,
             is_active BOOLEAN DEFAULT TRUE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            scan_id VARCHAR(128) NULL,
             FOREIGN KEY (build_id) REFERENCES builds(id),
             FOREIGN KEY (config_id) REFERENCES configurations(id),
             FOREIGN KEY (classifier_id) REFERENCES classifiers(id)
