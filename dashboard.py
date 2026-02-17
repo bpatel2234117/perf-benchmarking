@@ -972,9 +972,15 @@ def fetch_parent_scans_from_api(base_url, token, states=None, skip=0, limit=200)
     Fetch parent scans with optional state filter.
     """
     url = build_api_url(base_url, INTERNAL_PARENT_SCANS_API_PATH)
-    filter_items = [
-        {"field": "initiatedSource", "value": ["scans", None], "operator": "in"}
-    ]
+    # Do NOT over-filter by initiatedSource; it can hide real scans in some envs.
+    # Keep optional gating via BIGID_PARENT_SCANS_FILTER_INITIATED_SOURCE=1.
+    filter_items = []
+    try:
+        gate = str(os.getenv("BIGID_PARENT_SCANS_FILTER_INITIATED_SOURCE", "0") or "0").strip().lower() in {"1", "true", "yes", "y"}
+    except Exception:
+        gate = False
+    if gate:
+        filter_items.append({"field": "initiatedSource", "value": ["scans", "system", "scheduler", None], "operator": "in"})
     cleaned_states = [str(s).strip() for s in (states or []) if str(s).strip()]
     if cleaned_states:
         filter_items.insert(0, {"field": "state", "operator": "in", "value": cleaned_states})
@@ -3296,7 +3302,12 @@ def load_scan_parents_for_environments(environment_ids, status_view="All", limit
                 LEFT JOIN test_environments te ON te.id = sp.environment_id
                 WHERE sp.environment_id IN :env_ids
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
-                ORDER BY sp.updated_at DESC
+                ORDER BY
+                    CASE
+                        WHEN sp.scan_status IN ('Started','Awaiting','In Progress','InProgress','Running') THEN 0
+                        ELSE 1
+                    END,
+                    sp.updated_at DESC
                 LIMIT :lim
             """).bindparams(bindparam("env_ids", expanding=True)), {"env_ids": cleaned_ids, "lim": int(limit)}).fetchall()
     except Exception:
