@@ -6373,6 +6373,14 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(x))]
         except Exception:
             pass
+
+    # Table order: newest build first (descending) while charts remain ascending.
+    try:
+        table_df = plot_df.copy()
+        table_df["_build_num"] = pd.to_numeric(table_df["Build_Version"], errors="coerce")
+        table_df = table_df.sort_values(by=["_build_num", "Build_Version"], ascending=[False, False]).drop(columns=["_build_num"])
+    except Exception:
+        table_df = plot_df.copy()
     
     # Select columns in desired order: Data Throughput first, then File Throughput
     cols_to_show = [
@@ -6389,7 +6397,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     if compare_by and compare_by not in cols_to_show:
         cols_to_show.append(compare_by)
         
-    disp_df = plot_df[cols_to_show].copy()
+    disp_df = table_df[cols_to_show].copy()
     
     # Define clearer display names for columns (with line breaks for compact display)
     display_names = {
