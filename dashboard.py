@@ -6195,6 +6195,13 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     
     # Base filtering
     df_filtered = df.copy()
+    # Normalize key filter columns (prevents missing rows due to whitespace/casing inconsistencies)
+    try:
+        for col in ["Build_Version", "Data_Source_Type", "Scan_Type", "file_set_type"]:
+            if col in df_filtered.columns:
+                df_filtered[col] = df_filtered[col].astype(str).str.strip()
+    except Exception:
+        pass
     if file_set_filter:
         # Use partial match (case-insensitive) to capture "SMB Large Files", "S3 Large Files", etc.
         df_filtered = df_filtered[df_filtered['file_set_type'].astype(str).str.contains(file_set_filter, case=False, na=False)]
@@ -6261,6 +6268,14 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     # Drop rows with missing cluster throughput
     if 'throughput_cluster_gb_hr' in plot_df.columns:
         plot_df = plot_df[plot_df['throughput_cluster_gb_hr'].notna()]
+
+    # Quick sanity caption so it's obvious if latest build is included
+    try:
+        builds = plot_df["Build_Version"].astype(str).tolist()
+        max_build = sorted({b.strip() for b in builds if b and b.strip()})[-1] if builds else ""
+        st.caption(f"Builds in view: {plot_df['Build_Version'].nunique()} | Latest build in view: `{max_build}`")
+    except Exception:
+        pass
 
     # Charts
     t_col1, t_col2 = st.columns(2)
