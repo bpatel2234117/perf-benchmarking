@@ -258,7 +258,8 @@ except Exception:
 
 def load_data(include_inactive=False):
     if not engine: return pd.DataFrame()
-    where_clause = "" if include_inactive else "WHERE b.is_active = 1"
+    # Some historical rows may have NULL is_active; treat NULL as active.
+    where_clause = "" if include_inactive else "WHERE COALESCE(b.is_active, 1) = 1"
     # Ensure optional columns exist (non-breaking for existing DBs)
     try:
         with engine.connect() as conn:
@@ -6349,8 +6350,14 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
 
     # Detailed Table
     st.markdown("### Summary Data")
-    # Filter for active rows (extra safety layer)
-    plot_df = plot_df[plot_df['is_active'] == 1]
+    # Filter for active rows (extra safety layer). Treat NULL/truthy as active.
+    try:
+        plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(int(x)) if str(x).strip().isdigit() else bool(x))]
+    except Exception:
+        try:
+            plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(x))]
+        except Exception:
+            pass
     
     # Select columns in desired order: Data Throughput first, then File Throughput
     cols_to_show = [
