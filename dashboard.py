@@ -11,9 +11,6 @@ import numpy as np
 import requests
 import os
 import json
-import platform
-import socket
-import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
 import html
@@ -250,73 +247,6 @@ def get_engine():
         return None
 
 engine = get_engine()
-
-# ---- Diagnostics (helps confirm same code + same DB) ----
-def _get_git_commit_short() -> str:
-    try:
-        repo_dir = Path(__file__).resolve().parent
-        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo_dir), stderr=subprocess.DEVNULL)
-        return out.decode("utf-8", errors="ignore").strip()
-    except Exception:
-        return "unknown"
-
-
-def get_app_fingerprint() -> dict:
-    try:
-        host = socket.gethostname()
-    except Exception:
-        host = "unknown-host"
-    try:
-        os_name = platform.platform()
-    except Exception:
-        os_name = "unknown-os"
-    try:
-        py_ver = platform.python_version()
-    except Exception:
-        py_ver = "unknown-py"
-    return {
-        "host": host,
-        "os": os_name,
-        "python": py_ver,
-        "git_commit": _get_git_commit_short(),
-    }
-
-
-@st.cache_data(ttl=30)
-def get_db_fingerprint() -> dict:
-    """
-    DB fingerprint to verify two Streamlit servers are truly using the same DB/schema.
-    Cached briefly to avoid hammering DB.
-    """
-    if not engine:
-        return {"connected": False}
-    out = {"connected": True}
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("SELECT DATABASE(), @@hostname, @@port, VERSION()")).fetchone()
-            if row:
-                out["database"] = row[0]
-                out["db_host"] = row[1]
-                out["db_port"] = row[2]
-                out["db_version"] = row[3]
-            # lightweight row counts
-            try:
-                out["benchmarks_rows"] = int(conn.execute(text("SELECT COUNT(*) FROM benchmarks")).scalar() or 0)
-            except Exception:
-                pass
-            try:
-                out["scan_parents_rows"] = int(conn.execute(text("SELECT COUNT(*) FROM scan_parents")).scalar() or 0)
-            except Exception:
-                pass
-            try:
-                out["scan_progress_rows"] = int(conn.execute(text("SELECT COUNT(*) FROM scan_progress")).scalar() or 0)
-            except Exception:
-                pass
-    except Exception as ex:
-        out["connected"] = False
-        out["error"] = str(ex)
-    return out
-
 
 # Best-effort: auto-start tracker when Streamlit runs (no manual commands).
 # Can be disabled via DISABLE_TRACKER_AUTOSTART=1.
@@ -8273,24 +8203,6 @@ def main():
     if st.sidebar.button("Clear Cache & Refresh Data", use_container_width=True): 
         st.cache_data.clear()
         st.rerun()
-
-    # Diagnostics (collapsed) so differences are obvious across hosts.
-    with st.sidebar.expander("Diagnostics", expanded=False):
-        af = get_app_fingerprint()
-        st.caption(f"Host: `{af.get('host')}`")
-        st.caption(f"OS: `{af.get('os')}` | Python: `{af.get('python')}`")
-        st.caption(f"Code commit: `{af.get('git_commit')}`")
-        dbf = get_db_fingerprint()
-        if not dbf.get("connected"):
-            st.caption(f"DB: `disconnected` {dbf.get('error','')}")
-        else:
-            st.caption(f"DB: `{dbf.get('database')}` @ `{dbf.get('db_host')}:{dbf.get('db_port')}`")
-            st.caption(
-                "Counts: "
-                f"benchmarks={dbf.get('benchmarks_rows','?')} | "
-                f"scan_parents={dbf.get('scan_parents_rows','?')} | "
-                f"scan_progress={dbf.get('scan_progress_rows','?')}"
-            )
 
     page = st.session_state.current_page
     
