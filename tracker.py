@@ -45,12 +45,43 @@ DEFAULT_CLASSIFIERS_API_PATH = (
 CLASSIFIERS_API_PATH = os.getenv("BIGID_CLASSIFIERS_API_PATH", DEFAULT_CLASSIFIERS_API_PATH).strip() or DEFAULT_CLASSIFIERS_API_PATH
 
 
-RUNNING_STATES = ["Started", "Awaiting", "In Progress", "InProgress", "Running"]
+# Include non-terminal transitional states so we keep tracking them.
+# BigID can show "Stop Requested" for a long time before becoming terminal.
+RUNNING_STATES = [
+    "Started",
+    "Awaiting",
+    "In Progress",
+    "InProgress",
+    "Running",
+    "Stop Requested",
+    "StopRequested",
+    "Stopping",
+]
 TERMINAL_STATES = ["Failed", "CompletedWithFailures", "Completed", "Stopped", "Aborted", "Cancelled", "Canceled"]
 
 
 def _compact_state(s: Any) -> str:
     return str(s or "").strip().lower().replace(" ", "")
+
+
+def _normalize_scan_type_value(raw_type: Any, template_name: Any = None) -> str:
+    """
+    BigID returns scan "type" inconsistently across endpoints:
+    - insights.scanProfile.type: e.g. "dsScan"
+    - parent-scans.scan.type: e.g. "full_scan"
+    Both can represent a user-visible "Full Scan". Normalize to reduce confusion.
+    """
+    t = str(raw_type or "").strip()
+    ct = _compact_state(t)
+    tmpl = str(template_name or "").strip().lower()
+
+    if ct in {"dsscan"}:
+        return "full_scan"
+    if ct in {"full_scan", "fullscan"}:
+        return "full_scan"
+    if "data source scan" in tmpl and ct in {"", "dsscan"}:
+        return "full_scan"
+    return t
 
 
 def _is_terminal_state(s: Any) -> bool:
@@ -59,6 +90,42 @@ def _is_terminal_state(s: Any) -> bool:
 
 def _is_running_state(s: Any) -> bool:
     return _compact_state(s) in {_compact_state(x) for x in RUNNING_STATES}
+
+
+def _state_rank(s: Any) -> int:
+    """
+    Prefer more-advanced states to avoid regressions like:
+    parent-scans says "In Progress" but insights says "Started".
+    """
+    cs = _compact_state(s)
+    if not cs:
+        return 0
+    if _is_terminal_state(cs):
+        return 100
+    if _is_running_state(cs):
+        # Within running, "inprogress" should win over "started".
+        order = {
+            _compact_state("In Progress"): 40,
+            _compact_state("InProgress"): 40,
+            _compact_state("Stop Requested"): 35,
+            _compact_state("StopRequested"): 35,
+            _compact_state("Stopping"): 34,
+            _compact_state("Running"): 30,
+            _compact_state("Awaiting"): 20,
+            _compact_state("Started"): 10,
+        }
+        return 50 + int(order.get(cs, 0))
+    return 10
+
+
+def _choose_best_state(parent_state: Any, insight_state: Any) -> str:
+    a = str(parent_state or "").strip()
+    b = str(insight_state or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if _state_rank(a) >= _state_rank(b) else b
 
 
 def _now_utc_naive() -> datetime:
@@ -992,10 +1059,10 @@ def upsert_scan_parent_record(engine, env_id: Any, scan: Dict[str, Any], status:
     if not scan_id:
         return
     name = str(scan.get("name") or scan.get("scanName") or scan.get("displayName") or "").strip() or None
-    scan_type = str(scan.get("type") or "").strip() or None
+    template_name = str(scan.get("scanTemplateName") or "").strip() or None
+    scan_type = _normalize_scan_type_value(scan.get("type") or "", template_name) or None
     started_at = str(scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt") or "").strip() or None
     completed_at = str(scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt") or "").strip() or None
-    template_name = str(scan.get("scanTemplateName") or "").strip() or None
     status_val = str(status or "").strip() or None
     try:
         env_id_int = int(env_id) if env_id is not None and str(env_id).strip() != "" else None
@@ -1032,7 +1099,14 @@ def upsert_scan_parent_record(engine, env_id: Any, scan: Dict[str, Any], status:
         conn.commit()
 
 
-def upsert_scan_progress_record(engine, env_id: Any, scan_id: str, scan_name: str, insight_payload: Dict[str, Any]) -> None:
+def upsert_scan_progress_record(
+    engine,
+    env_id: Any,
+    scan_id: str,
+    scan_name: str,
+    insight_payload: Dict[str, Any],
+    forced_state: Optional[str] = None,
+) -> None:
     if not scan_id:
         return
 
@@ -1053,7 +1127,7 @@ def upsert_scan_progress_record(engine, env_id: Any, scan_id: str, scan_name: st
     data_sources = si.get("dataSources") if isinstance(si.get("dataSources"), dict) else {}
     classifications = data_sources.get("classifications") if isinstance(data_sources.get("classifications"), dict) else {}
     progress = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    scan_state = str(si.get("state") or progress.get("state") or "").strip() or None
+    scan_state = str(forced_state or si.get("state") or progress.get("state") or "").strip() or None
 
     completed_sub = _to_int(subscans.get("completedSubScans", 0))
     failed_sub = _to_int(subscans.get("failedSubScans", 0))
@@ -1463,13 +1537,14 @@ def track_once(engine) -> Dict[str, Any]:
         prog = sp.get("progress") if isinstance(sp.get("progress"), dict) else {}
         state = str(si.get("state") or prog.get("state") or "").strip()
         name = str(sp.get("name") or "").strip()
+        tmpl = str(sp.get("scanTemplateName") or "").strip()
         scan_row = {
             "_id": str(scan_id),
             "name": name,
-            "type": str(sp.get("type") or "").strip(),
+            "type": _normalize_scan_type_value(sp.get("type") or "", tmpl),
             "startedAt": sp.get("startedAt") or sp.get("updatedAt"),
             "completedAt": sp.get("completedAt"),
-            "scanTemplateName": str(sp.get("scanTemplateName") or "").strip(),
+            "scanTemplateName": tmpl,
             "state": state,
         }
         return scan_row, state, name
@@ -1708,7 +1783,7 @@ def track_once(engine) -> Dict[str, Any]:
                 pass
             if not _is_running_state(status):
                 continue
-            jobs.append((base_url, env, scan_id, scan_name))
+            jobs.append((base_url, env, scan_id, scan_name, status))
 
     # DB-driven safety net: keep tracking scans that DB believes are still running
     db_running = load_running_scan_env_rows(engine)
@@ -1723,11 +1798,19 @@ def track_once(engine) -> Dict[str, Any]:
             "env_name": r.get("env_name"),
             "base_url": r.get("base_url"),
         }
-        jobs.append((str(env_row.get("base_url") or "").strip(), env_row, sid, str(r.get("scan_name") or "")))
+        jobs.append(
+            (
+                str(env_row.get("base_url") or "").strip(),
+                env_row,
+                sid,
+                str(r.get("scan_name") or ""),
+                str(r.get("scan_status") or ""),
+            )
+        )
         seen_scan_ids.add(sid)
 
-    def process_scan(job: Tuple[str, Dict[str, Any], str, str]) -> Tuple[bool, str, int]:
-        base_url, env_row, scan_id, scan_name = job
+    def process_scan(job: Tuple[str, Dict[str, Any], str, str, str]) -> Tuple[bool, str, int]:
+        base_url, env_row, scan_id, scan_name, parent_state = job
         if not base_url or not scan_id:
             return False, "bad_job", 0
         try:
@@ -1750,14 +1833,23 @@ def track_once(engine) -> Dict[str, Any]:
 
         try:
             # Use insights payload to keep scan_parents status accurate (running -> terminal, etc.)
-            scan_row, state, insight_name = _scan_row_from_insights(scan_id, insight)
+            scan_row, insight_state, insight_name = _scan_row_from_insights(scan_id, insight)
+            best_state = _choose_best_state(parent_state, insight_state)
+            scan_row["state"] = best_state
             try:
-                upsert_scan_parent_record(engine, env_row.get("id"), scan_row, state)
+                upsert_scan_parent_record(engine, env_row.get("id"), scan_row, best_state)
             except Exception:
                 pass
 
             # Snapshot row (slot-aligned) + normalized insights summary
-            upsert_scan_progress_record(engine, env_row.get("id"), scan_id, scan_name or insight_name, insight)
+            upsert_scan_progress_record(
+                engine,
+                env_row.get("id"),
+                scan_id,
+                scan_name or insight_name,
+                insight,
+                forced_state=best_state,
+            )
             upsert_scan_insights_record(engine, scan_id, insight)
 
             # Template classifier set sync (what user means by "template has ~72 classifiers").

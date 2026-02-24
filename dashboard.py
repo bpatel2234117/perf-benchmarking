@@ -552,7 +552,13 @@ def page_overview(df):
         return group.iloc[0]
     
     if not filtered_df.empty:
-        filtered_df = filtered_df.groupby(['Build_Version', 'Data_Source_Type'], as_index=False).apply(select_best_run).reset_index(drop=True)
+        gb = filtered_df.groupby(["Build_Version", "Data_Source_Type"], group_keys=False, sort=False)
+        try:
+            # Pandas 2.x: avoid deprecated behavior of including grouping columns in apply().
+            filtered_df = gb.apply(select_best_run, include_groups=False).reset_index(drop=True)
+        except TypeError:
+            # Older Pandas: no include_groups arg.
+            filtered_df = gb.apply(select_best_run).reset_index(drop=True)
 
     # KPIs
     st.markdown("### Key Metrics")
@@ -3392,10 +3398,16 @@ def upsert_scan_parent_record(env_id, scan_row, resolved_status):
     if not scan_id:
         return
     name = str(scan_row.get("name") or scan_row.get("scanName") or scan_row.get("displayName") or "").strip()
-    scan_type = str(scan_row.get("type") or "").strip()
+    template_name = str(scan_row.get("scanTemplateName") or "").strip()
+    scan_type_raw = str(scan_row.get("type") or "").strip()
+    _ct = scan_type_raw.strip().lower().replace(" ", "")
+    _tmpl = template_name.strip().lower()
+    if _ct in {"dsscan", "fullscan", "full_scan"} or ("data source scan" in _tmpl and _ct in {"", "dsscan"}):
+        scan_type = "full_scan"
+    else:
+        scan_type = scan_type_raw
     started_at = str(scan_row.get("startedAt") or scan_row.get("startTime") or scan_row.get("createdAt") or "").strip()
     completed_at = str(scan_row.get("completedAt") or scan_row.get("endTime") or scan_row.get("endedAt") or "").strip()
-    template_name = str(scan_row.get("scanTemplateName") or "").strip()
     status = str(resolved_status or "").strip()
     try:
         with engine.connect() as conn:
@@ -3574,7 +3586,7 @@ def load_scan_parents_for_environments(environment_ids, status_view="All", limit
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
                 ORDER BY
                     CASE
-                        WHEN sp.scan_status IN ('Started','Awaiting','In Progress','InProgress','Running') THEN 0
+                        WHEN sp.scan_status IN ('Started','Awaiting','In Progress','InProgress','Running','Stop Requested','StopRequested','Stopping') THEN 0
                         ELSE 1
                     END,
                     sp.updated_at DESC
@@ -6062,7 +6074,18 @@ def page_scan_status():
             pass
         st.rerun()
 
-    running_states = ["Started", "Awaiting", "In Progress", "InProgress", "Running", "Queued", "Pending"]
+    running_states = [
+        "Started",
+        "Awaiting",
+        "In Progress",
+        "InProgress",
+        "Running",
+        "Queued",
+        "Pending",
+        "Stop Requested",
+        "StopRequested",
+        "Stopping",
+    ]
     completed_states = ["Failed", "CompletedWithFailures", "Completed", "Stopped", "Aborted", "Cancelled", "Canceled"]
     def _compact_state(v: str) -> str:
         return str(v or "").strip().lower().replace(" ", "")
@@ -6146,10 +6169,45 @@ def page_scan_status():
     )
     # Ensure running scans are not missed: union in latest running scan_progress rows.
     try:
-        running_states_local = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending"}
+        running_states_local = {
+            "started",
+            "awaiting",
+            "inprogress",
+            "in progress",
+            "running",
+            "queued",
+            "pending",
+            "stoprequested",
+            "stop requested",
+            "stopping",
+        }
         def _compact(s: str) -> str:
             return str(s or "").strip().lower().replace(" ", "")
         running_compact = {_compact(x) for x in running_states_local}
+
+        # Only treat scan_progress as "running" if the latest snapshot is fresh.
+        # Otherwise stale rows can look like extra running scans.
+        try:
+            stale_minutes = int(os.getenv("SCAN_STATUS_PROGRESS_STALE_MINUTES", "60") or "60")
+        except Exception:
+            stale_minutes = 60
+        now_utc = datetime.utcnow()
+        def _age_minutes(pr: dict) -> Optional[float]:
+            try:
+                ts = pr.get("captured_at_utc") or pr.get("timestamp")
+                if ts is None:
+                    return None
+                # ts is usually a datetime from DB; handle strings too.
+                if isinstance(ts, str):
+                    dt = pd.to_datetime(ts, errors="coerce")
+                    if pd.isna(dt):
+                        return None
+                    dt = dt.to_pydatetime()
+                else:
+                    dt = ts
+                return (now_utc - dt).total_seconds() / 60.0
+            except Exception:
+                return None
 
         progress_latest = load_latest_scan_progress_rows_for_environments(active_env_ids)
         items_by_id = {}
@@ -6161,12 +6219,17 @@ def page_scan_status():
             if sid and sid not in items_by_id:
                 items_by_id[sid] = it
         added_from_progress = 0
+        skipped_stale_progress = 0
         for pr in (progress_latest or []):
             sid = str(pr.get("scan_id") or "").strip()
             if not sid:
                 continue
             p_state = str(pr.get("scan_state") or "").strip()
             if _compact(p_state) not in running_compact:
+                continue
+            age_m = _age_minutes(pr)
+            if age_m is not None and age_m > float(stale_minutes):
+                skipped_stale_progress += 1
                 continue
             if sid in items_by_id:
                 # If scan_parents state is stale/non-running but progress shows running, trust progress.
@@ -6195,6 +6258,8 @@ def page_scan_status():
             added_from_progress += 1
         if added_from_progress:
             st.caption(f"Added {added_from_progress} running scans from scan_progress (scan_parents was missing them).")
+        if skipped_stale_progress and st.query_params.get("debug") == "true":
+            st.caption(f"Skipped {skipped_stale_progress} stale running rows from scan_progress (>{stale_minutes} min old).")
     except Exception:
         pass
     running_total = None
@@ -6310,8 +6375,14 @@ def page_scan_status():
         if status_view == "Completed" and _compact_state(state) not in completed_compact:
             continue
 
-        # UI normalization: BigID "running" effectively means "In Progress".
-        display_state = "In Progress" if _compact_state(state) in running_compact else (state or "Unknown")
+        # UI normalization:
+        # - keep "Stop Requested"/"Stopping" explicit (important diagnostic)
+        # - otherwise treat "running" variants as "In Progress"
+        cs = _compact_state(state)
+        if cs in {"stoprequested", "stopping"}:
+            display_state = "Stop Requested" if cs == "stoprequested" else "Stopping"
+        else:
+            display_state = "In Progress" if cs in running_compact else (state or "Unknown")
 
         insight_metrics = {
             "distinct_classification_attributes": "",
@@ -6343,11 +6414,22 @@ def page_scan_status():
         started_at = scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt")
         completed_at = scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt")
 
+        raw_scan_type = scan.get("type") or ""
+        tmpl_name = scan.get("scanTemplateName") or ""
+        cs_type = str(raw_scan_type or "").strip().lower().replace(" ", "")
+        cs_tmpl = str(tmpl_name or "").strip().lower()
+        if cs_type in {"dsscan", "fullscan", "full_scan"} or ("data source scan" in cs_tmpl and cs_type in {"", "dsscan"}):
+            display_scan_type = "Full Scan"
+        elif cs_type:
+            display_scan_type = str(raw_scan_type or "").strip()
+        else:
+            display_scan_type = ""
+
         summary_rows.append({
             "Environment": scan_env_name or str((scan_env_row or {}).get("env_name") or selected_env.get("env_name") or ""),
             "Scan Name": scan.get("name") or scan.get("scanName") or scan.get("displayName") or "",
             "Scan Id": scan_id,
-            "Scan Type": scan.get("type") or "",
+            "Scan Type": display_scan_type,
             "Start Time": started_at or "",
             "End Time": completed_at or "",
             "Template": scan.get("scanTemplateName") or "",
@@ -7451,7 +7533,13 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     group_cols = ['Build_Version']
     if compare_by: group_cols.append(compare_by)
     
-    plot_df = df_filtered.groupby(group_cols, as_index=False).apply(select_best_run).reset_index(drop=True)
+    gb = df_filtered.groupby(group_cols, group_keys=False, sort=False)
+    try:
+        # Pandas 2.x: avoid deprecated behavior of including grouping columns in apply().
+        plot_df = gb.apply(select_best_run, include_groups=False).reset_index(drop=True)
+    except TypeError:
+        # Older Pandas: no include_groups arg.
+        plot_df = gb.apply(select_best_run).reset_index(drop=True)
     plot_df = plot_df.sort_values('Build_Version')
     # Drop rows with missing cluster throughput
     if 'throughput_cluster_gb_hr' in plot_df.columns:
