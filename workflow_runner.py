@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -53,6 +54,7 @@ TERMINAL_STATES = {"failed", "completedwithfailures", "completed", "stopped", "a
 ENV_FILE_PATH = Path(__file__).parent / ".env"
 
 RUNNER_HEARTBEAT_NAME = "workflow_runner"
+RUNNER_LOCK_KEY = "workflow_runner_lock"
 
 def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
     try:
@@ -63,6 +65,103 @@ def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
         return last.isdigit() and len(last) == 14
     except Exception:
         return False
+
+def ensure_tracker_kv_table(engine) -> None:
+    """
+    Ensure tracker_kv exists so we can use it for a DB-wide runner lock.
+    (Table is also used by tracker.py.)
+    """
+    try:
+        dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_kv (
+                        k TEXT PRIMARY KEY,
+                        v TEXT NULL,
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """))
+            else:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_kv (
+                        k VARCHAR(200) PRIMARY KEY,
+                        v VARCHAR(2000) NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    )
+                """))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _parse_db_dt(v: Any) -> Optional[datetime]:
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, str) and v.strip():
+        s = v.strip().replace("Z", "")
+        # try a few common formats
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+            try:
+                return datetime.strptime(s, fmt)
+            except Exception:
+                continue
+    return None
+
+
+def acquire_runner_lock(engine, *, ttl_seconds: int = 120) -> Tuple[bool, str]:
+    """
+    DB-wide lock so only one workflow runner executes steps across all machines
+    sharing the same DB. Uses tracker_kv as a heartbeat lock with TTL.
+    """
+    ensure_tracker_kv_table(engine)
+    who = f"{socket.gethostname()}:{os.getpid()}"
+    now = _now_utc()
+    ttl = timedelta(seconds=max(30, int(ttl_seconds)))
+    try:
+        dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT v, updated_at FROM tracker_kv WHERE k=:k LIMIT 1"),
+                {"k": RUNNER_LOCK_KEY},
+            ).fetchone()
+            if row:
+                holder = str(row[0] or "").strip()
+                updated = _parse_db_dt(row[1])
+                if updated and (updated + ttl) > now and holder and holder != who:
+                    return False, f"lock held by {holder} (updated {updated} UTC)"
+            # acquire/renew
+            if "sqlite" in dialect:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_kv (k, v, updated_at)
+                        VALUES (:k, :v, datetime('now'))
+                        ON CONFLICT(k) DO UPDATE SET
+                            v=excluded.v,
+                            updated_at=datetime('now')
+                    """),
+                    {"k": RUNNER_LOCK_KEY, "v": who},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_kv (k, v)
+                        VALUES (:k, :v)
+                        ON DUPLICATE KEY UPDATE
+                            v=VALUES(v),
+                            updated_at=CURRENT_TIMESTAMP
+                    """),
+                    {"k": RUNNER_LOCK_KEY, "v": who},
+                )
+        return True, f"lock ok ({who})"
+    except Exception as ex:
+        return True, f"lock unavailable (proceeding): {ex}"
 
 
 def _compact(s: Any) -> str:
@@ -1291,6 +1390,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     """
     ensure_workflow_tables(engine)
     set_runner_heartbeat(engine, status="running", message="tick", started=False)
+    ok_lock, lock_msg = acquire_runner_lock(engine, ttl_seconds=120)
+    if not ok_lock:
+        set_runner_heartbeat(engine, status="idle", message=lock_msg, started=False)
+        return False
     now = _now_utc()
     with engine.connect() as conn:
         run_row = conn.execute(
