@@ -10471,7 +10471,24 @@ def page_workflow_automation():
         active_df = steps_df[active_mask].copy()
         if active_df.empty:
             active_df = steps_df[stv.isin(["pending"])].copy()
-        active_row = active_df.sort_values(by=["seq"], ascending=[True]).iloc[0].to_dict() if not active_df.empty else {}
+        # Prefer the most relevant/most recently updated active step.
+        # (Avoid always showing seq=1 when later steps are actually running.)
+        _prio = {
+            "running": 100,
+            "scan_running": 90,
+            "scan_created": 80,
+            "ds_test_ok": 70,
+            "ds_created": 60,
+            "pre_action_done": 50,
+            "pending": 10,
+        }
+        try:
+            active_df["_status_norm"] = active_df["status"].fillna("").astype(str).str.strip().str.lower()
+            active_df["_prio"] = active_df["_status_norm"].map(lambda s: int(_prio.get(str(s), 0)))
+        except Exception:
+            active_df["_prio"] = 0
+        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df.columns]
+        active_row = active_df.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df.empty else {}
     except Exception:
         counts = {}
         active_row = {}
