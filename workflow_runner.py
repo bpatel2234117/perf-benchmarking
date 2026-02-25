@@ -711,6 +711,7 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     out: Dict[str, str] = {}
     if k == "smb":
         out["SMB_username"] = _getenv_any(["SMB_username", "SMB_USERNAME", "smb_username", "smb_USERNAME"])
+        out["SMB_domain"] = _getenv_any(["SMB_domain", "SMB_DOMAIN", "smb_domain"])
         out["SMB_password"] = _getenv_any(["SMB_password", "SMB_PASSWORD", "smb_password"])
         out["SMB_password_enc"] = _getenv_any(["SMB_password_enc", "SMB_PASSWORD_ENC", "smb_password_enc"])
     elif k == "s3":
@@ -1024,18 +1025,30 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
                 ap["tenantId"] = tid
             ds_conn["authenticationProperties"] = ap
     elif k == "smb":
+        u = _get("SMB_username")
+        d = _get("SMB_domain")
+        pw_enc = _get("SMB_password_enc")
+        pw = _get("SMB_password")
+        # Some exports store SMB creds at top-level, some under authenticationProperties.
+        if u:
+            ds_conn["username"] = u
+        if d and ("domain" in ds_conn):
+            ds_conn["domain"] = d
+        if pw_enc:
+            ds_conn["password_enc"] = pw_enc
+            ds_conn.pop("password", None)
+        elif pw:
+            ds_conn["password_enc"] = pw
+            ds_conn.pop("password", None)
         if isinstance(ap, dict):
-            u = _get("SMB_username")
             if u:
                 ap["username"] = u
-            pw_enc = _get("SMB_password_enc")
-            pw = _get("SMB_password")
+            if d and ("domain" in ap):
+                ap["domain"] = d
             if pw_enc:
                 ap["password_enc"] = pw_enc
                 ap.pop("password", None)
             elif pw:
-                # BigID UI uses password_enc. If user only provides SMB_password,
-                # place it into password_enc.
                 ap["password_enc"] = pw
                 ap.pop("password", None)
             ds_conn["authenticationProperties"] = ap
