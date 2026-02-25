@@ -23,6 +23,13 @@ cd C:\performanceBenchmark
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\install_autostart_tasks.ps1
 ```
 
+If you're already in the `windows` folder:
+
+```powershell
+cd C:\performanceBenchmark\windows
+powershell -NoProfile -ExecutionPolicy Bypass -File .\install_autostart_tasks.ps1
+```
+
 Logs:
 - `C:\performanceBenchmark\logs\tracker.out.log`
 - `C:\performanceBenchmark\logs\tracker.err.log`
@@ -33,4 +40,11 @@ To uninstall tasks:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\windows\uninstall_autostart_tasks.ps1
+```
+
+Or from the `windows` folder:
+
+```powershell
+cd C:\performanceBenchmark\windows
+powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall_autostart_tasks.ps1
 ```

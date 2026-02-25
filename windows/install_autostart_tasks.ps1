@@ -12,6 +12,15 @@ if (-not (Test-Path $TrackerScript)) { throw "Missing $TrackerScript" }
 $taskDash = "ScanPerfDashboard"
 $taskTracker = "ScanPerfTracker"
 
+function Test-TaskExists {
+  param([string]$TaskName)
+  # schtasks.exe prints "ERROR: The system cannot find the file specified." for missing tasks.
+  # In newer PowerShell, native command failures can be treated as terminating errors.
+  # Use cmd.exe and redirect output to avoid hard-failing the script.
+  cmd.exe /c "schtasks.exe /Query /TN ""$TaskName"" >nul 2>nul"
+  return ($LASTEXITCODE -eq 0)
+}
+
 function Register-StartupTask {
   param(
     [string]$TaskName,
@@ -23,9 +32,8 @@ function Register-StartupTask {
   $cmdArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
 
   # Remove existing task if present (idempotent)
-  schtasks.exe /Query /TN $TaskName *> $null
-  if ($LASTEXITCODE -eq 0) {
-    schtasks.exe /Delete /TN $TaskName /F *> $null
+  if (Test-TaskExists -TaskName $TaskName) {
+    schtasks.exe /Delete /TN $TaskName /F | Out-Null
   }
 
   $delay = ("{0:00}:{1:00}" -f [Math]::Floor($DelaySeconds / 60), ($DelaySeconds % 60))
