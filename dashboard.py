@@ -10478,7 +10478,7 @@ def page_workflow_automation():
 
     a1, a2, a3, a4, a5 = st.columns(5)
     a1.metric("Pending", int(counts.get("pending", 0)))
-    a2.metric("In progress", int(counts.get("running", 0) + counts.get("scan_running", 0)))
+    a2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
     a3.metric("Completed", int(counts.get("completed", 0)))
     a4.metric("Disabled", int(counts.get("disabled", 0)))
     a5.metric("Errors", int(counts.get("error", 0)))
@@ -10494,6 +10494,24 @@ def page_workflow_automation():
 
     # Convenience display columns
     disp = steps_df.copy()
+    # Phase column to avoid confusion between "step running" vs "scan running"
+    try:
+        _phase_map = {
+            "pending": "Pending",
+            "disabled": "Disabled",
+            "error": "Error",
+            "running": "Executing step",
+            "pre_action_done": "Pre-action done",
+            "ds_created": "DS created",
+            "ds_test_ok": "DS test OK",
+            "scan_created": "Scan profile created",
+            "scan_running": "Scan running",
+            "completed": "Completed",
+        }
+        disp["_status_norm"] = disp["status"].fillna("").astype(str).str.strip().str.lower()
+        disp["Phase"] = disp["_status_norm"].map(lambda s: _phase_map.get(str(s), str(s or "").strip() or ""))
+    except Exception:
+        disp["Phase"] = disp.get("status")
     disp["Flags"] = disp.apply(
         lambda r: ", ".join([x for x in [
             "ACL" if bool(r.get("is_acl")) else "",
@@ -10502,6 +10520,10 @@ def page_workflow_automation():
         ] if x]),
         axis=1,
     )
+    try:
+        disp["Scan Started"] = disp["scan_id"].map(lambda sid: "yes" if str(sid or "").strip() else "")
+    except Exception:
+        disp["Scan Started"] = ""
     disp["Progress"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
     disp = disp.rename(columns={
         "seq": "Step",
@@ -10516,7 +10538,7 @@ def page_workflow_automation():
         "notes": "Notes",
     })
     st.markdown("### Steps")
-    cols = ["Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Step Status", "build_version", "build_prefix", "DS Id", "Scan Id", "Progress", "Notes", "last_error", "updated_at"]
+    cols = ["Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Phase", "Scan Started", "Step Status", "build_version", "build_prefix", "DS Id", "Scan Id", "Progress", "Notes", "last_error", "updated_at"]
     cols = [c for c in cols if c in disp.columns]
     st.dataframe(
         disp[cols],
@@ -10526,6 +10548,42 @@ def page_workflow_automation():
             "Progress": st.column_config.LinkColumn("Progress", display_text="View"),
         },
     )
+
+    with st.expander("Maintenance (reset stale status)", expanded=False):
+        st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans; it only resets DB state for the run.")
+        if st.button("Reset unfinished steps to pending", key="wf_reset_steps"):
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        UPDATE workflow_steps
+                        SET status='pending',
+                            last_error=NULL,
+                            started_at=NULL,
+                            finished_at=NULL,
+                            ds_id=NULL,
+                            scan_profile_id=NULL,
+                            scan_profile_name=NULL,
+                            scan_id=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE run_id=:rid
+                          AND COALESCE(status,'') NOT IN ('completed','disabled')
+                    """), {"rid": int(run_id)})
+                    conn.execute(text("""
+                        UPDATE workflow_runs
+                        SET last_error=NULL,
+                            next_eligible_at=CURRENT_TIMESTAMP,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id=:rid
+                    """), {"rid": int(run_id)})
+                    conn.commit()
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success("Reset done. Click Start/Resume to run again.")
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Reset failed: {ex}")
 
     # Hide manual template editing in normal mode (workflow should be automatic).
     # If needed for troubleshooting, enable debug view via ?debug=true
