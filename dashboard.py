@@ -10300,9 +10300,35 @@ def page_workflow_automation():
     selected_run_label = st.selectbox("Select run", run_options, index=default_idx, key="wf_run_sel")
     run_id = int(run_map[selected_run_label])
 
+    # Disable starting/resuming multiple workflows at once (prevents conflicts).
+    try:
+        tmp = runs_df.copy()
+        tmp["status_norm"] = tmp["status"].astype(str).str.strip().str.lower()
+        running_rows = tmp[tmp["status_norm"] == "running"].copy()
+        any_running = not running_rows.empty
+        running_ids = sorted({int(x) for x in running_rows["id"].tolist() if str(x).strip().isdigit()})
+    except Exception:
+        any_running = False
+        running_ids = []
+
+    try:
+        selected_status = str(runs_df[runs_df["id"] == run_id].iloc[0]["status"] or "").strip().lower()
+    except Exception:
+        selected_status = ""
+    selected_is_running = selected_status == "running"
+    other_running_ids = [x for x in running_ids if int(x) != int(run_id)]
+    if any_running and other_running_ids:
+        st.warning(f"Another workflow is already running (run id(s): {', '.join([str(x) for x in other_running_ids])}). Pause/Stop it before starting another.")
+    elif selected_is_running:
+        st.info("This workflow run is currently running.")
+
     # Controls
-    b1, b2, b3, b4, b5 = st.columns([1.0, 1.0, 1.0, 1.2, 1.0])
-    if b1.button("Start Workflow", type="primary"):
+    b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3, 1.0])
+    start_disabled = bool(any_running)  # requirement: only one running workflow at a time
+    pause_disabled = (selected_status != "running")
+    resume_disabled = (selected_status != "paused") or (bool(any_running) and not selected_is_running)
+    stop_disabled = (selected_status not in {"running", "paused"})
+    if b1.button("Start Workflow", type="primary", disabled=start_disabled):
         try:
             with engine.connect() as conn:
                 conn.execute(text("""
@@ -10322,10 +10348,10 @@ def page_workflow_automation():
             st.rerun()
         except Exception as ex:
             st.error(f"Start failed: {ex}")
-    if b2.button("Pause"):
+    if b2.button("Pause", disabled=pause_disabled):
         set_workflow_run_status(int(run_id), "paused")
         st.rerun()
-    if b3.button("Resume Workflow"):
+    if b3.button("Resume Workflow", disabled=resume_disabled):
         set_workflow_run_status(int(run_id), "running")
         try:
             if callable(ensure_workflow_runner_running):
@@ -10333,7 +10359,7 @@ def page_workflow_automation():
         except Exception:
             pass
         st.rerun()
-    if b5.button("Stop Workflow"):
+    if b6.button("Stop Workflow", disabled=stop_disabled):
         set_workflow_run_status(int(run_id), "stopped")
         try:
             with engine.connect() as conn:
@@ -10342,7 +10368,13 @@ def page_workflow_automation():
         except Exception:
             pass
         st.rerun()
-    if b4.button("Reconcile from DB"):
+    if b4.button("Refresh"):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+    if b5.button("Reconcile from DB"):
         res = reconcile_workflow_run(int(run_id))
         st.caption(f"Reconciled: updated_steps={res.get('updated_steps')} completed_run={res.get('completed_run')}")
         try:
@@ -10364,10 +10396,48 @@ def page_workflow_automation():
     if str(rrow.get("last_error") or "").strip():
         st.error(str(rrow.get("last_error") or "").strip())
 
+    # If run is running, show (and trigger) runner autostart status so it's obvious what's happening.
+    if selected_is_running:
+        try:
+            if callable(ensure_workflow_runner_running):
+                ok, msg = ensure_workflow_runner_running(engine)
+                st.caption(f"Runner: {msg}")
+        except Exception:
+            pass
+
     steps_df = load_workflow_steps(int(run_id))
     if steps_df.empty:
         st.info("No steps found for this run.")
         return
+
+    # Current activity summary
+    try:
+        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
+        counts = stv.value_counts().to_dict()
+        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
+        active_df = steps_df[active_mask].copy()
+        if active_df.empty:
+            active_df = steps_df[stv.isin(["pending"])].copy()
+        active_row = active_df.sort_values(by=["seq"], ascending=[True]).iloc[0].to_dict() if not active_df.empty else {}
+    except Exception:
+        counts = {}
+        active_row = {}
+
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Pending", int(counts.get("pending", 0)))
+    a2.metric("In progress", int(counts.get("running", 0) + counts.get("scan_running", 0)))
+    a3.metric("Completed", int(counts.get("completed", 0)))
+    a4.metric("Disabled", int(counts.get("disabled", 0)))
+    a5.metric("Errors", int(counts.get("error", 0)))
+    try:
+        if active_row:
+            st.caption(
+                f"Current step: {int(active_row.get('seq'))} | status={str(active_row.get('status') or '').strip()} | "
+                f"ds=`{str(active_row.get('ds_name') or '').strip()}` | file_set=`{str(active_row.get('file_set_type') or '').strip()}` | "
+                f"env={str(active_row.get('environment') or active_row.get('environment_id') or '').strip()} | updated_at={active_row.get('updated_at')}"
+            )
+    except Exception:
+        pass
 
     # Convenience display columns
     disp = steps_df.copy()
