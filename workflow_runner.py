@@ -55,6 +55,7 @@ ENV_FILE_PATH = Path(__file__).parent / ".env"
 
 RUNNER_HEARTBEAT_NAME = "workflow_runner"
 RUNNER_LOCK_KEY = "workflow_runner_lock"
+RUNNER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
     try:
@@ -118,7 +119,7 @@ def acquire_runner_lock(engine, *, ttl_seconds: int = 120) -> Tuple[bool, str]:
     sharing the same DB. Uses tracker_kv as a heartbeat lock with TTL.
     """
     ensure_tracker_kv_table(engine)
-    who = f"{socket.gethostname()}:{os.getpid()}"
+    who = RUNNER_ID
     now = _now_utc()
     ttl = timedelta(seconds=max(30, int(ttl_seconds)))
     try:
@@ -785,7 +786,8 @@ def set_runner_heartbeat(engine, *, status: str, message: str = "", started: boo
     """
     ensure_runner_heartbeat_table(engine)
     stv = str(status or "").strip()[:16]
-    msg = str(message or "").strip()[:2000]
+    msg_raw = str(message or "").strip()
+    msg = (f"{RUNNER_ID} {msg_raw}").strip()[:2000]
     now = _now_utc()
     started_at = now if started else None
     finished_at = now if not started else None

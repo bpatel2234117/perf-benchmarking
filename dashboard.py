@@ -10442,6 +10442,21 @@ def page_workflow_automation():
                 st.caption(f"Runner heartbeat: status={row[2]} started={row[0]} finished={row[1]} msg={row[3]}")
         except Exception:
             pass
+        # DB-wide lock holder (useful when multiple machines share the same DB)
+        try:
+            with engine.connect() as conn:
+                row2 = conn.execute(
+                    text("""
+                        SELECT v, updated_at
+                        FROM tracker_kv
+                        WHERE k = 'workflow_runner_lock'
+                        LIMIT 1
+                    """)
+                ).fetchone()
+            if row2:
+                st.caption(f"Runner lock: holder={row2[0]} updated_at={row2[1]}")
+        except Exception:
+            pass
 
     steps_df = load_workflow_steps(int(run_id))
     if steps_df.empty:
