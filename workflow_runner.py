@@ -217,6 +217,7 @@ def ensure_workflow_tables(engine) -> None:
                     ds_name TEXT NULL,
                     scan_kind TEXT NULL,
                     file_set_type TEXT NULL,
+                    is_enabled INTEGER DEFAULT 1,
                     is_acl INTEGER DEFAULT 0,
                     is_ocr INTEGER DEFAULT 0,
                     is_structured_ff INTEGER DEFAULT 0,
@@ -255,6 +256,7 @@ def ensure_workflow_tables(engine) -> None:
                 pass
             # Non-breaking upgrades for existing sqlite DBs
             for stmt in [
+                "ALTER TABLE workflow_steps ADD COLUMN is_enabled INTEGER DEFAULT 1",
                 "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
@@ -294,6 +296,7 @@ def ensure_workflow_tables(engine) -> None:
                 ds_name VARCHAR(500) NULL,
                 scan_kind VARCHAR(64) NULL,
                 file_set_type VARCHAR(150) NULL,
+                is_enabled BOOLEAN DEFAULT TRUE,
                 is_acl BOOLEAN DEFAULT FALSE,
                 is_ocr BOOLEAN DEFAULT FALSE,
                 is_structured_ff BOOLEAN DEFAULT FALSE,
@@ -328,6 +331,7 @@ def ensure_workflow_tables(engine) -> None:
         """))
         # Non-breaking upgrades
         for stmt in [
+            "ALTER TABLE workflow_steps ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE",
             "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
             "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
             "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
@@ -1233,10 +1237,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     if skip_errors:
         # Bulk-create: continue past failures and also resume half-done steps.
         # Terminal for our purposes: scan_created/completed; and we explicitly skip error.
-        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error')"
+        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error') AND COALESCE(is_enabled, 1) = 1"
     else:
         # Normal mode: allow retrying errors by default.
-        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error')"
+        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(is_enabled, 1) = 1"
 
     # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
     avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}

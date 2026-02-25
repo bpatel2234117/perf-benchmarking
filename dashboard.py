@@ -3008,6 +3008,7 @@ def ensure_workflow_tables():
                         ds_name TEXT NULL,
                         scan_kind TEXT NULL,
                         file_set_type TEXT NULL,
+                        is_enabled INTEGER DEFAULT 1,
                         is_acl INTEGER DEFAULT 0,
                         is_ocr INTEGER DEFAULT 0,
                         is_structured_ff INTEGER DEFAULT 0,
@@ -3039,6 +3040,7 @@ def ensure_workflow_tables():
                 """))
                 # Non-breaking upgrades for existing sqlite DBs
                 for stmt in [
+                    "ALTER TABLE workflow_steps ADD COLUMN is_enabled INTEGER DEFAULT 1",
                     "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id TEXT NULL",
                     "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
                     "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
@@ -3088,6 +3090,7 @@ def ensure_workflow_tables():
                     ds_name VARCHAR(500) NULL,
                     scan_kind VARCHAR(64) NULL,
                     file_set_type VARCHAR(150) NULL,
+                    is_enabled BOOLEAN DEFAULT TRUE,
                     is_acl BOOLEAN DEFAULT FALSE,
                     is_ocr BOOLEAN DEFAULT FALSE,
                     is_structured_ff BOOLEAN DEFAULT FALSE,
@@ -3122,6 +3125,7 @@ def ensure_workflow_tables():
             """))
             # Non-breaking upgrades for existing MySQL DBs
             for stmt in [
+                "ALTER TABLE workflow_steps ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE",
                 "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id VARCHAR(128) NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
@@ -3189,6 +3193,7 @@ def create_workflow_run(
         for i, stp in enumerate(steps or [], start=1):
             if not isinstance(stp, dict):
                 continue
+            enabled = bool(stp.get("is_enabled", True))
             seq_rows.append({
                 "rid": int(run_id),
                 "seq": int(i),
@@ -3197,13 +3202,14 @@ def create_workflow_run(
                 "dn": str(stp.get("ds_name") or "").strip() or None,
                 "sk": str(stp.get("scan_kind") or "").strip() or None,
                 "fs": str(stp.get("file_set_type") or "").strip() or None,
+                "en": 1 if enabled else 0,
                 "acl": 1 if bool(stp.get("is_acl")) else 0,
                 "ocr": 1 if bool(stp.get("is_ocr")) else 0,
                 "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
                 "ols": 1 if bool(stp.get("is_ols")) else 0,
                 "ff": str(stp.get("feature_flags") or "").strip() or None,
                 "notes": str(stp.get("notes") or "").strip() or None,
-                "status": str(stp.get("status") or "pending").strip(),
+                "status": ("pending" if enabled else "disabled"),
             })
         if seq_rows:
             conn.execute(
@@ -3211,12 +3217,14 @@ def create_workflow_run(
                     INSERT INTO workflow_steps (
                         run_id, seq, environment_id,
                         ds_kind, ds_name, scan_kind, file_set_type,
+                        is_enabled,
                         is_acl, is_ocr, is_structured_ff, is_ols,
                         feature_flags, notes, status
                     )
                     VALUES (
                         :rid, :seq, :eid,
                         :dk, :dn, :sk, :fs,
+                        :en,
                         :acl, :ocr, :sff, :ols,
                         :ff, :notes, :status
                     )
@@ -3284,6 +3292,7 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
                         ws.ds_name,
                         ws.scan_kind,
                         ws.file_set_type,
+                        ws.is_enabled,
                         ws.is_acl,
                         ws.is_ocr,
                         ws.is_structured_ff,
@@ -3311,7 +3320,7 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
         cols = [
             "id","run_id","seq","environment_id","environment",
             "ds_kind","ds_name","scan_kind","file_set_type",
-            "is_acl","is_ocr","is_structured_ff","is_ols",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
@@ -10102,8 +10111,14 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (CSV Files)"},
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": True,  "feature_flags": "Structured Files Discovery", "notes": "S3 Full Scan (CSV Files) Structured Discovery FF ON"},
 
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
+
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
         {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
 
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
         {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
@@ -10191,11 +10206,27 @@ def page_workflow_automation():
     wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name")
 
     preview_steps = _build_default_workflow_steps(env1_id, env2_id)
-    with st.expander("Preview steps (16)", expanded=False):
+    for stp in preview_steps or []:
+        if isinstance(stp, dict) and "is_enabled" not in stp:
+            stp["is_enabled"] = True
+    with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
         prev_df = pd.DataFrame(preview_steps)
-        show_cols = ["environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
+        show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
         show_cols = [c for c in show_cols if c in prev_df.columns]
-        st.dataframe(prev_df[show_cols], width="stretch", hide_index=True)
+        editable_df = st.data_editor(
+            prev_df[show_cols],
+            width="stretch",
+            hide_index=True,
+            key="wf_preview_steps_editor",
+            column_config={
+                "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+            },
+            disabled=[c for c in show_cols if c != "is_enabled"],
+        )
+        try:
+            preview_steps = editable_df.to_dict("records")
+        except Exception:
+            pass
 
     if st.button("Create workflow plan", type="primary"):
         rid = create_workflow_run(
