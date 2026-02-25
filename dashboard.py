@@ -10427,6 +10427,21 @@ def page_workflow_automation():
                 st.caption(f"Runner: {msg}")
         except Exception:
             pass
+        # Runner heartbeat (shows why it might be idle: cooldown/waiting/blocked/error)
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("""
+                        SELECT last_started_at_utc, last_finished_at_utc, last_status, last_message
+                        FROM tracker_heartbeat
+                        WHERE name = 'workflow_runner'
+                        LIMIT 1
+                    """)
+                ).fetchone()
+            if row:
+                st.caption(f"Runner heartbeat: status={row[2]} started={row[0]} finished={row[1]} msg={row[3]}")
+        except Exception:
+            pass
 
     steps_df = load_workflow_steps(int(run_id))
     if steps_df.empty:

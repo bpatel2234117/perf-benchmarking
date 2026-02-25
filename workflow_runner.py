@@ -52,6 +52,8 @@ TERMINAL_STATES = {"failed", "completedwithfailures", "completed", "stopped", "a
 
 ENV_FILE_PATH = Path(__file__).parent / ".env"
 
+RUNNER_HEARTBEAT_NAME = "workflow_runner"
+
 
 def _compact(s: Any) -> str:
     return str(s or "").strip().lower().replace(" ", "")
@@ -624,6 +626,27 @@ def set_run_error(engine, run_id: int, message: str) -> None:
         conn.commit()
 
 
+def pause_run(engine, run_id: int, *, reason: str = "") -> None:
+    """
+    Pause the workflow run to avoid endless retries when a hard error occurs.
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    UPDATE workflow_runs
+                    SET status='paused',
+                        last_error=COALESCE(:e, last_error),
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE id=:rid
+                """),
+                {"rid": int(run_id), "e": (str(reason)[:2000] if str(reason or "").strip() else None)},
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def set_step_error(engine, step_id: int, message: str) -> None:
     with engine.connect() as conn:
         conn.execute(
@@ -643,6 +666,76 @@ def set_step_status(engine, step_id: int, status: str, **fields: Any) -> None:
     with engine.connect() as conn:
         conn.execute(text(sql), params)
         conn.commit()
+
+
+def ensure_runner_heartbeat_table(engine) -> None:
+    """
+    Ensure tracker_heartbeat exists so the runner can report liveness + last action.
+    (Table is also used by tracker.py; we create it here for standalone runner usage.)
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                    name VARCHAR(64) PRIMARY KEY,
+                    last_started_at_utc DATETIME NULL,
+                    last_finished_at_utc DATETIME NULL,
+                    last_status VARCHAR(16) NULL,
+                    last_message VARCHAR(2000) NULL
+                )
+            """))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def set_runner_heartbeat(engine, *, status: str, message: str = "", started: bool = False) -> None:
+    """
+    Updates tracker_heartbeat row for this workflow runner.
+    - started=True updates last_started_at_utc
+    - started=False updates last_finished_at_utc
+    """
+    ensure_runner_heartbeat_table(engine)
+    stv = str(status or "").strip()[:16]
+    msg = str(message or "").strip()[:2000]
+    now = _now_utc()
+    started_at = now if started else None
+    finished_at = now if not started else None
+    try:
+        dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :sa, :fa, :s, :m)
+                        ON CONFLICT(name) DO UPDATE SET
+                            last_started_at_utc=COALESCE(excluded.last_started_at_utc, tracker_heartbeat.last_started_at_utc),
+                            last_finished_at_utc=COALESCE(excluded.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
+                            last_status=COALESCE(excluded.last_status, tracker_heartbeat.last_status),
+                            last_message=COALESCE(excluded.last_message, tracker_heartbeat.last_message)
+                    """),
+                    {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :sa, :fa, :s, :m)
+                        ON DUPLICATE KEY UPDATE
+                            last_started_at_utc=COALESCE(VALUES(last_started_at_utc), last_started_at_utc),
+                            last_finished_at_utc=COALESCE(VALUES(last_finished_at_utc), last_finished_at_utc),
+                            last_status=COALESCE(VALUES(last_status), last_status),
+                            last_message=COALESCE(VALUES(last_message), last_message)
+                    """),
+                    {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
+                )
+            conn.commit()
+    except Exception:
+        pass
 
 
 def _apply_build_prefix(name: str, build_prefix: str) -> str:
@@ -1171,6 +1264,10 @@ def wait_for_scan_terminal_or_pause(engine, run_id: int, base_url: str, token: s
                 return stv, True
         except Exception:
             pass
+        try:
+            set_runner_heartbeat(engine, status="waiting", message=f"waiting scan={scan_id} state={last_state or 'unknown'}", started=False)
+        except Exception:
+            pass
         time.sleep(max(5, int(poll_seconds)))
     return last_state or "unknown", True
 
@@ -1204,6 +1301,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     Returns True if any work was done.
     """
     ensure_workflow_tables(engine)
+    set_runner_heartbeat(engine, status="running", message="tick", started=False)
     now = _now_utc()
     with engine.connect() as conn:
         run_row = conn.execute(
@@ -1216,6 +1314,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             """)
         ).fetchone()
     if not run_row:
+        set_runner_heartbeat(engine, status="idle", message="no running workflows", started=False)
         return False
 
     run_id = int(run_row[0])
@@ -1229,6 +1328,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     next_eligible = run_row[3]
     if next_eligible is not None and isinstance(next_eligible, datetime):
         if next_eligible > now:
+            set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
             return False
 
     # Find next step for this run.
@@ -1285,10 +1385,15 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         step = cand
         break
     if not step:
-        # All done
+        # If we had candidates but none were selectable due to scenario locks, just idle and try again later.
+        if candidates and avoid_parallel and running_keys:
+            set_runner_heartbeat(engine, status="idle", message="blocked by scenario lock (waiting for other scan_running steps)", started=False)
+            return False
+        # All done (no remaining eligible steps)
         with engine.connect() as conn:
             conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
             conn.commit()
+        set_runner_heartbeat(engine, status="idle", message=f"run {run_id} completed", started=False)
         return True
 
     step_id = int(step[0])
@@ -1322,6 +1427,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     }
 
     set_step_status(engine, step_id, "running", started_at=now)
+    set_runner_heartbeat(engine, status="working", message=f"run={run_id} step={seq} starting", started=False)
 
     # Build prefix should be refreshed when workflow starts / step executes.
     try:
@@ -1393,6 +1499,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Don't block forever: mark error so user can fix template/payload.
         set_step_error(engine, step_id, f"Pre-step action failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: pre-step action failed")
+        pause_run(engine, run_id, reason=f"Step {seq}: pre-step action failed")
         return True
 
     # --- DS create/update ---
@@ -1451,6 +1558,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"DS create failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: DS create failed")
+        pause_run(engine, run_id, reason=f"Step {seq}: DS create failed")
         return True
 
     # --- DS connection test (required before scan creation) ---
@@ -1501,6 +1609,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"DS connection test failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: DS connection test failed")
+        pause_run(engine, run_id, reason=f"Step {seq}: DS connection test failed")
         return True
 
     # We need ds_id for scan template variables; prefer stored column now.
@@ -1544,6 +1653,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"Scan profile create failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
+        pause_run(engine, run_id, reason=f"Step {seq}: scan profile create failed")
         return True
 
     # If we only want DS + scan profile creation (no scan trigger), stop here.
@@ -1591,6 +1701,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"Scan start failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: scan start failed")
+        pause_run(engine, run_id, reason=f"Step {seq}: scan start failed")
         return True
 
     # Wait for completion if we have scan_id.
@@ -1650,7 +1761,9 @@ def main() -> int:
 
     while True:
         try:
+            set_runner_heartbeat(engine, status="running", message="loop", started=True)
             did = run_once(engine, quiet=bool(args.quiet))
+            set_runner_heartbeat(engine, status=("work" if did else "idle"), message=("did work" if did else "idle"), started=False)
             if not did:
                 time.sleep(max(5, int(args.interval_seconds)))
             else:
@@ -1659,6 +1772,10 @@ def main() -> int:
         except KeyboardInterrupt:
             return 0
         except Exception as ex:
+            try:
+                set_runner_heartbeat(engine, status="error", message=f"runner_error: {ex}", started=False)
+            except Exception:
+                pass
             if not args.quiet:
                 print(f"[{_now_utc().isoformat()}Z] runner_error: {ex}", flush=True)
             time.sleep(max(10, int(args.interval_seconds)))

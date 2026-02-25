@@ -86,6 +86,15 @@ def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
     env = os.environ.copy()
 
     try:
+        logs_dir = repo_dir / "logs"
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        out_path = logs_dir / "workflow_runner.out.log"
+        err_path = logs_dir / "workflow_runner.err.log"
+        stdout_f = open(out_path, "ab", buffering=0)
+        stderr_f = open(err_path, "ab", buffering=0)
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -93,8 +102,8 @@ def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
                 cmd,
                 cwd=str(repo_dir),
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
                 creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
             )
         else:
@@ -102,12 +111,12 @@ def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
                 cmd,
                 cwd=str(repo_dir),
                 env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=stdout_f,
+                stderr=stderr_f,
                 start_new_session=True,
             )
         _write_pidfile(pidfile, int(p.pid))
-        return True, f"spawned (pid={p.pid})"
+        return True, f"spawned (pid={p.pid}) logs={logs_dir}"
     except Exception as ex:
         return False, f"spawn failed: {ex}"
 
