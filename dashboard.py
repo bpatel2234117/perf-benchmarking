@@ -18,7 +18,7 @@ import html
 import re
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
 try:
@@ -26,6 +26,12 @@ try:
     from tracker_autostart import ensure_tracker_running  # type: ignore
 except Exception:
     ensure_tracker_running = None
+
+try:
+    # Optional: auto-start workflow runner when workflows are running.
+    from workflow_autostart import ensure_workflow_runner_running  # type: ignore
+except Exception:
+    ensure_workflow_runner_running = None
 
 # --- Configuration & Styling ---
 st.set_page_config(
@@ -57,6 +63,7 @@ INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_A
 INTERNAL_SCANNER_GROUPS_API_PATH = os.getenv("BIGID_SCANNER_GROUPS_API_PATH", "/api/v1/scanner-groups").strip() or "/api/v1/scanner-groups"
 INTERNAL_DS_CONNECTIONS_API_PATH = os.getenv("BIGID_DS_CONNECTIONS_API_PATH", "/api/v1/ds_connections").strip() or "/api/v1/ds_connections"
 INTERNAL_DS_CONNECTION_TEST_API_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
+INTERNAL_SCAN_TEMPLATES_API_PATH = os.getenv("BIGID_SCAN_TEMPLATES_API_PATH", "/api/v1/scan-templates").strip() or "/api/v1/scan-templates"
 
 # Local LLM (optional): Ollama or OpenAI-compatible server
 LOCAL_LLM_PROVIDER = os.getenv("LOCAL_LLM_PROVIDER", "").strip().lower()  # "ollama" | "openai"
@@ -260,6 +267,15 @@ try:
     if engine:
         if callable(ensure_tracker_running):
             ensure_tracker_running(engine)
+except Exception:
+    pass
+
+# Best-effort: auto-start workflow runner if any workflow is running.
+# Can be disabled via DISABLE_WORKFLOW_AUTOSTART=1.
+try:
+    if engine:
+        if callable(ensure_workflow_runner_running):
+            ensure_workflow_runner_running(engine)
 except Exception:
     pass
 
@@ -1708,6 +1724,140 @@ def fetch_scanner_groups_with_auth_retry(env_row):
         return fetch_scanner_groups_from_api(base_url, token)
 
 
+def extract_scan_templates_payload(payload):
+    """
+    Returns (items, total_count) for scan templates response.
+    """
+    items = []
+    total_count = None
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        root = data_block if isinstance(data_block, dict) else payload
+        for key in ["scanTemplates", "scan_templates", "templates", "items", "results"]:
+            val = root.get(key)
+            if isinstance(val, list):
+                items = [x for x in val if isinstance(x, dict)]
+                break
+        if root.get("totalCount") is not None:
+            try:
+                total_count = int(root.get("totalCount"))
+            except Exception:
+                total_count = None
+    return items, total_count
+
+
+def fetch_scan_templates_from_api(base_url, token, *, limit: int = 200, skip: int = 0):
+    url = build_api_url(base_url, INTERNAL_SCAN_TEMPLATES_API_PATH)
+    params = {
+        "skip": int(skip),
+        "limit": int(limit),
+        "requireTotalCount": "true",
+        # Match UI request shape: no-op filter + updated_at desc, name asc
+        "filter": json.dumps([{"field": "_id", "value": [], "operator": "notIn"}], separators=(",", ":")),
+        "sort": json.dumps(
+            [{"field": "updated_at", "order": "desc"}, {"field": "name", "order": "asc"}],
+            separators=(",", ":"),
+        ),
+    }
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.get(url, params=params, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, params=params, headers=headers_bearer, timeout=45)
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scan templates API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scan templates API.")
+    resp.raise_for_status()
+    payload = resp.json()
+    items, total_count = extract_scan_templates_payload(payload)
+    return items, total_count, getattr(resp, "url", url)
+
+
+def fetch_scan_templates_with_auth_retry(env_row, *, limit: int = 200, skip: int = 0):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return fetch_scan_templates_from_api(base_url, "", limit=limit, skip=skip)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_scan_templates_from_api(base_url, token, limit=limit, skip=skip)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_scan_templates_from_api(base_url, fresh, limit=limit, skip=skip)
+        token = fetch_auth_token_for_env(env_row)
+        return fetch_scan_templates_from_api(base_url, token, limit=limit, skip=skip)
+
+
+def _normalize_template_name(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
+def ensure_env_default_scan_template_id(env_row: Dict[str, Any]) -> str:
+    """
+    Automatic: if config::scan_template_id::env=<id> is missing, fetch /scan-templates and save
+    the template id for "Data source scan".
+    """
+    try:
+        env_id = int(env_row.get("id")) if env_row and env_row.get("id") is not None else None
+    except Exception:
+        env_id = None
+    if env_id is None:
+        return ""
+    key_env = f"config::scan_template_id::env={int(env_id)}"
+    try:
+        existing = str(get_workflow_template_payload(key_env) or "").strip()
+        if existing:
+            return existing
+    except Exception:
+        existing = ""
+
+    # Avoid repeated API calls in one session
+    cache_key = f"_auto_scan_template_done::{int(env_id)}"
+    try:
+        if st.session_state.get(cache_key):
+            return ""
+    except Exception:
+        pass
+
+    try:
+        items, _total, _url = fetch_scan_templates_with_auth_retry(env_row, limit=200, skip=0)
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            nm = _normalize_template_name(it.get("name"))
+            if nm in {"data source scan", "data source scan "}:
+                tid = str(it.get("_id") or it.get("id") or "").strip()
+                if tid:
+                    upsert_workflow_template(key_env, "config", tid)
+                    try:
+                        st.session_state[cache_key] = True
+                    except Exception:
+                        pass
+                    return tid
+        try:
+            st.session_state[cache_key] = True
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        try:
+            st.session_state[cache_key] = True
+        except Exception:
+            pass
+        return ""
+
+
 def put_ds_connection_from_api(base_url, ds_name, token, payload):
     from urllib.parse import quote
 
@@ -2816,6 +2966,578 @@ def ensure_scan_progress_table():
             conn.commit()
     except Exception:
         pass
+
+
+def ensure_workflow_tables():
+    """
+    DB-backed workflow to orchestrate DS + scan creation/runs.
+    UI-first: this just stores the plan + state so a background runner can execute it.
+    """
+    if not engine:
+        return
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NULL,
+                        status TEXT NULL,
+                        env1_id INTEGER NULL,
+                        env2_id INTEGER NULL,
+                        cooldown_minutes INTEGER DEFAULT 15,
+                        next_eligible_at TEXT NULL,
+                        last_error TEXT NULL,
+                        started_at TEXT NULL,
+                        finished_at TEXT NULL,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_steps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id INTEGER NOT NULL,
+                        seq INTEGER NOT NULL,
+                        environment_id INTEGER NULL,
+                        ds_kind TEXT NULL,
+                        ds_name TEXT NULL,
+                        scan_kind TEXT NULL,
+                        file_set_type TEXT NULL,
+                        is_acl INTEGER DEFAULT 0,
+                        is_ocr INTEGER DEFAULT 0,
+                        is_structured_ff INTEGER DEFAULT 0,
+                        is_ols INTEGER DEFAULT 0,
+                        feature_flags TEXT NULL,
+                        notes TEXT NULL,
+                        ds_id TEXT NULL,
+                        scan_profile_id TEXT NULL,
+                        scan_profile_name TEXT NULL,
+                        build_version TEXT NULL,
+                        build_prefix TEXT NULL,
+                        scan_id TEXT NULL,
+                        status TEXT NULL,
+                        last_error TEXT NULL,
+                        started_at TEXT NULL,
+                        finished_at TEXT NULL,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        UNIQUE(run_id, seq)
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_templates (
+                        k TEXT PRIMARY KEY,
+                        template_kind TEXT NULL,
+                        payload_json TEXT NULL,
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """))
+                # Non-breaking upgrades for existing sqlite DBs
+                for stmt in [
+                    "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
+                    "ALTER TABLE workflow_templates ADD COLUMN template_kind TEXT NULL",
+                    "ALTER TABLE workflow_templates ADD COLUMN payload_json TEXT NULL",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                    except Exception:
+                        pass
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_run_seq ON workflow_steps(run_id, seq)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_templates_kind ON workflow_templates(template_kind)"))
+                except Exception:
+                    pass
+                conn.commit()
+                return
+
+            # MySQL / others
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NULL,
+                    status VARCHAR(32) NULL,
+                    env1_id INT NULL,
+                    env2_id INT NULL,
+                    cooldown_minutes INT DEFAULT 15,
+                    next_eligible_at DATETIME NULL,
+                    last_error TEXT NULL,
+                    started_at DATETIME NULL,
+                    finished_at DATETIME NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_workflow_runs_status (status)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_steps (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    run_id INT NOT NULL,
+                    seq INT NOT NULL,
+                    environment_id INT NULL,
+                    ds_kind VARCHAR(64) NULL,
+                    ds_name VARCHAR(500) NULL,
+                    scan_kind VARCHAR(64) NULL,
+                    file_set_type VARCHAR(150) NULL,
+                    is_acl BOOLEAN DEFAULT FALSE,
+                    is_ocr BOOLEAN DEFAULT FALSE,
+                    is_structured_ff BOOLEAN DEFAULT FALSE,
+                    is_ols BOOLEAN DEFAULT FALSE,
+                    feature_flags VARCHAR(500) NULL,
+                    notes VARCHAR(1000) NULL,
+                    ds_id VARCHAR(128) NULL,
+                    scan_profile_id VARCHAR(128) NULL,
+                    scan_profile_name VARCHAR(500) NULL,
+                    build_version VARCHAR(50) NULL,
+                    build_prefix VARCHAR(20) NULL,
+                    scan_id VARCHAR(128) NULL,
+                    status VARCHAR(32) NULL,
+                    last_error TEXT NULL,
+                    started_at DATETIME NULL,
+                    finished_at DATETIME NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_workflow_step (run_id, seq),
+                    INDEX idx_workflow_steps_run_seq (run_id, seq),
+                    INDEX idx_workflow_steps_status (status)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    k VARCHAR(200) PRIMARY KEY,
+                    template_kind VARCHAR(32) NULL,
+                    payload_json LONGTEXT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_workflow_templates_kind (template_kind)
+                )
+            """))
+            # Non-breaking upgrades for existing MySQL DBs
+            for stmt in [
+                "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id VARCHAR(128) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
+                "ALTER TABLE workflow_templates ADD COLUMN template_kind VARCHAR(32) NULL",
+                "ALTER TABLE workflow_templates ADD COLUMN payload_json LONGTEXT NULL",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    conn.commit()
+                except Exception:
+                    pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _workflow_now_utc() -> datetime:
+    return datetime.utcnow()
+
+
+def create_workflow_run(
+    name: str,
+    env1_id: Optional[int],
+    env2_id: Optional[int],
+    steps: List[Dict[str, Any]],
+    cooldown_minutes: int = 15,
+) -> Optional[int]:
+    if not engine:
+        return None
+    ensure_workflow_tables()
+    nm = str(name or "").strip() or f"workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    try:
+        cd = int(cooldown_minutes)
+    except Exception:
+        cd = 15
+
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+
+    with engine.connect() as conn:
+        if "sqlite" in dialect:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes, created_at, updated_at)
+                    VALUES (:n, :s, :e1, :e2, :cd, datetime('now'), datetime('now'))
+                """),
+                {"n": nm, "s": "created", "e1": env1_id, "e2": env2_id, "cd": cd},
+            )
+            run_id = conn.execute(text("SELECT last_insert_rowid()")).fetchone()[0]
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes)
+                    VALUES (:n, :s, :e1, :e2, :cd)
+                """),
+                {"n": nm, "s": "created", "e1": env1_id, "e2": env2_id, "cd": cd},
+            )
+            run_id = conn.execute(text("SELECT LAST_INSERT_ID()")).fetchone()[0]
+
+        # Insert steps (seq starts at 1)
+        seq_rows = []
+        for i, stp in enumerate(steps or [], start=1):
+            if not isinstance(stp, dict):
+                continue
+            seq_rows.append({
+                "rid": int(run_id),
+                "seq": int(i),
+                "eid": stp.get("environment_id"),
+                "dk": str(stp.get("ds_kind") or "").strip() or None,
+                "dn": str(stp.get("ds_name") or "").strip() or None,
+                "sk": str(stp.get("scan_kind") or "").strip() or None,
+                "fs": str(stp.get("file_set_type") or "").strip() or None,
+                "acl": 1 if bool(stp.get("is_acl")) else 0,
+                "ocr": 1 if bool(stp.get("is_ocr")) else 0,
+                "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
+                "ols": 1 if bool(stp.get("is_ols")) else 0,
+                "ff": str(stp.get("feature_flags") or "").strip() or None,
+                "notes": str(stp.get("notes") or "").strip() or None,
+                "status": str(stp.get("status") or "pending").strip(),
+            })
+        if seq_rows:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_steps (
+                        run_id, seq, environment_id,
+                        ds_kind, ds_name, scan_kind, file_set_type,
+                        is_acl, is_ocr, is_structured_ff, is_ols,
+                        feature_flags, notes, status
+                    )
+                    VALUES (
+                        :rid, :seq, :eid,
+                        :dk, :dn, :sk, :fs,
+                        :acl, :ocr, :sff, :ols,
+                        :ff, :notes, :status
+                    )
+                """),
+                seq_rows,
+            )
+        conn.commit()
+    try:
+        return int(run_id)
+    except Exception:
+        return None
+
+
+def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
+    ensure_workflow_tables()
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        wr.id,
+                        wr.name,
+                        wr.status,
+                        wr.env1_id,
+                        wr.env2_id,
+                        wr.cooldown_minutes,
+                        wr.next_eligible_at,
+                        wr.started_at,
+                        wr.finished_at,
+                        wr.updated_at,
+                        wr.created_at,
+                        wr.last_error
+                    FROM workflow_runs wr
+                    ORDER BY wr.id DESC
+                    LIMIT :lim
+                """),
+                {"lim": int(limit)},
+            ).fetchall()
+        cols = [
+            "id","name","status","env1_id","env2_id","cooldown_minutes",
+            "next_eligible_at","started_at","finished_at","updated_at","created_at","last_error",
+        ]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_workflow_steps(run_id: int) -> pd.DataFrame:
+    ensure_workflow_tables()
+    if not engine or run_id is None:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        ws.id,
+                        ws.run_id,
+                        ws.seq,
+                        ws.environment_id,
+                        te.env_name,
+                        ws.ds_kind,
+                        ws.ds_name,
+                        ws.scan_kind,
+                        ws.file_set_type,
+                        ws.is_acl,
+                        ws.is_ocr,
+                        ws.is_structured_ff,
+                        ws.is_ols,
+                        ws.feature_flags,
+                        ws.notes,
+                        ws.ds_id,
+                    ws.scan_profile_id,
+                    ws.scan_profile_name,
+                    ws.build_version,
+                    ws.build_prefix,
+                        ws.scan_id,
+                        ws.status,
+                        ws.started_at,
+                        ws.finished_at,
+                        ws.updated_at,
+                        ws.last_error
+                    FROM workflow_steps ws
+                    LEFT JOIN test_environments te ON te.id = ws.environment_id
+                    WHERE ws.run_id = :rid
+                    ORDER BY ws.seq ASC
+                """),
+                {"rid": int(run_id)},
+            ).fetchall()
+        cols = [
+            "id","run_id","seq","environment_id","environment",
+            "ds_kind","ds_name","scan_kind","file_set_type",
+            "is_acl","is_ocr","is_structured_ff","is_ols",
+            "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
+            "status","started_at","finished_at","updated_at","last_error",
+        ]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
+def set_workflow_run_status(run_id: int, status: str, *, last_error: Optional[str] = None) -> None:
+    if not engine or run_id is None:
+        return
+    ensure_workflow_tables()
+    stv = str(status or "").strip()
+    if not stv:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    UPDATE workflow_runs
+                    SET status = :s, last_error = COALESCE(:e, last_error)
+                    WHERE id = :rid
+                """),
+                {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _workflow_ds_template_key(step: Dict[str, Any]) -> str:
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip() or "default"
+    acl = 1 if bool(step.get("is_acl")) else 0
+    struct = 1 if bool(step.get("is_structured_ff")) else 0
+    return f"ds::{ds_kind}::{fs}::acl={acl}::struct={struct}"
+
+
+def _workflow_scan_template_key(step: Dict[str, Any]) -> str:
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip() or "default"
+    acl = 1 if bool(step.get("is_acl")) else 0
+    ols = 1 if bool(step.get("is_ols")) else 0
+    struct = 1 if bool(step.get("is_structured_ff")) else 0
+    return f"scan::{ds_kind}::{fs}::acl={acl}::ols={ols}::struct={struct}"
+
+
+def upsert_workflow_template(key: str, template_kind: str, payload_json: str) -> None:
+    ensure_workflow_tables()
+    if not engine:
+        return
+    k = str(key or "").strip()
+    if not k:
+        return
+    tk = str(template_kind or "").strip() or None
+    pj = str(payload_json or "").strip() or None
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(
+                    text("""
+                        INSERT INTO workflow_templates (k, template_kind, payload_json, updated_at)
+                        VALUES (:k, :t, :p, datetime('now'))
+                        ON CONFLICT(k) DO UPDATE SET
+                            template_kind=excluded.template_kind,
+                            payload_json=excluded.payload_json,
+                            updated_at=datetime('now')
+                    """),
+                    {"k": k, "t": tk, "p": pj},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO workflow_templates (k, template_kind, payload_json)
+                        VALUES (:k, :t, :p)
+                        ON DUPLICATE KEY UPDATE
+                            template_kind=VALUES(template_kind),
+                            payload_json=VALUES(payload_json),
+                            updated_at=CURRENT_TIMESTAMP
+                    """),
+                    {"k": k, "t": tk, "p": pj},
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_workflow_template_payload(key: str) -> str:
+    ensure_workflow_tables()
+    if not engine:
+        return ""
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT payload_json FROM workflow_templates WHERE k = :k LIMIT 1"),
+                {"k": k},
+            ).fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+
+def _is_terminal_state_anywhere(state: Any) -> bool:
+    s = str(state or "").strip().lower().replace(" ", "")
+    return s in {"failed","completedwithfailures","completed","stopped","aborted","cancelled","canceled"}
+
+
+def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
+    """
+    Best-effort reconciliation using DB scan status.
+    - Marks workflow step completed if its scan_id is terminal in scan_parents or scan_progress
+    - Advances run.next_eligible_at after a step completes
+    """
+    out = {"updated_steps": 0, "completed_run": False}
+    if not engine or run_id is None:
+        return out
+    ensure_workflow_tables()
+    try:
+        steps_df = load_workflow_steps(int(run_id))
+        if steps_df.empty:
+            return out
+    except Exception:
+        return out
+
+    # Find steps that have scan_id and are not completed yet.
+    try:
+        pending = steps_df[steps_df["status"].astype(str).isin(["pending", "running", "created", "scan_running", "ds_created", "scan_created"])]
+    except Exception:
+        pending = steps_df
+    scan_ids = [str(x).strip() for x in pending.get("scan_id", pd.Series(dtype=str)).tolist() if str(x).strip()]
+    if not scan_ids:
+        return out
+
+    # Resolve latest statuses for scan_ids
+    status_map: Dict[str, str] = {}
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT scan_id, scan_status
+                    FROM scan_parents
+                    WHERE scan_id IN :ids
+                """).bindparams(bindparam("ids", expanding=True)),
+                {"ids": scan_ids},
+            ).fetchall()
+        for r in rows or []:
+            sid = str(r[0] or "").strip()
+            if sid:
+                status_map[sid] = str(r[1] or "").strip()
+    except Exception:
+        pass
+    try:
+        p_map = load_latest_scan_progress_state_map(scan_ids)
+        for sid, stv in (p_map or {}).items():
+            if sid and sid not in status_map:
+                status_map[str(sid)] = str(stv or "").strip()
+    except Exception:
+        pass
+
+    updated = 0
+    now = _workflow_now_utc()
+    try:
+        cooldown = None
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT cooldown_minutes FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
+            if r:
+                try:
+                    cooldown = int(r[0]) if r[0] is not None else 15
+                except Exception:
+                    cooldown = 15
+    except Exception:
+        cooldown = 15
+    if cooldown is None:
+        cooldown = 15
+
+    try:
+        with engine.connect() as conn:
+            for row in pending.itertuples():
+                sid = str(getattr(row, "scan_id", "") or "").strip()
+                if not sid:
+                    continue
+                stv = status_map.get(sid, "")
+                if not _is_terminal_state_anywhere(stv):
+                    continue
+                # Mark step completed
+                conn.execute(
+                    text("""
+                        UPDATE workflow_steps
+                        SET status = 'completed', finished_at = COALESCE(finished_at, :t), updated_at = CURRENT_TIMESTAMP
+                        WHERE id = :id
+                    """),
+                    {"id": int(getattr(row, "id")), "t": now},
+                )
+                updated += 1
+            if updated:
+                # Set run cooldown timer
+                next_t = now + timedelta(minutes=float(cooldown))
+                conn.execute(
+                    text("""
+                        UPDATE workflow_runs
+                        SET next_eligible_at = :t, updated_at = CURRENT_TIMESTAMP
+                        WHERE id = :rid
+                    """),
+                    {"t": next_t, "rid": int(run_id)},
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+    out["updated_steps"] = updated
+    try:
+        steps_df2 = load_workflow_steps(int(run_id))
+        if not steps_df2.empty and (steps_df2["status"].astype(str) == "completed").all():
+            set_workflow_run_status(int(run_id), "completed")
+            out["completed_run"] = True
+    except Exception:
+        pass
+    return out
 
 
 def _safe_int(val):
@@ -9350,6 +10072,328 @@ def page_scan_progress():
         st.rerun()
 
 
+def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    UI plan (no side-effects). Backend runner will execute these sequentially.
+    Alternates env1/env2 per step.
+    """
+    envs = [env1_id, env2_id]
+    def _env_for_idx(i: int) -> Optional[int]:
+        if not envs or (envs[0] is None and envs[1] is None):
+            return None
+        return envs[i % 2] if envs[i % 2] is not None else envs[(i + 1) % 2]
+
+    base: List[Dict[str, Any]] = [
+        {"ds_kind": "postgres", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "Postgres Full Scan"},
+        {"ds_kind": "mssql", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "MSSQL Full Scan"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Small Files)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Small Files)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Large Files)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Large Files)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Small Files) ACL ON"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Small Files) ACL ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Large Files) ACL ON"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Large Files) ACL ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (CSV Files)"},
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": True,  "feature_flags": "Structured Files Discovery", "notes": "S3 Full Scan (CSV Files) Structured Discovery FF ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+    ]
+
+    steps: List[Dict[str, Any]] = []
+    for idx, stp in enumerate(base):
+        stp2 = dict(stp)
+        stp2["environment_id"] = _env_for_idx(idx)
+        # Provide a deterministic DS name suggestion; backend can override.
+        ds_kind = str(stp2.get("ds_kind") or "").strip().upper()
+        fs = str(stp2.get("file_set_type") or "").strip()
+        flags = []
+        if bool(stp2.get("is_acl")):
+            flags.append("ACL")
+        if bool(stp2.get("is_ols")):
+            flags.append("OLS")
+        if bool(stp2.get("is_structured_ff")):
+            flags.append("STRUCT")
+        flag_s = (" " + " ".join(flags)) if flags else ""
+        stp2["ds_name"] = f"{ds_kind}{(' ' + fs) if fs else ''}{flag_s}".strip()
+        stp2["status"] = "pending"
+        steps.append(stp2)
+    return steps
+
+
+def page_workflow_automation():
+    st.title("🧪 Workflow Automation")
+    st.caption("UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially.")
+
+    ensure_test_environments_table()
+    ensure_scan_tracking_tables()
+    ensure_scan_progress_table()
+    ensure_workflow_tables()
+
+    env_df = load_test_environments()
+    if env_df.empty:
+        st.info("No test environments found. Add them in `Manage Test Environments` first.")
+        return
+
+    work_df = env_df.copy()
+    work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
+    active_df = work_df[work_df["is_active"] == True].copy()
+    active_df = active_df.sort_values(by=["env_name"], ascending=[True]).reset_index(drop=True)
+    if active_df.empty:
+        st.warning("No active environments. Mark at least two environments active to run this workflow.")
+        return
+
+    # --- Create new workflow plan ---
+    st.markdown("### Create Workflow Plan")
+    c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
+    env_labels = [f"{r.env_name} (id={int(r.id)})" for r in active_df.itertuples()]
+    env_ids = [int(r.id) for r in active_df.itertuples()]
+    env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1")
+    env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2")
+    cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd"))
+    env1_id = env_ids[env_labels.index(env1_label)]
+    env2_id = env_ids[env_labels.index(env2_label)]
+    wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name")
+
+    preview_steps = _build_default_workflow_steps(env1_id, env2_id)
+    with st.expander("Preview steps (16)", expanded=False):
+        prev_df = pd.DataFrame(preview_steps)
+        show_cols = ["environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
+        show_cols = [c for c in show_cols if c in prev_df.columns]
+        st.dataframe(prev_df[show_cols], width="stretch", hide_index=True)
+
+    if st.button("Create workflow plan", type="primary"):
+        rid = create_workflow_run(
+            wf_name,
+            env1_id=int(env1_id),
+            env2_id=int(env2_id),
+            steps=preview_steps,
+            cooldown_minutes=int(cooldown),
+        )
+        if rid:
+            st.success(f"Created workflow run id={rid}.")
+            st.query_params["page"] = "Workflow Automation"
+            st.query_params["run_id"] = str(int(rid))
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
+        else:
+            st.error("Failed to create workflow plan.")
+
+    st.divider()
+
+    # --- Existing runs ---
+    st.markdown("### Workflow Runs")
+    runs_df = load_workflow_runs(limit=50)
+    if runs_df.empty:
+        st.info("No workflow runs yet. Create one above.")
+        return
+
+    try:
+        run_id_qp = str(st.query_params.get("run_id", "") or "").strip()
+    except Exception:
+        run_id_qp = ""
+    run_options = []
+    run_map = {}
+    for r in runs_df.itertuples():
+        rid = int(r.id)
+        label = f"{rid} | {str(r.status or '').strip() or 'unknown'} | {str(r.name or '').strip()}"
+        run_options.append(label)
+        run_map[label] = rid
+    default_idx = 0
+    if run_id_qp.isdigit():
+        want = int(run_id_qp)
+        for i, lab in enumerate(run_options):
+            if run_map.get(lab) == want:
+                default_idx = i
+                break
+    selected_run_label = st.selectbox("Select run", run_options, index=default_idx, key="wf_run_sel")
+    run_id = int(run_map[selected_run_label])
+
+    # Controls
+    b1, b2, b3, b4, b5 = st.columns([1.0, 1.0, 1.0, 1.2, 1.0])
+    if b1.button("Start Workflow", type="primary"):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE workflow_runs
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                        next_eligible_at = COALESCE(next_eligible_at, CURRENT_TIMESTAMP)
+                    WHERE id = :rid
+                """), {"rid": int(run_id)})
+                conn.commit()
+            # Ensure background runner is started (so workflow continues unattended).
+            try:
+                if callable(ensure_workflow_runner_running):
+                    ensure_workflow_runner_running(engine)
+            except Exception:
+                pass
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Start failed: {ex}")
+    if b2.button("Pause"):
+        set_workflow_run_status(int(run_id), "paused")
+        st.rerun()
+    if b3.button("Resume Workflow"):
+        set_workflow_run_status(int(run_id), "running")
+        try:
+            if callable(ensure_workflow_runner_running):
+                ensure_workflow_runner_running(engine)
+        except Exception:
+            pass
+        st.rerun()
+    if b5.button("Stop Workflow"):
+        set_workflow_run_status(int(run_id), "stopped")
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("UPDATE workflow_runs SET finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": int(run_id)})
+                conn.commit()
+        except Exception:
+            pass
+        st.rerun()
+    if b4.button("Reconcile from DB"):
+        res = reconcile_workflow_run(int(run_id))
+        st.caption(f"Reconciled: updated_steps={res.get('updated_steps')} completed_run={res.get('completed_run')}")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+    # Run meta
+    try:
+        rrow = runs_df[runs_df["id"] == run_id].iloc[0].to_dict()
+    except Exception:
+        rrow = {}
+    st.caption(
+        f"Run id={run_id} | status={str(rrow.get('status') or '').strip() or 'unknown'}"
+        + (f" | next_eligible_at={rrow.get('next_eligible_at')}" if rrow.get("next_eligible_at") else "")
+        + (f" | cooldown={rrow.get('cooldown_minutes')}m" if rrow.get("cooldown_minutes") is not None else "")
+    )
+    if str(rrow.get("last_error") or "").strip():
+        st.error(str(rrow.get("last_error") or "").strip())
+
+    steps_df = load_workflow_steps(int(run_id))
+    if steps_df.empty:
+        st.info("No steps found for this run.")
+        return
+
+    # Convenience display columns
+    disp = steps_df.copy()
+    disp["Flags"] = disp.apply(
+        lambda r: ", ".join([x for x in [
+            "ACL" if bool(r.get("is_acl")) else "",
+            "STRUCT" if bool(r.get("is_structured_ff")) else "",
+            "OLS" if bool(r.get("is_ols")) else "",
+        ] if x]),
+        axis=1,
+    )
+    disp["Progress"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
+    disp = disp.rename(columns={
+        "seq": "Step",
+        "environment": "Environment",
+        "ds_kind": "DS Type",
+        "ds_name": "DS Name",
+        "scan_kind": "Scan Type",
+        "file_set_type": "File Set",
+        "status": "Step Status",
+        "scan_id": "Scan Id",
+        "ds_id": "DS Id",
+        "notes": "Notes",
+    })
+    st.markdown("### Steps")
+    cols = ["Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Step Status", "build_version", "build_prefix", "DS Id", "Scan Id", "Progress", "Notes", "last_error", "updated_at"]
+    cols = [c for c in cols if c in disp.columns]
+    st.dataframe(
+        disp[cols],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Progress": st.column_config.LinkColumn("Progress", display_text="View"),
+        },
+    )
+
+    # Hide manual template editing in normal mode (workflow should be automatic).
+    # If needed for troubleshooting, enable debug view via ?debug=true
+    if st.query_params.get("debug") == "true":
+        st.divider()
+        st.markdown("### Templates (Debug)")
+        st.caption("Debug-only: manual editing of workflow templates stored in DB.")
+
+        # Pick a step to derive keys
+        try:
+            step_nums = [int(x) for x in steps_df["seq"].tolist() if str(x).strip()]
+            step_nums = sorted(set(step_nums))
+        except Exception:
+            step_nums = list(range(1, 17))
+        pick_step = st.selectbox("Select step to edit templates", step_nums, index=0, key="wf_tpl_step")
+        try:
+            step_row = steps_df[steps_df["seq"] == int(pick_step)].iloc[0].to_dict()
+        except Exception:
+            step_row = {}
+
+        ds_key = _workflow_ds_template_key(step_row or {})
+        scan_key = _workflow_scan_template_key(step_row or {})
+
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.markdown("**DS template**")
+            st.code(ds_key)
+            ds_existing = get_workflow_template_payload(ds_key)
+            ds_text = st.text_area(
+                "DS JSON (PUT /ds_connections/<name>)",
+                value=ds_existing or "{\n  \"ds_connection\": {\n    \"name\": \"{{DS_NAME}}\",\n    \"type\": \"{{DS_TYPE}}\",\n    \"enabled\": true\n  }\n}\n",
+                height=220,
+                key="wf_ds_json",
+            )
+            if st.button("Save DS template", key="wf_save_ds"):
+                upsert_workflow_template(ds_key, "ds", ds_text)
+                st.success("Saved DS template.")
+        with t2:
+            st.markdown("**Scan template**")
+            st.code(scan_key)
+            scan_existing = get_workflow_template_payload(scan_key)
+            scan_text = st.text_area(
+                "Scan JSON (POST /scanProfiles)",
+                value=scan_existing or "{\n  \"name\": \"{{SCAN_PROFILE_NAME}}\",\n  \"description\": \"{{NOTES}}\",\n  \"dataSourceList\": [\"{{DS_ID}}\"],\n  \"scanTemplateId\": \"{{SCAN_TEMPLATE_ID}}\",\n  \"isSingleRunScan\": true\n}\n",
+                height=220,
+                key="wf_scan_json",
+            )
+            if st.button("Save Scan template", key="wf_save_scan"):
+                upsert_workflow_template(scan_key, "scan", scan_text)
+                st.success("Saved Scan template.")
+        with t3:
+            st.markdown("**Pre-OLS action (FF change)**")
+            st.caption("Executed automatically before OLS steps. Use env-specific key if needed.")
+            action_key_global = "action::pre_ols"
+            action_key_env = f"action::pre_ols::env={int(step_row.get('environment_id'))}" if step_row.get("environment_id") is not None else ""
+            st.code(action_key_env or action_key_global)
+            existing = get_workflow_template_payload(action_key_env) if action_key_env else ""
+            if not existing:
+                existing = get_workflow_template_payload(action_key_global)
+            action_text = st.text_area(
+                "Action JSON (method/path/body)",
+                value=existing or "{\n  \"method\": \"POST\",\n  \"path\": \"/api/v1/REPLACE_ME\",\n  \"params\": {},\n  \"body\": {}\n}\n",
+                height=220,
+                key="wf_action_json",
+            )
+            if st.button("Save Pre-OLS action", key="wf_save_action"):
+                upsert_workflow_template(action_key_env or action_key_global, "action", action_text)
+                st.success("Saved Pre-OLS action template.")
+
+
 def page_create_data_source():
     """
     Wizard-like tool:
@@ -9375,6 +10419,137 @@ def page_create_data_source():
     selected_label = st.selectbox("Environment", labels, index=0)
     selected_env = work_df.iloc[labels.index(selected_label)].to_dict()
 
+    ensure_workflow_tables()
+    st.markdown("### Environment Info")
+    base_url = str(selected_env.get("base_url") or "").strip()
+    env_id_val = selected_env.get("id")
+    env_name_val = str(selected_env.get("env_name") or "").strip()
+    current_version = str(selected_env.get("version") or "").strip()
+
+    def _build_prefix_from_version(v: str) -> str:
+        s = str(v or "").strip()
+        if not s:
+            return ""
+        # 248.1 -> 248-1
+        if "." in s:
+            parts = s.split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                return f"{parts[0]}-{parts[1]}"
+        if s.lower().startswith("release-"):
+            s = s[len("release-"):].strip()
+        return s.replace(".", "-")
+
+    b1, b2, b3 = st.columns([1.0, 1.0, 1.4])
+    if b1.button("Fetch build (/about)", type="primary"):
+        try:
+            tok = fetch_auth_token_for_env(selected_env)
+        except Exception:
+            tok = ""
+        try:
+            clean_version, raw_version, about_url = fetch_core_version_from_api(base_url, tok, INTERNAL_ABOUT_API_PATH)
+            if clean_version:
+                try:
+                    record_environment_version(env_id_val, env_name_val, clean_version)
+                except Exception:
+                    pass
+                selected_env["version"] = clean_version
+                st.session_state["create_ds_env_version"] = clean_version
+                st.success(f"Build version: `{clean_version}`")
+                st.caption(f"API: `{about_url}`")
+            else:
+                st.warning("Could not extract releaseVersion from /about response.")
+        except Exception as ex:
+            st.error(f"Failed to fetch /about: {ex}")
+
+    effective_version = str(st.session_state.get("create_ds_env_version") or current_version or "").strip()
+    b2.metric("Build version", effective_version or "—")
+    b3.metric("Build prefix", _build_prefix_from_version(effective_version) or "—")
+
+    st.markdown("### Automation Defaults")
+    st.caption("Saved to DB (used by workflow runner).")
+    key_env = f"config::scan_template_id::env={int(env_id_val)}" if env_id_val is not None else ""
+    key_global = "config::scan_template_id"
+    # Automatic: try to populate env scanTemplateId from API (Data source scan).
+    try:
+        auto_id = ensure_env_default_scan_template_id(selected_env)
+    except Exception:
+        auto_id = ""
+    existing_id = (get_workflow_template_payload(key_env) if key_env else "") or get_workflow_template_payload(key_global) or ""
+    if (not existing_id) and auto_id:
+        existing_id = auto_id
+    c1, c2, c3 = st.columns([1.6, 1.0, 1.0])
+    scan_template_id = c1.text_input("Default Scan Template ID", value=str(existing_id or "").strip(), key="create_ds_scan_template_id")
+    if c2.button("Save (this env)"):
+        if not key_env:
+            st.error("Missing environment id.")
+        elif not str(scan_template_id or "").strip():
+            st.error("Scan Template ID is required.")
+        else:
+            upsert_workflow_template(key_env, "config", str(scan_template_id).strip())
+            st.success("Saved env scanTemplateId.")
+    if c3.button("Save (global)"):
+        if not str(scan_template_id or "").strip():
+            st.error("Scan Template ID is required.")
+        else:
+            upsert_workflow_template(key_global, "config", str(scan_template_id).strip())
+            st.success("Saved global scanTemplateId.")
+
+    # Default scanner group for automation
+    st.markdown("**Default scanner group (automation)**")
+    sg_key_env = f"config::scanner_group::env={int(env_id_val)}" if env_id_val is not None else ""
+    sg_key_global = "config::scanner_group"
+    sg_existing = (get_workflow_template_payload(sg_key_env) if sg_key_env else "") or get_workflow_template_payload(sg_key_global) or ""
+    try:
+        groups_cached = st.session_state.get("scanner_groups_last") or []
+        group_names_cached = []
+        for g in groups_cached:
+            if isinstance(g, dict):
+                nm = str(g.get("name") or g.get("scanner_group") or g.get("id") or g.get("_id") or "").strip()
+                if nm:
+                    group_names_cached.append(nm)
+        group_names_cached = sorted(set(group_names_cached))
+    except Exception:
+        group_names_cached = []
+    sg_options = group_names_cached or ["default"]
+    default_idx = 0
+    try:
+        if str(sg_existing).strip() and str(sg_existing).strip() in sg_options:
+            default_idx = sg_options.index(str(sg_existing).strip())
+    except Exception:
+        default_idx = 0
+    sg_val = st.selectbox("Scanner group (default for runner)", sg_options, index=default_idx, key="create_ds_default_scanner_group")
+    s1, s2 = st.columns([1.0, 1.0])
+    if s1.button("Save scanner group (this env)"):
+        if not sg_key_env:
+            st.error("Missing environment id.")
+        else:
+            upsert_workflow_template(sg_key_env, "config", str(sg_val).strip())
+            st.success("Saved env scanner group.")
+    if s2.button("Save scanner group (global)"):
+        upsert_workflow_template(sg_key_global, "config", str(sg_val).strip())
+        st.success("Saved global scanner group.")
+
+    st.markdown("**Scan template id (automatic)**")
+    st.caption("Auto-detected from Scan Templates API by picking template name `Data source scan`.")
+    if st.query_params.get("debug") == "true":
+        if st.button("Debug: show templates list"):
+            with st.spinner("Fetching scan templates..."):
+                try:
+                    items, _total, url = fetch_scan_templates_with_auth_retry(selected_env, limit=200, skip=0)
+                    rows = []
+                    for it in items or []:
+                        if isinstance(it, dict):
+                            rows.append({
+                                "name": str(it.get("name") or "").strip(),
+                                "_id": str(it.get("_id") or it.get("id") or "").strip(),
+                                "updated_at": it.get("updated_at") or it.get("updatedAt") or it.get("updated") or "",
+                            })
+                    st.caption(f"API: `{url}`")
+                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                except Exception as ex:
+                    st.error(f"Failed: {ex}")
+
+    st.divider()
     st.markdown("**Step 1: Fetch scanner groups**")
     if st.button("Get scanner groups", type="primary"):
         with st.spinner("Fetching scanner groups..."):
@@ -9635,6 +10810,7 @@ def main():
                 "Classifier Changes": "Classifier Changes",
                 "Manage Test Environments": "Manage Test Environments",
                 "Version Comparison": "Version Comparison",
+                "Workflow Automation": "Workflow Automation",
                 "Create Data Source": "Create Data Source",
                 "Scan Status": "Scan Status",
                 "Scan Progress": "Scan Progress"
@@ -9873,6 +11049,7 @@ def main():
                 <a href="?page=Edit+Records" target="_self" class="flyout-item"><span>🛠️</span> <span>Edit Existing Records</span></a>
                 <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
                 <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
+                <a href="?page=Workflow+Automation" target="_self" class="flyout-item"><span>🧪</span> <span>Workflow Automation</span></a>
                 <a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>
                 <a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>
                 <a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>
@@ -9954,6 +11131,8 @@ def main():
         page_manage_test_environments()
     elif page == "Version Comparison":
         page_version_comparison()
+    elif page == "Workflow Automation":
+        page_workflow_automation()
     elif page == "Create Data Source":
         page_create_data_source()
     elif page == "Scan Status":
