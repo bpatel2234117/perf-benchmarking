@@ -57,6 +57,43 @@ RUNNER_HEARTBEAT_NAME = "workflow_runner"
 RUNNER_LOCK_KEY = "workflow_runner_lock"
 RUNNER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(os.getenv(name, "") or "").strip() or default)
+    except Exception:
+        return int(default)
+
+
+def _ds_kind_timeout_seconds(ds_kind: Any) -> int:
+    """
+    DS connection test can be slow (esp MSSQL). Allow per-DS override:
+      WORKFLOW_DS_TEST_TIMEOUT_SECONDS_MSSQL=420
+    Fallback: WORKFLOW_DS_TEST_TIMEOUT_SECONDS (default 180)
+    """
+    k = str(ds_kind or "").strip().upper()
+    if k:
+        v = _env_int(f"WORKFLOW_DS_TEST_TIMEOUT_SECONDS_{k}", -1)
+        if v and v > 0:
+            return int(max(30, min(1800, v)))
+    v2 = _env_int("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", 180)
+    return int(max(30, min(1800, v2)))
+
+
+def _ds_kind_poll_seconds(ds_kind: Any) -> int:
+    """
+    Per-DS polling override:
+      WORKFLOW_DS_TEST_POLL_SECONDS_MSSQL=10
+    Fallback: WORKFLOW_DS_TEST_POLL_SECONDS (default 5)
+    """
+    k = str(ds_kind or "").strip().upper()
+    if k:
+        v = _env_int(f"WORKFLOW_DS_TEST_POLL_SECONDS_{k}", -1)
+        if v and v > 0:
+            return int(max(2, min(60, v)))
+    v2 = _env_int("WORKFLOW_DS_TEST_POLL_SECONDS", 5)
+    return int(max(2, min(60, v2)))
+
 def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
     try:
         s = str(name or "").strip()
@@ -1709,13 +1746,15 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 ds_connection=ds_conn_obj,
                 broadcast_event=broadcast,
             )
+            timeout_s = _ds_kind_timeout_seconds(step_dict.get("ds_kind"))
+            poll_s = _ds_kind_poll_seconds(step_dict.get("ds_kind"))
             ok, msg = wait_for_ds_connection_test_result(
                 base_url,
                 token,
                 desired_ds_name,
                 test_started_at=test_started,
-                timeout_seconds=int(os.getenv("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", "180") or "180"),
-                poll_seconds=int(os.getenv("WORKFLOW_DS_TEST_POLL_SECONDS", "5") or "5"),
+                timeout_seconds=int(timeout_s),
+                poll_seconds=int(poll_s),
             )
             last_msg = msg or last_msg
             if ok:
