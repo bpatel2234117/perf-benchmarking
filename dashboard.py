@@ -10396,6 +10396,29 @@ def page_workflow_automation():
     if str(rrow.get("last_error") or "").strip():
         st.error(str(rrow.get("last_error") or "").strip())
 
+    # Extra visibility into why "nothing is happening"
+    try:
+        ne = rrow.get("next_eligible_at")
+        now_utc = datetime.utcnow()
+        ne_dt = None
+        if isinstance(ne, datetime):
+            ne_dt = ne
+        elif isinstance(ne, str) and ne.strip():
+            ne_dt = _parse_utc_dt(ne.strip())
+        if selected_is_running and ne_dt and ne_dt > now_utc:
+            remaining_s = int(max(0, (ne_dt - now_utc).total_seconds()))
+            remaining_m = remaining_s // 60
+            st.info(f"Cooldown active. Next step will be eligible in ~{remaining_m} min (at {ne_dt} UTC).")
+    except Exception:
+        pass
+    try:
+        if str(os.getenv("WORKFLOW_CREATE_ONLY", "") or "").strip():
+            st.warning("Runner is in CREATE-ONLY mode (`WORKFLOW_CREATE_ONLY` is set). It will NOT trigger scans.")
+        if str(os.getenv("WORKFLOW_SKIP_WAIT_FOR_TERMINAL", "") or "").strip():
+            st.warning("Runner is in SKIP-WAIT mode (`WORKFLOW_SKIP_WAIT_FOR_TERMINAL` is set). It will not wait for scans to finish (reconcile needed).")
+    except Exception:
+        pass
+
     # If run is running, show (and trigger) runner autostart status so it's obvious what's happening.
     if selected_is_running:
         try:
