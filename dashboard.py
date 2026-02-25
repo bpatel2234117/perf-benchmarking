@@ -8264,13 +8264,35 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     group_cols = ['Build_Version']
     if compare_by: group_cols.append(compare_by)
     
-    gb = df_filtered.groupby(group_cols, group_keys=False, sort=False)
+    # Pick best run per (Build_Version, compare_by?) without groupby.apply().
+    # This avoids pandas deprecation warnings AND keeps grouping columns (Build_Version),
+    # which we need for sorting/plotting.
+    picked_idxs = []
     try:
-        # Pandas 2.x: avoid deprecated behavior of including grouping columns in apply().
-        plot_df = gb.apply(select_best_run, include_groups=False).reset_index(drop=True)
+        gb = df_filtered.groupby(group_cols, sort=False, dropna=False)
     except TypeError:
-        # Older Pandas: no include_groups arg.
-        plot_df = gb.apply(select_best_run).reset_index(drop=True)
+        # Older pandas: no dropna kwarg
+        gb = df_filtered.groupby(group_cols, sort=False)
+    for _, group in gb:
+        try:
+            if 'total_scan_hours' in group.columns and group['total_scan_hours'].notna().any():
+                valid_time = group[group['total_scan_hours'].notna()]
+                if not valid_time.empty:
+                    picked_idxs.append(valid_time['total_scan_hours'].idxmin())
+                    continue
+            if 'throughput_cluster_gb_hr' in group.columns and group['throughput_cluster_gb_hr'].notna().any():
+                valid_tp = group[group['throughput_cluster_gb_hr'].notna()]
+                if not valid_tp.empty:
+                    picked_idxs.append(valid_tp['throughput_cluster_gb_hr'].idxmax())
+                    continue
+            picked_idxs.append(group.index[0])
+        except Exception:
+            try:
+                picked_idxs.append(group.index[0])
+            except Exception:
+                pass
+    plot_df = df_filtered.loc[picked_idxs].copy() if picked_idxs else df_filtered.head(0).copy()
+    plot_df = plot_df.reset_index(drop=True)
     plot_df = plot_df.sort_values('Build_Version')
     # Drop rows with missing cluster throughput
     if 'throughput_cluster_gb_hr' in plot_df.columns:
