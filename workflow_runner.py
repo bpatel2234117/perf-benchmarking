@@ -54,6 +54,16 @@ ENV_FILE_PATH = Path(__file__).parent / ".env"
 
 RUNNER_HEARTBEAT_NAME = "workflow_runner"
 
+def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
+    try:
+        s = str(name or "").strip()
+        if not s:
+            return False
+        last = s.split()[-1]
+        return last.isdigit() and len(last) == 14
+    except Exception:
+        return False
+
 
 def _compact(s: Any) -> str:
     return str(s or "").strip().lower().replace(" ", "")
@@ -1436,12 +1446,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         build_version = ""
     build_prefix = _build_prefix(build_version)
 
-    # Always enforce standard scenario naming; otherwise DS collisions make it look like nothing happened.
-    attempt_ts = _now_utc().strftime("%Y%m%d%H%M%S")
-    base_ds_name = _standard_ds_base_name(step_dict)
-    desired_ds_name = _apply_build_prefix(f"{base_ds_name} {attempt_ts}".strip(), build_prefix)
+    # IMPORTANT: DS name must be stable per step.
+    # Otherwise, a failing DS connection test would create N new DS connections.
+    existing_ds_name = str(step_dict.get("ds_name") or "").strip()
+    desired_ds_name = existing_ds_name
+    if (not desired_ds_name) or (not _has_yyyymmddhhmmss_suffix(desired_ds_name)):
+        # First time this step is executed (or legacy plan name without timestamp) -> generate once.
+        attempt_ts = _now_utc().strftime("%Y%m%d%H%M%S")
+        base_ds_name = _standard_ds_base_name(step_dict)
+        desired_ds_name = _apply_build_prefix(f"{base_ds_name} {attempt_ts}".strip(), build_prefix)
     try:
-        # Persist to DB so UI shows build-prefixed names.
+        # Persist build + stable ds_name so UI + retries stay consistent.
         set_step_status(
             engine,
             step_id,
@@ -1452,6 +1467,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         )
     except Exception:
         pass
+    step_dict["ds_name"] = desired_ds_name
 
     # --- Pre-step action (feature flags on/off etc) ---
     # If a matching action template exists, run it before DS/scan creation.
