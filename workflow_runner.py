@@ -636,27 +636,6 @@ def set_run_error(engine, run_id: int, message: str) -> None:
         conn.commit()
 
 
-def pause_run(engine, run_id: int, *, reason: str = "") -> None:
-    """
-    Pause the workflow run to avoid endless retries when a hard error occurs.
-    """
-    try:
-        with engine.connect() as conn:
-            conn.execute(
-                text("""
-                    UPDATE workflow_runs
-                    SET status='paused',
-                        last_error=COALESCE(:e, last_error),
-                        updated_at=CURRENT_TIMESTAMP
-                    WHERE id=:rid
-                """),
-                {"rid": int(run_id), "e": (str(reason)[:2000] if str(reason or "").strip() else None)},
-            )
-            conn.commit()
-    except Exception:
-        pass
-
-
 def set_step_error(engine, step_id: int, message: str) -> None:
     with engine.connect() as conn:
         conn.execute(
@@ -1342,14 +1321,16 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             return False
 
     # Find next step for this run.
-    # In bulk-create mode we want to continue past failures, not retry the same error forever.
-    skip_errors = str(os.getenv("WORKFLOW_SKIP_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    # Default behavior: continue past failures (do not retry errors forever).
+    # Set WORKFLOW_RETRY_ERROR_STEPS=1 to retry errors instead.
+    retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    skip_errors = not retry_errors
     if skip_errors:
         # Bulk-create: continue past failures and also resume half-done steps.
         # Terminal for our purposes: scan_created/completed; and we explicitly skip error.
         where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error') AND COALESCE(is_enabled, 1) = 1"
     else:
-        # Normal mode: allow retrying errors by default.
+        # Retry mode: allow retrying errors.
         where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(is_enabled, 1) = 1"
 
     # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
@@ -1515,7 +1496,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Don't block forever: mark error so user can fix template/payload.
         set_step_error(engine, step_id, f"Pre-step action failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: pre-step action failed")
-        pause_run(engine, run_id, reason=f"Step {seq}: pre-step action failed")
+        # Move on to next step (do not pause entire run).
+        set_run_next_eligible(engine, run_id, _now_utc())
         return True
 
     # --- DS create/update ---
@@ -1574,7 +1556,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"DS create failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: DS create failed")
-        pause_run(engine, run_id, reason=f"Step {seq}: DS create failed")
+        set_run_next_eligible(engine, run_id, _now_utc())
         return True
 
     # --- DS connection test (required before scan creation) ---
@@ -1625,7 +1607,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"DS connection test failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: DS connection test failed")
-        pause_run(engine, run_id, reason=f"Step {seq}: DS connection test failed")
+        set_run_next_eligible(engine, run_id, _now_utc())
         return True
 
     # We need ds_id for scan template variables; prefer stored column now.
@@ -1669,7 +1651,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"Scan profile create failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
-        pause_run(engine, run_id, reason=f"Step {seq}: scan profile create failed")
+        set_run_next_eligible(engine, run_id, _now_utc())
         return True
 
     # If we only want DS + scan profile creation (no scan trigger), stop here.
@@ -1717,7 +1699,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception as ex:
         set_step_error(engine, step_id, f"Scan start failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: scan start failed")
-        pause_run(engine, run_id, reason=f"Step {seq}: scan start failed")
+        set_run_next_eligible(engine, run_id, _now_utc())
         return True
 
     # Wait for completion if we have scan_id.
