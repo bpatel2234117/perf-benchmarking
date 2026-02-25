@@ -585,24 +585,6 @@ def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: st
     return ""
 
 
-def resolve_default_scan_template_name(engine, env_id: Optional[int], base_url: str, token: str) -> str:
-    """
-    Cosmetic only: used for naming scan profiles ("Scan for <DS> <TemplateName>").
-    """
-    tid = resolve_default_scan_template_id(engine, env_id, base_url, token)
-    if not tid:
-        return "Data source scan"
-    try:
-        items = fetch_scan_templates(base_url, token, limit=200, skip=0)
-        for it in items or []:
-            if str(it.get("_id") or it.get("id") or "").strip() == tid:
-                nm = str(it.get("name") or "").strip()
-                return nm or "Data source scan"
-    except Exception:
-        pass
-    return "Data source scan"
-
-
 def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute a generic API call described by JSON:
@@ -765,13 +747,6 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
 
     def _get(name: str) -> str:
         return str(secret_vars.get(name) or "").strip()
-
-    def _looks_bigid_encrypted(value: str) -> bool:
-        """
-        BigID encrypted secrets often look like: <base64>==$<base64>
-        """
-        s = str(value or "").strip()
-        return bool(s) and ("$" in s) and ("==" in s)
 
     if k == "s3":
         if isinstance(ap, dict):
@@ -1062,51 +1037,6 @@ def test_ds_connection_auto(
     # 2) client-style test
     return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event)
 
-def _ds_connection_test_ok(payload: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Heuristic: BigID versions vary. Treat obvious errors as failure,
-    otherwise assume OK when response doesn't indicate failure.
-    Returns (ok, message).
-    """
-    if not isinstance(payload, dict):
-        return True, ""
-    # common fields
-    for k in ["success", "ok", "connected", "isConnected", "passed"]:
-        v = payload.get(k)
-        if isinstance(v, bool):
-            return v, k
-    st = str(payload.get("status") or payload.get("state") or "").strip().lower()
-    if st:
-        if st in {"success", "ok", "passed", "connected", "completed"}:
-            return True, st
-        if st in {"failed", "error", "failure", "disconnected"}:
-            return False, st
-    msg = str(payload.get("message") or payload.get("error") or payload.get("details") or "").strip()
-    if msg:
-        low = msg.lower()
-        if any(x in low for x in ["fail", "error", "invalid", "denied", "unauthorized", "timed out", "timeout"]):
-            return False, msg[:300]
-        return True, msg[:300]
-
-    # ids-based endpoint: look for per-id results and obvious failures
-    try:
-        data_block = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        root = data_block if isinstance(data_block, dict) else payload
-        for key in ["results", "items", "data", "connections", "dsConnections"]:
-            val = root.get(key) if isinstance(root, dict) else None
-            if isinstance(val, list) and val:
-                # if any item indicates failure, fail
-                for it in val:
-                    if not isinstance(it, dict):
-                        continue
-                    ok, _ = _ds_connection_test_ok(it)
-                    if not ok:
-                        return False, str(it.get("message") or it.get("error") or it.get("status") or "connection test failed")[:300]
-                return True, ""
-    except Exception:
-        pass
-    return True, ""
-
 def start_scan_profile(base_url: str, token: str, scan_profile_id: str) -> Dict[str, Any]:
     """
     BigID versions differ. Try several common start/run endpoints.
@@ -1252,6 +1182,18 @@ def _extract_id(payload: Dict[str, Any], keys: List[str]) -> str:
     return ""
 
 
+def _scenario_lock_key(ds_kind: Any, file_set_type: Any) -> str:
+    """
+    Lock key that prevents running the *same DS kind + file set* in parallel across envs.
+    Examples:
+      s3::Small Files
+      smb::Large Files
+    """
+    dk = str(ds_kind or "").strip().lower()
+    fs = str(file_set_type or "").strip() or "default"
+    return f"{dk}::{fs}"
+
+
 def run_once(engine, *, quiet: bool = False) -> bool:
     """
     Executes at most one step across all runs.
@@ -1295,8 +1237,26 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     else:
         # Normal mode: allow retrying errors by default.
         where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error')"
+
+    # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
+    avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+    running_keys: set[str] = set()
+    if avoid_parallel:
+        try:
+            with engine.connect() as conn:
+                rrows = conn.execute(
+                    text("""
+                        SELECT ds_kind, file_set_type
+                        FROM workflow_steps
+                        WHERE COALESCE(status,'') = 'scan_running'
+                    """)
+                ).fetchall()
+            for rr in rrows or []:
+                running_keys.add(_scenario_lock_key(rr[0], rr[1]))
+        except Exception:
+            running_keys = set()
     with engine.connect() as conn:
-        step = conn.execute(
+        candidates = conn.execute(
             text(f"""
                 SELECT
                     id, seq, environment_id, ds_kind, ds_name,
@@ -1306,10 +1266,20 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 WHERE run_id = :rid
                   {where_status}
                 ORDER BY seq ASC
-                LIMIT 1
+                LIMIT 25
             """),
             {"rid": int(run_id)},
-        ).fetchone()
+        ).fetchall()
+
+    step = None
+    for cand in candidates or []:
+        if avoid_parallel and running_keys:
+            key = _scenario_lock_key(cand[3], cand[6])  # ds_kind, file_set_type
+            # Only block if the same scenario is already scan_running somewhere.
+            if key in running_keys:
+                continue
+        step = cand
+        break
     if not step:
         # All done
         with engine.connect() as conn:
