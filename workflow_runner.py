@@ -391,6 +391,13 @@ def _workflow_ds_key_candidates(step: Dict[str, Any]) -> List[str]:
     return [
         f"ds::{ds_kind}::{fs}::acl={acl}::struct={struct}",
         f"ds::{ds_kind}::{fs}::acl={acl}",
+        # Fallbacks: reuse base template and apply flags at runtime
+        f"ds::{ds_kind}::{fs}::acl=0::struct=0",
+        f"ds::{ds_kind}::{fs}::acl=0",
+        f"ds::{ds_kind}::default::acl={acl}::struct={struct}",
+        f"ds::{ds_kind}::default::acl={acl}",
+        f"ds::{ds_kind}::default::acl=0::struct=0",
+        f"ds::{ds_kind}::default::acl=0",
     ]
 
 
@@ -759,6 +766,13 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     def _get(name: str) -> str:
         return str(secret_vars.get(name) or "").strip()
 
+    def _looks_bigid_encrypted(value: str) -> bool:
+        """
+        BigID encrypted secrets often look like: <base64>==$<base64>
+        """
+        s = str(value or "").strip()
+        return bool(s) and ("$" in s) and ("==" in s)
+
     if k == "s3":
         if isinstance(ap, dict):
             ak = _get("S3_accessKey")
@@ -770,8 +784,11 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
                 ap["secret_key_enc"] = sk_enc
                 ap.pop("secret_key", None)
             elif sk:
-                ap["secret_key"] = sk
-                ap.pop("secret_key_enc", None)
+                # BigID UI uses secret_key_enc. If user only provides S3_secret_key,
+                # place it into secret_key_enc (works for both encrypted and plain values
+                # in many deployments; avoids silent ignore of secret_key).
+                ap["secret_key_enc"] = sk
+                ap.pop("secret_key", None)
             tid = _get("S3_tenantid")
             if tid and "tenantId" in ap:
                 ap["tenantId"] = tid
@@ -787,7 +804,10 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
                 ap["password_enc"] = pw_enc
                 ap.pop("password", None)
             elif pw:
-                ap["password"] = pw
+                # BigID UI uses password_enc. If user only provides SMB_password,
+                # place it into password_enc.
+                ap["password_enc"] = pw
+                ap.pop("password", None)
             ds_conn["authenticationProperties"] = ap
     elif k == "postgres":
         u = _get("Postgres_username")
@@ -828,6 +848,38 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
             if p:
                 ap["password"] = p
             ds_conn["authenticationProperties"] = ap
+
+    if isinstance(root.get("ds_connection"), dict):
+        root["ds_connection"] = ds_conn
+        return root
+    return ds_conn
+
+
+def _apply_runtime_flags(step: Dict[str, Any], ds_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply step flags (ACL / Structured FF) to DS payload so we don't require a
+    separate imported template for every acl/struct combination.
+    """
+    if not isinstance(ds_payload, dict):
+        return ds_payload
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    root = ds_payload
+    ds_conn = root.get("ds_connection") if isinstance(root.get("ds_connection"), dict) else None
+    if not isinstance(ds_conn, dict):
+        ds_conn = root
+
+    is_acl = bool(step.get("is_acl"))
+    is_struct = bool(step.get("is_structured_ff"))
+
+    # Common connector fields for unstructured connectors (s3/smb)
+    if ds_kind in {"s3", "smb"}:
+        # BigID sometimes stores these as strings "true"/"false"
+        ds_conn["metadataAclScanEnabled"] = "true" if is_acl else "false"
+        ds_conn["dsAclScanEnabled"] = "true" if is_acl else "false"
+        trp = ds_conn.get("typeRequestProperties")
+        if isinstance(trp, dict):
+            trp["enableStructuredFilesDiscovery"] = bool(is_struct)
+            ds_conn["typeRequestProperties"] = trp
 
     if isinstance(root.get("ds_connection"), dict):
         root["ds_connection"] = ds_conn
@@ -1233,17 +1285,26 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         if next_eligible > now:
             return False
 
-    # Find next pending step for this run
+    # Find next step for this run.
+    # In bulk-create mode we want to continue past failures, not retry the same error forever.
+    skip_errors = str(os.getenv("WORKFLOW_SKIP_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if skip_errors:
+        # Bulk-create: continue past failures and also resume half-done steps.
+        # Terminal for our purposes: scan_created/completed; and we explicitly skip error.
+        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error')"
+    else:
+        # Normal mode: allow retrying errors by default.
+        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error')"
     with engine.connect() as conn:
         step = conn.execute(
-            text("""
+            text(f"""
                 SELECT
                     id, seq, environment_id, ds_kind, ds_name,
                     scan_kind, file_set_type, is_acl, is_ocr, is_structured_ff, is_ols,
                     feature_flags, notes, ds_id, scan_profile_id, scan_profile_name, build_version, build_prefix, scan_id, status
                 FROM workflow_steps
                 WHERE run_id = :rid
-                  AND COALESCE(status, 'pending') IN ('pending', 'error')
+                  {where_status}
                 ORDER BY seq ASC
                 LIMIT 1
             """),
@@ -1402,6 +1463,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         ds_payload = json.loads(ds_payload_raw)
         # Force secrets from .env when present (even if template contains old values).
         ds_payload = _apply_runtime_secrets(str(step_dict.get("ds_kind") or ""), ds_payload, secret_vars)
+        # Apply ACL/Structured flags at runtime (so one base template is enough).
+        ds_payload = _apply_runtime_flags(step_dict, ds_payload)
         out = put_ds_connection(base_url, token, desired_ds_name, ds_payload)
         ds_id = _extract_id(out, ["_id", "id", "dsId", "ds_id"])
         if not ds_id:
@@ -1430,25 +1493,36 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         ds_conn_obj["name"] = desired_ds_name
         ds_conn_obj["id"] = desired_ds_name
 
-        broadcast = f"{desired_ds_name}-test-connection-complete-{uuid.uuid4()}"[:250]
-        test_started = _now_utc()
-        test_ds_connection_auto(
-            base_url,
-            token,
-            ds_name=desired_ds_name,
-            ds_connection=ds_conn_obj,
-            broadcast_event=broadcast,
-        )
-        ok, msg = wait_for_ds_connection_test_result(
-            base_url,
-            token,
-            desired_ds_name,
-            test_started_at=test_started,
-            timeout_seconds=int(os.getenv("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", "180") or "180"),
-            poll_seconds=int(os.getenv("WORKFLOW_DS_TEST_POLL_SECONDS", "5") or "5"),
-        )
+        max_attempts = int(os.getenv("WORKFLOW_DS_TEST_MAX_ATTEMPTS", "2") or "2")
+        max_attempts = max(1, min(5, max_attempts))
+        last_msg = ""
+        ok = False
+        for attempt in range(1, max_attempts + 1):
+            broadcast = f"{desired_ds_name}-test-connection-complete-{uuid.uuid4()}"[:250]
+            test_started = _now_utc()
+            test_ds_connection_auto(
+                base_url,
+                token,
+                ds_name=desired_ds_name,
+                ds_connection=ds_conn_obj,
+                broadcast_event=broadcast,
+            )
+            ok, msg = wait_for_ds_connection_test_result(
+                base_url,
+                token,
+                desired_ds_name,
+                test_started_at=test_started,
+                timeout_seconds=int(os.getenv("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", "180") or "180"),
+                poll_seconds=int(os.getenv("WORKFLOW_DS_TEST_POLL_SECONDS", "5") or "5"),
+            )
+            last_msg = msg or last_msg
+            if ok:
+                break
+            # small backoff before retry
+            if attempt < max_attempts:
+                time.sleep(2)
         if not ok:
-            raise RuntimeError(msg or "connection test failed")
+            raise RuntimeError(last_msg or "connection test failed")
         set_step_status(engine, step_id, "ds_test_ok")
     except Exception as ex:
         set_step_error(engine, step_id, f"DS connection test failed: {ex}")
@@ -1503,16 +1577,18 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     if create_only:
         if not quiet:
             print(f"[{_now_utc().isoformat()}Z] run={run_id} step={seq} create_only=1 (DS + scan profile created; not triggering scan)", flush=True)
-        # Pause the run so it doesn't continue creating more DS/scan profiles automatically.
-        try:
-            with engine.connect() as conn:
-                conn.execute(
-                    text("UPDATE workflow_runs SET status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=:rid"),
-                    {"rid": int(run_id)},
-                )
-                conn.commit()
-        except Exception:
-            pass
+        pause_after = str(os.getenv("WORKFLOW_CREATE_ONLY_PAUSE", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if pause_after:
+            # Pause the run so it doesn't continue creating more DS/scan profiles automatically.
+            try:
+                with engine.connect() as conn:
+                    conn.execute(
+                        text("UPDATE workflow_runs SET status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=:rid"),
+                        {"rid": int(run_id)},
+                    )
+                    conn.commit()
+            except Exception:
+                pass
         return True
 
     # --- Start scan profile & capture parent scan id ---
