@@ -660,7 +660,7 @@ def _standard_ds_base_name(step: Dict[str, Any]) -> str:
     """
     Enforce stable DS naming so builds/scenarios are distinguishable:
       S3 Small Files With ACL
-      S3 Large Files No ACL
+      S3 Large Files
       S3 CSV Files Structured Files Discovery
       ...
     Build prefix is applied separately.
@@ -674,8 +674,8 @@ def _standard_ds_base_name(step: Dict[str, Any]) -> str:
     if k in {"s3", "smb"}:
         prefix = "S3" if k == "s3" else "SMB"
         nm = f"{prefix} {fs}".strip() if fs else prefix
-        if fs in {"Small Files", "Large Files"}:
-            nm += " With ACL" if is_acl else " No ACL"
+        if fs in {"Small Files", "Large Files"} and is_acl:
+            nm += " With ACL"
         if is_struct:
             nm += " Structured Files Discovery"
         if is_ols:

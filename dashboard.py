@@ -10134,9 +10134,9 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
             else:
                 nm = prefix
 
-            # Explicit ACL naming for Small/Large files (as requested)
-            if fs in {"Small Files", "Large Files"}:
-                nm += " With ACL" if bool(is_acl) else " No ACL"
+            # Only tag when ACL is enabled; default case stays clean (no "No ACL")
+            if fs in {"Small Files", "Large Files"} and bool(is_acl):
+                nm += " With ACL"
 
             # Structured discovery naming (esp for CSV)
             if bool(is_structured_ff):
