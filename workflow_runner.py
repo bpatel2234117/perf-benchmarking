@@ -623,10 +623,27 @@ def _read_dotenv_map() -> Dict[str, str]:
     return values
 
 
-_DOTENV_MAP = _read_dotenv_map()
+_DOTENV_MAP: Dict[str, str] = {}
+_DOTENV_MTIME: Optional[float] = None
+
+
+def _maybe_reload_dotenv() -> None:
+    global _DOTENV_MAP, _DOTENV_MTIME
+    try:
+        st = ENV_FILE_PATH.stat()
+        mtime = float(st.st_mtime)
+    except Exception:
+        return
+    if _DOTENV_MTIME is None or (mtime != _DOTENV_MTIME):
+        try:
+            _DOTENV_MAP = _read_dotenv_map()
+            _DOTENV_MTIME = mtime
+        except Exception:
+            pass
 
 
 def _getenv_any(names: List[str]) -> str:
+    _maybe_reload_dotenv()
     for n in names:
         v = str(os.getenv(n, "") or _DOTENV_MAP.get(n, "") or "").strip()
         if v:
