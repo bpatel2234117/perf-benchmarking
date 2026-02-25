@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import socket
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -55,7 +56,20 @@ ENV_FILE_PATH = Path(__file__).parent / ".env"
 
 RUNNER_HEARTBEAT_NAME = "workflow_runner"
 RUNNER_LOCK_KEY = "workflow_runner_lock"
-RUNNER_ID = f"{socket.gethostname()}:{os.getpid()}"
+
+def _git_head_short() -> str:
+    try:
+        repo_dir = Path(__file__).resolve().parent
+        # Fast, best-effort. If git isn't available, just return "".
+        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo_dir), stderr=subprocess.DEVNULL, timeout=1.5)
+        sha = out.decode("utf-8", errors="ignore").strip()
+        return sha[:12]
+    except Exception:
+        return ""
+
+
+_GIT_SHA = _git_head_short()
+RUNNER_ID = f"{socket.gethostname()}:{os.getpid()}" + (f":{_GIT_SHA}" if _GIT_SHA else "")
 
 
 def _env_int(name: str, default: int) -> int:
