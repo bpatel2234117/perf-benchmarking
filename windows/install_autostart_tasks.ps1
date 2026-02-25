@@ -36,10 +36,14 @@ function Register-StartupTask {
     schtasks.exe /Delete /TN $TaskName /F | Out-Null
   }
 
-  $delay = ("{0:00}:{1:00}" -f [Math]::Floor($DelaySeconds / 60), ($DelaySeconds % 60))
+  # schtasks.exe expects /DELAY in mmmm:ss format (4-digit minutes)
+  $delay = ("{0:0000}:{1:00}" -f [Math]::Floor($DelaySeconds / 60), ($DelaySeconds % 60))
   # Run at startup, run whether user is logged on or not, with highest privileges
   schtasks.exe /Create /TN $TaskName /SC ONSTART /DELAY $delay /RL HIGHEST /F `
     /TR "`"$cmd`" $cmdArgs" | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to create task: $TaskName (exit=$LASTEXITCODE)"
+  }
 }
 
 Register-StartupTask -TaskName $taskTracker -ScriptPath $TrackerScript -DelaySeconds 20
