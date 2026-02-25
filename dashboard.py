@@ -10109,22 +10109,48 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
         {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
     ]
 
+    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool) -> str:
+        k = str(ds_kind or "").strip().lower()
+        fs = str(file_set_type or "").strip()
+        if k in {"s3", "smb"}:
+            prefix = "S3" if k == "s3" else "SMB"
+            if fs:
+                nm = f"{prefix} {fs}"
+            else:
+                nm = prefix
+
+            # Explicit ACL naming for Small/Large files (as requested)
+            if fs in {"Small Files", "Large Files"}:
+                nm += " With ACL" if bool(is_acl) else " No ACL"
+
+            # Structured discovery naming (esp for CSV)
+            if bool(is_structured_ff):
+                nm += " Structured Files Discovery"
+
+            if bool(is_ols):
+                nm += " With OLS"
+
+            return nm.strip()
+
+        if k == "postgres":
+            return "Postgres"
+        if k == "mssql":
+            return "MSSQL"
+        if k == "mysql":
+            return "MySQL"
+        return str(ds_kind or "").strip().upper() or "DS"
+
     steps: List[Dict[str, Any]] = []
     for idx, stp in enumerate(base):
         stp2 = dict(stp)
         stp2["environment_id"] = _env_for_idx(idx)
-        # Provide a deterministic DS name suggestion; backend can override.
-        ds_kind = str(stp2.get("ds_kind") or "").strip().upper()
-        fs = str(stp2.get("file_set_type") or "").strip()
-        flags = []
-        if bool(stp2.get("is_acl")):
-            flags.append("ACL")
-        if bool(stp2.get("is_ols")):
-            flags.append("OLS")
-        if bool(stp2.get("is_structured_ff")):
-            flags.append("STRUCT")
-        flag_s = (" " + " ".join(flags)) if flags else ""
-        stp2["ds_name"] = f"{ds_kind}{(' ' + fs) if fs else ''}{flag_s}".strip()
+        stp2["ds_name"] = _standard_ds_name(
+            str(stp2.get("ds_kind") or ""),
+            stp2.get("file_set_type"),
+            bool(stp2.get("is_acl")),
+            bool(stp2.get("is_ols")),
+            bool(stp2.get("is_structured_ff")),
+        )
         stp2["status"] = "pending"
         steps.append(stp2)
     return steps

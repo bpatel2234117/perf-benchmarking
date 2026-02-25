@@ -27,6 +27,9 @@ from sqlalchemy import create_engine, text
 
 from db_config import DB_CONNECTION_STRING
 
+FORCE_SECRET_PLACEHOLDERS = str(os.getenv("WORKFLOW_IMPORT_FORCE_SECRET_PLACEHOLDERS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+PRESERVE_EXISTING_SECRETS = str(os.getenv("WORKFLOW_IMPORT_PRESERVE_EXISTING_SECRETS", "1") or "1").strip().lower() not in {"0", "false", "no", "n", "off"}
+
 
 def _compact(s: Any) -> str:
     return str(s or "").strip().lower().replace(" ", "")
@@ -76,6 +79,8 @@ def _infer_ds_kind(ds: Dict[str, Any]) -> str:
         return "mssql"
     if t in {"rdb-postgresql", "postgresql", "postgres"}:
         return "postgres"
+    if t in {"rdb-mysql", "mysql"}:
+        return "mysql"
     return t or "unknown"
 
 
@@ -123,27 +128,127 @@ def _clean_ds_for_template(ds: Dict[str, Any], *, ds_kind: str) -> Dict[str, Any
     if ds_kind == "smb":
         ap = keep.get("authenticationProperties")
         if isinstance(ap, dict):
-            ap["username"] = "{{SMB_username}}"
-            # allow both enc and plain; user will set one.
-            ap.setdefault("password_enc", "{{SMB_password_enc}}")
-            ap.setdefault("password", "{{SMB_password}}")
+            if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+                ap["username"] = "{{SMB_username}}"
+                ap["password_enc"] = "{{SMB_password_enc}}"
+                ap["password"] = "{{SMB_password}}"
+            else:
+                # Only add placeholders when missing. If export already has values, keep them.
+                ap.setdefault("username", "{{SMB_username}}")
+                # Only require one of password_enc/password; don't add the other placeholder
+                # if an encrypted/plain secret already exists in the export.
+                has_enc = bool(str(ap.get("password_enc") or "").strip())
+                has_plain = bool(str(ap.get("password") or "").strip())
+                if not (has_enc or has_plain):
+                    ap["password_enc"] = "{{SMB_password_enc}}"
+                    ap["password"] = "{{SMB_password}}"
             keep["authenticationProperties"] = ap
     if ds_kind == "s3":
         ap = keep.get("authenticationProperties")
         if isinstance(ap, dict):
-            ap["accessKey"] = "{{S3_accessKey}}"
-            ap.setdefault("secret_key_enc", "{{S3_secret_key_enc}}")
-            ap.setdefault("secret_key", "{{S3_secret_key}}")
+            if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+                ap["accessKey"] = "{{S3_accessKey}}"
+                ap["secret_key_enc"] = "{{S3_secret_key_enc}}"
+                ap["secret_key"] = "{{S3_secret_key}}"
+            else:
+                ap.setdefault("accessKey", "{{S3_accessKey}}")
+                has_enc = bool(str(ap.get("secret_key_enc") or "").strip())
+                has_plain = bool(str(ap.get("secret_key") or "").strip())
+                if not (has_enc or has_plain):
+                    ap["secret_key_enc"] = "{{S3_secret_key_enc}}"
+                    ap["secret_key"] = "{{S3_secret_key}}"
             keep["authenticationProperties"] = ap
     if ds_kind == "mssql":
-        # rdb-mssql uses flat fields
-        keep["username"] = "{{MSSQL_username}}"
-        keep["password"] = "{{MSSQL_password}}"
+        # Some exports use flat fields, others use authenticationProperties.
+        if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+            keep["username"] = "{{MSSQL_username}}"
+            keep["password"] = "{{MSSQL_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap["username"] = "{{MSSQL_username}}"
+                ap["password"] = "{{MSSQL_password}}"
+                keep["authenticationProperties"] = ap
+        else:
+            if not str(keep.get("username") or "").strip():
+                keep["username"] = "{{MSSQL_username}}"
+            if not str(keep.get("password") or "").strip() and not str(keep.get("password_enc") or "").strip():
+                keep["password"] = "{{MSSQL_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap.setdefault("username", "{{MSSQL_username}}")
+                ap.setdefault("password", "{{MSSQL_password}}")
+                keep["authenticationProperties"] = ap
     if ds_kind == "postgres":
-        keep["username"] = "{{Postgres_username}}"
-        keep["password"] = "{{Postgres_password}}"
+        if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+            keep["username"] = "{{Postgres_username}}"
+            keep["password"] = "{{Postgres_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap["username"] = "{{Postgres_username}}"
+                ap["password"] = "{{Postgres_password}}"
+                keep["authenticationProperties"] = ap
+        else:
+            if not str(keep.get("username") or "").strip():
+                keep["username"] = "{{Postgres_username}}"
+            if not str(keep.get("password") or "").strip() and not str(keep.get("password_enc") or "").strip():
+                keep["password"] = "{{Postgres_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap.setdefault("username", "{{Postgres_username}}")
+                ap.setdefault("password", "{{Postgres_password}}")
+                keep["authenticationProperties"] = ap
+
+    if ds_kind == "mysql":
+        # Some exports use flat fields, others use authenticationProperties.
+        if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+            keep["username"] = "{{MySQL_username}}"
+            keep["password"] = "{{MySQL_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap["username"] = "{{MySQL_username}}"
+                ap["password"] = "{{MySQL_password}}"
+                keep["authenticationProperties"] = ap
+        else:
+            if not str(keep.get("username") or "").strip():
+                keep["username"] = "{{MySQL_username}}"
+            if not str(keep.get("password") or "").strip() and not str(keep.get("password_enc") or "").strip():
+                keep["password"] = "{{MySQL_password}}"
+            ap = keep.get("authenticationProperties")
+            if isinstance(ap, dict):
+                ap.setdefault("username", "{{MySQL_username}}")
+                ap.setdefault("password", "{{MySQL_password}}")
+                keep["authenticationProperties"] = ap
 
     return keep
+
+def _score_ds_candidate(ds: Dict[str, Any], *, ds_kind: str) -> int:
+    """
+    Heuristic to pick one DS per key when export contains duplicates.
+    Higher score wins; ties are broken deterministically by name.
+    """
+    score = 0
+    # Prefer enabled-ish
+    enabled = ds.get("enabled")
+    if enabled is True or str(enabled or "").strip().lower() in {"1", "true", "yes", "y", "enabled"}:
+        score += 5
+    # Prefer objects that look "complete"
+    if ds.get("scanner_group"):
+        score += 2
+    if isinstance(ds.get("resourceProperties"), dict) and ds.get("resourceProperties"):
+        score += 2
+    if isinstance(ds.get("authenticationProperties"), dict) and ds.get("authenticationProperties"):
+        score += 2
+    if isinstance(ds.get("containerizedFilter"), dict) and ds.get("containerizedFilter"):
+        score += 2
+    # Connector-specific hints
+    if ds_kind in {"s3", "smb"}:
+        ap = ds.get("authenticationProperties")
+        if isinstance(ap, dict) and any(str(ap.get(k) or "").strip() for k in ["accessKey", "secret_key_enc", "username", "password_enc", "password"]):
+            score += 2
+    if ds_kind in {"mssql", "postgres"}:
+        if any(str(ds.get(k) or "").strip() for k in ["username", "password", "password_enc", "host", "database"]):
+            score += 2
+    return score
 
 
 def ensure_workflow_templates_table(engine) -> None:
@@ -215,7 +320,9 @@ def import_file(engine, path: str) -> Tuple[int, int]:
         raise RuntimeError("Expected a JSON array of datasources")
 
     seen = 0
-    saved = 0
+    kept_by_key: Dict[str, Tuple[int, str, Dict[str, Any], str]] = {}
+    eligible = 0
+    duplicates_skipped = 0
     for ds in data:
         if not isinstance(ds, dict):
             continue
@@ -224,13 +331,32 @@ def import_file(engine, path: str) -> Tuple[int, int]:
         file_set = _infer_file_set(ds)
         is_acl = _infer_acl(ds)
         is_struct = _infer_struct(ds)
-        if ds_kind not in {"smb", "s3", "mssql", "postgres"}:
+        if ds_kind not in {"smb", "s3", "mssql", "postgres", "mysql"}:
             continue
+        k = key_for(ds_kind, file_set, is_acl, is_struct)
+        eligible += 1
+        score = _score_ds_candidate(ds, ds_kind=ds_kind)
+        nm = str(ds.get("name") or "").strip()
+        prev = kept_by_key.get(k)
+        if prev is None:
+            kept_by_key[k] = (score, nm, ds, ds_kind)
+            continue
+        prev_score, prev_nm, _, _ = prev
+        if score > prev_score or (score == prev_score and nm and (not prev_nm or nm < prev_nm)):
+            duplicates_skipped += 1
+            kept_by_key[k] = (score, nm, ds, ds_kind)
+        else:
+            duplicates_skipped += 1
+
+    saved = 0
+    for k, (_score, _nm, ds, ds_kind) in kept_by_key.items():
         cleaned = _clean_ds_for_template(ds, ds_kind=ds_kind)
         payload = {"ds_connection": cleaned, "isSavedAsDraft": False}
-        k = key_for(ds_kind, file_set, is_acl, is_struct)
         upsert_template(engine, k, "ds", json.dumps(payload, indent=2))
         saved += 1
+
+    # Keep return signature the same, but save count is "unique keys saved"
+    # and seen is "items in file".
     return seen, saved
 
 

@@ -19,8 +19,10 @@ import argparse
 import json
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -36,12 +38,19 @@ DS_CONNECTIONS_PATH = os.getenv("BIGID_DS_CONNECTIONS_API_PATH", "/api/v1/ds_con
 SCAN_PROFILES_PATH = os.getenv("BIGID_SCAN_PROFILES_API_PATH", "/api/v1/scanProfiles").strip() or "/api/v1/scanProfiles"
 ABOUT_PATH = os.getenv("BIGID_ABOUT_API_PATH", "/api/v1/about").strip() or "/api/v1/about"
 SCAN_TEMPLATES_PATH = os.getenv("BIGID_SCAN_TEMPLATES_API_PATH", "/api/v1/scan-templates").strip() or "/api/v1/scan-templates"
+SCANS_TRIGGER_PATH = os.getenv("BIGID_SCANS_TRIGGER_API_PATH", "/api/v1/scans").strip() or "/api/v1/scans"
+DS_CONNECTION_TEST_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
+DS_CONNECTIONS_TEST_PATH = os.getenv("BIGID_DS_CONNECTIONS_TEST_API_PATH", "/api/v1/ds-connections/test").strip() or "/api/v1/ds-connections/test"
+
+DEFAULT_SCAN_OWNER_EMAIL = str(os.getenv("WORKFLOW_SCAN_OWNER_EMAIL", "admin@bigid.com") or "").strip()
 
 # Conservative request timeout so one hung call can't freeze the workflow.
 HTTP_TIMEOUT = float(os.getenv("WORKFLOW_HTTP_TIMEOUT_SECONDS", "45") or "45")
 
 RUNNING_STATES = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending", "stoprequested", "stop requested", "stopping"}
 TERMINAL_STATES = {"failed", "completedwithfailures", "completed", "stopped", "aborted", "cancelled", "canceled"}
+
+ENV_FILE_PATH = Path(__file__).parent / ".env"
 
 
 def _compact(s: Any) -> str:
@@ -76,7 +85,16 @@ def _request(method: str, url: str, token: str, *, params: Optional[Dict[str, An
     resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_raw, timeout=HTTP_TIMEOUT)
     if resp.status_code in (401, 403) and token:
         resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_bearer, timeout=HTTP_TIMEOUT)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as ex:
+        body = ""
+        try:
+            body = (resp.text or "").strip()
+        except Exception:
+            body = ""
+        snippet = body[:1200] + ("..." if len(body) > 1200 else "")
+        raise RuntimeError(f"{method} {url} failed [{resp.status_code}]: {snippet}") from ex
     return resp
 
 
@@ -462,10 +480,32 @@ def resolve_default_scanner_group(engine, env_id: Optional[int]) -> str:
             return v
     return "default"
 
+def _read_dotenv_map() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    try:
+        if not ENV_FILE_PATH.exists():
+            return values
+        text_value = ENV_FILE_PATH.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return values
+    for line in text_value.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        key = k.strip()
+        val = v.strip().strip('"').strip("'")
+        if key:
+            values[key] = val
+    return values
+
+
+_DOTENV_MAP = _read_dotenv_map()
+
 
 def _getenv_any(names: List[str]) -> str:
     for n in names:
-        v = str(os.getenv(n, "") or "").strip()
+        v = str(os.getenv(n, "") or _DOTENV_MAP.get(n, "") or "").strip()
         if v:
             return v
     return ""
@@ -494,6 +534,9 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     elif k == "mssql":
         out["MSSQL_username"] = _getenv_any(["MSSQL_username", "MSSQL_USERNAME", "mssql_username"])
         out["MSSQL_password"] = _getenv_any(["MSSQL_password", "MSSQL_PASSWORD", "mssql_password"])
+    elif k == "mysql":
+        out["MySQL_username"] = _getenv_any(["MySQL_username", "MYSQL_username", "MYSQL_USERNAME", "mysql_username"])
+        out["MySQL_password"] = _getenv_any(["MySQL_password", "MYSQL_password", "MYSQL_PASSWORD", "mysql_password"])
     return out
 
 
@@ -533,6 +576,24 @@ def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: st
     except Exception:
         pass
     return ""
+
+
+def resolve_default_scan_template_name(engine, env_id: Optional[int], base_url: str, token: str) -> str:
+    """
+    Cosmetic only: used for naming scan profiles ("Scan for <DS> <TemplateName>").
+    """
+    tid = resolve_default_scan_template_id(engine, env_id, base_url, token)
+    if not tid:
+        return "Data source scan"
+    try:
+        items = fetch_scan_templates(base_url, token, limit=200, skip=0)
+        for it in items or []:
+            if str(it.get("_id") or it.get("id") or "").strip() == tid:
+                nm = str(it.get("name") or "").strip()
+                return nm or "Data source scan"
+    except Exception:
+        pass
+    return "Data source scan"
 
 
 def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -602,6 +663,42 @@ def _apply_build_prefix(name: str, build_prefix: str) -> str:
     return f"{bp} {nm}".strip()
 
 
+def _standard_ds_base_name(step: Dict[str, Any]) -> str:
+    """
+    Enforce stable DS naming so builds/scenarios are distinguishable:
+      S3 Small Files With ACL
+      S3 Large Files No ACL
+      S3 CSV Files Structured Files Discovery
+      ...
+    Build prefix is applied separately.
+    """
+    k = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip()
+    is_acl = bool(step.get("is_acl"))
+    is_ols = bool(step.get("is_ols"))
+    is_struct = bool(step.get("is_structured_ff"))
+
+    if k in {"s3", "smb"}:
+        prefix = "S3" if k == "s3" else "SMB"
+        nm = f"{prefix} {fs}".strip() if fs else prefix
+        if fs in {"Small Files", "Large Files"}:
+            nm += " With ACL" if is_acl else " No ACL"
+        if is_struct:
+            nm += " Structured Files Discovery"
+        if is_ols:
+            nm += " With OLS"
+        return nm.strip()
+
+    if k == "postgres":
+        return "Postgres"
+    if k == "mssql":
+        return "MSSQL"
+    if k == "mysql":
+        return "MySQL"
+    # fallback to existing ds_name if any
+    return str(step.get("ds_name") or step.get("ds_kind") or "DS").strip()
+
+
 def set_run_next_eligible(engine, run_id: int, next_dt: datetime) -> None:
     with engine.connect() as conn:
         conn.execute(
@@ -615,7 +712,7 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
     with engine.connect() as conn:
         row = conn.execute(
             text("""
-                SELECT id, env_name, base_url, auth_module_path, auth_function_name, classifiers_api_path, is_active
+                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
                 FROM test_environments
                 WHERE id = :id
                 LIMIT 1
@@ -628,10 +725,11 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
         "id": row[0],
         "env_name": row[1],
         "base_url": row[2],
-        "auth_module_path": row[3],
-        "auth_function_name": row[4],
-        "classifiers_api_path": row[5],
-        "is_active": row[6],
+        "version": row[3],
+        "auth_module_path": row[4],
+        "auth_function_name": row[5],
+        "classifiers_api_path": row[6],
+        "is_active": row[7],
     }
 
 
@@ -642,6 +740,101 @@ def _render_template(text_value: str, variables: Dict[str, str]) -> str:
     return s
 
 
+def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Even if templates were imported with real secret values (or without placeholders),
+    override connector creds from .env when provided.
+    """
+    if not isinstance(ds_payload, dict):
+        return ds_payload
+    k = str(ds_kind or "").strip().lower()
+    root = ds_payload
+    ds_conn = root.get("ds_connection") if isinstance(root.get("ds_connection"), dict) else None
+    if not isinstance(ds_conn, dict):
+        ds_conn = root
+    ap = ds_conn.get("authenticationProperties")
+    if not isinstance(ap, dict):
+        ap = None
+
+    def _get(name: str) -> str:
+        return str(secret_vars.get(name) or "").strip()
+
+    if k == "s3":
+        if isinstance(ap, dict):
+            ak = _get("S3_accessKey")
+            if ak:
+                ap["accessKey"] = ak
+            sk_enc = _get("S3_secret_key_enc")
+            sk = _get("S3_secret_key")
+            if sk_enc:
+                ap["secret_key_enc"] = sk_enc
+                ap.pop("secret_key", None)
+            elif sk:
+                ap["secret_key"] = sk
+                ap.pop("secret_key_enc", None)
+            tid = _get("S3_tenantid")
+            if tid and "tenantId" in ap:
+                ap["tenantId"] = tid
+            ds_conn["authenticationProperties"] = ap
+    elif k == "smb":
+        if isinstance(ap, dict):
+            u = _get("SMB_username")
+            if u:
+                ap["username"] = u
+            pw_enc = _get("SMB_password_enc")
+            pw = _get("SMB_password")
+            if pw_enc:
+                ap["password_enc"] = pw_enc
+                ap.pop("password", None)
+            elif pw:
+                ap["password"] = pw
+            ds_conn["authenticationProperties"] = ap
+    elif k == "postgres":
+        u = _get("Postgres_username")
+        p = _get("Postgres_password")
+        if u:
+            ds_conn["username"] = u
+        if p:
+            ds_conn["password"] = p
+        if isinstance(ap, dict):
+            if u:
+                ap["username"] = u
+            if p:
+                ap["password"] = p
+            ds_conn["authenticationProperties"] = ap
+    elif k == "mssql":
+        u = _get("MSSQL_username")
+        p = _get("MSSQL_password")
+        if u:
+            ds_conn["username"] = u
+        if p:
+            ds_conn["password"] = p
+        if isinstance(ap, dict):
+            if u:
+                ap["username"] = u
+            if p:
+                ap["password"] = p
+            ds_conn["authenticationProperties"] = ap
+    elif k == "mysql":
+        u = _get("MySQL_username")
+        p = _get("MySQL_password")
+        if u:
+            ds_conn["username"] = u
+        if p:
+            ds_conn["password"] = p
+        if isinstance(ap, dict):
+            if u:
+                ap["username"] = u
+            if p:
+                ap["password"] = p
+            ds_conn["authenticationProperties"] = ap
+
+    if isinstance(root.get("ds_connection"), dict):
+        root["ds_connection"] = ds_conn
+        return root
+    return ds_conn
+
+
 def _action_pre_ols_key(env_id: Optional[int]) -> List[str]:
     """
     Prefer env-specific action, fallback to global.
@@ -650,6 +843,23 @@ def _action_pre_ols_key(env_id: Optional[int]) -> List[str]:
     if env_id is not None:
         keys.append(f"action::pre_ols::env={int(env_id)}")
     keys.append("action::pre_ols")
+    return keys
+
+
+def _action_pre_step_keys(step: Dict[str, Any], env_id: Optional[int]) -> List[str]:
+    """
+    Per-step action (for FF on/off etc) keyed by DS + scenario flags.
+    Most specific first.
+    """
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip() or "default"
+    acl = 1 if bool(step.get("is_acl")) else 0
+    struct = 1 if bool(step.get("is_structured_ff")) else 0
+    ols = 1 if bool(step.get("is_ols")) else 0
+    keys: List[str] = []
+    if env_id is not None:
+        keys.append(f"action::pre_step::env={int(env_id)}::{ds_kind}::{fs}::acl={acl}::struct={struct}::ols={ols}")
+    keys.append(f"action::pre_step::{ds_kind}::{fs}::acl={acl}::struct={struct}::ols={ols}")
     return keys
 
 
@@ -664,11 +874,186 @@ def put_ds_connection(base_url: str, token: str, ds_name: str, payload: Dict[str
     return resp.json() if resp.content else {}
 
 
+def fetch_ds_connection(base_url: str, token: str, ds_name: str) -> Dict[str, Any]:
+    from urllib.parse import quote
+    name = str(ds_name or "").strip()
+    if not name:
+        raise RuntimeError("ds_name is required")
+    base_path = DS_CONNECTIONS_PATH.rstrip("/")
+    url = build_api_url(base_url, f"{base_path}/{quote(name, safe='')}")
+    resp = _request("GET", url, token)
+    return resp.json() if resp.content else {}
+
+
+def _parse_utc_dt(v: Any) -> Optional[datetime]:
+    s = str(v or "").strip()
+    if not s:
+        return None
+    # Examples: 2026-02-25T08:56:26.790Z
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        # Normalize to naive UTC for safe comparisons with datetime.utcnow()
+        if getattr(dt, "tzinfo", None) is not None:
+            try:
+                dt = dt.astimezone(tz=None).replace(tzinfo=None)
+            except Exception:
+                dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def wait_for_ds_connection_test_result(
+    base_url: str,
+    token: str,
+    ds_name: str,
+    *,
+    test_started_at: datetime,
+    timeout_seconds: int = 180,
+    poll_seconds: int = 5,
+) -> Tuple[bool, str]:
+    """
+    Poll DS until connectionStatusTest.last_connection is updated after test_started_at.
+    Return (ok, message).
+    """
+    deadline = _now_utc() + timedelta(seconds=max(10, int(timeout_seconds)))
+    last_seen = None
+    while _now_utc() < deadline:
+        try:
+            payload = fetch_ds_connection(base_url, token, ds_name)
+            dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
+            cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
+            if isinstance(cst, dict):
+                last_conn = _parse_utc_dt(cst.get("last_connection"))
+                if last_conn:
+                    last_seen = last_conn
+                # only decide once we see an updated last_connection after we started the test
+                if last_conn and last_conn >= (test_started_at - timedelta(seconds=2)):
+                    is_success = cst.get("is_success")
+                    if isinstance(is_success, bool):
+                        return is_success, json.dumps({k: cst.get(k) for k in ["is_success", "last_connection", "is_connection_ever_succeeded"]}, separators=(",", ":"))[:500]
+                    # if it's present but not bool, treat truthy strings
+                    s = str(is_success or "").strip().lower()
+                    if s in {"true", "1", "yes", "ok", "success"}:
+                        return True, "success"
+                    if s in {"false", "0", "no", "fail", "failed", "error"}:
+                        return False, "failed"
+        except Exception:
+            pass
+        time.sleep(max(2, int(poll_seconds)))
+    msg = f"Timed out waiting for DS connection test result (last_seen={last_seen.isoformat() if last_seen else 'none'})"
+    return False, msg
+
 def create_scan_profile(base_url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = build_api_url(base_url, SCAN_PROFILES_PATH)
     resp = _request("POST", url, token, json_body=payload)
     return resp.json() if resp.content else {}
 
+
+def test_ds_connection(base_url: str, token: str, *, ds_connection: Dict[str, Any], broadcast_event: str) -> Dict[str, Any]:
+    """
+    Best-effort DS connection test.
+    Mirrors UI curl: POST /api/v1/ds-connection-test/client?broadcastEvent=...
+    """
+    url = build_api_url(base_url, DS_CONNECTION_TEST_PATH)
+    params = {"broadcastEvent": str(broadcast_event or "").strip()}
+    body = {
+        "ds_connection": ds_connection,
+        "broadcastEvent": str(broadcast_event or "").strip(),
+        "isNewSessionToken": False,
+        "isFirstAttempt": False,
+        "isNewConnection": True,
+    }
+    resp = _request("POST", url, token, params=params, json_body=body)
+    try:
+        return resp.json() if resp.content else {}
+    except Exception:
+        return {"_raw": (resp.text or "")}
+
+
+def test_ds_connections_by_ids(base_url: str, token: str, *, ids: List[str], broadcast_event: str) -> Dict[str, Any]:
+    """
+    Newer API observed in UI:
+      POST /api/v1/ds-connections/test?broadcastEvent=...
+      body: {"ids":[...],"allSelected":false,"query":{"filter":[]}}
+    """
+    url = build_api_url(base_url, DS_CONNECTIONS_TEST_PATH)
+    params = {"broadcastEvent": str(broadcast_event or "").strip()}
+    body = {"ids": [str(x).strip() for x in (ids or []) if str(x).strip()], "allSelected": False, "query": {"filter": []}}
+    resp = _request("POST", url, token, params=params, json_body=body)
+    try:
+        return resp.json() if resp.content else {}
+    except Exception:
+        return {"_raw": (resp.text or "")}
+
+
+def test_ds_connection_auto(
+    base_url: str,
+    token: str,
+    *,
+    ds_name: str,
+    ds_connection: Dict[str, Any],
+    broadcast_event: str,
+) -> Dict[str, Any]:
+    """
+    Try ids-based endpoint first (doesn't require passing full DS),
+    fallback to client endpoint.
+    """
+    name = str(ds_name or "").strip()
+    # 1) ids-based test
+    try:
+        return test_ds_connections_by_ids(base_url, token, ids=[name], broadcast_event=broadcast_event)
+    except Exception:
+        pass
+    # 2) client-style test
+    return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event)
+
+def _ds_connection_test_ok(payload: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Heuristic: BigID versions vary. Treat obvious errors as failure,
+    otherwise assume OK when response doesn't indicate failure.
+    Returns (ok, message).
+    """
+    if not isinstance(payload, dict):
+        return True, ""
+    # common fields
+    for k in ["success", "ok", "connected", "isConnected", "passed"]:
+        v = payload.get(k)
+        if isinstance(v, bool):
+            return v, k
+    st = str(payload.get("status") or payload.get("state") or "").strip().lower()
+    if st:
+        if st in {"success", "ok", "passed", "connected", "completed"}:
+            return True, st
+        if st in {"failed", "error", "failure", "disconnected"}:
+            return False, st
+    msg = str(payload.get("message") or payload.get("error") or payload.get("details") or "").strip()
+    if msg:
+        low = msg.lower()
+        if any(x in low for x in ["fail", "error", "invalid", "denied", "unauthorized", "timed out", "timeout"]):
+            return False, msg[:300]
+        return True, msg[:300]
+
+    # ids-based endpoint: look for per-id results and obvious failures
+    try:
+        data_block = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        root = data_block if isinstance(data_block, dict) else payload
+        for key in ["results", "items", "data", "connections", "dsConnections"]:
+            val = root.get(key) if isinstance(root, dict) else None
+            if isinstance(val, list) and val:
+                # if any item indicates failure, fail
+                for it in val:
+                    if not isinstance(it, dict):
+                        continue
+                    ok, _ = _ds_connection_test_ok(it)
+                    if not ok:
+                        return False, str(it.get("message") or it.get("error") or it.get("status") or "connection test failed")[:300]
+                return True, ""
+    except Exception:
+        pass
+    return True, ""
 
 def start_scan_profile(base_url: str, token: str, scan_profile_id: str) -> Dict[str, Any]:
     """
@@ -695,6 +1080,20 @@ def start_scan_profile(base_url: str, token: str, scan_profile_id: str) -> Dict[
             last_ex = ex
             continue
     raise RuntimeError(f"Failed to start scan profile via known endpoints: {last_ex}")
+
+
+def trigger_scan(base_url: str, token: str, scan_profile_name: str, *, scan_type: str = "dsScan") -> Dict[str, Any]:
+    """
+    Matches MegaScale trigger logic (no scheduling):
+      POST /api/v1/scans  {"scanType":"dsScan","scanProfileName":"...","scanOrigin":"Invoked manually"}
+    """
+    spn = str(scan_profile_name or "").strip()
+    if not spn:
+        raise RuntimeError("scan_profile_name is required")
+    url = build_api_url(base_url, SCANS_TRIGGER_PATH)
+    payload = {"scanType": str(scan_type or "dsScan").strip() or "dsScan", "scanProfileName": spn, "scanOrigin": "Invoked manually"}
+    resp = _request("POST", url, token, json_body=payload)
+    return resp.json() if resp.content else {}
 
 
 def guess_latest_scan_id(base_url: str, token: str, *, name_contains: str = "", limit: int = 80) -> str:
@@ -896,7 +1295,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         build_version = ""
     build_prefix = _build_prefix(build_version)
 
-    desired_ds_name = _apply_build_prefix(str(step_dict.get("ds_name") or f"{step_dict.get('ds_kind') or ''} step{seq}").strip(), build_prefix)
+    # Always enforce standard scenario naming; otherwise DS collisions make it look like nothing happened.
+    attempt_ts = _now_utc().strftime("%Y%m%d%H%M%S")
+    base_ds_name = _standard_ds_base_name(step_dict)
+    desired_ds_name = _apply_build_prefix(f"{base_ds_name} {attempt_ts}".strip(), build_prefix)
     try:
         # Persist to DB so UI shows build-prefixed names.
         set_step_status(
@@ -910,36 +1312,53 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception:
         pass
 
-    # --- Pre-OLS action (feature flag change) ---
-    if bool(step_dict.get("is_ols")):
-        if not _run_is_running(engine, int(run_id)):
-            return True
-        try:
-            action_tpl = ""
-            for k in _action_pre_ols_key(int(env_id) if env_id is not None else None):
-                action_tpl = get_template(engine, k)
-                if action_tpl:
-                    break
+    # --- Pre-step action (feature flags on/off etc) ---
+    # If a matching action template exists, run it before DS/scan creation.
+    if not _run_is_running(engine, int(run_id)):
+        return True
+    try:
+        action_tpl = ""
+        action_key_used = ""
+        env_int = int(env_id) if env_id is not None else None
+        candidates: List[str] = []
+        candidates.extend(_action_pre_step_keys(step_dict, env_int))
+        # Backward-compat: for OLS steps, also allow the old pre_ols action key.
+        if bool(step_dict.get("is_ols")):
+            candidates.extend(_action_pre_ols_key(env_int))
+        for k in candidates:
+            action_tpl = get_template(engine, k)
             if action_tpl:
-                action_raw = _render_template(
-                    action_tpl,
-                    {
-                        "ENV_ID": str(env_id or ""),
-                        "DS_NAME": desired_ds_name,
-                        "DS_KIND": str(step[3] or "").strip(),
-                        "FILE_SET_TYPE": str(step[6] or "").strip(),
-                        "BUILD_VERSION": build_version,
-                        "BUILD_PREFIX": build_prefix,
-                    },
-                )
-                action_payload = json.loads(action_raw)
-                run_action_template(base_url, token, action_payload)
-                set_step_status(engine, step_id, "pre_ols_done")
-        except Exception as ex:
-            # Don't block forever: mark error so user can fix template/payload.
-            set_step_error(engine, step_id, f"Pre-OLS action failed: {ex}")
-            set_run_error(engine, run_id, f"Step {seq}: pre-OLS action failed")
-            return True
+                action_key_used = k
+                break
+        if action_tpl:
+            action_raw = _render_template(
+                action_tpl,
+                {
+                    "ENV_ID": str(env_id or ""),
+                    "DS_NAME": desired_ds_name,
+                    "DS_KIND": str(step_dict.get("ds_kind") or "").strip(),
+                    "FILE_SET_TYPE": str(step_dict.get("file_set_type") or "").strip(),
+                    "IS_ACL": "1" if bool(step_dict.get("is_acl")) else "0",
+                    "IS_OLS": "1" if bool(step_dict.get("is_ols")) else "0",
+                    "IS_STRUCTURED_FF": "1" if bool(step_dict.get("is_structured_ff")) else "0",
+                    "FEATURE_FLAGS": str(step_dict.get("feature_flags") or "").strip(),
+                    "NOTES": str(step_dict.get("notes") or "").strip(),
+                    "BUILD_VERSION": build_version,
+                    "BUILD_PREFIX": build_prefix,
+                    "ACTION_KEY": action_key_used,
+                },
+            )
+            unresolved = _unresolved_placeholders(action_raw)
+            if unresolved:
+                raise RuntimeError(f"Unresolved action placeholders: {', '.join(unresolved[:20])}")
+            action_payload = json.loads(action_raw)
+            run_action_template(base_url, token, action_payload)
+            set_step_status(engine, step_id, "pre_action_done")
+    except Exception as ex:
+        # Don't block forever: mark error so user can fix template/payload.
+        set_step_error(engine, step_id, f"Pre-step action failed: {ex}")
+        set_run_error(engine, run_id, f"Step {seq}: pre-step action failed")
+        return True
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):
@@ -981,6 +1400,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         if unresolved:
             raise RuntimeError(f"Unresolved template placeholders: {', '.join(unresolved[:20])}")
         ds_payload = json.loads(ds_payload_raw)
+        # Force secrets from .env when present (even if template contains old values).
+        ds_payload = _apply_runtime_secrets(str(step_dict.get("ds_kind") or ""), ds_payload, secret_vars)
         out = put_ds_connection(base_url, token, desired_ds_name, ds_payload)
         ds_id = _extract_id(out, ["_id", "id", "dsId", "ds_id"])
         if not ds_id:
@@ -995,6 +1416,45 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         set_run_error(engine, run_id, f"Step {seq}: DS create failed")
         return True
 
+    # --- DS connection test (required before scan creation) ---
+    if not _run_is_running(engine, int(run_id)):
+        return True
+    try:
+        # ds_payload was either {"ds_connection": {...}, ...} or connector payload.
+        ds_conn_obj = ds_payload.get("ds_connection") if isinstance(ds_payload, dict) else None
+        if not isinstance(ds_conn_obj, dict):
+            ds_conn_obj = ds_payload if isinstance(ds_payload, dict) else {}
+
+        # Ensure DS connection object has the runtime name and scanner group.
+        ds_conn_obj = dict(ds_conn_obj)
+        ds_conn_obj["name"] = desired_ds_name
+        ds_conn_obj["id"] = desired_ds_name
+
+        broadcast = f"{desired_ds_name}-test-connection-complete-{uuid.uuid4()}"[:250]
+        test_started = _now_utc()
+        test_ds_connection_auto(
+            base_url,
+            token,
+            ds_name=desired_ds_name,
+            ds_connection=ds_conn_obj,
+            broadcast_event=broadcast,
+        )
+        ok, msg = wait_for_ds_connection_test_result(
+            base_url,
+            token,
+            desired_ds_name,
+            test_started_at=test_started,
+            timeout_seconds=int(os.getenv("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", "180") or "180"),
+            poll_seconds=int(os.getenv("WORKFLOW_DS_TEST_POLL_SECONDS", "5") or "5"),
+        )
+        if not ok:
+            raise RuntimeError(msg or "connection test failed")
+        set_step_status(engine, step_id, "ds_test_ok")
+    except Exception as ex:
+        set_step_error(engine, step_id, f"DS connection test failed: {ex}")
+        set_run_error(engine, run_id, f"Step {seq}: DS connection test failed")
+        return True
+
     # We need ds_id for scan template variables; prefer stored column now.
     with engine.connect() as conn:
         row = conn.execute(text("SELECT ds_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
@@ -1003,37 +1463,29 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # --- Scan profile create ---
     if not _run_is_running(engine, int(run_id)):
         return True
-    scan_key = _workflow_scan_key(step_dict)
-    scan_tpl = get_template(engine, scan_key)
-    if not scan_tpl:
-        set_step_error(engine, step_id, f"Missing Scan template for key: {scan_key}")
-        set_run_error(engine, run_id, f"Missing Scan template: {scan_key}")
-        return True
-    scan_profile_name = f"{desired_ds_name} - {str(step[12] or '').strip()}".strip()[:240] or f"workflow run {run_id} step {seq}"
     try:
-        scan_payload_raw = _render_template(
-            scan_tpl,
-            {
-                "SCAN_PROFILE_NAME": scan_profile_name,
-                "NOTES": str(step[12] or "").strip(),
-                "DS_ID": ds_id_val,
-                "SCAN_TEMPLATE_ID": resolve_default_scan_template_id(engine, int(env_id) if env_id is not None else None, base_url, token),
-                "ENV_ID": str(env_id or ""),
-                "DS_NAME": desired_ds_name,
-                "DS_KIND": str(step[3] or "").strip(),
-                "FILE_SET_TYPE": str(step[6] or "").strip(),
-                "IS_ACL": "1" if bool(step_dict.get("is_acl")) else "0",
-                "IS_OLS": "1" if bool(step_dict.get("is_ols")) else "0",
-                "IS_STRUCTURED_FF": "1" if bool(step_dict.get("is_structured_ff")) else "0",
-                "FEATURE_FLAGS": str(step_dict.get("feature_flags") or "").strip(),
-                "BUILD_VERSION": build_version,
-                "BUILD_PREFIX": build_prefix,
-            },
-        )
-        unresolved = _unresolved_placeholders(scan_payload_raw)
-        if unresolved:
-            raise RuntimeError(f"Unresolved template placeholders: {', '.join(unresolved[:20])}")
-        scan_payload = json.loads(scan_payload_raw)
+        template_id = resolve_default_scan_template_id(engine, int(env_id) if env_id is not None else None, base_url, token)
+        if not template_id:
+            raise RuntimeError("No default scan template id resolved (expected 'Data source scan')")
+
+        # Scan profile name should be readable and not duplicate the build prefix.
+        # DS name already contains prefix + timestamp + scenario.
+        scan_kind_raw = str(step_dict.get("scan_kind") or "").strip().lower().replace(" ", "")
+        scan_kind_label = "Full Scan" if scan_kind_raw in {"full_scan", "fullscan", "dsscan", "dsscanprofile", "dsscanjob"} else (str(step_dict.get("scan_kind") or "Scan").strip() or "Scan")
+        # DS name already includes build + scenario + attempt timestamp.
+        # Don't duplicate the timestamp again in the scan profile name.
+        scan_profile_name = (f"{desired_ds_name} {scan_kind_label} (wf {run_id}-{seq})").strip()[:240] or f"{desired_ds_name} (wf {run_id}-{seq})"
+
+        scan_payload: Dict[str, Any] = {
+            "scanType": "dsScan",
+            "dataSourceList": [desired_ds_name],
+            "name": scan_profile_name,
+            "scanTemplateId": template_id,
+            "enabled": True,
+        }
+        if DEFAULT_SCAN_OWNER_EMAIL:
+            scan_payload["owners"] = [DEFAULT_SCAN_OWNER_EMAIL]
+
         out2 = create_scan_profile(base_url, token, scan_payload)
         scan_profile_id = _extract_id(out2, ["_id", "id", "scanProfileId", "scan_profile_id"])
         if not scan_profile_id:
@@ -1046,6 +1498,23 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
         return True
 
+    # If we only want DS + scan profile creation (no scan trigger), stop here.
+    create_only = str(os.getenv("WORKFLOW_CREATE_ONLY", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if create_only:
+        if not quiet:
+            print(f"[{_now_utc().isoformat()}Z] run={run_id} step={seq} create_only=1 (DS + scan profile created; not triggering scan)", flush=True)
+        # Pause the run so it doesn't continue creating more DS/scan profiles automatically.
+        try:
+            with engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE workflow_runs SET status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=:rid"),
+                    {"rid": int(run_id)},
+                )
+                conn.commit()
+        except Exception:
+            pass
+        return True
+
     # --- Start scan profile & capture parent scan id ---
     if not _run_is_running(engine, int(run_id)):
         return True
@@ -1053,11 +1522,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         with engine.connect() as conn:
             row = conn.execute(text("SELECT scan_profile_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
         spid = str(row[0] or "").strip() if row else ""
-        out3 = start_scan_profile(base_url, token, spid)
+        # Preferred (matches MegaScale): trigger by scan profile name (no scheduling).
+        out3: Dict[str, Any] = {}
+        try:
+            out3 = trigger_scan(base_url, token, scan_profile_name, scan_type="dsScan")
+        except Exception:
+            # Fallback for older deployments: try starting via scanProfileId endpoints.
+            out3 = start_scan_profile(base_url, token, spid)
         scan_id = _extract_id(out3, ["scanId", "scan_id", "parentScanId", "parent_scan_id", "_id", "id"])
         if not scan_id:
             # Fallback: infer from running parent scans list
-            scan_id = guess_latest_scan_id(base_url, token, name_contains=desired_ds_name or scan_profile_name)
+            scan_id = guess_latest_scan_id(base_url, token, name_contains=scan_profile_name) or guess_latest_scan_id(base_url, token, name_contains=desired_ds_name)
         if scan_id:
             set_step_status(engine, step_id, "scan_running", scan_id=str(scan_id))
         else:
@@ -1072,6 +1547,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     with engine.connect() as conn:
         row = conn.execute(text("SELECT scan_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
     sid = str(row[0] or "").strip() if row else ""
+    skip_wait = str(os.getenv("WORKFLOW_SKIP_WAIT_FOR_TERMINAL", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if skip_wait:
+        if not quiet:
+            print(f"[{_now_utc().isoformat()}Z] run={run_id} step={seq} skip_wait=1 scan={sid or 'unknown'}", flush=True)
+        # Do not enforce cooldown here; keep workflow paused on this step until user resumes/reconciles.
+        return True
     if sid:
         final_state, done = wait_for_scan_terminal_or_pause(
             engine,
