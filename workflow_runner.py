@@ -2011,6 +2011,28 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
 
     scan_running_exists = bool(inflight_envs)
+    # Capacity guard: when all workflow envs already have scan_running, don't start creating/testing
+    # the next DS/scan pipeline items. Only reconcile running scans until a slot frees up.
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT COUNT(DISTINCT environment_id)
+                FROM workflow_steps
+                WHERE run_id=:rid
+                  AND COALESCE(is_enabled,1)=1
+                  AND environment_id IS NOT NULL
+            """), {"rid": int(run_id)}).fetchone()
+        env_count = int(row[0]) if row and row[0] is not None else 0
+    except Exception:
+        env_count = 0
+    try:
+        max_scans = int(os.getenv('WORKFLOW_MAX_CONCURRENT_SCANS', '') or 0)
+    except Exception:
+        max_scans = 0
+    if max_scans <= 0:
+        max_scans = env_count if env_count > 0 else 2
+    scans_at_capacity = bool(len(inflight_envs) >= int(max_scans))
+
 
     # If there are no eligible steps left, mark the run completed immediately
     # (even if next_eligible_at is set in the future).
@@ -2089,6 +2111,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 continue
             if (not allow_scan_running) and cand_status == 'scan_running':
                 continue
+            if scans_at_capacity and (not allow_scan_running) and cand_status != 'scan_running':
+                continue
             cand_env = cand[2]
             # Do not start a second scan/step on the same environment while a scan is in-flight.
             if cand_status not in {'scan_running'} and cand_env is not None:
@@ -2111,6 +2135,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             if cand_status != 'scan_waiting':
                 continue
             if (not allow_scan_running) and cand_status == 'scan_running':
+                continue
+            if scans_at_capacity and (not allow_scan_running) and cand_status != 'scan_running':
                 continue
             cand_env = cand[2]
             if cand_env is not None:
