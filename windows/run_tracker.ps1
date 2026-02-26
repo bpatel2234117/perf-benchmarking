@@ -53,7 +53,9 @@ from db_config import DB_CONNECTION_STRING
 import datetime
 eng=create_engine(DB_CONNECTION_STRING)
 with eng.connect() as c:
-    row=c.execute(text("SELECT last_started_at_utc, last_finished_at_utc, last_status FROM tracker_heartbeat WHERE name='default' LIMIT 1")).fetchone()
+    import os
+name=os.getenv("SCAN_TRACKER_NAME","default")
+row=c.execute(text("SELECT last_started_at_utc, last_finished_at_utc, last_status FROM tracker_heartbeat WHERE name=:n LIMIT 1"), {"n": name}).fetchone()
 if not row:
     print(-1)
 else:
@@ -100,7 +102,7 @@ while ($true) {
       if ($sinceStart -lt 3) { continue }
       $age = Get-HeartbeatAgeMinutes
       if ($age -lt 0) {
-        Add-Content -Path $superLog -Value ("[{0}] heartbeat check failed (DB unreachable or no row yet)" -f (Get-Date).ToString("s"))
+        Add-Content -Path $superLog -Value ("[{0}] heartbeat missing/unknown (no row for SCAN_TRACKER_NAME/default yet)" -f (Get-Date).ToString("s"))
         continue
       }
       if ($age -ge $stale) {
