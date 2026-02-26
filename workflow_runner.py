@@ -1551,6 +1551,8 @@ def wait_for_ds_connection_test_result(
             payload = fetch_ds_connection(base_url, token, ds_name, timeout_seconds=min(10.0, float(HTTP_TIMEOUT)))
             dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
             cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
+            if cst is None and (_now_utc() >= grace_decide_at):
+                return True, "no connectionStatusTest field; proceeding"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
