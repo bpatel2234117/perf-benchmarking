@@ -2165,9 +2165,9 @@ def track_once(engine) -> Dict[str, Any]:
 
             # Attribute delta fetch can be slow; only do it when useful.
             try:
-                needs_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
-                if needs_attrs:
-                    if _is_terminal_state(state):
+                needs_terminal_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
+                if _is_terminal_state(state):
+                    if needs_terminal_attrs:
                         attrs = fetch_scan_classifier_attributes(
                             base_url,
                             scan_id,
@@ -2177,27 +2177,27 @@ def track_once(engine) -> Dict[str, Any]:
                             max_seconds_total=int(attrs_max_seconds_terminal),
                         )
                         upsert_scan_attribute_deltas(engine, scan_id, attrs)
-                    else:
-                        acquired = False
+                else:
+                    acquired = False
+                    try:
+                        acquired = bool(attrs_running_sem.acquire(blocking=False))
+                        if acquired and _should_fetch_attrs_for_running(scan_id):
+                            _kv_set(engine, f"attrs_running_last::{str(scan_id)}", _now_utc_naive().strftime('%Y-%m-%dT%H:%M:%S'))
+                            attrs = fetch_scan_classifier_attributes(
+                                base_url,
+                                scan_id,
+                                get_token_for_env(env_row),
+                                max_pages=int(attrs_max_pages_running),
+                                request_timeout_seconds=int(attrs_timeout_running_s),
+                                max_seconds_total=int(attrs_max_seconds_running),
+                            )
+                            upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                    finally:
                         try:
-                            acquired = bool(attrs_running_sem.acquire(blocking=False))
-                            if acquired and _should_fetch_attrs_for_running(scan_id):
-                                _kv_set(engine, f"attrs_running_last::{str(scan_id)}", _now_utc_naive().strftime('%Y-%m-%dT%H:%M:%S'))
-                                attrs = fetch_scan_classifier_attributes(
-                                    base_url,
-                                    scan_id,
-                                    get_token_for_env(env_row),
-                                    max_pages=int(attrs_max_pages_running),
-                                    request_timeout_seconds=int(attrs_timeout_running_s),
-                                    max_seconds_total=int(attrs_max_seconds_running),
-                                )
-                                upsert_scan_attribute_deltas(engine, scan_id, attrs)
-                        finally:
-                            try:
-                                if acquired:
-                                    attrs_running_sem.release()
-                            except Exception:
-                                pass
+                            if acquired:
+                                attrs_running_sem.release()
+                        except Exception:
+                            pass
             except Exception:
                 return True, "ok_attrs_failed", attempted
 
