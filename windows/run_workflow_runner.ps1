@@ -36,27 +36,28 @@ from db_config import DB_CONNECTION_STRING
 import datetime
 eng=create_engine(DB_CONNECTION_STRING)
 with eng.connect() as c:
-    row=c.execute(text("SELECT last_finished_at_utc FROM tracker_heartbeat WHERE name='workflow_runner' LIMIT 1")).fetchone()
-    v=row[0] if row else None
-if not v:
-    print(999999)
+    row=c.execute(text("SELECT last_started_at_utc, last_finished_at_utc, last_status FROM tracker_heartbeat WHERE name='workflow_runner' LIMIT 1")).fetchone()
+if not row:
+    print(-1)
 else:
-    if isinstance(v, str):
-        v=v.replace('Z','').replace('T',' ')
-    try:
-        # MySQL TIMESTAMP comes as datetime already
-        dt=v
-        if isinstance(dt, datetime.datetime):
-            age=(datetime.datetime.utcnow()-dt).total_seconds()/60.0
-        else:
-            age=999999
-    except Exception:
-        age=999999
-    print(age)
+    started, finished, st = row
+    ref = finished or started
+    if not ref:
+        print(-1)
+    else:
+        try:
+            dt = ref
+            if isinstance(dt, datetime.datetime):
+                age=(datetime.datetime.utcnow()-dt).total_seconds()/60.0
+            else:
+                age=-1
+        except Exception:
+            age=-1
+        print(age)
 '@
     $age = & $Py -c $code 2>$null
     return [double]::Parse(($age | Select-Object -First 1))
-  } catch { return 999999 }
+  } catch { return -1 }
 }
 
 Stop-ExistingRunner
@@ -67,10 +68,17 @@ while ($true) {
     Add-Content -Path $superLog -Value ("[{0}] starting workflow_runner" -f (Get-Date).ToString("s"))
     $p = Start-Process -FilePath $Py -ArgumentList @("workflow_runner.py", "--quiet") -WorkingDirectory $RepoRoot `
       -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+    $procStart = Get-Date
 
     while (-not $p.HasExited) {
       Start-Sleep -Seconds 60
+      $sinceStart = ((Get-Date) - $procStart).TotalMinutes
+      if ($sinceStart -lt 2) { continue }
       $age = Get-HeartbeatAgeMinutes
+      if ($age -lt 0) {
+        Add-Content -Path $superLog -Value ("[{0}] heartbeat check failed (DB unreachable or no row yet)" -f (Get-Date).ToString("s"))
+        continue
+      }
       if ($age -ge 6) {
         Add-Content -Path $superLog -Value ("[{0}] heartbeat stale ({1:n1}m) -> restarting" -f (Get-Date).ToString("s"), $age)
         try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
