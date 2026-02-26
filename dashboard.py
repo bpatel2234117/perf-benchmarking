@@ -10272,6 +10272,11 @@ def page_workflow_automation():
             st.success(f"Created workflow run id={rid}.")
             st.query_params["page"] = "Workflow Automation"
             st.query_params["run_id"] = str(int(rid))
+            # Make the new run selected by default after rerun.
+            try:
+                st.session_state["wf_run_sel_id"] = int(rid)
+            except Exception:
+                pass
             try:
                 st.cache_data.clear()
             except Exception:
@@ -10301,14 +10306,25 @@ def page_workflow_automation():
         run_options.append(label)
         run_map[label] = rid
     default_idx = 0
-    if run_id_qp.isdigit():
+    want = None
+    try:
+        if str(st.session_state.get("wf_run_sel_id", "")).strip():
+            want = int(st.session_state.get("wf_run_sel_id"))
+    except Exception:
+        want = None
+    if want is None and run_id_qp.isdigit():
         want = int(run_id_qp)
+    if want is not None:
         for i, lab in enumerate(run_options):
-            if run_map.get(lab) == want:
+            if run_map.get(lab) == int(want):
                 default_idx = i
                 break
     selected_run_label = st.selectbox("Select run", run_options, index=default_idx, key="wf_run_sel")
     run_id = int(run_map[selected_run_label])
+    try:
+        st.session_state["wf_run_sel_id"] = int(run_id)
+    except Exception:
+        pass
 
     # Disable starting/resuming multiple workflows at once (prevents conflicts).
     try:
