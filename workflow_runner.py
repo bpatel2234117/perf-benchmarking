@@ -709,6 +709,28 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     """
     k = str(ds_kind or "").strip().lower()
     out: Dict[str, str] = {}
+    # Generic support for current + future DS kinds:
+    # include ALL env/.env variables with prefix "<ds_kind>_" (case-insensitive),
+    # so templates can reference them without adding code here.
+    try:
+        _maybe_reload_dotenv()
+        pref = f"{k}_"
+        for src in (os.environ, _DOTENV_MAP):
+            try:
+                items = src.items()  # type: ignore[attr-defined]
+            except Exception:
+                items = []
+            for kk, vv in items:
+                kks = str(kk or "").strip()
+                if not kks:
+                    continue
+                if str(kks).lower().startswith(pref):
+                    vvs = str(vv or "").strip()
+                    if vvs:
+                        out[kks] = vvs
+    except Exception:
+        pass
+
     if k == "smb":
         out["SMB_username"] = _getenv_any(["SMB_username", "SMB_USERNAME", "smb_username", "smb_USERNAME"])
         out["SMB_domain"] = _getenv_any(["SMB_domain", "SMB_DOMAIN", "smb_domain"])
@@ -804,6 +826,17 @@ def set_run_error(engine, run_id: int, message: str) -> None:
         )
         conn.commit()
 
+
+def clear_run_error(engine, run_id: int) -> None:
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE workflow_runs SET last_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"),
+                {"rid": int(run_id)},
+            )
+            conn.commit()
+    except Exception:
+        pass
 
 def set_step_error(engine, step_id: int, message: str) -> None:
     with engine.connect() as conn:
@@ -1004,6 +1037,24 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     def _get(name: str) -> str:
         return str(secret_vars.get(name) or "").strip()
 
+    def _get_prefixed_field(field_name: str) -> str:
+        """
+        Generic lookup for "<ds_kind>_<field>" in secret_vars (case-insensitive).
+        This enables future DS kinds without code changes, as long as .env uses that prefix.
+        """
+        try:
+            pref = f"{k}_"
+            want = str(field_name or "").strip().lower()
+            for kk, vv in (secret_vars or {}).items():
+                kkl = str(kk or "").strip().lower()
+                if not kkl.startswith(pref):
+                    continue
+                if kkl[len(pref):] == want:
+                    return str(vv or "").strip()
+        except Exception:
+            pass
+        return ""
+
     if k == "s3":
         if isinstance(ap, dict):
             ak = _get("S3_accessKey")
@@ -1091,6 +1142,29 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
             if p:
                 ap["password"] = p
             ds_conn["authenticationProperties"] = ap
+
+    # Generic fallback for current + future DS kinds:
+    # If the DS payload already contains a credential key, and .env provides
+    # "<ds_kind>_<that_key>", override it.
+    # (We only touch keys that already exist in the payload to avoid accidental injections.)
+    try:
+        for target in [ds_conn, ap]:
+            if not isinstance(target, dict):
+                continue
+            for key in list(target.keys()):
+                v = _get_prefixed_field(str(key))
+                if v:
+                    target[key] = v
+            # common convenience fallbacks
+            if "password" in target and not str(target.get("password") or "").strip():
+                v = _get_prefixed_field("password")
+                if v:
+                    target["password"] = v
+            if "password" in target and not _get_prefixed_field("password") and _get_prefixed_field("password_enc"):
+                # if template uses password but env provides password_enc, use it as-is
+                target["password"] = _get_prefixed_field("password_enc")
+    except Exception:
+        pass
 
     if isinstance(root.get("ds_connection"), dict):
         root["ds_connection"] = ds_conn
@@ -1605,6 +1679,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
     set_step_status(engine, step_id, "running", started_at=now)
     set_runner_heartbeat(engine, status="working", message=f"run={run_id} step={seq} starting", started=False)
+    # We are actively working; clear stale run-level failure messages so UI reflects current state.
+    clear_run_error(engine, int(run_id))
 
     # Build prefix should be refreshed when workflow starts / step executes.
     try:
