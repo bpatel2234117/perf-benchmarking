@@ -3458,35 +3458,34 @@ def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
     except Exception:
         pending = steps_df
     scan_ids = [str(x).strip() for x in pending.get("scan_id", pd.Series(dtype=str)).tolist() if str(x).strip()]
-    if not scan_ids:
-        return out
 
-    # Resolve latest statuses for scan_ids
+    # Resolve latest statuses for scan_ids (if any)
     status_map: Dict[str, str] = {}
-    try:
-        from sqlalchemy import bindparam
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("""
-                    SELECT scan_id, scan_status
-                    FROM scan_parents
-                    WHERE scan_id IN :ids
-                """).bindparams(bindparam("ids", expanding=True)),
-                {"ids": scan_ids},
-            ).fetchall()
-        for r in rows or []:
-            sid = str(r[0] or "").strip()
-            if sid:
-                status_map[sid] = str(r[1] or "").strip()
-    except Exception:
-        pass
-    try:
-        p_map = load_latest_scan_progress_state_map(scan_ids)
-        for sid, stv in (p_map or {}).items():
-            if sid and sid not in status_map:
-                status_map[str(sid)] = str(stv or "").strip()
-    except Exception:
-        pass
+    if scan_ids:
+        try:
+            from sqlalchemy import bindparam
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT scan_id, scan_status
+                        FROM scan_parents
+                        WHERE scan_id IN :ids
+                    """).bindparams(bindparam("ids", expanding=True)),
+                    {"ids": scan_ids},
+                ).fetchall()
+            for r in rows or []:
+                sid = str(r[0] or "").strip()
+                if sid:
+                    status_map[sid] = str(r[1] or "").strip()
+        except Exception:
+            pass
+        try:
+            p_map = load_latest_scan_progress_state_map(scan_ids)
+            for sid, stv in (p_map or {}).items():
+                if sid and sid not in status_map:
+                    status_map[str(sid)] = str(stv or "").strip()
+        except Exception:
+            pass
 
     updated = 0
     now = _workflow_now_utc()
@@ -3504,39 +3503,40 @@ def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
     if cooldown is None:
         cooldown = 15
 
-    try:
-        with engine.connect() as conn:
-            for row in pending.itertuples():
-                sid = str(getattr(row, "scan_id", "") or "").strip()
-                if not sid:
-                    continue
-                stv = status_map.get(sid, "")
-                if not _is_terminal_state_anywhere(stv):
-                    continue
-                # Mark step completed
-                conn.execute(
-                    text("""
-                        UPDATE workflow_steps
-                        SET status = 'completed', finished_at = COALESCE(finished_at, :t), updated_at = CURRENT_TIMESTAMP
-                        WHERE id = :id
-                    """),
-                    {"id": int(getattr(row, "id")), "t": now},
-                )
-                updated += 1
-            if updated:
-                # Set run cooldown timer
-                next_t = now + timedelta(minutes=float(cooldown))
-                conn.execute(
-                    text("""
-                        UPDATE workflow_runs
-                        SET next_eligible_at = :t, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = :rid
-                    """),
-                    {"t": next_t, "rid": int(run_id)},
-                )
-            conn.commit()
-    except Exception:
-        pass
+    if scan_ids:
+        try:
+            with engine.connect() as conn:
+                for row in pending.itertuples():
+                    sid = str(getattr(row, "scan_id", "") or "").strip()
+                    if not sid:
+                        continue
+                    stv = status_map.get(sid, "")
+                    if not _is_terminal_state_anywhere(stv):
+                        continue
+                    # Mark step completed
+                    conn.execute(
+                        text("""
+                            UPDATE workflow_steps
+                            SET status = 'completed', finished_at = COALESCE(finished_at, :t), updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :id
+                        """),
+                        {"id": int(getattr(row, "id")), "t": now},
+                    )
+                    updated += 1
+                if updated:
+                    # Set run cooldown timer
+                    next_t = now + timedelta(minutes=float(cooldown))
+                    conn.execute(
+                        text("""
+                            UPDATE workflow_runs
+                            SET next_eligible_at = :t, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :rid
+                        """),
+                        {"t": next_t, "rid": int(run_id)},
+                    )
+                conn.commit()
+        except Exception:
+            pass
 
     out["updated_steps"] = updated
     try:

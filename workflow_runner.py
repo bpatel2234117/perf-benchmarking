@@ -1600,12 +1600,13 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
     skip_errors = not retry_errors
     if skip_errors:
-        # Bulk-create: continue past failures and also resume half-done steps.
-        # Terminal for our purposes: scan_created/completed; and we explicitly skip error.
-        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error') AND COALESCE(is_enabled, 1) = 1"
+        # Default: continue past failures and also resume half-done steps.
+        # Terminal for our purposes: scan_created/completed/error/disabled.
+        # NOTE: Some older rows may have status='disabled' with is_enabled NULL/1; always exclude by status too.
+        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
     else:
         # Retry mode: allow retrying errors.
-        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(is_enabled, 1) = 1"
+        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
 
     # If any scan is already running for this run, we must keep processing it even during cooldown.
     scan_running_exists = False
