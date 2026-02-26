@@ -10,6 +10,9 @@
 __pycache__/
 *.pyc
 
+# logs
+logs/
+
 # local db/artifacts
 benchmark.db
 benchmark_charts/
