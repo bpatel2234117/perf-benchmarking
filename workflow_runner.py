@@ -1594,6 +1594,54 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception:
         cooldown_m = 15
 
+    # Reconcile in-flight scans for this run, and prevent starting multiple scans
+    # on the same environment at once.
+    inflight_envs: set[int] = set()
+    try:
+        with engine.connect() as conn:
+            inflight_rows = conn.execute(
+                text("""
+                    SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status
+                    FROM workflow_steps ws
+                    LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
+                    WHERE ws.run_id=:rid
+                      AND COALESCE(ws.is_enabled,1)=1
+                      AND ws.scan_id IS NOT NULL
+                      AND TRIM(ws.scan_id) <> ''
+                      AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
+                    ORDER BY ws.updated_at DESC
+                """),
+                {"rid": int(run_id)},
+            ).fetchall()
+        did_reconcile = False
+        for rr in inflight_rows or []:
+            step_id = int(rr[0])
+            seq = int(rr[1])
+            env_id = rr[2]
+            sid = str(rr[3] or "").strip()
+            st_status = str(rr[4] or "").strip().lower()
+            scan_status = str(rr[5] or "").strip()
+            if env_id is not None:
+                try:
+                    inflight_envs.add(int(env_id))
+                except Exception:
+                    pass
+            if scan_status and _is_terminal_state(scan_status):
+                set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+                did_reconcile = True
+                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={scan_status}", started=False)
+            else:
+                # If scan exists but step shows error/running, normalize to scan_running.
+                if st_status != "scan_running":
+                    set_step_status(engine, step_id, "scan_running")
+                    did_reconcile = True
+        if did_reconcile:
+            # After reconciling terminal scans, enforce cooldown window before next start.
+            set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
+            return True
+    except Exception:
+        pass
+
     # Find next step for this run.
     # Default behavior: continue past failures (do not retry errors forever).
     # Set WORKFLOW_RETRY_ERROR_STEPS=1 to retry errors instead.
@@ -1608,24 +1656,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Retry mode: allow retrying errors.
         where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
 
-    # If any scan is already running for this run, we must keep processing it even during cooldown.
-    scan_running_exists = False
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT 1
-                    FROM workflow_steps
-                    WHERE run_id=:rid
-                      AND COALESCE(is_enabled,1)=1
-                      AND COALESCE(status,'')='scan_running'
-                    LIMIT 1
-                """),
-                {"rid": int(run_id)},
-            ).fetchone()
-        scan_running_exists = bool(row and row[0] == 1)
-    except Exception:
-        scan_running_exists = False
+    scan_running_exists = bool(inflight_envs)
 
     # If there are no eligible steps left, mark the run completed immediately
     # (even if next_eligible_at is set in the future).
@@ -1651,12 +1682,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         set_runner_heartbeat(engine, status="idle", message=f"run {run_id} completed (no eligible steps)", started=False)
         return True
 
-    # Cooldown gate (but do not block scan_running reconciliation)
+    # Cooldown gate:
+    # If any environment is currently running a scan, do not block reconciliation.
+    # Also, allow starting work on a different environment even during cooldown.
     next_eligible = run_row[3]
-    if (not scan_running_exists) and next_eligible is not None and isinstance(next_eligible, datetime):
+    if next_eligible is not None and isinstance(next_eligible, datetime):
         if next_eligible > now:
-            set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
-            return False
+            # If we have an idle environment with eligible work, proceed despite cooldown.
+            # Otherwise idle until cooldown expires.
+            if not inflight_envs:
+                set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
+                return False
 
     # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
     avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -1694,6 +1730,15 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     step = None
     for cand in candidates or []:
         cand_status = str(cand[19] or "").strip().lower()
+        cand_env = cand[2]
+        # Do not start a second scan on the same environment.
+        # (But allow processing scan_running itself.)
+        if cand_status not in {"scan_running"} and cand_env is not None:
+            try:
+                if int(cand_env) in inflight_envs:
+                    continue
+            except Exception:
+                pass
         if avoid_parallel and running_keys:
             # IMPORTANT: never block processing of an already-running scan step.
             # The lock is meant to prevent starting *new* parallel scans, not to
