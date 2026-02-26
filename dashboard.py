@@ -10598,6 +10598,70 @@ def page_workflow_automation():
         },
     )
 
+    with st.expander("Edit steps (before run)", expanded=False):
+        st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
+        if selected_status == "running":
+            st.info("Pause/Stop the workflow run to edit steps.")
+        else:
+            edit_df = steps_df.copy()
+            if "is_enabled" not in edit_df.columns:
+                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
+            try:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
+            except Exception:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
+            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
+            show_cols = [c for c in show_cols if c in edit_df.columns]
+            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Environment", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
+            editor = st.data_editor(
+                view,
+                width="stretch",
+                hide_index=True,
+                key=f"wf_edit_steps_{run_id}",
+                column_config={
+                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                },
+                disabled=[c for c in view.columns if c != "is_enabled"],
+            )
+            if st.button("Save step selection", type="primary", key=f"wf_save_steps_{run_id}"):
+                try:
+                    desired = editor[["id", "is_enabled"]].copy()
+                    desired["id"] = desired["id"].astype(int)
+                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
+                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
+                    from sqlalchemy import bindparam
+                    with engine.connect() as conn:
+                        if disable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": disable_ids},
+                            )
+                        if enable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=1,
+                                        status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END,
+                                        last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END,
+                                        updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": enable_ids},
+                            )
+                        conn.commit()
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Saved.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
     with st.expander("Maintenance (reset stale status)", expanded=False):
         st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans; it only resets DB state for the run.")
         if st.button("Reset unfinished steps to pending", key="wf_reset_steps"):
