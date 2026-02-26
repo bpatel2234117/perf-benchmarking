@@ -9459,11 +9459,38 @@ def page_scan_progress():
     # Load (possibly updated) history after any auto-save.
     df = load_scan_progress_history(scan_id)
 
+    def _tracker_slot_minutes() -> int:
+        # Prefer process env, fallback to .env in repo root.
+        try:
+            v = str(os.getenv("TRACKER_SLOT_MINUTES", "") or "").strip()
+            if v:
+                m = int(v)
+                return m if 1 <= m <= 60 else 10
+        except Exception:
+            pass
+        try:
+            env_path = Path(__file__).parent / ".env"
+            if env_path.exists():
+                for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    ss = line.strip()
+                    if not ss or ss.startswith('#') or '=' not in ss:
+                        continue
+                    k, v = ss.split('=', 1)
+                    if k.strip() == 'TRACKER_SLOT_MINUTES':
+                        mv = int(str(v).strip().strip('"').strip("'"))
+                        return mv if 1 <= mv <= 60 else 10
+        except Exception:
+            pass
+        return 10
+
+    slot_m = _tracker_slot_minutes()
+    stale_threshold_min = float((slot_m * 2) + 5)
+
     # No forced auto-refresh here.
 
     if df.empty:
         st.warning("No saved snapshots yet for this scan.")
-        st.caption("Waiting for `tracker.py` to write snapshots (every 10 minutes).")
+        st.caption(f"Waiting for `tracker.py` to write snapshots (every {slot_m} minutes).")
 
         if st.button("Back to Scan Status"):
             st.query_params["page"] = "Scan Status"
@@ -9524,13 +9551,13 @@ def page_scan_progress():
             ).strip()
         except Exception:
             latest_state_for_scan = ""
-        if isinstance(age_min, (int, float)) and age_min >= 25 and (not _is_terminal_state(latest_state_for_scan)):
+        if isinstance(age_min, (int, float)) and age_min >= stale_threshold_min and (not _is_terminal_state(latest_state_for_scan)):
             extra = ""
             if isinstance(g_age, (int, float)):
                 extra = f" (DB-wide latest age: {g_age:.1f} min)"
             st.warning(
-                "Tracker looks stale for this scan (no new snapshots in 25+ minutes). "
-                "If you expect updates every 10 minutes while the scan is running, the tracker is likely not running or is failing."
+                f"Tracker looks stale for this scan (no new snapshots in {stale_threshold_min:.0f}+ minutes). "
+                f"If you expect updates every {slot_m} minutes while the scan is running, the tracker is likely not running or is failing."
                 + extra
             )
     except Exception:
@@ -9552,6 +9579,16 @@ def page_scan_progress():
             started_at, finished_at, stt, msg = hb
             s = pd.to_datetime(started_at, errors="coerce", utc=True) if started_at else None
             f = pd.to_datetime(finished_at, errors="coerce", utc=True) if finished_at else None
+            try:
+                if now_utc is not None and f is not None and pd.notnull(f):
+                    hb_age = (now_utc - f).total_seconds() / 60.0
+                    if (not _is_terminal_state(latest_state_for_scan)) and hb_age >= stale_threshold_min:
+                        st.error(
+                            f"Tracker appears stuck: last finished cycle was {hb_age:.0f} minutes ago. "
+                            f"Expected cadence is ~{slot_m} minutes."
+                        )
+            except Exception:
+                pass
             st.caption(
                 "Tracker heartbeat: "
                 + (f"status=`{stt}` " if stt else "")
