@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_config import DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token
+
+
+ENV_FILE_PATH = Path(__file__).parent / ".env"
+
+_DOTENV_MAP: Dict[str, str] = {}
+_DOTENV_MTIME: Optional[float] = None
+
+
+def _read_dotenv_map() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    try:
+        if not ENV_FILE_PATH.exists():
+            return values
+        text_value = ENV_FILE_PATH.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return values
+    for line in text_value.splitlines():
+        ss = line.strip()
+        if not ss or ss.startswith("#") or "=" not in ss:
+            continue
+        k, v = ss.split("=", 1)
+        key = k.strip()
+        val = v.strip().strip('"').strip("'")
+        if key:
+            values[key] = val
+    return values
+
+
+def _maybe_reload_dotenv() -> None:
+    global _DOTENV_MAP, _DOTENV_MTIME
+    try:
+        st = ENV_FILE_PATH.stat()
+        mtime = float(st.st_mtime)
+    except Exception:
+        return
+    if _DOTENV_MTIME is None or (mtime != _DOTENV_MTIME):
+        try:
+            _DOTENV_MAP = _read_dotenv_map()
+            _DOTENV_MTIME = mtime
+        except Exception:
+            pass
+
+
+def _getenv_str(name: str, default: str = "") -> str:
+    _maybe_reload_dotenv()
+    v = str(os.getenv(name, "") or "").strip()
+    if v:
+        return v
+    v2 = str(_DOTENV_MAP.get(name, "") or "").strip()
+    return v2 or str(default or "")
 
 
 PARENT_SCANS_PATH = os.getenv("BIGID_PARENT_SCANS_API_PATH", "/api/v1/scans/parent-scans").strip() or "/api/v1/scans/parent-scans"
@@ -132,6 +183,22 @@ def _choose_best_state(parent_state: Any, insight_state: Any) -> str:
 def _now_utc_naive() -> datetime:
     # Naive UTC datetime suitable for MySQL DATETIME
     return datetime.utcnow()
+
+
+def _slot_minutes() -> int:
+    """Slot size in minutes for progress snapshots and main loop alignment.
+
+    Controlled by TRACKER_SLOT_MINUTES (default 10).
+    """
+    try:
+        m = int(_getenv_str('TRACKER_SLOT_MINUTES', '10') or '10')
+    except Exception:
+        m = 10
+    if m <= 0:
+        m = 10
+    if m > 60:
+        m = 60
+    return m
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -1261,7 +1328,8 @@ def upsert_scan_progress_record(
 
     # Align to 10-minute marks in UTC for clean chart axis (11:10, 11:20, ...)
     now_utc = _now_utc_naive()
-    captured_at_utc = now_utc.replace(minute=(now_utc.minute // 10) * 10, second=0, microsecond=0)
+    slot_m = _slot_minutes()
+    captured_at_utc = now_utc.replace(minute=(now_utc.minute // slot_m) * slot_m, second=0, microsecond=0)
 
     try:
         env_id_int = int(env_id) if env_id is not None and str(env_id).strip() != "" else None
@@ -1639,35 +1707,35 @@ def track_once(engine) -> Dict[str, Any]:
     # Attribute-delta fetch can be heavy. Keep it enabled for running scans,
     # but throttle it so it never blocks progress snapshots.
     try:
-        attrs_running_ttl_min = int(os.getenv('TRACKER_ATTRS_RUNNING_TTL_MINUTES', '60') or '60')
+        attrs_running_ttl_min = int(_getenv_str('TRACKER_ATTRS_RUNNING_TTL_MINUTES', '60') or '60')
     except Exception:
         attrs_running_ttl_min = 60
     try:
-        attrs_max_running_per_cycle = int(os.getenv('TRACKER_ATTRS_MAX_RUNNING_PER_CYCLE', '1') or '1')
+        attrs_max_running_per_cycle = int(_getenv_str('TRACKER_ATTRS_MAX_RUNNING_PER_CYCLE', '1') or '1')
     except Exception:
         attrs_max_running_per_cycle = 1
     try:
-        attrs_timeout_running_s = int(os.getenv('TRACKER_ATTRS_TIMEOUT_SECONDS_RUNNING', '8') or '8')
+        attrs_timeout_running_s = int(_getenv_str('TRACKER_ATTRS_TIMEOUT_SECONDS_RUNNING', '8') or '8')
     except Exception:
         attrs_timeout_running_s = 8
     try:
-        attrs_timeout_terminal_s = int(os.getenv('TRACKER_ATTRS_TIMEOUT_SECONDS_TERMINAL', '20') or '20')
+        attrs_timeout_terminal_s = int(_getenv_str('TRACKER_ATTRS_TIMEOUT_SECONDS_TERMINAL', '20') or '20')
     except Exception:
         attrs_timeout_terminal_s = 20
     try:
-        attrs_max_pages_running = int(os.getenv('TRACKER_ATTRS_MAX_PAGES_RUNNING', '2') or '2')
+        attrs_max_pages_running = int(_getenv_str('TRACKER_ATTRS_MAX_PAGES_RUNNING', '2') or '2')
     except Exception:
         attrs_max_pages_running = 2
     try:
-        attrs_max_pages_terminal = int(os.getenv('TRACKER_ATTRS_MAX_PAGES_TERMINAL', '10') or '10')
+        attrs_max_pages_terminal = int(_getenv_str('TRACKER_ATTRS_MAX_PAGES_TERMINAL', '10') or '10')
     except Exception:
         attrs_max_pages_terminal = 10
     try:
-        attrs_max_seconds_running = int(os.getenv('TRACKER_ATTRS_MAX_SECONDS_RUNNING', '12') or '12')
+        attrs_max_seconds_running = int(_getenv_str('TRACKER_ATTRS_MAX_SECONDS_RUNNING', '12') or '12')
     except Exception:
         attrs_max_seconds_running = 12
     try:
-        attrs_max_seconds_terminal = int(os.getenv('TRACKER_ATTRS_MAX_SECONDS_TERMINAL', '60') or '60')
+        attrs_max_seconds_terminal = int(_getenv_str('TRACKER_ATTRS_MAX_SECONDS_TERMINAL', '60') or '60')
     except Exception:
         attrs_max_seconds_terminal = 60
 
@@ -2313,13 +2381,13 @@ def main() -> int:
         "--align-10min",
         action="store_true",
         default=True,
-        help="Align runs to UTC 10-minute boundaries (default: on)",
+        help="Align runs to UTC slot boundaries (TRACKER_SLOT_MINUTES, default 10)",
     )
     ap.add_argument(
         "--no-align-10min",
         action="store_false",
         dest="align_10min",
-        help="Disable alignment to 10-minute boundaries",
+        help="Disable alignment to slot boundaries",
     )
     ap.add_argument("--once", action="store_true", help="Run one cycle then exit")
     ap.add_argument("--scan-id", type=str, default="", help="Force-update a specific scan id (try all envs)")
@@ -2381,10 +2449,10 @@ def main() -> int:
             )
         return 0
 
-    def seconds_until_next_10min_boundary() -> int:
+    def seconds_until_next_slot_boundary(slot_minutes: int) -> int:
         now = _now_utc_naive()
         base = now.replace(second=0, microsecond=0)
-        next_min = ((base.minute // 10) + 1) * 10
+        next_min = ((base.minute // slot_minutes) + 1) * slot_minutes
         if next_min >= 60:
             target = base.replace(minute=0) + timedelta(hours=1)
         else:
@@ -2393,13 +2461,14 @@ def main() -> int:
         return max(1, int(delta))
 
     last_slot_key = None
+    slot_minutes = _slot_minutes()
     while True:
         if args.align_10min:
             now = _now_utc_naive()
-            slot = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
+            slot = now.replace(minute=(now.minute // slot_minutes) * slot_minutes, second=0, microsecond=0)
             slot_key = slot.strftime("%Y-%m-%dT%H:%M")
             if slot_key == last_slot_key:
-                time.sleep(seconds_until_next_10min_boundary())
+                time.sleep(seconds_until_next_slot_boundary(slot_minutes))
                 continue
             last_slot_key = slot_key
         started = _now_utc_naive()
@@ -2450,7 +2519,7 @@ def main() -> int:
         if args.once:
             return 0
         if args.align_10min:
-            time.sleep(seconds_until_next_10min_boundary())
+            time.sleep(seconds_until_next_slot_boundary(slot_minutes))
         else:
             time.sleep(max(5, int(args.interval_seconds)))
 
