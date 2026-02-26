@@ -1628,11 +1628,16 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
     step = None
     for cand in candidates or []:
+        cand_status = str(cand[19] or "").strip().lower()
         if avoid_parallel and running_keys:
-            key = _scenario_lock_key(cand[3], cand[6])  # ds_kind, file_set_type
-            # Only block if the same scenario is already scan_running somewhere.
-            if key in running_keys:
-                continue
+            # IMPORTANT: never block processing of an already-running scan step.
+            # The lock is meant to prevent starting *new* parallel scans, not to
+            # prevent the runner from waiting/reconciling the scan it already started.
+            if cand_status not in {"scan_running", "running"}:
+                key = _scenario_lock_key(cand[3], cand[6])  # ds_kind, file_set_type
+                # Only block if the same scenario is already scan_running somewhere.
+                if key in running_keys:
+                    continue
         step = cand
         break
     if not step:
@@ -1677,10 +1682,33 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         "notes": step[12],
     }
 
-    set_step_status(engine, step_id, "running", started_at=now)
+    cur_status = str(step[19] or "").strip().lower()
+    # Don't overwrite scan_running with running; keep stable phases.
+    if cur_status == "scan_running":
+        set_step_status(engine, step_id, "scan_running")
+    else:
+        set_step_status(engine, step_id, "running", started_at=now)
     set_runner_heartbeat(engine, status="working", message=f"run={run_id} step={seq} starting", started=False)
     # We are actively working; clear stale run-level failure messages so UI reflects current state.
     clear_run_error(engine, int(run_id))
+
+    # Fast-path: if this step already has a scan_id and DB says it's terminal, mark completed.
+    try:
+        sid = str(step[18] or "").strip()
+        if sid:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("SELECT scan_status FROM scan_parents WHERE scan_id=:sid LIMIT 1"),
+                    {"sid": sid},
+                ).fetchone()
+            stv = str(row[0] or "").strip() if row else ""
+            if stv and _is_terminal_state(stv):
+                set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={stv}", started=False)
+                set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
+                return True
+    except Exception:
+        pass
 
     # Build prefix should be refreshed when workflow starts / step executes.
     try:
