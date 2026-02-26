@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import time
@@ -136,7 +137,11 @@ def _ds_kind_timeout_seconds(ds_kind: Any) -> int:
         v = _env_int(f"WORKFLOW_DS_TEST_TIMEOUT_SECONDS_{k}", -1)
         if v and v > 0:
             return int(max(30, min(1800, v)))
-    v2 = _env_int("WORKFLOW_DS_TEST_TIMEOUT_SECONDS", 180)
+    # Default MSSQL test timeout is higher (3-5 min is common).
+    if k == 'MSSQL':
+        v2 = _env_int('WORKFLOW_DS_TEST_TIMEOUT_SECONDS', 420)
+    else:
+        v2 = _env_int('WORKFLOW_DS_TEST_TIMEOUT_SECONDS', 180)
     return int(max(30, min(1800, v2)))
 
 
@@ -1634,8 +1639,10 @@ def test_ds_connection_auto(
     try:
         return test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
     except Exception:
-        pass
-    # 2) client-style test
+        allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
+        if did and (not allow_fallback):
+            raise
+    # 2) client-style test (fallback)
     return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event)
 
 
@@ -1704,11 +1711,8 @@ def find_scan_profile_id_by_name(base_url: str, token: str, scan_profile_name: s
                     vid = str(it.get("_id") or it.get("id") or "").strip()
                     if vid:
                         return vid
-            # If contains returned a superset, accept first id as fallback.
-            it0 = items[0]
-            vid = str(it0.get("_id") or it0.get("id") or "").strip()
-            if vid:
-                return vid
+            # Do not guess: only reuse when we have an exact name match.
+            continue
         except Exception:
             continue
     return ""
@@ -1953,7 +1957,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                       AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
                       AND (
                         (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
-                        OR COALESCE(ws.status,'') IN ('scan_running','running')
+                        OR COALESCE(ws.status,'') = 'scan_running'
                       )
                     ORDER BY ws.updated_at DESC
                 """),
@@ -2168,11 +2172,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     }
 
     cur_status = str(step[19] or "").strip().lower()
-    # Don't overwrite scan_running with running; keep stable phases.
-    if cur_status == "scan_running":
-        set_step_status(engine, step_id, "scan_running")
+    # Preserve stable phases so retries resume where they left off.
+    stable_phases = {'scan_running','scan_created','ds_test_ok','ds_created','scan_waiting'}
+    if cur_status in stable_phases:
+        set_step_status(engine, step_id, cur_status)
     else:
-        set_step_status(engine, step_id, "running", started_at=now)
+        set_step_status(engine, step_id, 'running', started_at=now)
     set_runner_heartbeat(engine, status="working", message=f"run={run_id} step={seq} starting", started=False)
     # We are actively working; clear stale run-level failure messages so UI reflects current state.
     clear_run_error(engine, int(run_id))
@@ -2223,7 +2228,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # Always apply build prefix (if we have it).
     base_with_prefix = _apply_build_prefix(base_ds_name, build_prefix) if build_prefix else base_ds_name
     # Ensure uniqueness per workflow run/step without timestamps.
-    desired_ds_name = f"{base_with_prefix} (wf {run_id}-{seq})".strip()
+    # Ensure we don't accumulate duplicate workflow suffixes on retries.
+    _wf_suffix = f"(wf {run_id}-{seq})"
+    base_with_prefix_clean = re.sub(r"(?:\s*\(wf\s+\d+\-\d+\)\s*)+$", "", str(base_with_prefix or '').strip()).strip()
+    desired_ds_name = f"{base_with_prefix_clean} {_wf_suffix}".strip()
     try:
         logger.info('desired_ds_name step=%s ds_name=%s', seq, desired_ds_name)
     except Exception:
@@ -2336,7 +2344,23 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         ds_payload = _apply_runtime_secrets(str(step_dict.get("ds_kind") or ""), ds_payload, secret_vars)
         # Apply ACL/Structured flags at runtime (so one base template is enough).
         ds_payload = _apply_runtime_flags(step_dict, ds_payload)
-        out = put_ds_connection(base_url, token, desired_ds_name, ds_payload)
+
+        # Idempotency: if DS already exists for this step (ds_id stored) and name matches,
+        # avoid re-PUT to prevent accidental duplicate DS artifacts.
+        existing_ds_id = str(step[13] or '').strip()
+        existing_ds_name_db = str(step[4] or '').strip()
+        skip_put = bool(existing_ds_id) and (str(cur_status or '').strip().lower() in {'ds_created','ds_test_ok','scan_created','scan_running','scan_waiting'}) and (existing_ds_name_db == desired_ds_name)
+        if skip_put:
+            try:
+                fetched = fetch_ds_connection(base_url, token, desired_ds_name)
+                if isinstance(fetched, dict) and fetched:
+                    ds_payload = fetched
+            except Exception:
+                pass
+            out = {}
+            ds_id = existing_ds_id
+        else:
+            out = put_ds_connection(base_url, token, desired_ds_name, ds_payload)
         # PUT response often does not include DS internal id; fetch after PUT.
         ds_id = _extract_ds_id_from_payload(out) or _extract_id(out, ["_id", "id", "dsId", "ds_id"]) or _extract_id(out, ["ds_connection", "_id", "id"])
         try:
@@ -2360,66 +2384,84 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     if not _run_is_running(engine, int(run_id)):
         return True
     try:
-        # ds_payload was either {"ds_connection": {...}, ...} or connector payload.
-        ds_conn_obj = ds_payload.get("ds_connection") if isinstance(ds_payload, dict) else None
-        if not isinstance(ds_conn_obj, dict):
-            ds_conn_obj = ds_payload if isinstance(ds_payload, dict) else {}
+        # Skip retesting if we already have ds_test_ok (or beyond).
+        st_db = str(cur_status or "").strip().lower()
+        skip_ds_test = st_db in {"ds_test_ok", "scan_created", "scan_running", "scan_waiting"}
+        if not skip_ds_test:
+            # ds_payload was either {"ds_connection": {...}, ...} or connector payload.
+            ds_conn_obj = ds_payload.get("ds_connection") if isinstance(ds_payload, dict) else None
+            if not isinstance(ds_conn_obj, dict):
+                ds_conn_obj = ds_payload if isinstance(ds_payload, dict) else {}
 
-        # Ensure DS connection object has the runtime name and scanner group.
-        ds_conn_obj = dict(ds_conn_obj)
-        ds_conn_obj["name"] = desired_ds_name
-        ds_conn_obj["id"] = desired_ds_name
+            # Ensure DS connection object has the runtime name.
+            ds_conn_obj = dict(ds_conn_obj)
+            ds_conn_obj["name"] = desired_ds_name
+            ds_conn_obj["id"] = desired_ds_name
 
-        max_attempts = int(os.getenv("WORKFLOW_DS_TEST_MAX_ATTEMPTS", "2") or "2")
-        max_attempts = max(1, min(5, max_attempts))
-        # Prefer ds_id if available for ids-based test endpoint.
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(text("SELECT ds_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
-            ds_id_val = str(row[0] or "").strip() if row else ""
-        except Exception:
-            ds_id_val = ""
-        last_msg = ""
-        ok = False
-        for attempt in range(1, max_attempts + 1):
-            broadcast = f"{desired_ds_name}-test-connection-complete-{uuid.uuid4()}"[:250]
-            test_started = _now_utc()
-            test_ds_connection_auto(
-                base_url,
-                token,
-                ds_name=desired_ds_name,
-                ds_id=ds_id_val,
-                ds_connection=ds_conn_obj,
-                broadcast_event=broadcast,
-            )
-            timeout_s = _ds_kind_timeout_seconds(step_dict.get("ds_kind"))
-            poll_s = _ds_kind_poll_seconds(step_dict.get("ds_kind"))
-            initial_wait_s = _ds_kind_initial_wait_seconds(step_dict.get("ds_kind"))
-            if initial_wait_s > 0:
-                time.sleep(initial_wait_s)
-            ok, msg = wait_for_ds_connection_test_result(
-                base_url,
-                token,
-                desired_ds_name,
-                test_started_at=test_started,
-                timeout_seconds=int(timeout_s),
-                poll_seconds=int(poll_s),
-            )
-            last_msg = msg or last_msg
-            if ok:
-                break
-            # small backoff before retry
-            if attempt < max_attempts:
-                time.sleep(2)
-        if not ok:
-            raise RuntimeError(last_msg or "connection test failed")
-        set_step_status(engine, step_id, "ds_test_ok")
+            max_attempts = int(os.getenv("WORKFLOW_DS_TEST_MAX_ATTEMPTS", "2") or "2")
+            max_attempts = max(1, min(5, max_attempts))
+
+            # Prefer ds_id if available for ids-based test endpoint.
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(text("SELECT ds_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
+                ds_id_val = str(row[0] or "").strip() if row else ""
+            except Exception:
+                ds_id_val = ""
+
+            last_msg = ""
+            ok = False
+            for attempt in range(1, max_attempts + 1):
+                broadcast = f"{desired_ds_name}-test-connection-complete-{uuid.uuid4()}"[:250]
+                test_started = _now_utc()
+                test_ds_connection_auto(
+                    base_url,
+                    token,
+                    ds_name=desired_ds_name,
+                    ds_id=ds_id_val,
+                    ds_connection=ds_conn_obj,
+                    broadcast_event=broadcast,
+                )
+                timeout_s = _ds_kind_timeout_seconds(step_dict.get("ds_kind"))
+                poll_s = _ds_kind_poll_seconds(step_dict.get("ds_kind"))
+                initial_wait_s = _ds_kind_initial_wait_seconds(step_dict.get("ds_kind"))
+                try:
+                    logger.info(
+                        "ds_test step=%s attempt=%s timeout_s=%s poll_s=%s initial_wait_s=%s ds_kind=%s",
+                        seq,
+                        attempt,
+                        timeout_s,
+                        poll_s,
+                        initial_wait_s,
+                        str(step_dict.get("ds_kind") or ""),
+                    )
+                except Exception:
+                    pass
+                if initial_wait_s > 0:
+                    time.sleep(initial_wait_s)
+
+                ok, msg = wait_for_ds_connection_test_result(
+                    base_url,
+                    token,
+                    desired_ds_name,
+                    test_started_at=test_started,
+                    timeout_seconds=int(timeout_s),
+                    poll_seconds=int(poll_s),
+                )
+                last_msg = msg or last_msg
+                if ok:
+                    break
+                if attempt < max_attempts:
+                    time.sleep(2)
+
+            if not ok:
+                raise RuntimeError(last_msg or "connection test failed")
+            set_step_status(engine, step_id, "ds_test_ok")
     except Exception as ex:
         set_step_error(engine, step_id, f"DS connection test failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: DS connection test failed")
         set_run_next_eligible(engine, run_id, _now_utc())
         return True
-
     # We need ds_id for scan template variables; prefer stored column now.
     with engine.connect() as conn:
         row = conn.execute(text("SELECT ds_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
