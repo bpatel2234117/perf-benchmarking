@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import time
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -601,12 +602,18 @@ def load_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
         return []
 
 
-def _request_get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+def _request_get(
+    url: str,
+    token: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_seconds: int = 20,
+) -> requests.Response:
     headers_raw = {"authorization": token} if token else {}
     headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
-    resp = requests.get(url, params=params or {}, headers=headers_raw, timeout=20)
+    resp = requests.get(url, params=params or {}, headers=headers_raw, timeout=int(timeout_seconds))
     if resp.status_code in (401, 403) and token:
-        resp = requests.get(url, params=params or {}, headers=headers_bearer, timeout=20)
+        resp = requests.get(url, params=params or {}, headers=headers_bearer, timeout=int(timeout_seconds))
     return resp
 
 
@@ -1111,7 +1118,16 @@ def upsert_build_classifier_set(engine, build_version: str, template_name: str, 
             )
         conn.commit()
 
-def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, limit: int = 200) -> List[Dict[str, Any]]:
+def fetch_scan_classifier_attributes(
+    base_url: str,
+    scan_id: str,
+    token: str,
+    *,
+    limit: int = 200,
+    max_pages: int = 10,
+    request_timeout_seconds: int = 20,
+    max_seconds_total: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Fetch per-scan classifier attributes delta list.
     Endpoint: {INSIGHTS_PATH}/{scan_id}/attributes?type=classifier
@@ -1121,7 +1137,13 @@ def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, li
     all_items: List[Dict[str, Any]] = []
     skip = 0
     total_count: Optional[int] = None
-    for _ in range(10):
+    started = time.time()
+    for _ in range(int(max_pages) if int(max_pages) > 0 else 0):
+        try:
+            if max_seconds_total is not None and (time.time() - started) > float(max_seconds_total):
+                break
+        except Exception:
+            pass
         params = {
             "skip": int(skip),
             "limit": int(limit),
@@ -1129,7 +1151,7 @@ def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, li
             "sort": json.dumps([{"field": "new", "order": "desc"}], separators=(",", ":")),
             "type": "classifier",
         }
-        resp = _request_get(url, token, params=params)
+        resp = _request_get(url, token, params=params, timeout_seconds=int(request_timeout_seconds))
         if resp.status_code in (401, 403):
             raise RuntimeError(f"Unauthorized scan attributes API: {resp.status_code}")
         resp.raise_for_status()
@@ -1614,6 +1636,57 @@ def track_once(engine) -> Dict[str, Any]:
         "env_version_updated": 0,
     }
 
+    # Attribute-delta fetch can be heavy. Keep it enabled for running scans,
+    # but throttle it so it never blocks progress snapshots.
+    try:
+        attrs_running_ttl_min = int(os.getenv('TRACKER_ATTRS_RUNNING_TTL_MINUTES', '60') or '60')
+    except Exception:
+        attrs_running_ttl_min = 60
+    try:
+        attrs_max_running_per_cycle = int(os.getenv('TRACKER_ATTRS_MAX_RUNNING_PER_CYCLE', '1') or '1')
+    except Exception:
+        attrs_max_running_per_cycle = 1
+    try:
+        attrs_timeout_running_s = int(os.getenv('TRACKER_ATTRS_TIMEOUT_SECONDS_RUNNING', '8') or '8')
+    except Exception:
+        attrs_timeout_running_s = 8
+    try:
+        attrs_timeout_terminal_s = int(os.getenv('TRACKER_ATTRS_TIMEOUT_SECONDS_TERMINAL', '20') or '20')
+    except Exception:
+        attrs_timeout_terminal_s = 20
+    try:
+        attrs_max_pages_running = int(os.getenv('TRACKER_ATTRS_MAX_PAGES_RUNNING', '2') or '2')
+    except Exception:
+        attrs_max_pages_running = 2
+    try:
+        attrs_max_pages_terminal = int(os.getenv('TRACKER_ATTRS_MAX_PAGES_TERMINAL', '10') or '10')
+    except Exception:
+        attrs_max_pages_terminal = 10
+    try:
+        attrs_max_seconds_running = int(os.getenv('TRACKER_ATTRS_MAX_SECONDS_RUNNING', '12') or '12')
+    except Exception:
+        attrs_max_seconds_running = 12
+    try:
+        attrs_max_seconds_terminal = int(os.getenv('TRACKER_ATTRS_MAX_SECONDS_TERMINAL', '60') or '60')
+    except Exception:
+        attrs_max_seconds_terminal = 60
+
+    attrs_running_sem = threading.Semaphore(max(0, int(attrs_max_running_per_cycle)))
+
+    def _should_fetch_attrs_for_running(scan_id: str) -> bool:
+        if attrs_running_ttl_min <= 0:
+            return True
+        key = f'attrs_running_last::{str(scan_id)}'
+        last = _parse_iso_dt(_kv_get(engine, key))
+        if not last:
+            return True
+        try:
+            age_min = (datetime.utcnow() - last).total_seconds() / 60.0
+            return bool(age_min >= float(attrs_running_ttl_min))
+        except Exception:
+            return True
+
+
     def get_token_for_env(env_row: Dict[str, Any]) -> str:
         base_url = str(env_row.get("base_url") or "").strip()
         if not base_url:
@@ -2024,10 +2097,39 @@ def track_once(engine) -> Dict[str, Any]:
 
             # Attribute delta fetch can be slow; only do it when useful.
             try:
-                fetch_attrs_running = str(os.getenv('TRACKER_FETCH_ATTRS_FOR_RUNNING', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
-                if _is_terminal_state(state) or (fetch_attrs_running and (_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))):
-                    attrs = fetch_scan_classifier_attributes(base_url, scan_id, get_token_for_env(env_row))
-                    upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                needs_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
+                if needs_attrs:
+                    if _is_terminal_state(state):
+                        attrs = fetch_scan_classifier_attributes(
+                            base_url,
+                            scan_id,
+                            get_token_for_env(env_row),
+                            max_pages=int(attrs_max_pages_terminal),
+                            request_timeout_seconds=int(attrs_timeout_terminal_s),
+                            max_seconds_total=int(attrs_max_seconds_terminal),
+                        )
+                        upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                    else:
+                        acquired = False
+                        try:
+                            acquired = bool(attrs_running_sem.acquire(blocking=False))
+                            if acquired and _should_fetch_attrs_for_running(scan_id):
+                                _kv_set(engine, f"attrs_running_last::{str(scan_id)}", _now_utc_naive().strftime('%Y-%m-%dT%H:%M:%S'))
+                                attrs = fetch_scan_classifier_attributes(
+                                    base_url,
+                                    scan_id,
+                                    get_token_for_env(env_row),
+                                    max_pages=int(attrs_max_pages_running),
+                                    request_timeout_seconds=int(attrs_timeout_running_s),
+                                    max_seconds_total=int(attrs_max_seconds_running),
+                                )
+                                upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                        finally:
+                            try:
+                                if acquired:
+                                    attrs_running_sem.release()
+                            except Exception:
+                                pass
             except Exception:
                 return True, "ok_attrs_failed", attempted
 
