@@ -15,6 +15,9 @@ $taskDash = "ScanPerfDashboard"
 $taskTracker = "ScanPerfTracker"
 $taskRunner = "ScanPerfWorkflowRunner"
 
+$userId = $env:USERNAME
+if ($env:USERDOMAIN) { $userId = "$env:USERDOMAIN\$env:USERNAME" }
+
 function Register-LogonTask {
   param(
     [string]$TaskName,
@@ -27,7 +30,7 @@ function Register-LogonTask {
   if ($DelaySeconds -gt 0) {
     $trigger.Delay = (New-TimeSpan -Seconds $DelaySeconds)
   }
-  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType InteractiveToken -RunLevel Highest
+  $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
   $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
 
   try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
