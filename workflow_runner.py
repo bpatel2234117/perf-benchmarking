@@ -317,12 +317,12 @@ def build_api_url(base_url: str, api_path: str) -> str:
     return f"{base}{p}"
 
 
-def _request(method: str, url: str, token: str, *, params: Optional[Dict[str, Any]] = None, json_body: Any = None) -> requests.Response:
+def _request(method: str, url: str, token: str, *, params: Optional[Dict[str, Any]] = None, json_body: Any = None, timeout_seconds: Optional[float] = None) -> requests.Response:
     headers_raw = {"authorization": token} if token else {}
     headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
-    resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_raw, timeout=HTTP_TIMEOUT)
+    resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_raw, timeout=(HTTP_TIMEOUT if timeout_seconds is None else float(timeout_seconds)))
     if resp.status_code in (401, 403) and token:
-        resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_bearer, timeout=HTTP_TIMEOUT)
+        resp = requests.request(method, url, params=params or {}, json=json_body, headers=headers_bearer, timeout=(HTTP_TIMEOUT if timeout_seconds is None else float(timeout_seconds)))
     try:
         resp.raise_for_status()
     except requests.HTTPError as ex:
@@ -386,7 +386,7 @@ def _build_prefix(build_version: str) -> str:
 
 def fetch_about(base_url: str, token: str) -> Dict[str, Any]:
     url = build_api_url(base_url, ABOUT_PATH)
-    resp = _request("GET", url, token)
+    resp = _request("GET", url, token, timeout_seconds=timeout_seconds)
     try:
         return resp.json() if resp.content else {}
     except Exception:
@@ -1499,7 +1499,7 @@ def put_ds_connection(base_url: str, token: str, ds_name: str, payload: Dict[str
     return resp.json() if resp.content else {}
 
 
-def fetch_ds_connection(base_url: str, token: str, ds_name: str) -> Dict[str, Any]:
+def fetch_ds_connection(base_url: str, token: str, ds_name: str, *, timeout_seconds: Optional[float] = None) -> Dict[str, Any]:
     from urllib.parse import quote
     name = str(ds_name or "").strip()
     if not name:
@@ -1548,7 +1548,7 @@ def wait_for_ds_connection_test_result(
     grace_decide_at = test_started_at + timedelta(seconds=15)
     while _now_utc() < deadline:
         try:
-            payload = fetch_ds_connection(base_url, token, ds_name)
+            payload = fetch_ds_connection(base_url, token, ds_name, timeout_seconds=min(10.0, float(HTTP_TIMEOUT)))
             dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
             cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
             if isinstance(cst, dict):
