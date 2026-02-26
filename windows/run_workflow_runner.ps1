@@ -55,8 +55,12 @@ else:
             age=-1
         print(age)
 '@
-    $age = & $Py -c $code 2>$null
-    return [double]::Parse(($age | Select-Object -First 1))
+    $out = & $Py -c $code 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      Add-Content -Path $superLog -Value ("[{0}] heartbeat query error: {1}" -f (Get-Date).ToString("s"), ($out | Select-Object -First 6 | Out-String).Trim())
+      return -1
+    }
+    return [double]::Parse(($out | Select-Object -First 1))
   } catch { return -1 }
 }
 
