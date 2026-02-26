@@ -108,6 +108,30 @@ def _ds_kind_poll_seconds(ds_kind: Any) -> int:
     v2 = _env_int("WORKFLOW_DS_TEST_POLL_SECONDS", 5)
     return int(max(2, min(60, v2)))
 
+
+def _ds_kind_initial_wait_seconds(ds_kind: Any) -> int:
+    """
+    Some deployments update connectionStatusTest asynchronously. Give it a moment before polling.
+      WORKFLOW_DS_TEST_INITIAL_WAIT_SECONDS_MSSQL=10
+    Fallback: WORKFLOW_DS_TEST_INITIAL_WAIT_SECONDS (default 5)
+    """
+    k = str(ds_kind or "").strip().upper()
+    if k:
+        v = _env_int(f"WORKFLOW_DS_TEST_INITIAL_WAIT_SECONDS_{k}", -1)
+        if v and v > 0:
+            return int(max(0, min(60, v)))
+    v2 = _env_int("WORKFLOW_DS_TEST_INITIAL_WAIT_SECONDS", 5)
+    return int(max(0, min(60, v2)))
+
+
+def _post_trigger_sleep_seconds() -> int:
+    """
+    After starting a scan, wait a bit before checking insights/state.
+    This avoids false negatives when the backend hasn't materialized scan state yet.
+    """
+    v = _env_int("WORKFLOW_POST_TRIGGER_SLEEP_SECONDS", 30)
+    return int(max(0, min(120, v)))
+
 def _has_yyyymmddhhmmss_suffix(name: str) -> bool:
     try:
         s = str(name or "").strip()
@@ -1308,6 +1332,7 @@ def wait_for_ds_connection_test_result(
     """
     deadline = _now_utc() + timedelta(seconds=max(10, int(timeout_seconds)))
     last_seen = None
+    grace_decide_at = test_started_at + timedelta(seconds=15)
     while _now_utc() < deadline:
         try:
             payload = fetch_ds_connection(base_url, token, ds_name)
@@ -1328,6 +1353,11 @@ def wait_for_ds_connection_test_result(
                         return True, "success"
                     if s in {"false", "0", "no", "fail", "failed", "error"}:
                         return False, "failed"
+                # Fallback: sometimes is_success flips before last_connection is updated.
+                if (not last_conn) and (_now_utc() >= grace_decide_at):
+                    is_success = cst.get("is_success")
+                    if isinstance(is_success, bool):
+                        return is_success, json.dumps({k: cst.get(k) for k in ["is_success", "last_connection", "is_connection_ever_succeeded"]}, separators=(",", ":"))[:500]
         except Exception:
             pass
         time.sleep(max(2, int(poll_seconds)))
@@ -1606,9 +1636,11 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
                     WHERE ws.run_id=:rid
                       AND COALESCE(ws.is_enabled,1)=1
-                      AND ws.scan_id IS NOT NULL
-                      AND TRIM(ws.scan_id) <> ''
                       AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
+                      AND (
+                        (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
+                        OR COALESCE(ws.status,'') = 'scan_running'
+                      )
                     ORDER BY ws.updated_at DESC
                 """),
                 {"rid": int(run_id)},
@@ -1989,6 +2021,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             )
             timeout_s = _ds_kind_timeout_seconds(step_dict.get("ds_kind"))
             poll_s = _ds_kind_poll_seconds(step_dict.get("ds_kind"))
+            initial_wait_s = _ds_kind_initial_wait_seconds(step_dict.get("ds_kind"))
+            if initial_wait_s > 0:
+                time.sleep(initial_wait_s)
             ok, msg = wait_for_ds_connection_test_result(
                 base_url,
                 token,
@@ -2114,6 +2149,13 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             print(f"[{_now_utc().isoformat()}Z] run={run_id} step={seq} skip_wait=1 scan={sid or 'unknown'}", flush=True)
         # Do not enforce cooldown here; keep workflow paused on this step until user resumes/reconciles.
         return True
+    # Give the backend some time to materialize scan state before polling.
+    try:
+        post_sleep = _post_trigger_sleep_seconds()
+        if post_sleep > 0:
+            time.sleep(post_sleep)
+    except Exception:
+        pass
     if sid:
         final_state, done = wait_for_scan_terminal_or_pause(
             engine,
