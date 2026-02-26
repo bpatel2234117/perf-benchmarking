@@ -1574,11 +1574,6 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         cooldown_m = int(run_row[2]) if run_row[2] is not None else 15
     except Exception:
         cooldown_m = 15
-    next_eligible = run_row[3]
-    if next_eligible is not None and isinstance(next_eligible, datetime):
-        if next_eligible > now:
-            set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
-            return False
 
     # Find next step for this run.
     # Default behavior: continue past failures (do not retry errors forever).
@@ -1592,6 +1587,56 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     else:
         # Retry mode: allow retrying errors.
         where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(is_enabled, 1) = 1"
+
+    # If any scan is already running for this run, we must keep processing it even during cooldown.
+    scan_running_exists = False
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT 1
+                    FROM workflow_steps
+                    WHERE run_id=:rid
+                      AND COALESCE(is_enabled,1)=1
+                      AND COALESCE(status,'')='scan_running'
+                    LIMIT 1
+                """),
+                {"rid": int(run_id)},
+            ).fetchone()
+        scan_running_exists = bool(row and row[0] == 1)
+    except Exception:
+        scan_running_exists = False
+
+    # If there are no eligible steps left, mark the run completed immediately
+    # (even if next_eligible_at is set in the future).
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(f"""
+                    SELECT 1
+                    FROM workflow_steps
+                    WHERE run_id=:rid
+                      {where_status}
+                    LIMIT 1
+                """),
+                {"rid": int(run_id)},
+            ).fetchone()
+        has_eligible = bool(row and row[0] == 1)
+    except Exception:
+        has_eligible = True
+    if not has_eligible:
+        with engine.connect() as conn:
+            conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
+            conn.commit()
+        set_runner_heartbeat(engine, status="idle", message=f"run {run_id} completed (no eligible steps)", started=False)
+        return True
+
+    # Cooldown gate (but do not block scan_running reconciliation)
+    next_eligible = run_row[3]
+    if (not scan_running_exists) and next_eligible is not None and isinstance(next_eligible, datetime):
+        if next_eligible > now:
+            set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
+            return False
 
     # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
     avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}

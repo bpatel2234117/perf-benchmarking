@@ -3541,9 +3541,19 @@ def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
     out["updated_steps"] = updated
     try:
         steps_df2 = load_workflow_steps(int(run_id))
-        if not steps_df2.empty and (steps_df2["status"].astype(str) == "completed").all():
-            set_workflow_run_status(int(run_id), "completed")
-            out["completed_run"] = True
+        if not steps_df2.empty:
+            stv2 = steps_df2["status"].fillna("").astype(str).str.strip().str.lower()
+            enabled2 = steps_df2.get("is_enabled", pd.Series([1] * len(steps_df2))).fillna(1)
+            try:
+                enabled2 = enabled2.astype(int)
+            except Exception:
+                enabled2 = enabled2.apply(lambda x: 1 if bool(x) else 0)
+            # Treat completed/disabled/error/scan_created as terminal for run completion.
+            term = {"completed", "disabled", "error", "scan_created"}
+            remaining = steps_df2[(enabled2.astype(int) == 1) & (~stv2.isin(list(term)))].copy()
+            if remaining.empty:
+                set_workflow_run_status(int(run_id), "completed")
+                out["completed_run"] = True
     except Exception:
         pass
     return out
@@ -10393,8 +10403,14 @@ def page_workflow_automation():
         + (f" | next_eligible_at={rrow.get('next_eligible_at')}" if rrow.get("next_eligible_at") else "")
         + (f" | cooldown={rrow.get('cooldown_minutes')}m" if rrow.get("cooldown_minutes") is not None else "")
     )
-    if str(rrow.get("last_error") or "").strip():
-        st.error(str(rrow.get("last_error") or "").strip())
+    last_err = str(rrow.get("last_error") or "").strip()
+    if last_err:
+        # When a run is running, last_error is historical (previous failure) and can be misleading.
+        # Only show as a blocking error when the run is paused/stopped.
+        if selected_status in {"paused", "stopped"}:
+            st.error(last_err)
+        else:
+            st.caption(f"Last failure (history): {last_err}")
 
     # Extra visibility into why "nothing is happening"
     try:
