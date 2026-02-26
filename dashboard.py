@@ -10664,7 +10664,8 @@ def page_workflow_automation():
 
     with st.expander("Maintenance (reset stale status)", expanded=False):
         st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans; it only resets DB state for the run.")
-        if st.button("Reset unfinished steps to pending", key="wf_reset_steps"):
+        st.caption("This reset keeps DS + scan profile ids so the runner will NOT recreate them.")
+        if st.button("Reset unfinished steps", key="wf_reset_steps_soft"):
             try:
                 with engine.connect() as conn:
                     conn.execute(text("""
@@ -10673,9 +10674,6 @@ def page_workflow_automation():
                             last_error=NULL,
                             started_at=NULL,
                             finished_at=NULL,
-                            ds_id=NULL,
-                            scan_profile_id=NULL,
-                            scan_profile_name=NULL,
                             scan_id=NULL,
                             updated_at=CURRENT_TIMESTAMP
                         WHERE run_id=:rid
@@ -10693,10 +10691,10 @@ def page_workflow_automation():
                     st.cache_data.clear()
                 except Exception:
                     pass
-                st.success("Reset done. Click Start/Resume to run again.")
+                st.success("Soft reset done. Click Start/Resume to run again.")
                 st.rerun()
             except Exception as ex:
-                st.error(f"Reset failed: {ex}")
+                st.error(f"Soft reset failed: {ex}")
 
     # Hide manual template editing in normal mode (workflow should be automatic).
     # If needed for troubleshooting, enable debug view via ?debug=true

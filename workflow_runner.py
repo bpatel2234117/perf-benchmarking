@@ -760,6 +760,8 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
         out["SMB_domain"] = _getenv_any(["SMB_domain", "SMB_DOMAIN", "smb_domain"])
         out["SMB_password"] = _getenv_any(["SMB_password", "SMB_PASSWORD", "smb_password"])
         out["SMB_password_enc"] = _getenv_any(["SMB_password_enc", "SMB_PASSWORD_ENC", "smb_password_enc"])
+        # Override SMB target host/ip (resourceProperties.resourceAddress)
+        out["SMB_resourceAddress"] = _getenv_any(["SMB_resourceAddress", "SMB_RESOURCE_ADDRESS", "smb_resourceAddress", "smb_resource_address"])
     elif k == "s3":
         out["S3_accessKey"] = _getenv_any(["S3_accessKey", "S3_ACCESSKEY", "S3_ACCESS_KEY", "s3_accessKey"])
         out["S3_secret_key"] = _getenv_any(["S3_secret_key", "S3_SECRET_KEY", "S3_secretKey", "s3_secret_key"])
@@ -769,12 +771,24 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     elif k == "postgres":
         out["Postgres_username"] = _getenv_any(["Postgres_username", "POSTGRES_username", "POSTGRES_USERNAME", "postgres_username"])
         out["Postgres_password"] = _getenv_any(["Postgres_password", "POSTGRES_password", "POSTGRES_PASSWORD", "postgres_password"])
+        # Host/port override for rdb_url (host:port)
+        out["Postgres_host"] = _getenv_any(["Postgres_host", "POSTGRES_host", "POSTGRES_HOST", "postgres_host", "Postgres_hostname", "POSTGRES_HOSTNAME", "postgres_hostname"])
+        out["Postgres_port"] = _getenv_any(["Postgres_port", "POSTGRES_port", "POSTGRES_PORT", "postgres_port"])
+        out["Postgres_rdb_url"] = _getenv_any(["Postgres_rdb_url", "POSTGRES_RDB_URL", "postgres_rdb_url"])
     elif k == "mssql":
         out["MSSQL_username"] = _getenv_any(["MSSQL_username", "MSSQL_USERNAME", "mssql_username"])
         out["MSSQL_password"] = _getenv_any(["MSSQL_password", "MSSQL_PASSWORD", "mssql_password"])
+        # Host/port override for rdb_url (host:port)
+        out["MSSQL_host"] = _getenv_any(["MSSQL_host", "MSSQL_HOST", "mssql_host", "MSSQL_hostname", "MSSQL_HOSTNAME", "mssql_hostname"])
+        out["MSSQL_port"] = _getenv_any(["MSSQL_port", "MSSQL_PORT", "mssql_port"])
+        out["MSSQL_rdb_url"] = _getenv_any(["MSSQL_rdb_url", "MSSQL_RDB_URL", "mssql_rdb_url"])
     elif k == "mysql":
         out["MySQL_username"] = _getenv_any(["MySQL_username", "MYSQL_username", "MYSQL_USERNAME", "mysql_username"])
         out["MySQL_password"] = _getenv_any(["MySQL_password", "MYSQL_password", "MYSQL_PASSWORD", "mysql_password"])
+        # Host/port override for rdb_url (host:port)
+        out["MySQL_host"] = _getenv_any(["MySQL_host", "MYSQL_host", "MYSQL_HOST", "mysql_host", "MySQL_hostname", "MYSQL_HOSTNAME", "mysql_hostname"])
+        out["MySQL_port"] = _getenv_any(["MySQL_port", "MYSQL_port", "MYSQL_PORT", "mysql_port"])
+        out["MySQL_rdb_url"] = _getenv_any(["MySQL_rdb_url", "MYSQL_RDB_URL", "mysql_rdb_url"])
     return out
 
 
@@ -1061,6 +1075,28 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     def _get(name: str) -> str:
         return str(secret_vars.get(name) or "").strip()
 
+    def _override_rdb_url(ds_conn_obj: Dict[str, Any], *, host: str, port: str, url_override: str) -> None:
+        """
+        BigID rdb connectors typically store endpoint as `rdb_url` in `host:port` form.
+        Allow overriding either full rdb_url or just host/port.
+        """
+        try:
+            if url_override:
+                ds_conn_obj["rdb_url"] = str(url_override).strip()
+                return
+            h = str(host or "").strip()
+            if not h:
+                return
+            cur = str(ds_conn_obj.get("rdb_url") or "").strip()
+            cur_host = ""
+            cur_port = ""
+            if cur and ":" in cur:
+                cur_host, cur_port = cur.rsplit(":", 1)
+            p = str(port or "").strip() or cur_port
+            ds_conn_obj["rdb_url"] = f"{h}:{p}".strip(":")
+        except Exception:
+            pass
+
     def _get_prefixed_field(field_name: str) -> str:
         """
         Generic lookup for "<ds_kind>_<field>" in secret_vars (case-insensitive).
@@ -1104,6 +1140,7 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
         d = _get("SMB_domain")
         pw_enc = _get("SMB_password_enc")
         pw = _get("SMB_password")
+        ra = _get("SMB_resourceAddress")
         # Some exports store SMB creds at top-level, some under authenticationProperties.
         if u:
             ds_conn["username"] = u
@@ -1115,6 +1152,15 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
         elif pw:
             ds_conn["password_enc"] = pw
             ds_conn.pop("password", None)
+        if ra:
+            try:
+                rp = ds_conn.get("resourceProperties")
+                if isinstance(rp, dict):
+                    rp["resourceAddress"] = ra
+                else:
+                    ds_conn["resourceProperties"] = {"resourceAddress": ra}
+            except Exception:
+                pass
         if isinstance(ap, dict):
             if u:
                 ap["username"] = u
@@ -1130,10 +1176,14 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     elif k == "postgres":
         u = _get("Postgres_username")
         p = _get("Postgres_password")
+        h = _get("Postgres_host")
+        pt = _get("Postgres_port")
+        ru = _get("Postgres_rdb_url")
         if u:
             ds_conn["username"] = u
         if p:
             ds_conn["password"] = p
+        _override_rdb_url(ds_conn, host=h, port=pt, url_override=ru)
         if isinstance(ap, dict):
             if u:
                 ap["username"] = u
@@ -1143,10 +1193,14 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     elif k == "mssql":
         u = _get("MSSQL_username")
         p = _get("MSSQL_password")
+        h = _get("MSSQL_host")
+        pt = _get("MSSQL_port")
+        ru = _get("MSSQL_rdb_url")
         if u:
             ds_conn["username"] = u
         if p:
             ds_conn["password"] = p
+        _override_rdb_url(ds_conn, host=h, port=pt, url_override=ru)
         if isinstance(ap, dict):
             if u:
                 ap["username"] = u
@@ -1156,10 +1210,14 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     elif k == "mysql":
         u = _get("MySQL_username")
         p = _get("MySQL_password")
+        h = _get("MySQL_host")
+        pt = _get("MySQL_port")
+        ru = _get("MySQL_rdb_url")
         if u:
             ds_conn["username"] = u
         if p:
             ds_conn["password"] = p
+        _override_rdb_url(ds_conn, host=h, port=pt, url_override=ru)
         if isinstance(ap, dict):
             if u:
                 ap["username"] = u
@@ -1189,6 +1247,8 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
             "accesskey","access_key","accesskeyid","access_key_id",
             "token","api_key","apikey","private_key","privatekey",
             "tenantid","tenant_id",
+            # Non-secret but environment-specific connector endpoints/hosts (esp SMB/MSSQL/Postgres exports)
+            "resourceaddress","host","hostname","server","serveraddress","address","endpoint","url",
         }
 
         def _walk(obj: Any) -> None:
@@ -1412,6 +1472,7 @@ def test_ds_connection_auto(
     token: str,
     *,
     ds_name: str,
+    ds_id: str = "",
     ds_connection: Dict[str, Any],
     broadcast_event: str,
 ) -> Dict[str, Any]:
@@ -1420,13 +1481,89 @@ def test_ds_connection_auto(
     fallback to client endpoint.
     """
     name = str(ds_name or "").strip()
+    did = str(ds_id or "").strip()
     # 1) ids-based test
     try:
-        return test_ds_connections_by_ids(base_url, token, ids=[name], broadcast_event=broadcast_event)
+        return test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
     except Exception:
         pass
     # 2) client-style test
     return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event)
+
+
+def _extract_ds_id_from_payload(payload: Dict[str, Any]) -> str:
+    """
+    Best-effort extract DS internal id from ds_connection payload.
+    BigID often stores it under ds_connection._id (Mongo ObjectId).
+    """
+    try:
+        dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
+        if isinstance(dc, dict):
+            for kk in ["_id", "id", "dsId", "ds_id"]:
+                v = dc.get(kk)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _extract_scan_profile_items(payload: Any) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    try:
+        if isinstance(payload, dict):
+            data_block = payload.get("data")
+            root = data_block if isinstance(data_block, dict) else payload
+            for key in ["scanProfiles", "scan_profiles", "profiles", "items", "results"]:
+                val = root.get(key)
+                if isinstance(val, list):
+                    items = [x for x in val if isinstance(x, dict)]
+                    break
+    except Exception:
+        pass
+    return items
+
+
+def find_scan_profile_id_by_name(base_url: str, token: str, scan_profile_name: str) -> str:
+    """
+    Best-effort lookup so resets/restarts don't re-create scan profiles and hit
+    'Scan name is already in use'. Tries a few filter operators across versions.
+    """
+    nm = str(scan_profile_name or "").strip()
+    if not nm:
+        return ""
+    url = build_api_url(base_url, SCAN_PROFILES_PATH)
+    # Try a few operators that BigID has used historically.
+    ops = ["eq", "equals", "contains"]
+    for op in ops:
+        try:
+            filter_items = [{"field": "name", "operator": op, "value": nm}]
+            params = {
+                "skip": 0,
+                "limit": 200,
+                "requireTotalCount": "true",
+                "filter": json.dumps(filter_items, separators=(",", ":")),
+                "sort": json.dumps([{"field": "updated_at", "order": "desc"}], separators=(",", ":")),
+            }
+            resp = _request("GET", url, token, params=params)
+            payload = resp.json() if resp.content else {}
+            items = _extract_scan_profile_items(payload)
+            if not items:
+                continue
+            # Exact match preference
+            for it in items:
+                if str(it.get("name") or "").strip() == nm:
+                    vid = str(it.get("_id") or it.get("id") or "").strip()
+                    if vid:
+                        return vid
+            # If contains returned a superset, accept first id as fallback.
+            it0 = items[0]
+            vid = str(it0.get("_id") or it0.get("id") or "").strip()
+            if vid:
+                return vid
+        except Exception:
+            continue
+    return ""
 
 def start_scan_profile(base_url: str, token: str, scan_profile_id: str) -> Dict[str, Any]:
     """
@@ -1566,6 +1703,33 @@ def wait_for_scan_terminal_or_pause(engine, run_id: int, base_url: str, token: s
     return last_state or "unknown", True
 
 
+def _find_latest_scan_parent_by_name(engine, *, scan_name: str) -> Tuple[str, str]:
+    """
+    Best-effort: find latest scan_id + status in local DB by exact scan_name.
+    This prevents re-triggering the same scan after a UI reset/restart.
+    """
+    nm = str(scan_name or "").strip()
+    if not nm:
+        return "", ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT scan_id, scan_status
+                    FROM scan_parents
+                    WHERE COALESCE(scan_name,'') = :nm
+                    ORDER BY last_seen_at DESC, id DESC
+                    LIMIT 1
+                """),
+                {"nm": nm},
+            ).fetchone()
+        if row and row[0]:
+            return str(row[0] or "").strip(), str(row[1] or "").strip()
+    except Exception:
+        pass
+    return "", ""
+
+
 def _extract_id(payload: Dict[str, Any], keys: List[str]) -> str:
     v = _deep_find(payload, keys)
     if isinstance(v, str) and v.strip():
@@ -1659,7 +1823,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 except Exception:
                     pass
             if scan_status and _is_terminal_state(scan_status):
-                set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+                set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
                 did_reconcile = True
                 set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={scan_status}", started=False)
             else:
@@ -1845,7 +2009,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 ).fetchone()
             stv = str(row[0] or "").strip() if row else ""
             if stv and _is_terminal_state(stv):
-                set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+                set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
                 set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={stv}", started=False)
                 set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
                 return True
@@ -1859,15 +2023,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         build_version = ""
     build_prefix = _build_prefix(build_version)
 
-    # IMPORTANT: DS name must be stable per step.
-    # Otherwise, a failing DS connection test would create N new DS connections.
+    # IMPORTANT:
+    # - DS name must be stable per step (avoid DS spam on retries).
+    # - DS name must be unique across BigID.
+    #
+    # We do NOT rely on timestamps for uniqueness. We use build prefix + scenario + wf run/seq.
     existing_ds_name = str(step_dict.get("ds_name") or "").strip()
-    if existing_ds_name:
-        desired_ds_name = existing_ds_name
-    else:
-        attempt_ts = _now_utc().strftime("%Y%m%d%H%M%S")
-        base_ds_name = _standard_ds_base_name(step_dict)
-        desired_ds_name = _apply_build_prefix(f"{base_ds_name} {attempt_ts}".strip(), build_prefix)
+    base_ds_name = existing_ds_name or _standard_ds_base_name(step_dict)
+    # Always apply build prefix (if we have it).
+    base_with_prefix = _apply_build_prefix(base_ds_name, build_prefix) if build_prefix else base_ds_name
+    # Ensure uniqueness per workflow run/step without timestamps.
+    desired_ds_name = f"{base_with_prefix} (wf {run_id}-{seq})".strip()
     try:
         # Persist build + stable ds_name so UI + retries stay consistent.
         set_step_status(
@@ -1977,10 +2143,15 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Apply ACL/Structured flags at runtime (so one base template is enough).
         ds_payload = _apply_runtime_flags(step_dict, ds_payload)
         out = put_ds_connection(base_url, token, desired_ds_name, ds_payload)
-        ds_id = _extract_id(out, ["_id", "id", "dsId", "ds_id"])
-        if not ds_id:
-            # Some responses embed ds_connection
-            ds_id = _extract_id(out, ["ds_connection", "_id", "id"])
+        # PUT response often does not include DS internal id; fetch after PUT.
+        ds_id = _extract_ds_id_from_payload(out) or _extract_id(out, ["_id", "id", "dsId", "ds_id"]) or _extract_id(out, ["ds_connection", "_id", "id"])
+        try:
+            fetched = fetch_ds_connection(base_url, token, desired_ds_name)
+            if isinstance(fetched, dict) and fetched:
+                ds_payload = fetched  # use canonical server payload for test
+                ds_id = ds_id or _extract_ds_id_from_payload(fetched)
+        except Exception:
+            pass
         if ds_id:
             set_step_status(engine, step_id, "ds_created", ds_id=str(ds_id))
         else:
@@ -2007,6 +2178,13 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
         max_attempts = int(os.getenv("WORKFLOW_DS_TEST_MAX_ATTEMPTS", "2") or "2")
         max_attempts = max(1, min(5, max_attempts))
+        # Prefer ds_id if available for ids-based test endpoint.
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT ds_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
+            ds_id_val = str(row[0] or "").strip() if row else ""
+        except Exception:
+            ds_id_val = ""
         last_msg = ""
         ok = False
         for attempt in range(1, max_attempts + 1):
@@ -2016,6 +2194,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 base_url,
                 token,
                 ds_name=desired_ds_name,
+                ds_id=ds_id_val,
                 ds_connection=ds_conn_obj,
                 broadcast_event=broadcast,
             )
@@ -2055,41 +2234,71 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # --- Scan profile create ---
     if not _run_is_running(engine, int(run_id)):
         return True
+    scan_profile_name = ""
     try:
-        template_id = resolve_default_scan_template_id(engine, int(env_id) if env_id is not None else None, base_url, token)
-        if not template_id:
-            raise RuntimeError("No default scan template id resolved (expected 'Data source scan')")
+        # Idempotency: if we already have a scan_profile_id, don't re-create.
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT scan_profile_id, scan_profile_name FROM workflow_steps WHERE id=:id"),
+                {"id": int(step_id)},
+            ).fetchone()
+        existing_spid = str(row[0] or "").strip() if row else ""
+        existing_spname = str(row[1] or "").strip() if row else ""
+        if existing_spid:
+            scan_profile_name = existing_spname
+            set_step_status(engine, step_id, "scan_created", scan_profile_id=existing_spid, scan_profile_name=(scan_profile_name or None))
+        else:
+            template_id = resolve_default_scan_template_id(engine, int(env_id) if env_id is not None else None, base_url, token)
+            if not template_id:
+                raise RuntimeError("No default scan template id resolved (expected 'Data source scan')")
 
-        # Scan profile name should be readable and not duplicate the build prefix.
-        # DS name already contains prefix + timestamp + scenario.
-        scan_kind_raw = str(step_dict.get("scan_kind") or "").strip().lower().replace(" ", "")
-        scan_kind_label = "Full Scan" if scan_kind_raw in {"full_scan", "fullscan", "dsscan", "dsscanprofile", "dsscanjob"} else (str(step_dict.get("scan_kind") or "Scan").strip() or "Scan")
-        # DS name already includes build + scenario + attempt timestamp.
-        # Don't duplicate the timestamp again in the scan profile name.
-        scan_profile_name = (f"{desired_ds_name} {scan_kind_label} (wf {run_id}-{seq})").strip()[:240] or f"{desired_ds_name} (wf {run_id}-{seq})"
+            # Scan profile name uniqueness comes from DS name (which is unique per wf step).
+            scan_kind_raw = str(step_dict.get("scan_kind") or "").strip().lower().replace(" ", "")
+            scan_kind_label = "Full Scan" if scan_kind_raw in {"full_scan", "fullscan", "dsscan", "dsscanprofile", "dsscanjob"} else (str(step_dict.get("scan_kind") or "Scan").strip() or "Scan")
+            scan_profile_name = (f"{desired_ds_name} {scan_kind_label}").strip()[:240] or f"{desired_ds_name}".strip()[:240]
 
-        scan_payload: Dict[str, Any] = {
-            "scanType": "dsScan",
-            "dataSourceList": [desired_ds_name],
-            "name": scan_profile_name,
-            "scanTemplateId": template_id,
-            "enabled": True,
-        }
-        if DEFAULT_SCAN_OWNER_EMAIL:
-            scan_payload["owners"] = [DEFAULT_SCAN_OWNER_EMAIL]
+            # If a reset/restart cleared scan_profile_id but BigID already has this profile, reuse it.
+            found = find_scan_profile_id_by_name(base_url, token, scan_profile_name)
+            if found:
+                set_step_status(engine, step_id, "scan_created", scan_profile_id=str(found), scan_profile_name=scan_profile_name)
+            else:
+                scan_payload: Dict[str, Any] = {
+                    "scanType": "dsScan",
+                    "dataSourceList": [desired_ds_name],
+                    "name": scan_profile_name,
+                    "scanTemplateId": template_id,
+                    "enabled": True,
+                }
+                if DEFAULT_SCAN_OWNER_EMAIL:
+                    scan_payload["owners"] = [DEFAULT_SCAN_OWNER_EMAIL]
 
-        out2 = create_scan_profile(base_url, token, scan_payload)
-        scan_profile_id = _extract_id(out2, ["_id", "id", "scanProfileId", "scan_profile_id"])
-        if not scan_profile_id:
-            scan_profile_id = _extract_id(out2, ["scanProfile", "_id", "id"])
-        if not scan_profile_id:
-            raise RuntimeError("scan profile id not found in response")
-        set_step_status(engine, step_id, "scan_created", scan_profile_id=str(scan_profile_id), scan_profile_name=scan_profile_name)
+                out2 = create_scan_profile(base_url, token, scan_payload)
+                scan_profile_id = _extract_id(out2, ["_id", "id", "scanProfileId", "scan_profile_id"])
+                if not scan_profile_id:
+                    scan_profile_id = _extract_id(out2, ["scanProfile", "_id", "id"])
+                if not scan_profile_id:
+                    raise RuntimeError("scan profile id not found in response")
+                set_step_status(engine, step_id, "scan_created", scan_profile_id=str(scan_profile_id), scan_profile_name=scan_profile_name)
     except Exception as ex:
-        set_step_error(engine, step_id, f"Scan profile create failed: {ex}")
-        set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
-        set_run_next_eligible(engine, run_id, _now_utc())
-        return True
+        # If the only issue is "name already in use", try to find and reuse it.
+        msg = str(ex)
+        if ("already in use" in msg.lower()) and scan_profile_name:
+            try:
+                found = find_scan_profile_id_by_name(base_url, token, scan_profile_name)
+                if found:
+                    set_step_status(engine, step_id, "scan_created", scan_profile_id=str(found), scan_profile_name=scan_profile_name)
+                else:
+                    raise ex
+            except Exception:
+                set_step_error(engine, step_id, f"Scan profile create failed: {ex}")
+                set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
+                set_run_next_eligible(engine, run_id, _now_utc())
+                return True
+        else:
+            set_step_error(engine, step_id, f"Scan profile create failed: {ex}")
+            set_run_error(engine, run_id, f"Step {seq}: scan profile create failed")
+            set_run_next_eligible(engine, run_id, _now_utc())
+            return True
 
     # If we only want DS + scan profile creation (no scan trigger), stop here.
     create_only = str(os.getenv("WORKFLOW_CREATE_ONLY", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
@@ -2117,12 +2326,34 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         with engine.connect() as conn:
             row = conn.execute(text("SELECT scan_profile_id FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
         spid = str(row[0] or "").strip() if row else ""
+        if not scan_profile_name:
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(text("SELECT scan_profile_name FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
+                scan_profile_name = str(row[0] or "").strip() if row else ""
+            except Exception:
+                scan_profile_name = ""
+
+        # If this step was reset and scan_id cleared, but DB already has a terminal scan
+        # for this exact scan profile name, don't trigger again.
+        if scan_profile_name:
+            prev_sid, prev_status = _find_latest_scan_parent_by_name(engine, scan_name=scan_profile_name)
+            if prev_sid and prev_status and _is_terminal_state(prev_status):
+                set_step_status(engine, step_id, "completed", scan_id=str(prev_sid), finished_at=_now_utc(), last_error=None)
+                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} already_done scan={prev_sid} terminal={prev_status}", started=False)
+                set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
+                return True
+
         # Preferred (matches MegaScale): trigger by scan profile name (no scheduling).
         out3: Dict[str, Any] = {}
-        try:
-            out3 = trigger_scan(base_url, token, scan_profile_name, scan_type="dsScan")
-        except Exception:
-            # Fallback for older deployments: try starting via scanProfileId endpoints.
+        if scan_profile_name:
+            try:
+                out3 = trigger_scan(base_url, token, scan_profile_name, scan_type="dsScan")
+            except Exception:
+                # Fallback for older deployments: try starting via scanProfileId endpoints.
+                out3 = start_scan_profile(base_url, token, spid)
+        else:
+            # No name stored; fallback to id-based start.
             out3 = start_scan_profile(base_url, token, spid)
         scan_id = _extract_id(out3, ["scanId", "scan_id", "parentScanId", "parent_scan_id", "_id", "id"])
         if not scan_id:
@@ -2166,7 +2397,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             poll_seconds=int(os.getenv("WORKFLOW_SCAN_POLL_SECONDS", "60") or "60"),
         )
         if done and _is_terminal_state(final_state):
-            set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+            set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
             if not quiet:
                 print(f"[{_now_utc().isoformat()}Z] run={run_id} step={seq} scan={sid} done state={final_state}", flush=True)
         else:
