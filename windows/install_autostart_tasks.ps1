@@ -39,7 +39,7 @@ function Register-LogonTask {
     [int]$DelaySeconds = 30
   )
 
-  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $ScriptPath)
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $ScriptPath)
   $trigger = New-ScheduledTaskTrigger -AtLogOn
   if ($DelaySeconds -gt 0) { $trigger.Delay = (To-IsoDelay -Seconds $DelaySeconds) }
   $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
@@ -53,7 +53,7 @@ Register-LogonTask -TaskName $taskTracker -ScriptPath $TrackerScript -DelaySecon
 Register-LogonTask -TaskName $taskRunner -ScriptPath $RunnerScript -DelaySeconds 20
 Register-LogonTask -TaskName $taskDash -ScriptPath $DashScript -DelaySeconds 30
 
-Write-Host "Installed logon tasks (interactive, VPN-friendly):"
+Write-Host "Installed logon tasks (interactive user session):"
 Write-Host " - $taskTracker"
 Write-Host " - $taskRunner"
 Write-Host " - $taskDash"
