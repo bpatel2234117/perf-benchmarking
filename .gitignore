@@ -1,0 +1,23 @@
+.DS_Store
+
+# secrets / editor swap
+.env
+.env.*
+*.swp
+*.swo
+
+# python
+__pycache__/
+*.pyc
+
+# local db/artifacts
+benchmark.db
+benchmark_charts/
+*.zip
+uploaded_media_*.png
+uploaded_media_*.webp
+
+# local runner pidfiles
+*.pid
+.tracker*.pid
+.workflow_runner.pid

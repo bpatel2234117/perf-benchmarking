@@ -11,15 +11,27 @@ import numpy as np
 import requests
 import os
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from textwrap import dedent
 import html
 import re
 import textwrap
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
-from tracker_autostart import ensure_tracker_running
+try:
+    # Optional: auto-start tracker when available (same folder as dashboard.py).
+    from tracker_autostart import ensure_tracker_running  # type: ignore
+except Exception:
+    ensure_tracker_running = None
+
+try:
+    # Optional: auto-start workflow runner when workflows are running.
+    from workflow_autostart import ensure_workflow_runner_running  # type: ignore
+except Exception:
+    ensure_workflow_runner_running = None
 
 # --- Configuration & Styling ---
 st.set_page_config(
@@ -51,6 +63,7 @@ INTERNAL_PARENT_SCAN_INSIGHTS_API_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_A
 INTERNAL_SCANNER_GROUPS_API_PATH = os.getenv("BIGID_SCANNER_GROUPS_API_PATH", "/api/v1/scanner-groups").strip() or "/api/v1/scanner-groups"
 INTERNAL_DS_CONNECTIONS_API_PATH = os.getenv("BIGID_DS_CONNECTIONS_API_PATH", "/api/v1/ds_connections").strip() or "/api/v1/ds_connections"
 INTERNAL_DS_CONNECTION_TEST_API_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
+INTERNAL_SCAN_TEMPLATES_API_PATH = os.getenv("BIGID_SCAN_TEMPLATES_API_PATH", "/api/v1/scan-templates").strip() or "/api/v1/scan-templates"
 
 # Local LLM (optional): Ollama or OpenAI-compatible server
 LOCAL_LLM_PROVIDER = os.getenv("LOCAL_LLM_PROVIDER", "").strip().lower()  # "ollama" | "openai"
@@ -252,22 +265,191 @@ engine = get_engine()
 # Can be disabled via DISABLE_TRACKER_AUTOSTART=1.
 try:
     if engine:
-        ensure_tracker_running(engine)
+        if callable(ensure_tracker_running):
+            ensure_tracker_running(engine)
 except Exception:
     pass
 
+# Best-effort: auto-start workflow runner if any workflow is running.
+# Can be disabled via DISABLE_WORKFLOW_AUTOSTART=1.
+try:
+    if engine:
+        if callable(ensure_workflow_runner_running):
+            ensure_workflow_runner_running(engine)
+except Exception:
+    pass
+
+
+@st.cache_data(ttl=600)
+def _db_dialect_name() -> str:
+    try:
+        return str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    except Exception:
+        return ""
+
+
+@st.cache_data(ttl=600)
+def _db_has_column(table_name: str, column_name: str) -> bool:
+    """
+    Safe schema check (cached). Never raises.
+    Supports MySQL and SQLite.
+    """
+    if not engine or not table_name or not column_name:
+        return False
+    try:
+        dialect = _db_dialect_name()
+        with engine.connect() as conn:
+            if "mysql" in dialect:
+                row = conn.execute(
+                    text(f"SHOW COLUMNS FROM {table_name} LIKE :c"),
+                    {"c": str(column_name)},
+                ).fetchone()
+                return bool(row)
+            if "sqlite" in dialect:
+                rows = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
+                return any(str(r[1]) == str(column_name) for r in (rows or []) if r and len(r) > 1)
+    except Exception:
+        return False
+    return False
+
+
+def ensure_perf_indexes():
+    """
+    Best-effort performance indexes.
+    Safe: ignored if index exists / no permissions / unsupported.
+    """
+    if not engine:
+        return
+    try:
+        if st.session_state.get("_perf_indexes_done"):
+            return
+        st.session_state["_perf_indexes_done"] = True
+    except Exception:
+        # No session available; still safe to run once.
+        pass
+
+    try:
+        dialect = _db_dialect_name()
+        with engine.connect() as conn:
+            # scan_parents: often filtered by env + status, ordered by last_seen_at.
+            try:
+                if "sqlite" in dialect:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_parents_env_status ON scan_parents(environment_id, scan_status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_parents_last_seen ON scan_parents(last_seen_at)"))
+                else:
+                    conn.execute(text("CREATE INDEX idx_scan_parents_env_status ON scan_parents(environment_id, scan_status)"))
+                    conn.execute(text("CREATE INDEX idx_scan_parents_last_seen ON scan_parents(last_seen_at)"))
+            except Exception:
+                pass
+
+            # scan_insights: joins on scan_id (unique), but we also sort/filter by updated_at.
+            try:
+                if "sqlite" in dialect:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_scan_insights_updated ON scan_insights(updated_at)"))
+                else:
+                    conn.execute(text("CREATE INDEX idx_scan_insights_updated ON scan_insights(updated_at)"))
+            except Exception:
+                pass
+
+            # benchmarks: common filters for trend pages.
+            try:
+                if "sqlite" in dialect:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_benchmarks_active ON benchmarks(is_active)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_benchmarks_filters ON benchmarks(file_set_type, scan_type, data_source_type)"))
+                else:
+                    conn.execute(text("CREATE INDEX idx_benchmarks_active ON benchmarks(is_active)"))
+                    conn.execute(text("CREATE INDEX idx_benchmarks_filters ON benchmarks(file_set_type, scan_type, data_source_type)"))
+            except Exception:
+                pass
+
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _ensure_throughput_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure throughput columns exist and are filled when possible.
+    Non-breaking: if required inputs are missing, leaves values as-is.
+    """
+    if df is None or df.empty:
+        return df
+    out = df
+    try:
+        if "total_scan_hours" not in out.columns:
+            return out
+        hours = pd.to_numeric(out["total_scan_hours"], errors="coerce")
+        # Prefer Total_* columns from the flattened dataset.
+        size_gb = pd.to_numeric(out["Total_Size_GB"], errors="coerce") if "Total_Size_GB" in out.columns else pd.Series([pd.NA] * len(out))
+        files = pd.to_numeric(out["Total_Files"], errors="coerce") if "Total_Files" in out.columns else pd.Series([pd.NA] * len(out))
+
+        safe_hours = hours.where((hours.notna()) & (hours > 0))
+        calc_gb = size_gb / safe_hours
+        calc_files = files / safe_hours
+
+        if "throughput_cluster_gb_hr" not in out.columns:
+            out["throughput_cluster_gb_hr"] = calc_gb
+        else:
+            existing = pd.to_numeric(out["throughput_cluster_gb_hr"], errors="coerce")
+            out["throughput_cluster_gb_hr"] = existing.fillna(calc_gb)
+
+        if "throughput_cluster_files_hr" not in out.columns:
+            out["throughput_cluster_files_hr"] = calc_files
+        else:
+            existing2 = pd.to_numeric(out["throughput_cluster_files_hr"], errors="coerce")
+            out["throughput_cluster_files_hr"] = existing2.fillna(calc_files)
+    except Exception:
+        return out
+    return out
+
 def load_data(include_inactive=False):
     if not engine: return pd.DataFrame()
+    ensure_perf_indexes()
     # Some historical rows may have NULL is_active; treat NULL as active.
     where_clause = "" if include_inactive else "WHERE COALESCE(b.is_active, 1) = 1"
     # Ensure optional columns exist (non-breaking for existing DBs)
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE benchmarks ADD COLUMN scenario_type VARCHAR(100)"))
+            # Classification metrics (manual benchmark meaning):
+            # - total_catalog_items is used as "New Attributes count" in your table
+            # Add missing fields so Trend chart can be complete.
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN total_classification BIGINT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN removed_attributes BIGINT NULL"))
+            except Exception:
+                pass
             conn.commit()
     except Exception:
         pass
     # Join Tables for Flat View
+    # Backward-compatible: if the DB user cannot ALTER, or columns don't exist yet,
+    # select NULL placeholders instead of failing.
+    has_total_classification = False
+    has_removed_attributes = False
+    try:
+        has_total_classification = _db_has_column("benchmarks", "total_classification")
+        has_removed_attributes = _db_has_column("benchmarks", "removed_attributes")
+    except Exception:
+        has_total_classification = False
+        has_removed_attributes = False
+
+    # Pull totals from scan_insights when available, without requiring benchmarks schema changes.
+    # If benchmarks has its own columns, prefer them but fall back to scan_insights.
+    total_class_expr = (
+        "COALESCE(b.total_classification, si.total_classification) as Total_Classification"
+        if has_total_classification
+        else "si.total_classification as Total_Classification"
+    )
+    removed_attr_expr = (
+        "COALESCE(b.removed_attributes, si.removed_attributes_count) as Removed_Attributes"
+        if has_removed_attributes
+        else "si.removed_attributes_count as Removed_Attributes"
+    )
+
     query = f"""
         SELECT 
             b.id,
@@ -284,7 +466,9 @@ def load_data(include_inactive=False):
             b.total_files as Total_Files,
             b.total_folders as Total_Folders,
             b.total_size_gb as Total_Size_GB,
-            b.total_catalog_items as Total_Catalog_Items,
+            b.total_catalog_items as New_Attributes,
+            {total_class_expr},
+            {removed_attr_expr},
             b.throughput_cluster_gb_hr,
             b.throughput_scanner_gb_hr,
             b.throughput_thread_gb_hr,
@@ -300,6 +484,7 @@ def load_data(include_inactive=False):
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
         LEFT JOIN classifiers c ON b.classifier_id = c.id
+        LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
         {where_clause}
     """
     try:
@@ -311,19 +496,23 @@ def load_data(include_inactive=False):
                 end = pd.to_datetime(df['scan_end_time'], errors='coerce')
                 calc_hours = (end - start).dt.total_seconds() / 3600
                 df['total_scan_hours'] = calc_hours.combine_first(df.get('total_scan_hours'))
-            for idx, row in df.iterrows():
-                sc = row.get('scanner_count')
-                tc = row.get('thread_count')
-                # GB/hr
-                if pd.notnull(row.get('throughput_cluster_gb_hr')) and pd.notnull(sc) and sc > 0:
-                    df.at[idx, 'throughput_scanner_gb_hr'] = row['throughput_cluster_gb_hr'] / sc
-                if pd.notnull(row.get('throughput_cluster_gb_hr')) and pd.notnull(tc) and tc > 0:
-                    df.at[idx, 'throughput_thread_gb_hr'] = row['throughput_cluster_gb_hr'] / tc
-                # Files/hr
-                if pd.notnull(row.get('throughput_cluster_files_hr')) and pd.notnull(sc) and sc > 0:
-                    df.at[idx, 'throughput_scanner_files_hr'] = row['throughput_cluster_files_hr'] / sc
-                if pd.notnull(row.get('throughput_cluster_files_hr')) and pd.notnull(tc) and tc > 0:
-                    df.at[idx, 'throughput_thread_files_hr'] = row['throughput_cluster_files_hr'] / tc
+            try:
+                sc = pd.to_numeric(df.get("scanner_count"), errors="coerce")
+                tc = pd.to_numeric(df.get("thread_count"), errors="coerce")
+                c_gb = pd.to_numeric(df.get("throughput_cluster_gb_hr"), errors="coerce")
+                c_f = pd.to_numeric(df.get("throughput_cluster_files_hr"), errors="coerce")
+
+                m_sc = c_gb.notna() & sc.notna() & (sc > 0)
+                m_tc = c_gb.notna() & tc.notna() & (tc > 0)
+                df.loc[m_sc, "throughput_scanner_gb_hr"] = (c_gb[m_sc] / sc[m_sc]).astype(float)
+                df.loc[m_tc, "throughput_thread_gb_hr"] = (c_gb[m_tc] / tc[m_tc]).astype(float)
+
+                m_sc2 = c_f.notna() & sc.notna() & (sc > 0)
+                m_tc2 = c_f.notna() & tc.notna() & (tc > 0)
+                df.loc[m_sc2, "throughput_scanner_files_hr"] = (c_f[m_sc2] / sc[m_sc2]).astype(float)
+                df.loc[m_tc2, "throughput_thread_files_hr"] = (c_f[m_tc2] / tc[m_tc2]).astype(float)
+            except Exception:
+                pass
         return df
     except Exception as e:
         st.error(f"Error loading data: {e}")
@@ -379,7 +568,13 @@ def page_overview(df):
         return group.iloc[0]
     
     if not filtered_df.empty:
-        filtered_df = filtered_df.groupby(['Build_Version', 'Data_Source_Type'], as_index=False).apply(select_best_run).reset_index(drop=True)
+        gb = filtered_df.groupby(["Build_Version", "Data_Source_Type"], group_keys=False, sort=False)
+        try:
+            # Pandas 2.x: avoid deprecated behavior of including grouping columns in apply().
+            filtered_df = gb.apply(select_best_run, include_groups=False).reset_index(drop=True)
+        except TypeError:
+            # Older Pandas: no include_groups arg.
+            filtered_df = gb.apply(select_best_run).reset_index(drop=True)
 
     # KPIs
     st.markdown("### Key Metrics")
@@ -1529,6 +1724,140 @@ def fetch_scanner_groups_with_auth_retry(env_row):
         return fetch_scanner_groups_from_api(base_url, token)
 
 
+def extract_scan_templates_payload(payload):
+    """
+    Returns (items, total_count) for scan templates response.
+    """
+    items = []
+    total_count = None
+    if isinstance(payload, dict):
+        data_block = payload.get("data")
+        root = data_block if isinstance(data_block, dict) else payload
+        for key in ["scanTemplates", "scan_templates", "templates", "items", "results"]:
+            val = root.get(key)
+            if isinstance(val, list):
+                items = [x for x in val if isinstance(x, dict)]
+                break
+        if root.get("totalCount") is not None:
+            try:
+                total_count = int(root.get("totalCount"))
+            except Exception:
+                total_count = None
+    return items, total_count
+
+
+def fetch_scan_templates_from_api(base_url, token, *, limit: int = 200, skip: int = 0):
+    url = build_api_url(base_url, INTERNAL_SCAN_TEMPLATES_API_PATH)
+    params = {
+        "skip": int(skip),
+        "limit": int(limit),
+        "requireTotalCount": "true",
+        # Match UI request shape: no-op filter + updated_at desc, name asc
+        "filter": json.dumps([{"field": "_id", "value": [], "operator": "notIn"}], separators=(",", ":")),
+        "sort": json.dumps(
+            [{"field": "updated_at", "order": "desc"}, {"field": "name", "order": "asc"}],
+            separators=(",", ":"),
+        ),
+    }
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = requests.get(url, params=params, headers=headers_raw, timeout=45)
+    if resp.status_code in (401, 403) and token:
+        resp = requests.get(url, params=params, headers=headers_bearer, timeout=45)
+    if resp.status_code in (401, 403):
+        if not token:
+            raise RuntimeError(
+                "Scan templates API requires authentication token. "
+                "Set BIGID_AUTH_TOKEN or BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD."
+            )
+        raise RuntimeError("Authentication token is invalid or expired for scan templates API.")
+    resp.raise_for_status()
+    payload = resp.json()
+    items, total_count = extract_scan_templates_payload(payload)
+    return items, total_count, getattr(resp, "url", url)
+
+
+def fetch_scan_templates_with_auth_retry(env_row, *, limit: int = 200, skip: int = 0):
+    env_row = env_row or {}
+    base_url = env_row.get("base_url")
+    try:
+        return fetch_scan_templates_from_api(base_url, "", limit=limit, skip=skip)
+    except Exception as ex:
+        msg = str(ex).lower()
+        if "requires authentication token" in msg or "unauthorized" in msg:
+            token = fetch_auth_token_for_env(env_row)
+            return fetch_scan_templates_from_api(base_url, token, limit=limit, skip=skip)
+        if "invalid or expired" in msg and "auth_token_cache" in st.session_state:
+            try:
+                key = normalize_base_url(base_url)
+                st.session_state.get("auth_token_cache", {}).pop(key, None)
+            except Exception:
+                pass
+            fresh = fetch_auth_token_for_env(env_row)
+            return fetch_scan_templates_from_api(base_url, fresh, limit=limit, skip=skip)
+        token = fetch_auth_token_for_env(env_row)
+        return fetch_scan_templates_from_api(base_url, token, limit=limit, skip=skip)
+
+
+def _normalize_template_name(s: Any) -> str:
+    return str(s or "").strip().lower()
+
+
+def ensure_env_default_scan_template_id(env_row: Dict[str, Any]) -> str:
+    """
+    Automatic: if config::scan_template_id::env=<id> is missing, fetch /scan-templates and save
+    the template id for "Data source scan".
+    """
+    try:
+        env_id = int(env_row.get("id")) if env_row and env_row.get("id") is not None else None
+    except Exception:
+        env_id = None
+    if env_id is None:
+        return ""
+    key_env = f"config::scan_template_id::env={int(env_id)}"
+    try:
+        existing = str(get_workflow_template_payload(key_env) or "").strip()
+        if existing:
+            return existing
+    except Exception:
+        existing = ""
+
+    # Avoid repeated API calls in one session
+    cache_key = f"_auto_scan_template_done::{int(env_id)}"
+    try:
+        if st.session_state.get(cache_key):
+            return ""
+    except Exception:
+        pass
+
+    try:
+        items, _total, _url = fetch_scan_templates_with_auth_retry(env_row, limit=200, skip=0)
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            nm = _normalize_template_name(it.get("name"))
+            if nm in {"data source scan", "data source scan "}:
+                tid = str(it.get("_id") or it.get("id") or "").strip()
+                if tid:
+                    upsert_workflow_template(key_env, "config", tid)
+                    try:
+                        st.session_state[cache_key] = True
+                    except Exception:
+                        pass
+                    return tid
+        try:
+            st.session_state[cache_key] = True
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        try:
+            st.session_state[cache_key] = True
+        except Exception:
+            pass
+        return ""
+
+
 def put_ds_connection_from_api(base_url, ds_name, token, payload):
     from urllib.parse import quote
 
@@ -2083,18 +2412,44 @@ def get_classifier_names_for_env_version(environment_id, version_value):
 def save_classifiers_to_db(classifier_names):
     if not engine:
         return 0
-    inserted = 0
+    cleaned = []
+    seen = set()
+    for name in classifier_names or []:
+        clean = str(name).strip()
+        if not clean or re.match(r"^\d+\s+Classifiers\s+from\s+Global\s+list$", clean, flags=re.IGNORECASE):
+            continue
+        k = clean.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        cleaned.append(clean)
+    if not cleaned:
+        return 0
+
+    def _in_params(values, prefix="v"):
+        vals = list(values or [])
+        params = {f"{prefix}{i}": v for i, v in enumerate(vals)}
+        clause = "(" + ",".join([f":{prefix}{i}" for i in range(len(vals))]) + ")"
+        return clause, params
+
+    dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
+    insert_ignore = "INSERT OR IGNORE" if dialect.lower() == "sqlite" else "INSERT IGNORE"
+
     with engine.connect() as conn:
-        for name in classifier_names:
-            clean = str(name).strip()
-            if not clean or re.match(r"^\d+\s+Classifiers\s+from\s+Global\s+list$", clean, flags=re.IGNORECASE):
-                continue
-            exists = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": clean}).fetchone()
-            if not exists:
-                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": clean})
-                inserted += 1
+        clause, params = _in_params(cleaned, prefix="n")
+        existing = conn.execute(
+            text(f"SELECT name FROM classifiers WHERE name IN {clause}"),
+            params,
+        ).fetchall()
+        existing_names = {str(r[0]) for r in existing if r and r[0]}
+        missing = [n for n in cleaned if n not in existing_names]
+        if missing:
+            conn.execute(
+                text(f"{insert_ignore} INTO classifiers (name) VALUES (:n)"),
+                [{"n": n} for n in missing],
+            )
         conn.commit()
-    return inserted
+    return len(missing)
 
 
 def create_or_get_classifier_set(classifier_names):
@@ -2122,43 +2477,65 @@ def create_or_get_classifier_set(classifier_names):
     if not cleaned:
         return None, 0, 0
 
+    def _in_params(values, prefix="v"):
+        vals = list(values or [])
+        params = {f"{prefix}{i}": v for i, v in enumerate(vals)}
+        clause = "(" + ",".join([f":{prefix}{i}" for i in range(len(vals))]) + ")"
+        return clause, params
+
+    dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
+    insert_ignore = "INSERT OR IGNORE" if dialect.lower() == "sqlite" else "INSERT IGNORE"
+
     new_classifiers = 0
     with engine.connect() as conn:
-        classifier_ids = []
-        for name in sorted(cleaned, key=lambda x: x.lower()):
-            row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
-            if row:
-                classifier_ids.append(int(row[0]))
-            else:
-                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": name})
-                new_classifiers += 1
-                row2 = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
-                classifier_ids.append(int(row2[0]))
+        ordered = sorted(cleaned, key=lambda x: x.lower())
+        clause, params = _in_params(ordered, prefix="n")
+        rows = conn.execute(
+            text(f"SELECT id, name FROM classifiers WHERE name IN {clause}"),
+            params,
+        ).fetchall()
+        name_to_id = {str(r[1]): int(r[0]) for r in rows if r and r[0] and r[1]}
+        missing = [n for n in ordered if n not in name_to_id]
+        if missing:
+            # Bulk insert missing classifiers then re-select ids once.
+            conn.execute(
+                text(f"{insert_ignore} INTO classifiers (name) VALUES (:n)"),
+                [{"n": n} for n in missing],
+            )
+            new_classifiers = len(missing)
+            rows2 = conn.execute(
+                text(f"SELECT id, name FROM classifiers WHERE name IN {clause}"),
+                params,
+            ).fetchall()
+            name_to_id = {str(r[1]): int(r[0]) for r in rows2 if r and r[0] and r[1]}
 
-        classifier_ids = sorted(set(classifier_ids))
+        classifier_ids = sorted({int(name_to_id[n]) for n in name_to_id})
         set_hash = hashlib.md5(",".join(str(i) for i in classifier_ids).encode()).hexdigest()
 
-        set_row = conn.execute(text("SELECT id FROM classifier_sets WHERE set_hash = :h"), {"h": set_hash}).fetchone()
+        set_row = conn.execute(
+            text("SELECT id FROM classifier_sets WHERE set_hash = :h"),
+            {"h": set_hash},
+        ).fetchone()
         if set_row:
             set_id = int(set_row[0])
         else:
             conn.execute(
-                text("INSERT INTO classifier_sets (set_hash, classifier_count) VALUES (:h, :c)"),
-                {"h": set_hash, "c": len(classifier_ids)}
+                text(f"{insert_ignore} INTO classifier_sets (set_hash, classifier_count) VALUES (:h, :c)"),
+                {"h": set_hash, "c": len(classifier_ids)},
             )
-            set_id = int(conn.execute(text("SELECT id FROM classifier_sets WHERE set_hash = :h"), {"h": set_hash}).fetchone()[0])
+            set_id = int(conn.execute(
+                text("SELECT id FROM classifier_sets WHERE set_hash = :h"),
+                {"h": set_hash},
+            ).fetchone()[0])
 
-        for cid in classifier_ids:
-            conn.execute(
-                text("""
-                    INSERT IGNORE INTO classifier_set_members (set_id, classifier_id)
-                    VALUES (:s, :c)
-                """),
-                {"s": set_id, "c": cid}
-            )
+        # Bulk insert members (ignore duplicates).
+        conn.execute(
+            text(f"{insert_ignore} INTO classifier_set_members (set_id, classifier_id) VALUES (:s, :c)"),
+            [{"s": set_id, "c": int(cid)} for cid in classifier_ids],
+        )
         conn.execute(
             text("UPDATE classifier_sets SET classifier_count = :c WHERE id = :s"),
-            {"c": len(classifier_ids), "s": set_id}
+            {"c": len(classifier_ids), "s": set_id},
         )
         conn.commit()
     return set_id, len(cleaned), new_classifiers
@@ -2192,68 +2569,108 @@ def sync_build_classifier_mappings(build_version, classifier_names, environment_
     if not cleaned:
         return {"new_classifiers": 0, "new_links": 0, "total_links_for_build": 0, "build_id": None}
 
+    def _in_params(values, prefix="v"):
+        vals = list(values or [])
+        params = {f"{prefix}{i}": v for i, v in enumerate(vals)}
+        clause = "(" + ",".join([f":{prefix}{i}" for i in range(len(vals))]) + ")"
+        return clause, params
+
+    dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
+    insert_ignore = "INSERT OR IGNORE" if dialect.lower() == "sqlite" else "INSERT IGNORE"
+
     new_classifiers = 0
     new_links = 0
     with engine.connect() as conn:
         build_id = get_or_create_id(conn, "builds", "version", build_version)
         env_id = int(environment_id) if environment_id is not None else None
-        for name in cleaned:
-            row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()
-            if row:
-                classifier_id = int(row[0])
-            else:
-                conn.execute(text("INSERT INTO classifiers (name) VALUES (:n)"), {"n": name})
-                new_classifiers += 1
-                classifier_id = int(conn.execute(text("SELECT id FROM classifiers WHERE name = :n"), {"n": name}).fetchone()[0])
 
-            if env_id is None:
-                link = conn.execute(
-                    text("""
-                        SELECT id
-                        FROM build_classifier_mappings
-                        WHERE build_id = :b AND classifier_id = :c AND environment_id IS NULL
-                    """),
-                    {"b": int(build_id), "c": int(classifier_id)}
-                ).fetchone()
-            else:
-                link = conn.execute(
-                    text("""
-                        SELECT id
-                        FROM build_classifier_mappings
-                        WHERE build_id = :b AND classifier_id = :c AND environment_id = :e
-                    """),
-                    {"b": int(build_id), "c": int(classifier_id), "e": env_id}
-                ).fetchone()
+        # 1) Ensure all classifiers exist (bulk), then fetch ids (single select).
+        clause, params = _in_params(cleaned, prefix="n")
+        rows = conn.execute(
+            text(f"SELECT id, name FROM classifiers WHERE name IN {clause}"),
+            params,
+        ).fetchall()
+        name_to_id = {str(r[1]): int(r[0]) for r in rows if r and r[0] and r[1]}
+        missing = [n for n in cleaned if n not in name_to_id]
+        if missing:
+            conn.execute(
+                text(f"{insert_ignore} INTO classifiers (name) VALUES (:n)"),
+                [{"n": n} for n in missing],
+            )
+            new_classifiers = len(missing)
+            rows2 = conn.execute(
+                text(f"SELECT id, name FROM classifiers WHERE name IN {clause}"),
+                params,
+            ).fetchall()
+            name_to_id = {str(r[1]): int(r[0]) for r in rows2 if r and r[0] and r[1]}
 
-            if link:
-                conn.execute(
-                    text("""
-                        UPDATE build_classifier_mappings
-                        SET last_synced_at = CURRENT_TIMESTAMP
-                        WHERE id = :id
-                    """),
-                    {"id": int(link[0])}
-                )
-            else:
-                conn.execute(
-                    text("""
-                        INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
-                        VALUES (:b, :c, :e)
-                    """),
-                    {"b": int(build_id), "c": int(classifier_id), "e": env_id}
-                )
-                new_links += 1
+        classifier_ids = sorted({int(name_to_id[n]) for n in name_to_id})
+        if not classifier_ids:
+            return {"new_classifiers": new_classifiers, "new_links": 0, "total_links_for_build": 0, "build_id": build_id}
 
+        # 2) Find existing links (single select) and bulk insert missing links.
+        cid_clause, cid_params = _in_params(classifier_ids, prefix="c")
+        link_params = {"b": int(build_id), **cid_params}
         if env_id is None:
+            existing_links = conn.execute(
+                text(f"""
+                    SELECT DISTINCT classifier_id
+                    FROM build_classifier_mappings
+                    WHERE build_id = :b
+                      AND environment_id IS NULL
+                      AND classifier_id IN {cid_clause}
+                """),
+                link_params,
+            ).fetchall()
+        else:
+            link_params["e"] = int(env_id)
+            existing_links = conn.execute(
+                text(f"""
+                    SELECT DISTINCT classifier_id
+                    FROM build_classifier_mappings
+                    WHERE build_id = :b
+                      AND environment_id = :e
+                      AND classifier_id IN {cid_clause}
+                """),
+                link_params,
+            ).fetchall()
+        existing_ids = {int(r[0]) for r in existing_links if r and r[0] is not None}
+        missing_ids = [cid for cid in classifier_ids if cid not in existing_ids]
+        if missing_ids:
+            conn.execute(
+                text(f"{insert_ignore} INTO build_classifier_mappings (build_id, classifier_id, environment_id) VALUES (:b, :c, :e)"),
+                [{"b": int(build_id), "c": int(cid), "e": (int(env_id) if env_id is not None else None)} for cid in missing_ids],
+            )
+            new_links = len(missing_ids)
+
+        # 3) Touch last_synced_at once for this build+env.
+        if env_id is None:
+            conn.execute(
+                text("""
+                    UPDATE build_classifier_mappings
+                    SET last_synced_at = CURRENT_TIMESTAMP
+                    WHERE build_id = :b AND environment_id IS NULL
+                """),
+                {"b": int(build_id)},
+            )
             total_links = int(conn.execute(
-                text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b"),
-                {"b": int(build_id)}
+                text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b AND environment_id IS NULL"),
+                {"b": int(build_id)},
             ).fetchone()[0])
         else:
+            conn.execute(
+                text("""
+                    UPDATE build_classifier_mappings
+                    SET last_synced_at = CURRENT_TIMESTAMP
+                    WHERE build_id = :b AND environment_id = :e
+                """),
+                {"b": int(build_id), "e": int(env_id)},
+            )
             total_links = int(conn.execute(
                 text("SELECT COUNT(*) FROM build_classifier_mappings WHERE build_id = :b AND environment_id = :e"),
-                {"b": int(build_id), "e": env_id}
+                {"b": int(build_id), "e": int(env_id)},
             ).fetchone()[0])
+
         conn.commit()
 
     return {
@@ -2271,34 +2688,40 @@ def clone_build_mappings_to_environment(environment_id, build_version):
     """
     if not engine or environment_id is None or not build_version:
         return 0
-    inserted = 0
+    dialect = getattr(getattr(engine, "dialect", None), "name", "") or ""
+    insert_ignore = "INSERT OR IGNORE" if dialect.lower() == "sqlite" else "INSERT IGNORE"
     with engine.connect() as conn:
         b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": str(build_version)}).fetchone()
         if not b_row:
             return 0
         build_id = int(b_row[0])
 
-        src_rows = conn.execute(text("""
-            SELECT DISTINCT classifier_id
-            FROM build_classifier_mappings
-            WHERE build_id = :b
-              AND classifier_id IS NOT NULL
-        """), {"b": build_id}).fetchall()
+        # One-shot clone: insert any missing (build_id, classifier_id, environment_id) rows.
+        result = conn.execute(
+            text(f"""
+                {insert_ignore} INTO build_classifier_mappings (build_id, classifier_id, environment_id)
+                SELECT :b, bcm.classifier_id, :e
+                FROM build_classifier_mappings bcm
+                WHERE bcm.build_id = :b
+                  AND bcm.classifier_id IS NOT NULL
+                GROUP BY bcm.classifier_id
+            """),
+            {"b": int(build_id), "e": int(environment_id)},
+        )
+        try:
+            inserted = int(getattr(result, "rowcount", 0) or 0)
+        except Exception:
+            inserted = 0
 
-        for (classifier_id,) in src_rows:
-            exists = conn.execute(text("""
-                SELECT id
-                FROM build_classifier_mappings
-                WHERE build_id = :b AND classifier_id = :c AND environment_id = :e
-                LIMIT 1
-            """), {"b": build_id, "c": int(classifier_id), "e": int(environment_id)}).fetchone()
-            if exists:
-                continue
-            conn.execute(text("""
-                INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
-                VALUES (:b, :c, :e)
-            """), {"b": build_id, "c": int(classifier_id), "e": int(environment_id)})
-            inserted += 1
+        # Touch last_synced_at once.
+        conn.execute(
+            text("""
+                UPDATE build_classifier_mappings
+                SET last_synced_at = CURRENT_TIMESTAMP
+                WHERE build_id = :b AND environment_id = :e
+            """),
+            {"b": int(build_id), "e": int(environment_id)},
+        )
         conn.commit()
     return inserted
 
@@ -2461,6 +2884,8 @@ def ensure_auto_scan_benchmarks_table():
                 conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_size_gb FLOAT NULL"))
                 conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_files BIGINT NULL"))
                 conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN total_folders BIGINT NULL"))
+                conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN throughput_cluster_gb_hr FLOAT NULL"))
+                conn.execute(text("ALTER TABLE auto_scan_benchmarks ADD COLUMN throughput_cluster_files_hr FLOAT NULL"))
                 conn.commit()
             except Exception:
                 pass
@@ -2541,6 +2966,597 @@ def ensure_scan_progress_table():
             conn.commit()
     except Exception:
         pass
+
+
+def ensure_workflow_tables():
+    """
+    DB-backed workflow to orchestrate DS + scan creation/runs.
+    UI-first: this just stores the plan + state so a background runner can execute it.
+    """
+    if not engine:
+        return
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_runs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NULL,
+                        status TEXT NULL,
+                        env1_id INTEGER NULL,
+                        env2_id INTEGER NULL,
+                        cooldown_minutes INTEGER DEFAULT 15,
+                        next_eligible_at TEXT NULL,
+                        last_error TEXT NULL,
+                        started_at TEXT NULL,
+                        finished_at TEXT NULL,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_steps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id INTEGER NOT NULL,
+                        seq INTEGER NOT NULL,
+                        environment_id INTEGER NULL,
+                        ds_kind TEXT NULL,
+                        ds_name TEXT NULL,
+                        scan_kind TEXT NULL,
+                        file_set_type TEXT NULL,
+                        is_enabled INTEGER DEFAULT 1,
+                        is_acl INTEGER DEFAULT 0,
+                        is_ocr INTEGER DEFAULT 0,
+                        is_structured_ff INTEGER DEFAULT 0,
+                        is_ols INTEGER DEFAULT 0,
+                        feature_flags TEXT NULL,
+                        notes TEXT NULL,
+                        ds_id TEXT NULL,
+                        scan_profile_id TEXT NULL,
+                        scan_profile_name TEXT NULL,
+                        build_version TEXT NULL,
+                        build_prefix TEXT NULL,
+                        scan_id TEXT NULL,
+                        status TEXT NULL,
+                        last_error TEXT NULL,
+                        started_at TEXT NULL,
+                        finished_at TEXT NULL,
+                        created_at TEXT DEFAULT (datetime('now')),
+                        updated_at TEXT DEFAULT (datetime('now')),
+                        UNIQUE(run_id, seq)
+                    )
+                """))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS workflow_templates (
+                        k TEXT PRIMARY KEY,
+                        template_kind TEXT NULL,
+                        payload_json TEXT NULL,
+                        updated_at TEXT DEFAULT (datetime('now'))
+                    )
+                """))
+                # Non-breaking upgrades for existing sqlite DBs
+                for stmt in [
+                    "ALTER TABLE workflow_steps ADD COLUMN is_enabled INTEGER DEFAULT 1",
+                    "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
+                    "ALTER TABLE workflow_templates ADD COLUMN template_kind TEXT NULL",
+                    "ALTER TABLE workflow_templates ADD COLUMN payload_json TEXT NULL",
+                ]:
+                    try:
+                        conn.execute(text(stmt))
+                    except Exception:
+                        pass
+                try:
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_run_seq ON workflow_steps(run_id, seq)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status)"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_templates_kind ON workflow_templates(template_kind)"))
+                except Exception:
+                    pass
+                conn.commit()
+                return
+
+            # MySQL / others
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    name VARCHAR(255) NULL,
+                    status VARCHAR(32) NULL,
+                    env1_id INT NULL,
+                    env2_id INT NULL,
+                    cooldown_minutes INT DEFAULT 15,
+                    next_eligible_at DATETIME NULL,
+                    last_error TEXT NULL,
+                    started_at DATETIME NULL,
+                    finished_at DATETIME NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_workflow_runs_status (status)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_steps (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    run_id INT NOT NULL,
+                    seq INT NOT NULL,
+                    environment_id INT NULL,
+                    ds_kind VARCHAR(64) NULL,
+                    ds_name VARCHAR(500) NULL,
+                    scan_kind VARCHAR(64) NULL,
+                    file_set_type VARCHAR(150) NULL,
+                    is_enabled BOOLEAN DEFAULT TRUE,
+                    is_acl BOOLEAN DEFAULT FALSE,
+                    is_ocr BOOLEAN DEFAULT FALSE,
+                    is_structured_ff BOOLEAN DEFAULT FALSE,
+                    is_ols BOOLEAN DEFAULT FALSE,
+                    feature_flags VARCHAR(500) NULL,
+                    notes VARCHAR(1000) NULL,
+                    ds_id VARCHAR(128) NULL,
+                    scan_profile_id VARCHAR(128) NULL,
+                    scan_profile_name VARCHAR(500) NULL,
+                    build_version VARCHAR(50) NULL,
+                    build_prefix VARCHAR(20) NULL,
+                    scan_id VARCHAR(128) NULL,
+                    status VARCHAR(32) NULL,
+                    last_error TEXT NULL,
+                    started_at DATETIME NULL,
+                    finished_at DATETIME NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_workflow_step (run_id, seq),
+                    INDEX idx_workflow_steps_run_seq (run_id, seq),
+                    INDEX idx_workflow_steps_status (status)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    k VARCHAR(200) PRIMARY KEY,
+                    template_kind VARCHAR(32) NULL,
+                    payload_json LONGTEXT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_workflow_templates_kind (template_kind)
+                )
+            """))
+            # Non-breaking upgrades for existing MySQL DBs
+            for stmt in [
+                "ALTER TABLE workflow_steps ADD COLUMN is_enabled BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE workflow_steps ADD COLUMN scan_profile_id VARCHAR(128) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
+                "ALTER TABLE workflow_templates ADD COLUMN template_kind VARCHAR(32) NULL",
+                "ALTER TABLE workflow_templates ADD COLUMN payload_json LONGTEXT NULL",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                    conn.commit()
+                except Exception:
+                    pass
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _workflow_now_utc() -> datetime:
+    return datetime.utcnow()
+
+
+def create_workflow_run(
+    name: str,
+    env1_id: Optional[int],
+    env2_id: Optional[int],
+    steps: List[Dict[str, Any]],
+    cooldown_minutes: int = 15,
+) -> Optional[int]:
+    if not engine:
+        return None
+    ensure_workflow_tables()
+    nm = str(name or "").strip() or f"workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+    try:
+        cd = int(cooldown_minutes)
+    except Exception:
+        cd = 15
+
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+
+    with engine.connect() as conn:
+        if "sqlite" in dialect:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes, created_at, updated_at)
+                    VALUES (:n, :s, :e1, :e2, :cd, datetime('now'), datetime('now'))
+                """),
+                {"n": nm, "s": "created", "e1": env1_id, "e2": env2_id, "cd": cd},
+            )
+            run_id = conn.execute(text("SELECT last_insert_rowid()")).fetchone()[0]
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes)
+                    VALUES (:n, :s, :e1, :e2, :cd)
+                """),
+                {"n": nm, "s": "created", "e1": env1_id, "e2": env2_id, "cd": cd},
+            )
+            run_id = conn.execute(text("SELECT LAST_INSERT_ID()")).fetchone()[0]
+
+        # Insert steps (seq starts at 1)
+        seq_rows = []
+        for i, stp in enumerate(steps or [], start=1):
+            if not isinstance(stp, dict):
+                continue
+            enabled = bool(stp.get("is_enabled", True))
+            seq_rows.append({
+                "rid": int(run_id),
+                "seq": int(i),
+                "eid": stp.get("environment_id"),
+                "dk": str(stp.get("ds_kind") or "").strip() or None,
+                "dn": str(stp.get("ds_name") or "").strip() or None,
+                "sk": str(stp.get("scan_kind") or "").strip() or None,
+                "fs": str(stp.get("file_set_type") or "").strip() or None,
+                "en": 1 if enabled else 0,
+                "acl": 1 if bool(stp.get("is_acl")) else 0,
+                "ocr": 1 if bool(stp.get("is_ocr")) else 0,
+                "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
+                "ols": 1 if bool(stp.get("is_ols")) else 0,
+                "ff": str(stp.get("feature_flags") or "").strip() or None,
+                "notes": str(stp.get("notes") or "").strip() or None,
+                "status": ("pending" if enabled else "disabled"),
+            })
+        if seq_rows:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_steps (
+                        run_id, seq, environment_id,
+                        ds_kind, ds_name, scan_kind, file_set_type,
+                        is_enabled,
+                        is_acl, is_ocr, is_structured_ff, is_ols,
+                        feature_flags, notes, status
+                    )
+                    VALUES (
+                        :rid, :seq, :eid,
+                        :dk, :dn, :sk, :fs,
+                        :en,
+                        :acl, :ocr, :sff, :ols,
+                        :ff, :notes, :status
+                    )
+                """),
+                seq_rows,
+            )
+        conn.commit()
+    try:
+        return int(run_id)
+    except Exception:
+        return None
+
+
+def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
+    ensure_workflow_tables()
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        wr.id,
+                        wr.name,
+                        wr.status,
+                        wr.env1_id,
+                        wr.env2_id,
+                        wr.cooldown_minutes,
+                        wr.next_eligible_at,
+                        wr.started_at,
+                        wr.finished_at,
+                        wr.updated_at,
+                        wr.created_at,
+                        wr.last_error
+                    FROM workflow_runs wr
+                    ORDER BY wr.id DESC
+                    LIMIT :lim
+                """),
+                {"lim": int(limit)},
+            ).fetchall()
+        cols = [
+            "id","name","status","env1_id","env2_id","cooldown_minutes",
+            "next_eligible_at","started_at","finished_at","updated_at","created_at","last_error",
+        ]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_workflow_steps(run_id: int) -> pd.DataFrame:
+    ensure_workflow_tables()
+    if not engine or run_id is None:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        ws.id,
+                        ws.run_id,
+                        ws.seq,
+                        ws.environment_id,
+                        te.env_name,
+                        ws.ds_kind,
+                        ws.ds_name,
+                        ws.scan_kind,
+                        ws.file_set_type,
+                        ws.is_enabled,
+                        ws.is_acl,
+                        ws.is_ocr,
+                        ws.is_structured_ff,
+                        ws.is_ols,
+                        ws.feature_flags,
+                        ws.notes,
+                        ws.ds_id,
+                    ws.scan_profile_id,
+                    ws.scan_profile_name,
+                    ws.build_version,
+                    ws.build_prefix,
+                        ws.scan_id,
+                        ws.status,
+                        ws.started_at,
+                        ws.finished_at,
+                        ws.updated_at,
+                        ws.last_error
+                    FROM workflow_steps ws
+                    LEFT JOIN test_environments te ON te.id = ws.environment_id
+                    WHERE ws.run_id = :rid
+                    ORDER BY ws.seq ASC
+                """),
+                {"rid": int(run_id)},
+            ).fetchall()
+        cols = [
+            "id","run_id","seq","environment_id","environment",
+            "ds_kind","ds_name","scan_kind","file_set_type",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
+            "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
+            "status","started_at","finished_at","updated_at","last_error",
+        ]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
+def set_workflow_run_status(run_id: int, status: str, *, last_error: Optional[str] = None) -> None:
+    if not engine or run_id is None:
+        return
+    ensure_workflow_tables()
+    stv = str(status or "").strip()
+    if not stv:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    UPDATE workflow_runs
+                    SET status = :s, last_error = COALESCE(:e, last_error)
+                    WHERE id = :rid
+                """),
+                {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _workflow_ds_template_key(step: Dict[str, Any]) -> str:
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip() or "default"
+    acl = 1 if bool(step.get("is_acl")) else 0
+    struct = 1 if bool(step.get("is_structured_ff")) else 0
+    return f"ds::{ds_kind}::{fs}::acl={acl}::struct={struct}"
+
+
+def _workflow_scan_template_key(step: Dict[str, Any]) -> str:
+    ds_kind = str(step.get("ds_kind") or "").strip().lower()
+    fs = str(step.get("file_set_type") or "").strip() or "default"
+    acl = 1 if bool(step.get("is_acl")) else 0
+    ols = 1 if bool(step.get("is_ols")) else 0
+    struct = 1 if bool(step.get("is_structured_ff")) else 0
+    return f"scan::{ds_kind}::{fs}::acl={acl}::ols={ols}::struct={struct}"
+
+
+def upsert_workflow_template(key: str, template_kind: str, payload_json: str) -> None:
+    ensure_workflow_tables()
+    if not engine:
+        return
+    k = str(key or "").strip()
+    if not k:
+        return
+    tk = str(template_kind or "").strip() or None
+    pj = str(payload_json or "").strip() or None
+    try:
+        dialect = _db_dialect_name()
+    except Exception:
+        dialect = ""
+    try:
+        with engine.connect() as conn:
+            if "sqlite" in dialect:
+                conn.execute(
+                    text("""
+                        INSERT INTO workflow_templates (k, template_kind, payload_json, updated_at)
+                        VALUES (:k, :t, :p, datetime('now'))
+                        ON CONFLICT(k) DO UPDATE SET
+                            template_kind=excluded.template_kind,
+                            payload_json=excluded.payload_json,
+                            updated_at=datetime('now')
+                    """),
+                    {"k": k, "t": tk, "p": pj},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO workflow_templates (k, template_kind, payload_json)
+                        VALUES (:k, :t, :p)
+                        ON DUPLICATE KEY UPDATE
+                            template_kind=VALUES(template_kind),
+                            payload_json=VALUES(payload_json),
+                            updated_at=CURRENT_TIMESTAMP
+                    """),
+                    {"k": k, "t": tk, "p": pj},
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def get_workflow_template_payload(key: str) -> str:
+    ensure_workflow_tables()
+    if not engine:
+        return ""
+    k = str(key or "").strip()
+    if not k:
+        return ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT payload_json FROM workflow_templates WHERE k = :k LIMIT 1"),
+                {"k": k},
+            ).fetchone()
+        return str(row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+
+
+def _is_terminal_state_anywhere(state: Any) -> bool:
+    s = str(state or "").strip().lower().replace(" ", "")
+    return s in {"failed","completedwithfailures","completed","stopped","aborted","cancelled","canceled"}
+
+
+def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
+    """
+    Best-effort reconciliation using DB scan status.
+    - Marks workflow step completed if its scan_id is terminal in scan_parents or scan_progress
+    - Advances run.next_eligible_at after a step completes
+    """
+    out = {"updated_steps": 0, "completed_run": False}
+    if not engine or run_id is None:
+        return out
+    ensure_workflow_tables()
+    try:
+        steps_df = load_workflow_steps(int(run_id))
+        if steps_df.empty:
+            return out
+    except Exception:
+        return out
+
+    # Find steps that have scan_id and are not completed yet.
+    try:
+        pending = steps_df[steps_df["status"].astype(str).isin(["pending", "running", "created", "scan_running", "ds_created", "scan_created"])]
+    except Exception:
+        pending = steps_df
+    scan_ids = [str(x).strip() for x in pending.get("scan_id", pd.Series(dtype=str)).tolist() if str(x).strip()]
+
+    # Resolve latest statuses for scan_ids (if any)
+    status_map: Dict[str, str] = {}
+    if scan_ids:
+        try:
+            from sqlalchemy import bindparam
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text("""
+                        SELECT scan_id, scan_status
+                        FROM scan_parents
+                        WHERE scan_id IN :ids
+                    """).bindparams(bindparam("ids", expanding=True)),
+                    {"ids": scan_ids},
+                ).fetchall()
+            for r in rows or []:
+                sid = str(r[0] or "").strip()
+                if sid:
+                    status_map[sid] = str(r[1] or "").strip()
+        except Exception:
+            pass
+        try:
+            p_map = load_latest_scan_progress_state_map(scan_ids)
+            for sid, stv in (p_map or {}).items():
+                if sid and sid not in status_map:
+                    status_map[str(sid)] = str(stv or "").strip()
+        except Exception:
+            pass
+
+    updated = 0
+    now = _workflow_now_utc()
+    try:
+        cooldown = None
+        with engine.connect() as conn:
+            r = conn.execute(text("SELECT cooldown_minutes FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
+            if r:
+                try:
+                    cooldown = int(r[0]) if r[0] is not None else 15
+                except Exception:
+                    cooldown = 15
+    except Exception:
+        cooldown = 15
+    if cooldown is None:
+        cooldown = 15
+
+    if scan_ids:
+        try:
+            with engine.connect() as conn:
+                for row in pending.itertuples():
+                    sid = str(getattr(row, "scan_id", "") or "").strip()
+                    if not sid:
+                        continue
+                    stv = status_map.get(sid, "")
+                    if not _is_terminal_state_anywhere(stv):
+                        continue
+                    # Mark step completed
+                    conn.execute(
+                        text("""
+                            UPDATE workflow_steps
+                            SET status = 'completed', finished_at = COALESCE(finished_at, :t), updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :id
+                        """),
+                        {"id": int(getattr(row, "id")), "t": now},
+                    )
+                    updated += 1
+                if updated:
+                    # Set run cooldown timer
+                    next_t = now + timedelta(minutes=float(cooldown))
+                    conn.execute(
+                        text("""
+                            UPDATE workflow_runs
+                            SET next_eligible_at = :t, updated_at = CURRENT_TIMESTAMP
+                            WHERE id = :rid
+                        """),
+                        {"t": next_t, "rid": int(run_id)},
+                    )
+                conn.commit()
+        except Exception:
+            pass
+
+    out["updated_steps"] = updated
+    try:
+        steps_df2 = load_workflow_steps(int(run_id))
+        if not steps_df2.empty:
+            stv2 = steps_df2["status"].fillna("").astype(str).str.strip().str.lower()
+            enabled2 = steps_df2.get("is_enabled", pd.Series([1] * len(steps_df2))).fillna(1)
+            try:
+                enabled2 = enabled2.astype(int)
+            except Exception:
+                enabled2 = enabled2.apply(lambda x: 1 if bool(x) else 0)
+            # Treat completed/disabled/error/scan_created as terminal for run completion.
+            term = {"completed", "disabled", "error", "scan_created"}
+            remaining = steps_df2[(enabled2.astype(int) == 1) & (~stv2.isin(list(term)))].copy()
+            if remaining.empty:
+                set_workflow_run_status(int(run_id), "completed")
+                out["completed_run"] = True
+    except Exception:
+        pass
+    return out
 
 
 def _safe_int(val):
@@ -3123,10 +4139,16 @@ def upsert_scan_parent_record(env_id, scan_row, resolved_status):
     if not scan_id:
         return
     name = str(scan_row.get("name") or scan_row.get("scanName") or scan_row.get("displayName") or "").strip()
-    scan_type = str(scan_row.get("type") or "").strip()
+    template_name = str(scan_row.get("scanTemplateName") or "").strip()
+    scan_type_raw = str(scan_row.get("type") or "").strip()
+    _ct = scan_type_raw.strip().lower().replace(" ", "")
+    _tmpl = template_name.strip().lower()
+    if _ct in {"dsscan", "fullscan", "full_scan"} or ("data source scan" in _tmpl and _ct in {"", "dsscan"}):
+        scan_type = "full_scan"
+    else:
+        scan_type = scan_type_raw
     started_at = str(scan_row.get("startedAt") or scan_row.get("startTime") or scan_row.get("createdAt") or "").strip()
     completed_at = str(scan_row.get("completedAt") or scan_row.get("endTime") or scan_row.get("endedAt") or "").strip()
-    template_name = str(scan_row.get("scanTemplateName") or "").strip()
     status = str(resolved_status or "").strip()
     try:
         with engine.connect() as conn:
@@ -3305,7 +4327,7 @@ def load_scan_parents_for_environments(environment_ids, status_view="All", limit
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
                 ORDER BY
                     CASE
-                        WHEN sp.scan_status IN ('Started','Awaiting','In Progress','InProgress','Running') THEN 0
+                        WHEN sp.scan_status IN ('Started','Awaiting','In Progress','InProgress','Running','Stop Requested','StopRequested','Stopping') THEN 0
                         ELSE 1
                     END,
                     sp.updated_at DESC
@@ -3480,10 +4502,82 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                 FROM scan_insights
                 WHERE scan_id IN :ids
             """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+
+            # Prefer attribute-delta sums when available (this matches Scan Progress page logic).
+            # This avoids showing 0/blank in Scan Status when scan_insights.*_count isn't populated yet.
+            delta_rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    COALESCE(SUM(CASE
+                        WHEN new_count_value IS NOT NULL THEN new_count_value
+                        WHEN is_new = TRUE THEN 1 ELSE 0 END), 0) AS new_count,
+                    COALESCE(SUM(CASE
+                        WHEN removed_count_value IS NOT NULL THEN removed_count_value
+                        WHEN is_removed = TRUE THEN 1 ELSE 0 END), 0) AS removed_count
+                FROM scan_insight_attribute_delta_map
+                WHERE scan_id IN :ids
+                GROUP BY scan_id
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+            delta_map = {}
+            for dr in (delta_rows or []):
+                sid2 = str(dr[0] or "").strip()
+                if not sid2:
+                    continue
+                try:
+                    delta_map[sid2] = (int(dr[1] or 0), int(dr[2] or 0))
+                except Exception:
+                    delta_map[sid2] = (0, 0)
+
+            # Final fallback: latest scan_progress snapshot counters (newly added / false removed).
+            # Some envs populate scan_progress sooner than attribute-delta tables.
+            prog_rows = conn.execute(text("""
+                SELECT
+                    scan_id,
+                    newly_added_classifications,
+                    false_removed_classifications
+                FROM scan_progress
+                WHERE scan_id IN :ids
+                ORDER BY COALESCE(captured_at_utc, timestamp) DESC, id DESC
+            """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
+            progress_map = {}
+            for pr in (prog_rows or []):
+                sid3 = str(pr[0] or "").strip()
+                if not sid3 or sid3 in progress_map:
+                    continue
+                try:
+                    progress_map[sid3] = (int(pr[1] or 0), int(pr[2] or 0))
+                except Exception:
+                    progress_map[sid3] = (0, 0)
         for r in rows:
             sid = str(r[0] or "").strip()
             if not sid:
                 continue
+            d_new, d_removed = (delta_map.get(sid) or (0, 0))
+            p_new, p_removed = (progress_map.get(sid) or (0, 0))
+            # scan_insights may store 0/NULL while progress has non-zero (or vice versa).
+            si_new = r[8]
+            si_removed = r[9]
+            try:
+                si_new_i = int(si_new) if si_new is not None and str(si_new).strip() != "" else None
+            except Exception:
+                si_new_i = None
+            try:
+                si_removed_i = int(si_removed) if si_removed is not None and str(si_removed).strip() != "" else None
+            except Exception:
+                si_removed_i = None
+
+            def _pick_count(delta_val: int, si_val: Optional[int], prog_val: int):
+                if int(delta_val or 0) > 0:
+                    return int(delta_val)
+                if si_val is not None and int(si_val) > 0:
+                    return int(si_val)
+                if int(prog_val or 0) > 0:
+                    return int(prog_val)
+                # If everything is zero but si has explicit 0, keep 0; else empty string.
+                if si_val is not None:
+                    return int(si_val)
+                return ""
+
             result[sid] = {
                 "distinct_classification_attributes": r[1] if r[1] is not None else "",
                 "classifier_attribute_names": str(r[2] or "").strip(),
@@ -3492,8 +4586,8 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                 "objects_scanned": r[5] if r[5] is not None else "",
                 "objects_enumerated": r[6] if r[6] is not None else "",
                 "total_classification": r[7] if r[7] is not None else "",
-                "new_attributes_count": r[8] if r[8] is not None else "",
-                "removed_attributes_count": r[9] if r[9] is not None else "",
+                "new_attributes_count": _pick_count(d_new, si_new_i, p_new),
+                "removed_attributes_count": _pick_count(d_removed, si_removed_i, p_removed),
             }
     except Exception:
         return {}
@@ -3816,7 +4910,12 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name):
     has_csv_file = "CSV FILES" in upper_name or "CSV FILE" in upper_name
     has_with_aci = ("WITH ACI" in upper_name or "ACL" in upper_name) and "NO ACL" not in upper_name
     has_no_ols = "NO OLS" in upper_name
-    has_struct_disc = "STRUCT DISC" in upper_name or "STRUCTURE DISCOVERY" in upper_name
+    has_struct_disc = (
+        "STRUCT DISC" in upper_name
+        or "STRUCTURE DISCOVERY" in upper_name
+        or "STRUCTURED FILES DISCOVERY" in upper_name
+        or "STRUCTURED FILE DISCOVERY" in upper_name
+    )
 
     build_version = parse_build_version_from_text(name)
 
@@ -4503,7 +5602,18 @@ def page_add_benchmark():
     total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
     total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
     total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
+    # New Attributes: this is the value you historically stored in benchmarks.total_catalog_items
+    # and want used for trends. Prefer scan_insights.new_attributes_count when scan_id is provided.
     total_catalog_items = 0
+    try:
+        if scan_prefill_id:
+            m = load_scan_insight_map_for_scan_ids([scan_prefill_id]).get(str(scan_prefill_id), {}) or {}
+            nac = m.get("new_attributes_count")
+            if nac is not None and str(nac).strip() != "":
+                total_catalog_items = int(nac)
+                st.caption(f"Prefilled from scan_insights: New Attributes = `{total_catalog_items:,}`")
+    except Exception:
+        pass
 
     with st.form("add_benchmark_form"):
         st.markdown("#### Scan Timing")
@@ -4716,8 +5826,7 @@ def page_add_benchmark():
                     # Attempt to check if scan_id column exists for INSERT
                     has_scan_id_col = False
                     try:
-                        col_check = conn.execute(text("SHOW COLUMNS FROM benchmarks LIKE 'scan_id'")).fetchone()
-                        has_scan_id_col = bool(col_check)
+                        has_scan_id_col = _db_has_column("benchmarks", "scan_id")
                     except Exception:
                         pass
 
@@ -4747,10 +5856,49 @@ def page_add_benchmark():
                         'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files
                     }
 
+                    # If scan_id is provided, pull classification metrics from scan_insights into benchmarks (manual trend table)
+                    try:
+                        if scan_prefill_id:
+                            si = conn.execute(
+                                text("""
+                                    SELECT total_classification, new_attributes_count, removed_attributes_count
+                                    FROM scan_insights
+                                    WHERE scan_id = :sid
+                                    LIMIT 1
+                                """),
+                                {"sid": str(scan_prefill_id).strip()},
+                            ).fetchone()
+                            if si:
+                                params_dict["tclass"] = si[0]
+                                # keep New Attributes in total_catalog_items
+                                try:
+                                    if si[1] is not None:
+                                        params_dict["tci"] = int(si[1])
+                                except Exception:
+                                    pass
+                                params_dict["trem"] = si[2]
+                    except Exception:
+                        pass
+
                     if has_scan_id_col:
                         cols_list.append("scan_id")
                         vals_placeholders.append(":sid")
                         params_dict['sid'] = scan_prefill_id if scan_prefill_id else None
+                        # Also insert missing classification columns if present in schema
+                        try:
+                            if _db_has_column("benchmarks", "total_classification"):
+                                cols_list.append("total_classification")
+                                vals_placeholders.append(":tclass")
+                                params_dict.setdefault("tclass", None)
+                        except Exception:
+                            pass
+                        try:
+                            if _db_has_column("benchmarks", "removed_attributes"):
+                                cols_list.append("removed_attributes")
+                                vals_placeholders.append(":trem")
+                                params_dict.setdefault("trem", None)
+                        except Exception:
+                            pass
 
                     ins_bench = text(f"""
                         INSERT INTO benchmarks 
@@ -4767,14 +5915,26 @@ def page_add_benchmark():
                             INSERT INTO benchmark_findings (benchmark_id, classifier_name, classifier_attribute, attribute_value, finding_count)
                             VALUES (:bid, :cname, :attr, :aval, :cnt)
                         """)
-                        for attr, aval, cnt in findings:
-                            conn.execute(ins_findings, {
-                                'bid': bench_id,
-                                'cname': attr or "",
-                                'attr': attr or None,
-                                'aval': aval or None,
-                                'cnt': cnt
-                            })
+                        try:
+                            conn.execute(
+                                ins_findings,
+                                [{
+                                    "bid": bench_id,
+                                    "cname": attr or "",
+                                    "attr": attr or None,
+                                    "aval": aval or None,
+                                    "cnt": cnt
+                                } for attr, aval, cnt in findings],
+                            )
+                        except Exception:
+                            for attr, aval, cnt in findings:
+                                conn.execute(ins_findings, {
+                                    'bid': bench_id,
+                                    'cname': attr or "",
+                                    'attr': attr or None,
+                                    'aval': aval or None,
+                                    'cnt': cnt
+                                })
                     conn.commit()
                     
                     st.success(f"✅ Successfully added Benchmark run for Build {build_ver}!")
@@ -4873,6 +6033,250 @@ def page_manage_test_environments():
 
     ensure_test_environments_table()
     env_df = load_test_environments()
+
+    # Bulk: sync current versions for all active envs + global enabled classifiers (no manual follow-up steps).
+    st.subheader("0. Bulk Actions")
+    if st.button("Sync current versions (API) for all active envs", type="primary"):
+        if env_df.empty:
+            st.warning("No environments found.")
+        else:
+            active_rows = env_df.copy()
+            try:
+                if "is_active" in active_rows.columns:
+                    active_rows["is_active"] = active_rows["is_active"].apply(lambda x: bool(x))
+                    active_rows = active_rows[active_rows["is_active"] == True]
+            except Exception:
+                pass
+
+            if active_rows.empty:
+                st.warning("No active environments to sync.")
+            else:
+                updated = 0
+                failed = 0
+                classifiers_ok = 0
+                classifiers_fail = 0
+                classifiers_skipped = 0
+                details = []
+
+                def _has_classifier_mappings(build_version: str, env_id_val: int) -> bool:
+                    try:
+                        with engine.connect() as conn:
+                            row = conn.execute(
+                                text("""
+                                    SELECT COUNT(DISTINCT bcm.classifier_id)
+                                    FROM build_classifier_mappings bcm
+                                    JOIN builds b ON b.id = bcm.build_id
+                                    WHERE b.version = :v AND bcm.environment_id = :e
+                                """),
+                                {"v": str(build_version).strip(), "e": int(env_id_val)},
+                            ).fetchone()
+                        return bool(row and int(row[0] or 0) > 0)
+                    except Exception:
+                        return False
+
+                def _sync_one(env_row: dict) -> dict:
+                    t0 = time.monotonic()
+                    env_id = env_row.get("id")
+                    env_name_val = str(env_row.get("env_name") or "").strip() or str(env_id or "")
+                    base = env_row.get("base_url")
+                    token = ""
+                    try:
+                        token = fetch_auth_token_for_env(env_row)
+                    except Exception:
+                        token = ""
+
+                    res = {
+                        "env": env_name_val,
+                        "version_ok": False,
+                        "version": "",
+                        "version_raw": "",
+                        "classifiers": "none",  # ok|fail|skipped|none
+                        "classifiers_n": 0,
+                        "classifiers_total": None,
+                        "error": "",
+                        "t_version_s": None,
+                        "t_classifiers_api_s": None,
+                        "t_db_sync_s": None,
+                        "t_total_s": None,
+                    }
+
+                    clean_version = ""
+                    raw_version = ""
+                    try:
+                        tv0 = time.monotonic()
+                        clean_version, raw_version, _about_url = fetch_core_version_from_api(base, token, INTERNAL_ABOUT_API_PATH)
+                        if clean_version and env_id is not None:
+                            with engine.connect() as conn:
+                                conn.execute(
+                                    text("UPDATE test_environments SET version = :v WHERE id = :id"),
+                                    {"v": str(clean_version), "id": int(env_id)},
+                                )
+                                conn.commit()
+                            res["version_ok"] = True
+                            res["version"] = str(clean_version)
+                            res["version_raw"] = str(raw_version)
+                        res["t_version_s"] = round(time.monotonic() - tv0, 3)
+                    except Exception as ex:
+                        res["error"] = f"version_sync_failed: {ex}"
+                        try:
+                            res["t_version_s"] = round(time.monotonic() - tv0, 3)
+                        except Exception:
+                            pass
+
+                    effective_version = str(clean_version or env_row.get("version") or "").strip()
+                    if not effective_version or env_id is None:
+                        res["classifiers"] = "fail"
+                        if not res["error"]:
+                            res["error"] = "no_build_or_env_id"
+                        res["t_total_s"] = round(time.monotonic() - t0, 3)
+                        return res
+
+                    # Skip heavy classifier fetch if mappings already exist for build+env.
+                    if _has_classifier_mappings(effective_version, int(env_id)):
+                        res["classifiers"] = "skipped"
+                        res["t_total_s"] = round(time.monotonic() - t0, 3)
+                        return res
+
+                    try:
+                        # If this build already has mappings in DB (from any environment),
+                        # clone them to this environment to avoid calling the classifiers API.
+                        try:
+                            has_any = False
+                            names_from_db = []
+                            with engine.connect() as conn:
+                                any_row = conn.execute(
+                                    text("""
+                                        SELECT COUNT(DISTINCT bcm.classifier_id)
+                                        FROM build_classifier_mappings bcm
+                                        JOIN builds b ON b.id = bcm.build_id
+                                        WHERE b.version = :v
+                                    """),
+                                    {"v": str(effective_version).strip()},
+                                ).fetchone()
+                                has_any = bool(any_row and int(any_row[0] or 0) > 0)
+                                if has_any:
+                                    names_from_db = [
+                                        str(r[0]).strip()
+                                        for r in conn.execute(
+                                            text("""
+                                                SELECT DISTINCT c.name
+                                                FROM build_classifier_mappings bcm
+                                                JOIN builds b ON b.id = bcm.build_id
+                                                JOIN classifiers c ON c.id = bcm.classifier_id
+                                                WHERE b.version = :v
+                                                ORDER BY c.name
+                                            """),
+                                            {"v": str(effective_version).strip()},
+                                        ).fetchall()
+                                        if r and r[0]
+                                    ]
+                            if has_any and names_from_db:
+                                td0 = time.monotonic()
+                                clone_build_mappings_to_environment(int(env_id), effective_version)
+                                set_id, _set_size, _new_cls_from_set = create_or_get_classifier_set(names_from_db)
+                                record_environment_version(
+                                    int(env_id),
+                                    env_name_val,
+                                    effective_version,
+                                    classifier_set_id=set_id
+                                )
+                                res["classifiers_total"] = None
+                                res["classifiers_n"] = len(names_from_db)
+                                res["classifiers"] = "ok"
+                                res["t_classifiers_api_s"] = 0.0
+                                res["t_db_sync_s"] = round(time.monotonic() - td0, 3)
+                                res["t_total_s"] = round(time.monotonic() - t0, 3)
+                                return res
+                        except Exception:
+                            pass
+
+                        ta0 = time.monotonic()
+                        classifier_names, total_count, _ = fetch_classifiers_with_auth_retry(env_row)
+                        res["t_classifiers_api_s"] = round(time.monotonic() - ta0, 3)
+                        res["classifiers_total"] = total_count
+                        res["classifiers_n"] = len(classifier_names or [])
+                        if classifier_names:
+                            td0 = time.monotonic()
+                            set_id, _set_size, _new_cls_from_set = create_or_get_classifier_set(classifier_names)
+                            record_environment_version(
+                                int(env_id),
+                                env_name_val,
+                                effective_version,
+                                classifier_set_id=set_id
+                            )
+                            sync_build_classifier_mappings(
+                                effective_version,
+                                classifier_names,
+                                environment_id=int(env_id)
+                            )
+                            res["t_db_sync_s"] = round(time.monotonic() - td0, 3)
+                            res["classifiers"] = "ok"
+                        else:
+                            res["classifiers"] = "fail"
+                            res["error"] = "classifiers_empty"
+                    except Exception as ex:
+                        res["classifiers"] = "fail"
+                        res["error"] = f"classifier_sync_failed: {ex}"
+                    res["t_total_s"] = round(time.monotonic() - t0, 3)
+                    return res
+
+                with st.spinner("Syncing versions + global classifiers (parallel)..."):
+                    rows_list = active_rows.to_dict(orient="records")
+                    max_workers = min(4, max(1, len(rows_list)))
+                    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                        futs = [ex.submit(_sync_one, r) for r in rows_list]
+                        for f in as_completed(futs):
+                            r = f.result()
+                            if r.get("version_ok"):
+                                updated += 1
+                                details.append(f"[{r.get('env')}] version={r.get('version')} (raw: {r.get('version_raw')})")
+                            else:
+                                failed += 1
+                                details.append(f"[{r.get('env')}] version sync failed")
+
+                            cst = r.get("classifiers")
+                            if cst == "ok":
+                                classifiers_ok += 1
+                                tc = r.get("classifiers_total")
+                                tc_suffix = f" (totalCount={tc})" if tc is not None else ""
+                                details.append(f"[{r.get('env')}] classifiers={r.get('classifiers_n')}{tc_suffix}")
+                            elif cst == "skipped":
+                                classifiers_skipped += 1
+                                details.append(f"[{r.get('env')}] classifiers skipped (already mapped)")
+                            elif cst == "fail":
+                                classifiers_fail += 1
+                                details.append(f"[{r.get('env')}] classifier sync failed")
+
+                            try:
+                                tv = r.get("t_version_s")
+                                ta = r.get("t_classifiers_api_s")
+                                td = r.get("t_db_sync_s")
+                                tt = r.get("t_total_s")
+                                parts = []
+                                if tv is not None:
+                                    parts.append(f"ver={tv}s")
+                                if ta is not None:
+                                    parts.append(f"api={ta}s")
+                                if td is not None:
+                                    parts.append(f"db={td}s")
+                                if tt is not None:
+                                    parts.append(f"total={tt}s")
+                                if parts:
+                                    details.append(f"[{r.get('env')}] timing " + " ".join(parts))
+                            except Exception:
+                                pass
+
+                st.success(
+                    f"Bulk sync complete. Versions updated={updated}, version failures={failed}. "
+                    f"Classifiers synced={classifiers_ok}, skipped={classifiers_skipped}, failures={classifiers_fail}."
+                )
+                if details:
+                    st.caption(" | ".join(details[:6]) + (" ..." if len(details) > 6 else ""))
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.rerun()
 
     st.subheader("1. Environment Details")
     env_names = env_df["env_name"].tolist() if not env_df.empty else []
@@ -5400,8 +6804,8 @@ def page_scan_status():
     c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.0, 1.0])
     status_view = c1.radio("Show", ["All", "In Progress", "Completed"], horizontal=True)
     limit = c2.number_input("Limit per API", min_value=10, max_value=1000, value=200, step=10)
-    refresh = c3.button("Reload from DB", type="primary", use_container_width=True)
-    manual_resync = c4.button("Manual Re-sync (API)", use_container_width=True)
+    refresh = c3.button("Reload from DB", type="primary", width="stretch")
+    manual_resync = c4.button("Manual Re-sync (API)", width="stretch")
     load_insights = True
 
     if refresh:
@@ -5411,8 +6815,23 @@ def page_scan_status():
             pass
         st.rerun()
 
-    running_states = ["Started", "Awaiting", "In Progress", "InProgress", "Running"]
-    completed_states = ["Failed", "CompletedWithFailures", "Completed"]
+    running_states = [
+        "Started",
+        "Awaiting",
+        "In Progress",
+        "InProgress",
+        "Running",
+        "Queued",
+        "Pending",
+        "Stop Requested",
+        "StopRequested",
+        "Stopping",
+    ]
+    completed_states = ["Failed", "CompletedWithFailures", "Completed", "Stopped", "Aborted", "Cancelled", "Canceled"]
+    def _compact_state(v: str) -> str:
+        return str(v or "").strip().lower().replace(" ", "")
+    running_compact = {_compact_state(x) for x in running_states}
+    completed_compact = {_compact_state(x) for x in completed_states}
 
     active_envs = [
         row._asdict()
@@ -5489,6 +6908,101 @@ def page_scan_status():
         status_view="All",
         limit=max(int(limit) * max(1, len(active_env_ids)), 500),
     )
+    # Ensure running scans are not missed: union in latest running scan_progress rows.
+    try:
+        running_states_local = {
+            "started",
+            "awaiting",
+            "inprogress",
+            "in progress",
+            "running",
+            "queued",
+            "pending",
+            "stoprequested",
+            "stop requested",
+            "stopping",
+        }
+        def _compact(s: str) -> str:
+            return str(s or "").strip().lower().replace(" ", "")
+        running_compact = {_compact(x) for x in running_states_local}
+
+        # Only treat scan_progress as "running" if the latest snapshot is fresh.
+        # Otherwise stale rows can look like extra running scans.
+        try:
+            stale_minutes = int(os.getenv("SCAN_STATUS_PROGRESS_STALE_MINUTES", "60") or "60")
+        except Exception:
+            stale_minutes = 60
+        now_utc = datetime.utcnow()
+        def _age_minutes(pr: dict) -> Optional[float]:
+            try:
+                ts = pr.get("captured_at_utc") or pr.get("timestamp")
+                if ts is None:
+                    return None
+                # ts is usually a datetime from DB; handle strings too.
+                if isinstance(ts, str):
+                    dt = pd.to_datetime(ts, errors="coerce")
+                    if pd.isna(dt):
+                        return None
+                    dt = dt.to_pydatetime()
+                else:
+                    dt = ts
+                return (now_utc - dt).total_seconds() / 60.0
+            except Exception:
+                return None
+
+        progress_latest = load_latest_scan_progress_rows_for_environments(active_env_ids)
+        items_by_id = {}
+        for it in (items or []):
+            try:
+                sid = str(it.get("_id") or it.get("id") or "").strip()
+            except Exception:
+                sid = ""
+            if sid and sid not in items_by_id:
+                items_by_id[sid] = it
+        added_from_progress = 0
+        skipped_stale_progress = 0
+        for pr in (progress_latest or []):
+            sid = str(pr.get("scan_id") or "").strip()
+            if not sid:
+                continue
+            p_state = str(pr.get("scan_state") or "").strip()
+            if _compact(p_state) not in running_compact:
+                continue
+            age_m = _age_minutes(pr)
+            if age_m is not None and age_m > float(stale_minutes):
+                skipped_stale_progress += 1
+                continue
+            if sid in items_by_id:
+                # If scan_parents state is stale/non-running but progress shows running, trust progress.
+                try:
+                    cur = items_by_id[sid]
+                    cur_state = resolve_scan_status_value(cur)
+                    if _compact(cur_state) not in running_compact:
+                        cur["state"] = p_state
+                except Exception:
+                    pass
+                continue
+            env_id = pr.get("environment_id")
+            env_name = ""
+            try:
+                env_name = str(next((e.get("env_name") for e in active_envs if int(e.get("id")) == int(env_id)), "") or "")
+            except Exception:
+                env_name = ""
+            items.append({
+                "_id": sid,
+                "name": pr.get("scan_name") or "",
+                "scanName": pr.get("scan_name") or "",
+                "environment_id": env_id,
+                "environment_name": env_name,
+                "state": p_state,
+            })
+            added_from_progress += 1
+        if added_from_progress:
+            st.caption(f"Added {added_from_progress} running scans from scan_progress (scan_parents was missing them).")
+        if skipped_stale_progress and st.query_params.get("debug") == "true":
+            st.caption(f"Skipped {skipped_stale_progress} stale running rows from scan_progress (>{stale_minutes} min old).")
+    except Exception:
+        pass
     running_total = None
     completed_total = None
     try:
@@ -5580,23 +7094,36 @@ def page_scan_status():
         except Exception:
             scan_env_row = None
 
-        # If scan_parents still says "running" but scan_progress latest state is terminal, trust scan_progress.
+        # Keep Scan Status accurate when scan_parents lags (case/space-insensitive):
+        # - if scan_parents says running but scan_progress says terminal -> trust scan_progress
+        # - if scan_parents says terminal/unknown but scan_progress says running -> trust scan_progress
         try:
             p_state = str((latest_progress_state_map or {}).get(scan_id) or "").strip()
-            if p_state and (p_state in completed_states) and (state in running_states):
+            if p_state and (_compact_state(p_state) in completed_compact) and (_compact_state(state) in running_compact):
                 state = p_state
                 # Backfill scan_parents for consistency (best-effort).
                 try:
                     upsert_scan_parent_record(scan_env_id or selected_env.get("id"), scan, state)
                 except Exception:
                     pass
+            if p_state and (_compact_state(p_state) in running_compact) and (_compact_state(state) not in running_compact) and (status_view != "Completed"):
+                state = p_state
         except Exception:
             pass
 
-        if status_view == "In Progress" and state not in running_states:
+        if status_view == "In Progress" and _compact_state(state) not in running_compact:
             continue
-        if status_view == "Completed" and state not in completed_states:
+        if status_view == "Completed" and _compact_state(state) not in completed_compact:
             continue
+
+        # UI normalization:
+        # - keep "Stop Requested"/"Stopping" explicit (important diagnostic)
+        # - otherwise treat "running" variants as "In Progress"
+        cs = _compact_state(state)
+        if cs in {"stoprequested", "stopping"}:
+            display_state = "Stop Requested" if cs == "stoprequested" else "Stopping"
+        else:
+            display_state = "In Progress" if cs in running_compact else (state or "Unknown")
 
         insight_metrics = {
             "distinct_classification_attributes": "",
@@ -5628,15 +7155,26 @@ def page_scan_status():
         started_at = scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt")
         completed_at = scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt")
 
+        raw_scan_type = scan.get("type") or ""
+        tmpl_name = scan.get("scanTemplateName") or ""
+        cs_type = str(raw_scan_type or "").strip().lower().replace(" ", "")
+        cs_tmpl = str(tmpl_name or "").strip().lower()
+        if cs_type in {"dsscan", "fullscan", "full_scan"} or ("data source scan" in cs_tmpl and cs_type in {"", "dsscan"}):
+            display_scan_type = "Full Scan"
+        elif cs_type:
+            display_scan_type = str(raw_scan_type or "").strip()
+        else:
+            display_scan_type = ""
+
         summary_rows.append({
             "Environment": scan_env_name or str((scan_env_row or {}).get("env_name") or selected_env.get("env_name") or ""),
             "Scan Name": scan.get("name") or scan.get("scanName") or scan.get("displayName") or "",
             "Scan Id": scan_id,
-            "Scan Type": scan.get("type") or "",
+            "Scan Type": display_scan_type,
             "Start Time": started_at or "",
             "End Time": completed_at or "",
             "Template": scan.get("scanTemplateName") or "",
-            "Scan Status": state or "Unknown",
+            "Scan Status": display_state,
             "Data Sources": insight_metrics["data_source_names"],
             "Distinct Classification Attributes": insight_metrics["distinct_classification_attributes"],
             "Classifier Attribute Names": insight_metrics["classifier_attribute_names"],
@@ -5684,7 +7222,7 @@ def page_scan_status():
             return ""
         state = str(row.get("Scan Status") or "").strip()
         # Show link if we have history already OR the scan is currently running.
-        if sid in progress_ids or state in running_states:
+        if sid in progress_ids or _compact_state(state) in running_compact:
             return f"?page=Scan+Progress&scan_id={sid}"
         return ""
     summary_df.insert(3, "Progress", summary_df.apply(_progress_link, axis=1))
@@ -6184,6 +7722,479 @@ def page_comparison(df):
     else:
         st.info("ℹ️ **Performance is comparable** (within 5% difference)")
 
+
+# --- Build + Data Source Runs (same build) ---
+def page_build_ds_runs():
+    st.markdown("## 🧪 Build + Data Source Runs")
+    st.caption("Compare **all runs** for a selected Build + File Set across **two Data Sources** (e.g. 247.7 + Small Files + S3 vs SMB).")
+
+    src = st.radio(
+        "Runs source",
+        ["Auto Scans (recommended)", "Manual Benchmarks", "Both"],
+        horizontal=True,
+        index=0,
+        key="build_ds_runs_source",
+    )
+    include_inactive = st.checkbox("Include inactive runs (manual only)", value=False, key="build_ds_runs_inactive")
+
+    frames = []
+    if src in {"Manual Benchmarks", "Both"}:
+        m = load_data(include_inactive=include_inactive)
+        if not m.empty:
+            m = m.copy()
+            m["_source"] = "manual"
+            m["_run_key"] = "m:" + m.get("id").astype(str)
+            frames.append(m)
+    if src in {"Auto Scans (recommended)", "Both"}:
+        a = load_auto_trend_as_manual_like_df()
+        if not a.empty:
+            a = a.copy()
+            a["_source"] = "auto"
+            a["_run_key"] = "a:" + a.get("scan_id", a.get("id")).astype(str)
+            frames.append(a)
+
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
+        st.warning("No runs found for the selected source(s) yet.")
+        return
+    df = _ensure_throughput_columns(df)
+    # Avoid Arrow type issues when mixing manual numeric ids + auto scan_id strings.
+    try:
+        if "id" in df.columns:
+            df["id"] = df["id"].astype("string")
+    except Exception:
+        pass
+
+    def _normalize_file_set_for_compare(v: str) -> str:
+        s = str(v or "").strip()
+        u = s.upper()
+        if "SMALL FILE" in u:
+            return "Small Files"
+        if "LARGE FILE" in u:
+            return "Large Files"
+        if "MIXED" in u:
+            return "Mixed Files"
+        if "CSV" in u:
+            return "CSV Files"
+        return s
+
+    for c in ["Build_Version", "Data_Source_Type", "Scan_Type", "file_set_type"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str)
+    if "file_set_type" in df.columns:
+        df["file_set_type"] = df["file_set_type"].apply(_normalize_file_set_for_compare)
+
+    def _uniq_sorted(series):
+        try:
+            vals = [str(x).strip() for x in series.dropna().unique().tolist()]
+        except Exception:
+            vals = [str(x).strip() for x in series.unique().tolist()]
+        vals = [v for v in vals if v and v.lower() != "nan"]
+        return sorted(set(vals))
+
+    def _pick_default(options, contains_text):
+        for o in options:
+            if contains_text.lower() in o.lower():
+                return o
+        return options[0] if options else ""
+
+    build_options = sorted(_uniq_sorted(df["Build_Version"]), reverse=True)
+    selected_build = st.selectbox("Build Version", build_options, index=0 if build_options else None)
+    build_df = df[df["Build_Version"].astype(str) == str(selected_build)]
+    if build_df.empty:
+        st.info("No runs for this build.")
+        return
+
+    # DS first (all DS types for this build), then file set types based on DS selection.
+    # DS options: filter out obvious garbage (scan-name-like strings).
+    raw_ds_options = _uniq_sorted(build_df["Data_Source_Type"])
+    ds_options = []
+    for v in raw_ds_options:
+        s = str(v or "").strip()
+        if not s or s.lower() == "nan":
+            continue
+        if len(s) > 20 or "scanner" in s.lower() or "thread" in s.lower() or " " in s:
+            continue
+        ds_options.append(s)
+    ds_options = sorted(set(ds_options)) if ds_options else raw_ds_options
+    default_ds = _pick_default(ds_options, "S3")
+    default_sel = [default_ds] if default_ds else []
+    selected_ds_list = st.multiselect(
+        "Data Source Types to compare (pick 1–2)",
+        options=ds_options,
+        default=default_sel,
+    )
+    # Keep it simple: clamp to 2 (user asked for two).
+    if len(selected_ds_list) > 2:
+        selected_ds_list = selected_ds_list[:2]
+        st.caption("Showing first 2 selected Data Sources.")
+    if not selected_ds_list:
+        st.warning("Select at least one Data Source Type.")
+        return
+
+    ds_df = build_df[build_df["Data_Source_Type"].astype(str).isin([str(x) for x in selected_ds_list])]
+
+    fs_options = _uniq_sorted(ds_df["file_set_type"]) if not ds_df.empty else _uniq_sorted(build_df["file_set_type"])
+    default_fs = _pick_default(fs_options, "Small Files")
+    selected_fs = st.selectbox("File Set Type", fs_options, index=fs_options.index(default_fs) if default_fs in fs_options else 0)
+    fs_df = ds_df[ds_df["file_set_type"].astype(str).str.contains(str(selected_fs), case=False, na=False)]
+
+    scan_type_options = _uniq_sorted(fs_df["Scan_Type"]) if not fs_df.empty else _uniq_sorted(ds_df["Scan_Type"])
+    selected_scan_type = st.selectbox("Scan Type", ["(All)"] + scan_type_options)
+
+    filtered = fs_df.copy() if not fs_df.empty else ds_df.copy()
+    if selected_scan_type != "(All)":
+        filtered = filtered[filtered["Scan_Type"].astype(str) == str(selected_scan_type)]
+
+    if filtered.empty:
+        st.warning("No runs match these filters.")
+        return
+    filtered = _ensure_throughput_columns(filtered)
+
+    # Summary per DS
+    st.markdown("### Summary (per Data Source)")
+    try:
+        tmp = filtered.copy()
+        tmp["GB_hr"] = pd.to_numeric(tmp.get("throughput_cluster_gb_hr"), errors="coerce")
+        tmp["Files_hr"] = pd.to_numeric(tmp.get("throughput_cluster_files_hr"), errors="coerce")
+        tmp["Hours"] = pd.to_numeric(tmp.get("total_scan_hours"), errors="coerce")
+        summ = tmp.groupby("Data_Source_Type", dropna=False).agg(
+            Runs=("Data_Source_Type", "size"),
+            Avg_GB_hr=("GB_hr", "mean"),
+            Best_GB_hr=("GB_hr", "max"),
+            Avg_Files_hr=("Files_hr", "mean"),
+            Fastest_Hours=("Hours", "min"),
+        ).reset_index()
+        st.dataframe(summ, width="stretch", hide_index=True)
+    except Exception:
+        pass
+
+    st.divider()
+
+    run_ids = filtered["_run_key"].dropna().astype(str).tolist() if "_run_key" in filtered.columns else []
+    run_label_map = {}
+    try:
+        tmp = filtered.copy()
+        tmp["Date"] = pd.to_datetime(tmp.get("Date"), errors="coerce")
+        tmp = tmp.sort_values(by=["Data_Source_Type", "Date", "_run_key"], ascending=[True, False, False])
+        for _, r in tmp.iterrows():
+            k = str(r.get("_run_key") or "").strip()
+            if not k:
+                continue
+            ds = str(r.get("Data_Source_Type") or "").strip()
+            dt = r.get("Date")
+            dt_txt = ""
+            try:
+                if pd.notna(dt):
+                    dt_txt = pd.to_datetime(dt).strftime("%Y-%m-%d")
+            except Exception:
+                dt_txt = ""
+            tail = k[-10:] if len(k) > 10 else k
+            run_label_map[k] = f"{ds} | {dt_txt} | {tail}"
+    except Exception:
+        run_label_map = {}
+    selected_ids = st.multiselect(
+        "Select specific runs (optional)",
+        options=run_ids,
+        default=run_ids[:8] if len(run_ids) > 8 else run_ids,
+        format_func=lambda k: run_label_map.get(k, str(k)),
+    )
+    show_df = filtered[filtered["_run_key"].isin(selected_ids)] if selected_ids and "_run_key" in filtered.columns else filtered
+
+    cols = [
+        "_source",
+        "_run_key",
+        "Date",
+        "Scenario_Type",
+        "Scan_Type",
+        "Data_Source_Type",
+        "file_set_type",
+        "scanner_count",
+        "thread_count",
+        "Total_Size_GB",
+        "Total_Files",
+        "total_scan_hours",
+        "throughput_cluster_gb_hr",
+        "throughput_cluster_files_hr",
+        "New_Attributes",
+        "Total_Classification",
+        "Removed_Attributes",
+    ]
+    cols = [c for c in cols if c in show_df.columns]
+    try:
+        show_sorted = show_df[cols].sort_values(by=["Date", "_run_key"], ascending=[False, False])
+    except Exception:
+        show_sorted = show_df[cols]
+    st.dataframe(show_sorted, width="stretch", hide_index=True)
+
+    chart_df = show_df.copy()
+    # Make a readable label for the x-axis (run id can be long for scan_id).
+    try:
+        d = pd.to_datetime(chart_df.get("Date"), errors="coerce")
+        d_txt = d.dt.strftime("%m-%d") if hasattr(d, "dt") else ""
+    except Exception:
+        d_txt = ""
+    try:
+        rk = chart_df.get("_run_key", chart_df.index.astype(str)).astype(str)
+        rk_short = rk.apply(lambda s: (s[-10:] if len(s) > 14 else s))
+        chart_df["Run_Label"] = chart_df.get("Data_Source_Type", "").astype(str) + " | " + rk_short + ((" | " + d_txt) if isinstance(d_txt, (pd.Series,)) else "")
+    except Exception:
+        chart_df["Run_Label"] = chart_df.get("_run_key", chart_df.index.astype(str)).astype(str)
+
+    st.markdown("### Charts (trend-style)")
+    chart_df["Date"] = pd.to_datetime(chart_df.get("Date"), errors="coerce")
+    chart_df = chart_df.sort_values(by=["Data_Source_Type", "Date", "_run_key"], ascending=[True, True, True])
+    # If Date is missing, fall back to a categorical x.
+    x_col = "Date" if chart_df.get("Date").notna().any() else "Run_Label"
+
+    def _line_fig(y_col: str, title: str, y_title: str):
+        fig = go.Figure()
+        for ds in sorted(chart_df["Data_Source_Type"].dropna().astype(str).unique().tolist()):
+            sdf = chart_df[chart_df["Data_Source_Type"].astype(str) == str(ds)].copy()
+            yv = pd.to_numeric(sdf.get(y_col), errors="coerce")
+            fig.add_trace(go.Scatter(
+                x=sdf[x_col],
+                y=yv,
+                mode="lines+markers",
+                name=str(ds),
+            ))
+        fig.update_layout(
+            title=title,
+            xaxis_title="Run Date" if x_col == "Date" else "Run",
+            yaxis_title=y_title,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        if x_col == "Date":
+            fig.update_xaxes(type="date")
+        else:
+            fig.update_xaxes(type="category")
+        return fig
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.plotly_chart(_line_fig("throughput_cluster_gb_hr", "GB/hr", "GB/hr"), width="stretch")
+    with c2:
+        st.plotly_chart(_line_fig("throughput_cluster_files_hr", "Files/hr", "Files/hr"), width="stretch")
+    with c3:
+        st.plotly_chart(_line_fig("total_scan_hours", "Total scan hours", "Hours"), width="stretch")
+
+
+# --- Cross Data Source Trend Comparison ---
+def page_data_source_trend_comparison(df):
+    st.markdown("## 📈 Data Source Trend Comparison")
+    st.caption("Compare multiple Data Sources (one line per DS) for a selected File Set and Scan Type.")
+    src = st.radio(
+        "Runs source",
+        ["Auto Scans (recommended)", "Manual Benchmarks", "Both"],
+        horizontal=True,
+        index=0,
+        key="ds_trend_source",
+    )
+    include_inactive = st.checkbox("Include inactive runs (manual only)", value=False, key="ds_trend_inactive")
+    frames = []
+    if src in {"Manual Benchmarks", "Both"}:
+        m = load_data(include_inactive=include_inactive)
+        if not m.empty:
+            frames.append(m)
+    if src in {"Auto Scans (recommended)", "Both"}:
+        a = load_auto_trend_as_manual_like_df()
+        if not a.empty:
+            frames.append(a)
+    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if df.empty:
+        st.warning("No runs found for the selected source(s) yet.")
+        return
+    df = _ensure_throughput_columns(df)
+
+    fs_options = sorted(set([str(x).strip() for x in df.get("file_set_type", pd.Series(dtype=str)).dropna().unique().tolist() if str(x).strip()]))
+    if not fs_options:
+        st.warning("No file set types found.")
+        return
+    default_fs = None
+    for o in fs_options:
+        if "large files" in o.lower():
+            default_fs = o
+            break
+    if default_fs is None:
+        default_fs = fs_options[0]
+    selected_fs = st.selectbox("File Set Type", fs_options, index=fs_options.index(default_fs) if default_fs in fs_options else 0)
+
+    scan_type_options = sorted(set([str(x).strip() for x in df.get("Scan_Type", pd.Series(dtype=str)).dropna().unique().tolist() if str(x).strip()]))
+    selected_scan_type = st.selectbox("Scan Type", ["(All)"] + scan_type_options)
+
+    scan_type_filter = None if selected_scan_type == "(All)" else selected_scan_type
+    render_trend_analysis(
+        df,
+        title=f"Data Source Trend Comparison ({selected_fs})",
+        file_set_filter=str(selected_fs),
+        scan_type_filter=scan_type_filter,
+        compare_by="Data_Source_Type",
+        show_standard_filters=False,
+    )
+
+# --- Classification Trends (from scan_insights) ---
+def load_classification_trend_from_scan_insights(file_set_filter: str, data_source_type: str, scan_type: str) -> pd.DataFrame:
+    """
+    Build-by-build classification metrics based on tracker-populated tables:
+    - scan_parents (scan_name / updated_at)
+    - scan_insights (total_classification, new/removed attrs, classifier count)
+
+    We infer build + ds + scan_type + file_set_type from scan_name to match trend filters.
+    """
+    engine = get_engine()
+    if engine is None:
+        return pd.DataFrame()
+
+    file_set_filter = str(file_set_filter or "").strip()
+    data_source_type = str(data_source_type or "").strip()
+    scan_type = str(scan_type or "").strip()
+
+    def _norm_ds(v: str) -> str:
+        return str(v or "").strip().upper()
+
+    def _norm_scan_type(v: str) -> str:
+        s = str(v or "").strip().lower()
+        if "ols" in s:
+            return "ols"
+        if "full" in s:
+            return "full"
+        return s
+
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        sp.scan_id,
+                        sp.scan_name,
+                        sp.updated_at,
+                        si.total_classification,
+                        si.new_attributes_count,
+                        si.removed_attributes_count,
+                        si.distinct_classification_attributes
+                    FROM scan_parents sp
+                    JOIN scan_insights si ON si.scan_id = sp.scan_id
+                    WHERE
+                        si.total_classification IS NOT NULL
+                        OR si.new_attributes_count IS NOT NULL
+                        OR si.removed_attributes_count IS NOT NULL
+                        OR si.distinct_classification_attributes IS NOT NULL
+                    ORDER BY sp.updated_at DESC
+                    LIMIT 6000
+                """)
+            ).fetchall()
+    except Exception:
+        return pd.DataFrame()
+
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=[
+        "scan_id",
+        "scan_name",
+        "updated_at",
+        "total_classification",
+        "new_attributes_count",
+        "removed_attributes_count",
+        "distinct_classification_attributes",
+    ])
+
+    # Infer filters from scan_name
+    def _infer_row(scan_name: str) -> Dict[str, str]:
+        d = infer_add_benchmark_defaults_from_scan_name(scan_name)
+        return {
+            "build_version": str(d.get("build_version") or parse_build_version_from_text(scan_name) or "").strip(),
+            "data_source_type": str(d.get("data_source_type") or "").strip(),
+            "scan_type": str(d.get("scan_type") or "").strip(),
+            "file_set_type": str(d.get("file_set_type") or "").strip(),
+        }
+
+    inferred = df["scan_name"].astype(str).apply(_infer_row)
+    df["Build_Version"] = inferred.apply(lambda x: x.get("build_version", ""))
+    df["Data_Source_Type"] = inferred.apply(lambda x: x.get("data_source_type", ""))
+    df["Scan_Type"] = inferred.apply(lambda x: x.get("scan_type", ""))
+    df["file_set_type"] = inferred.apply(lambda x: x.get("file_set_type", ""))
+
+    df = df[df["Build_Version"].astype(str).str.strip().ne("")]
+
+    if file_set_filter:
+        df = df[df["file_set_type"].astype(str).str.contains(file_set_filter, case=False, na=False)]
+    if data_source_type:
+        want_ds = _norm_ds(data_source_type)
+        df = df[df["Data_Source_Type"].astype(str).map(_norm_ds) == want_ds]
+    if scan_type:
+        want_st = _norm_scan_type(scan_type)
+        df = df[df["Scan_Type"].astype(str).map(_norm_scan_type) == want_st]
+
+    if df.empty:
+        return pd.DataFrame()
+
+    # Numeric coercion (Arrow-safe and Plotly-safe)
+    for c in ["total_classification", "new_attributes_count", "removed_attributes_count", "distinct_classification_attributes"]:
+        try:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        except Exception:
+            pass
+
+    # Pick latest scan per build (based on scan_parents.updated_at)
+    try:
+        df["updated_at"] = pd.to_datetime(df["updated_at"], errors="coerce")
+    except Exception:
+        pass
+    df = df.sort_values(["Build_Version", "updated_at"], ascending=[True, False])
+    df = df.drop_duplicates(subset=["Build_Version"], keep="first")
+    df = df.sort_values("Build_Version")
+
+    out = df[[
+        "Build_Version",
+        "total_classification",
+        "new_attributes_count",
+        "removed_attributes_count",
+    ]].copy()
+    out = out.rename(columns={
+        "total_classification": "Total_Classifications",
+        "new_attributes_count": "New_Attributes",
+        "removed_attributes_count": "Removed_Attributes",
+    })
+
+    # Template classifier count: from build_classifier_mappings (what user means by "template has ~72 classifiers").
+    try:
+        build_versions = [str(x).strip() for x in out["Build_Version"].astype(str).tolist() if str(x).strip()]
+        build_versions = list(dict.fromkeys(build_versions))
+        if build_versions:
+            engine2 = get_engine()
+            if engine2 is not None:
+                params = {}
+                ph = []
+                for i, bv in enumerate(build_versions[:200]):
+                    k = f"bv{i}"
+                    params[k] = bv
+                    ph.append(f":{k}")
+                if ph:
+                    with engine2.connect() as conn:
+                        rows2 = conn.execute(
+                            text(f"""
+                                SELECT b.version, COUNT(DISTINCT bcm.classifier_id) AS n
+                                FROM builds b
+                                JOIN build_classifier_mappings bcm ON bcm.build_id = b.id
+                                WHERE b.version IN ({",".join(ph)})
+                                GROUP BY b.version
+                            """),
+                            params,
+                        ).fetchall()
+                    m = {str(r[0]).strip(): (int(r[1]) if r[1] is not None else None) for r in (rows2 or [])}
+                    out["Template_Classifiers"] = out["Build_Version"].astype(str).map(lambda v: m.get(str(v).strip()))
+                else:
+                    out["Template_Classifiers"] = pd.NA
+            else:
+                out["Template_Classifiers"] = pd.NA
+        else:
+            out["Template_Classifiers"] = pd.NA
+    except Exception:
+        out["Template_Classifiers"] = pd.NA
+    return out
+
 # --- Trend Analysis (Multi-Build Comparison) ---
 def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None, compare_by=None, acl_filter=None, ff_filter=None, show_standard_filters=True):
     st.markdown(f"## 📈 {title}")
@@ -6192,9 +8203,20 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     if df.empty:
         st.warning("No data available.")
         return
+
+    # Ensure these are always defined (used by Classification Trends chart)
+    selected_ds = ""
+    selected_scan = ""
     
     # Base filtering
     df_filtered = df.copy()
+    # Normalize key filter columns (prevents missing rows due to whitespace/casing inconsistencies)
+    try:
+        for col in ["Build_Version", "Data_Source_Type", "Scan_Type", "file_set_type"]:
+            if col in df_filtered.columns:
+                df_filtered[col] = df_filtered[col].astype(str).str.strip()
+    except Exception:
+        pass
     if file_set_filter:
         # Use partial match (case-insensitive) to capture "SMB Large Files", "S3 Large Files", etc.
         df_filtered = df_filtered[df_filtered['file_set_type'].astype(str).str.contains(file_set_filter, case=False, na=False)]
@@ -6216,7 +8238,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     
     # If we are NOT comparing, show the standard filters
     if show_standard_filters and not compare_by:
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             available_ds = sorted(df_filtered['Data_Source_Type'].unique())
             selected_ds = st.selectbox(f"Data Source", available_ds, key=f"ds_{title}")
@@ -6228,13 +8250,9 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         with col3:
             filter_acl = st.checkbox("ACL Only", key=f"acl_{title}")
         with col4:
-            filter_ocr = st.checkbox("OCR Only", key=f"ocr_{title}")
-        with col5:
-            filter_ff = st.checkbox("FF Only", key=f"ff_{title}")
+            filter_ff = st.checkbox("FF Only (Structured Files Discovery)", key=f"ff_{title}")
         if filter_acl:
             df_filtered = df_filtered[df_filtered['is_acl'] == 1]
-        if filter_ocr:
-            df_filtered = df_filtered[df_filtered['is_ocr'] == 1]
         if filter_ff:
             df_filtered = df_filtered[df_filtered['is_feature_flags'] == 1]
     
@@ -6256,14 +8274,60 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     group_cols = ['Build_Version']
     if compare_by: group_cols.append(compare_by)
     
-    plot_df = df_filtered.groupby(group_cols, as_index=False).apply(select_best_run).reset_index(drop=True)
+    # Pick best run per (Build_Version, compare_by?) without groupby.apply().
+    # This avoids pandas deprecation warnings AND keeps grouping columns (Build_Version),
+    # which we need for sorting/plotting.
+    picked_idxs = []
+    try:
+        gb = df_filtered.groupby(group_cols, sort=False, dropna=False)
+    except TypeError:
+        # Older pandas: no dropna kwarg
+        gb = df_filtered.groupby(group_cols, sort=False)
+    for _, group in gb:
+        try:
+            if 'total_scan_hours' in group.columns and group['total_scan_hours'].notna().any():
+                valid_time = group[group['total_scan_hours'].notna()]
+                if not valid_time.empty:
+                    picked_idxs.append(valid_time['total_scan_hours'].idxmin())
+                    continue
+            if 'throughput_cluster_gb_hr' in group.columns and group['throughput_cluster_gb_hr'].notna().any():
+                valid_tp = group[group['throughput_cluster_gb_hr'].notna()]
+                if not valid_tp.empty:
+                    picked_idxs.append(valid_tp['throughput_cluster_gb_hr'].idxmax())
+                    continue
+            picked_idxs.append(group.index[0])
+        except Exception:
+            try:
+                picked_idxs.append(group.index[0])
+            except Exception:
+                pass
+    plot_df = df_filtered.loc[picked_idxs].copy() if picked_idxs else df_filtered.head(0).copy()
+    plot_df = plot_df.reset_index(drop=True)
     plot_df = plot_df.sort_values('Build_Version')
     # Drop rows with missing cluster throughput
     if 'throughput_cluster_gb_hr' in plot_df.columns:
         plot_df = plot_df[plot_df['throughput_cluster_gb_hr'].notna()]
 
+    # Auto scans may not have per-scanner/per-thread columns. Keep rendering robust.
+    for col in [
+        "throughput_scanner_gb_hr",
+        "throughput_thread_gb_hr",
+        "throughput_scanner_files_hr",
+        "throughput_thread_files_hr",
+    ]:
+        if col not in plot_df.columns:
+            plot_df[col] = pd.NA
+
+    # Quick sanity caption so it's obvious if latest build is included
+    try:
+        builds = plot_df["Build_Version"].astype(str).tolist()
+        max_build = sorted({b.strip() for b in builds if b and b.strip()})[-1] if builds else ""
+        st.caption(f"Builds in view: {plot_df['Build_Version'].nunique()} | Latest build in view: `{max_build}`")
+    except Exception:
+        pass
+
     # Charts
-    t_col1, t_col2 = st.columns(2)
+    t_col1, t_col2, t_col3 = st.columns(3)
     
     with t_col1:
         fig1 = go.Figure()
@@ -6278,8 +8342,13 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
                 fig1.add_trace(go.Scatter(x=cat_df['Build_Version'], y=cat_df['throughput_cluster_gb_hr'], mode='lines+markers', name=name, line=dict(color=colors[i % len(colors)], width=3)))
         else:
             fig1.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_cluster_gb_hr'], mode='lines+markers', name='Cluster', line=dict(color='#8B5CF6', width=4), marker=dict(size=10)))
-            fig1.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_gb_hr'], mode='lines+markers', name='Per Scanner', line=dict(color='#6366F1', width=2), marker=dict(size=8)))
-            fig1.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_thread_gb_hr'], mode='lines+markers', name='Per Thread', line=dict(color='#A78BFA', width=2), marker=dict(size=8)))
+            try:
+                if "throughput_scanner_gb_hr" in plot_df.columns and plot_df["throughput_scanner_gb_hr"].notna().any():
+                    fig1.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_gb_hr'], mode='lines+markers', name='Per Scanner', line=dict(color='#6366F1', width=2), marker=dict(size=8)))
+                if "throughput_thread_gb_hr" in plot_df.columns and plot_df["throughput_thread_gb_hr"].notna().any():
+                    fig1.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_thread_gb_hr'], mode='lines+markers', name='Per Thread', line=dict(color='#A78BFA', width=2), marker=dict(size=8)))
+            except Exception:
+                pass
         
         fig1.update_layout(title="Data Throughput Trend (GB/hr)", xaxis_title="Build Version", yaxis_title="GB/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig1.update_xaxes(type='category', categoryorder='category ascending')
@@ -6298,12 +8367,139 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
                 fig2.add_trace(go.Scatter(x=cat_df['Build_Version'], y=cat_df['throughput_cluster_files_hr'], mode='lines+markers', name=name, line=dict(color=colors[i % len(colors)], width=3)))
         else:
             fig2.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_cluster_files_hr'], mode='lines+markers', name='Cluster', line=dict(color='#10B981', width=4), marker=dict(size=10)))
-            fig2.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_files_hr'], mode='lines+markers', name='Per Scanner', line=dict(color='#34D399', width=2), marker=dict(size=8)))
-            fig2.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_thread_files_hr'], mode='lines+markers', name='Per Thread', line=dict(color='#6EE7B7', width=2), marker=dict(size=8)))
+            try:
+                if "throughput_scanner_files_hr" in plot_df.columns and plot_df["throughput_scanner_files_hr"].notna().any():
+                    fig2.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_files_hr'], mode='lines+markers', name='Per Scanner', line=dict(color='#34D399', width=2), marker=dict(size=8)))
+                if "throughput_thread_files_hr" in plot_df.columns and plot_df["throughput_thread_files_hr"].notna().any():
+                    fig2.add_trace(go.Scatter(x=plot_df['Build_Version'], y=plot_df['throughput_thread_files_hr'], mode='lines+markers', name='Per Thread', line=dict(color='#6EE7B7', width=2), marker=dict(size=8)))
+            except Exception:
+                pass
         
         fig2.update_layout(title="File Throughput Trend (files/hr)", xaxis_title="Build Version", yaxis_title="Files/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig2.update_xaxes(type='category', categoryorder='category ascending')
         st.plotly_chart(fig2, width="stretch")
+
+    with t_col3:
+        if compare_by:
+            st.caption("Classification Trends are shown only for the standard (non-compare) view.")
+        else:
+            # IMPORTANT:
+            # Always start from the Trend dataset values (benchmarks) so every build in view
+            # plots, then optionally overlay scan_insights to fill missing fields.
+            cls_df = pd.DataFrame()
+
+            # Always anchor the chart to the same build list as the throughput charts.
+            # Otherwise it will look like we "only have one build" when classification data
+            # exists for just a subset of builds.
+            try:
+                build_anchor = pd.DataFrame({"Build_Version": plot_df["Build_Version"].astype(str).tolist()})
+                build_anchor = build_anchor.drop_duplicates(subset=["Build_Version"], keep="first")
+                build_anchor = build_anchor.sort_values("Build_Version")
+            except Exception:
+                build_anchor = pd.DataFrame()
+
+            # Base series from the trend dataset itself (benchmarks):
+            # - benchmarks.total_catalog_items is treated as "New Attributes" per your meaning.
+            try:
+                fb = plot_df.copy()
+                base = pd.DataFrame({"Build_Version": fb["Build_Version"].astype(str)})
+                base["New_Attributes"] = pd.to_numeric(fb.get("New_Attributes"), errors="coerce") if "New_Attributes" in fb.columns else pd.NA
+                base["Total_Classifications"] = pd.to_numeric(fb.get("Total_Classification"), errors="coerce") if "Total_Classification" in fb.columns else pd.NA
+                base["Removed_Attributes"] = pd.to_numeric(fb.get("Removed_Attributes"), errors="coerce") if "Removed_Attributes" in fb.columns else pd.NA
+                cls_df = base.drop_duplicates(subset=["Build_Version"], keep="first").sort_values("Build_Version")
+            except Exception:
+                cls_df = pd.DataFrame()
+
+            # (Intentionally no scan_insights overlay here.)
+            # scan_insights is already joined into the base dataset in `load_data()` using scan_id,
+            # so the Trend chart stays simple and consistent.
+
+            # Pad missing builds so x-axis always shows full build range.
+            try:
+                if not build_anchor.empty:
+                    if cls_df is None or cls_df.empty:
+                        cls_df = build_anchor.copy()
+                        cls_df["Total_Classifications"] = pd.NA
+                        cls_df["New_Attributes"] = pd.NA
+                        cls_df["Removed_Attributes"] = pd.NA
+                    else:
+                        cls_df = build_anchor.merge(cls_df, on="Build_Version", how="left")
+            except Exception:
+                pass
+
+            if cls_df is None or cls_df.empty or ("Build_Version" not in cls_df.columns):
+                st.caption("Classification Trends: no data available yet for these filters. (Tracker will populate `scan_insights`; fallback data not present either.)")
+            else:
+                # Ensure template classifier counts are present when possible.
+                if "Template_Classifiers" not in cls_df.columns or cls_df["Template_Classifiers"].isna().all():
+                    try:
+                        engine3 = get_engine()
+                        if engine3 is not None and "Build_Version" in cls_df.columns:
+                            bvs = [str(x).strip() for x in cls_df["Build_Version"].astype(str).tolist() if str(x).strip()]
+                            bvs = list(dict.fromkeys(bvs))
+                            params = {}
+                            ph = []
+                            for i, bv in enumerate(bvs[:200]):
+                                k = f"bv{i}"
+                                params[k] = bv
+                                ph.append(f":{k}")
+                            if ph:
+                                with engine3.connect() as conn:
+                                    rows3 = conn.execute(
+                                        text(f"""
+                                            SELECT b.version, COUNT(DISTINCT bcm.classifier_id) AS n
+                                            FROM builds b
+                                            JOIN build_classifier_mappings bcm ON bcm.build_id = b.id
+                                            WHERE b.version IN ({",".join(ph)})
+                                            GROUP BY b.version
+                                        """),
+                                        params,
+                                    ).fetchall()
+                                m3 = {str(r[0]).strip(): (int(r[1]) if r[1] is not None else None) for r in (rows3 or [])}
+                                cls_df["Template_Classifiers"] = cls_df["Build_Version"].astype(str).map(lambda v: m3.get(str(v).strip()))
+                    except Exception:
+                        pass
+
+                # Tiny debug caption: how many builds have any classification data.
+                try:
+                    present = 0
+                    for c in ["Total_Classifications", "New_Attributes", "Removed_Attributes", "Template_Classifiers"]:
+                        if c in cls_df.columns:
+                            present = max(present, int(cls_df[c].notna().sum()))
+                    st.caption(f"Classification data present for {present} / {cls_df['Build_Version'].nunique()} builds in view.")
+                except Exception:
+                    pass
+                figc = go.Figure()
+                figc.add_trace(go.Scatter(
+                    x=cls_df["Build_Version"], y=cls_df["Total_Classifications"],
+                    mode="lines+markers", name="Total Classifications",
+                    line=dict(color="#3B82F6", width=3), marker=dict(size=8),
+                ))
+                figc.add_trace(go.Scatter(
+                    x=cls_df["Build_Version"], y=cls_df["New_Attributes"],
+                    mode="lines+markers", name="New Attributes",
+                    line=dict(color="#10B981", width=3), marker=dict(size=8),
+                ))
+                figc.add_trace(go.Scatter(
+                    x=cls_df["Build_Version"], y=cls_df["Removed_Attributes"],
+                    mode="lines+markers", name="Removed Attributes",
+                    line=dict(color="#EF4444", width=3), marker=dict(size=8),
+                ))
+                y_template = cls_df["Template_Classifiers"] if "Template_Classifiers" in cls_df.columns else None
+                figc.add_trace(go.Scatter(
+                    x=cls_df["Build_Version"], y=y_template,
+                    mode="lines+markers", name="Template Classifiers",
+                    line=dict(color="#8B5CF6", width=3), marker=dict(size=8),
+                ))
+                figc.update_layout(
+                    title="Classification Trends",
+                    xaxis_title="Build Version",
+                    yaxis_title="Count",
+                    hovermode="x unified",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                figc.update_xaxes(type="category", categoryorder="category ascending")
+                st.plotly_chart(figc, width="stretch")
 
     # Grouped Bar Charts - Restore these
     st.markdown("### Throughput Comparison (Grouped Bar Charts)")
@@ -6323,8 +8519,13 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
                 fig3.add_trace(go.Bar(x=cat_df['Build_Version'], y=cat_df['throughput_cluster_gb_hr'], name=name, marker_color=colors[i % len(colors)]))
         else:
             fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_cluster_gb_hr'], name='Cluster', marker_color='#8B5CF6'))
-            fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_gb_hr'], name='Per Scanner', marker_color='#6366F1'))
-            fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_gb_hr'], name='Per Thread', marker_color='#A78BFA'))
+            try:
+                if "throughput_scanner_gb_hr" in plot_df.columns and plot_df["throughput_scanner_gb_hr"].notna().any():
+                    fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_gb_hr'], name='Per Scanner', marker_color='#6366F1'))
+                if "throughput_thread_gb_hr" in plot_df.columns and plot_df["throughput_thread_gb_hr"].notna().any():
+                    fig3.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_gb_hr'], name='Per Thread', marker_color='#A78BFA'))
+            except Exception:
+                pass
         
         fig3.update_layout(title="Data Throughput Comparison", barmode='group', xaxis={'type': 'category', 'categoryorder': 'category ascending'}, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig3, width="stretch")
@@ -6342,8 +8543,13 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
                 fig4.add_trace(go.Bar(x=cat_df['Build_Version'], y=cat_df['throughput_cluster_files_hr'], name=name, marker_color=colors[i % len(colors)]))
         else:
             fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_cluster_files_hr'], name='Cluster', marker_color='#10B981'))
-            fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_files_hr'], name='Per Scanner', marker_color='#34D399'))
-            fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_files_hr'], name='Per Thread', marker_color='#6EE7B7'))
+            try:
+                if "throughput_scanner_files_hr" in plot_df.columns and plot_df["throughput_scanner_files_hr"].notna().any():
+                    fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_scanner_files_hr'], name='Per Scanner', marker_color='#34D399'))
+                if "throughput_thread_files_hr" in plot_df.columns and plot_df["throughput_thread_files_hr"].notna().any():
+                    fig4.add_trace(go.Bar(x=plot_df['Build_Version'], y=plot_df['throughput_thread_files_hr'], name='Per Thread', marker_color='#6EE7B7'))
+            except Exception:
+                pass
         
         fig4.update_layout(title="File Throughput Comparison", barmode='group', xaxis={'type': 'category', 'categoryorder': 'category ascending'}, legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig4, width="stretch")
@@ -6358,23 +8564,42 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(x))]
         except Exception:
             pass
+
+    # Table order: newest build first (descending) while charts remain ascending.
+    try:
+        table_df = plot_df.copy()
+        table_df["_build_num"] = pd.to_numeric(table_df["Build_Version"], errors="coerce")
+        table_df = table_df.sort_values(by=["_build_num", "Build_Version"], ascending=[False, False]).drop(columns=["_build_num"])
+    except Exception:
+        table_df = plot_df.copy()
     
     # Select columns in desired order: Data Throughput first, then File Throughput
-    cols_to_show = [
-        'Build_Version', 'Scan_Type',
-        # Data Throughput columns first
-        'throughput_cluster_gb_hr', 'throughput_scanner_gb_hr', 'throughput_thread_gb_hr',
-        # File Throughput columns second
-        'throughput_cluster_files_hr', 'throughput_scanner_files_hr', 'throughput_thread_files_hr',
-        # Configuration columns
-        'scanner_count', 'thread_count', 'total_scan_hours'
-    ]
+    if compare_by:
+        # In compare views (e.g., DS vs DS), per-scanner/per-thread is often missing and not meaningful.
+        cols_to_show = [
+            'Build_Version', 'Scan_Type',
+            'throughput_cluster_gb_hr',
+            'throughput_cluster_files_hr',
+            'scanner_count', 'thread_count', 'total_scan_hours',
+        ]
+    else:
+        cols_to_show = [
+            'Build_Version', 'Scan_Type',
+            # Data Throughput columns first
+            'throughput_cluster_gb_hr', 'throughput_scanner_gb_hr', 'throughput_thread_gb_hr',
+            # File Throughput columns second
+            'throughput_cluster_files_hr', 'throughput_scanner_files_hr', 'throughput_thread_files_hr',
+            # Configuration columns
+            'scanner_count', 'thread_count', 'total_scan_hours'
+        ]
     
     # Add comparison column if present
     if compare_by and compare_by not in cols_to_show:
         cols_to_show.append(compare_by)
-        
-    disp_df = plot_df[cols_to_show].copy()
+
+    # Avoid KeyError when some columns are absent (auto scans).
+    cols_to_show = [c for c in cols_to_show if c in table_df.columns]
+    disp_df = table_df[cols_to_show].copy() if cols_to_show else table_df.copy()
     
     # Define clearer display names for columns (with line breaks for compact display)
     display_names = {
@@ -6421,6 +8646,120 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     render_centered_table(disp_df)
 
 
+def page_classifier_build_diffs():
+    st.title("🧩 Classifiers: Build-by-Build Changes")
+    st.caption("Shows newly added/removed enabled classifiers per build (from `build_classifier_mappings`).")
+
+    if not engine:
+        st.error("Database not connected.")
+        return
+
+    ensure_build_templates_table()
+    ensure_test_environments_table()
+    try:
+        with engine.connect() as conn:
+            env_rows = conn.execute(text("SELECT id, env_name, is_active FROM test_environments ORDER BY is_active DESC, env_name")).fetchall()
+    except Exception:
+        env_rows = []
+
+    env_options = [("All environments", None)]
+    for r in env_rows or []:
+        try:
+            env_options.append((f"{str(r[1] or '').strip()} (id={int(r[0])})", int(r[0])))
+        except Exception:
+            pass
+
+    sel_label = st.selectbox("Environment", [x[0] for x in env_options], index=0)
+    sel_env_id = None
+    for lbl, eid in env_options:
+        if lbl == sel_label:
+            sel_env_id = eid
+            break
+
+    # Load sets per build
+    try:
+        with engine.connect() as conn:
+            if sel_env_id is None:
+                rows = conn.execute(text("""
+                    SELECT b.version, c.name
+                    FROM build_classifier_mappings bcm
+                    JOIN builds b ON b.id = bcm.build_id
+                    JOIN classifiers c ON c.id = bcm.classifier_id
+                    ORDER BY b.version, c.name
+                """)).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT b.version, c.name
+                    FROM build_classifier_mappings bcm
+                    JOIN builds b ON b.id = bcm.build_id
+                    JOIN classifiers c ON c.id = bcm.classifier_id
+                    WHERE bcm.environment_id = :e
+                    ORDER BY b.version, c.name
+                """), {"e": int(sel_env_id)}).fetchall()
+    except Exception as ex:
+        st.error(f"Failed to load classifier mappings: {ex}")
+        return
+
+    build_map: Dict[str, set] = {}
+    for ver, name in rows or []:
+        v = str(ver or "").strip()
+        n = str(name or "").strip()
+        if not v or not n:
+            continue
+        build_map.setdefault(v, set()).add(n)
+
+    if not build_map:
+        st.warning("No build classifier mappings found yet. Let `tracker.py` run (it will sync global classifiers per build).")
+        return
+
+    # Sort builds numerically when possible
+    def _build_key(v: str):
+        try:
+            return float(v)
+        except Exception:
+            return float("inf")
+
+    builds = sorted(build_map.keys(), key=_build_key)
+    rows_out = []
+    prev_set: Optional[set] = None
+    prev_build = ""
+    for bver in builds:
+        cur_set = build_map.get(bver) or set()
+        added = sorted(cur_set - (prev_set or set()))
+        removed = sorted((prev_set or set()) - cur_set) if prev_set is not None else []
+        rows_out.append({
+            "Build": bver,
+            "Classifier Count": len(cur_set),
+            "Added vs prev": len(added) if prev_set is not None else None,
+            "Removed vs prev": len(removed) if prev_set is not None else None,
+            "_added_list": added,
+            "_removed_list": removed,
+            "_prev": prev_build,
+        })
+        prev_set = cur_set
+        prev_build = bver
+
+    summary = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in rows_out])
+    st.dataframe(summary, width="stretch", hide_index=True)
+
+    st.divider()
+    st.markdown("### Added / Removed details")
+    for r in reversed(rows_out):  # newest first
+        bver = r["Build"]
+        prev = r["_prev"]
+        added = r["_added_list"]
+        removed = r["_removed_list"]
+        label = f"Build {bver}" + (f" (vs {prev})" if prev else "")
+        with st.expander(label, expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Added**")
+                st.dataframe(pd.DataFrame({"Classifier": added}) if added else pd.DataFrame({"Classifier": []}), width="stretch", hide_index=True)
+            with c2:
+                st.markdown("**Removed**")
+                st.dataframe(pd.DataFrame({"Classifier": removed}) if removed else pd.DataFrame({"Classifier": []}), width="stretch", hide_index=True)
+
+
 def load_auto_trend_dataset():
     if not engine:
         return pd.DataFrame()
@@ -6438,6 +8777,9 @@ def load_auto_trend_dataset():
                     COALESCE(ab.data_source_type, '') AS data_source_type,
                     COALESCE(ab.data_type, '') AS data_type,
                     COALESCE(ab.file_set_type, '') AS file_set_type,
+                    COALESCE(NULLIF(ab.scan_name, ''), NULLIF(sp.scan_name, ''), '') AS scan_name,
+                    ab.scan_start_time,
+                    ab.scan_end_time,
                     ab.total_scan_hours,
                     ab.total_size_gb,
                     ab.total_files,
@@ -6456,7 +8798,8 @@ def load_auto_trend_dataset():
             """)).fetchall()
         cols = [
             "scan_id", "environment_name", "build_version", "run_date", "scenario_type",
-            "scan_type", "data_source_type", "data_type", "file_set_type", "total_scan_hours",
+            "scan_type", "data_source_type", "data_type", "file_set_type", "scan_name",
+            "scan_start_time", "scan_end_time", "total_scan_hours",
             "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", 
             "new_attributes", "removed_attributes", "updated_at"
         ]
@@ -6464,8 +8807,18 @@ def load_auto_trend_dataset():
         if df.empty:
             return df
         df["run_date"] = pd.to_datetime(df["run_date"], errors="coerce")
+        df["scan_start_time"] = pd.to_datetime(df["scan_start_time"], errors="coerce")
+        df["scan_end_time"] = pd.to_datetime(df["scan_end_time"], errors="coerce")
         for col in ["total_scan_hours", "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", "new_attributes", "removed_attributes"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        # If hours is missing/invalid/tiny, recompute from start/end.
+        try:
+            calc = (df["scan_end_time"] - df["scan_start_time"]).dt.total_seconds() / 3600.0
+            mask = df["total_scan_hours"].isna() | (df["total_scan_hours"] <= 0) | (df["total_scan_hours"] < 0.01)
+            df.loc[mask & calc.notna() & (calc > 0), "total_scan_hours"] = calc[mask & calc.notna() & (calc > 0)]
+        except Exception:
+            pass
         return df
     except Exception:
         return pd.DataFrame()
@@ -6500,6 +8853,45 @@ def load_auto_trend_as_manual_like_df():
     out["Scan_Type"] = out["scan_type"].astype(str)
     out["Data_Source_Type"] = out["data_source_type"].astype(str)
     out["Data_Type"] = out["data_type"].astype(str)
+    out["scan_name"] = out.get("scan_name", "").astype(str)
+
+    # Re-infer core fields from scan_name when the auto table fields are missing/garbage.
+    try:
+        inferred = out["scan_name"].astype(str).apply(lambda s: infer_add_benchmark_defaults_from_scan_name(s) if str(s).strip() else {})
+        inf_build = inferred.apply(lambda d: str((d or {}).get("build_version") or "").strip())
+        inf_ds = inferred.apply(lambda d: str((d or {}).get("data_source_type") or "").strip())
+        inf_scan_type = inferred.apply(lambda d: str((d or {}).get("scan_type") or "").strip())
+        inf_fs = inferred.apply(lambda d: str((d or {}).get("file_set_type") or "").strip())
+
+        def _looks_like_ds(v: str) -> bool:
+            s = str(v or "").strip()
+            if not s:
+                return False
+            if any(ch.isdigit() for ch in s) and len(s) > 6:
+                return False
+            if " " in s:
+                return False
+            if len(s) > 12:
+                return False
+            return True
+
+        # Build version: if empty/unknown, use inferred.
+        bad_build = out["Build_Version"].astype(str).str.strip().isin(["", "Unknown", "unknown", "nan", "None"])
+        out.loc[bad_build & (inf_build != ""), "Build_Version"] = inf_build[bad_build & (inf_build != "")]
+
+        # DS: if not a compact token, use inferred.
+        bad_ds = ~out["Data_Source_Type"].astype(str).apply(_looks_like_ds)
+        out.loc[bad_ds & (inf_ds != ""), "Data_Source_Type"] = inf_ds[bad_ds & (inf_ds != "")]
+
+        # Scan type: if missing, use inferred.
+        bad_st = out["Scan_Type"].astype(str).str.strip().isin(["", "nan", "None"])
+        out.loc[bad_st & (inf_scan_type != ""), "Scan_Type"] = inf_scan_type[bad_st & (inf_scan_type != "")]
+
+        # File set type: if missing, use inferred (will be normalized below).
+        bad_fs = out["file_set_type"].astype(str).str.strip().isin(["", "nan", "None"])
+        out.loc[bad_fs & (inf_fs != ""), "file_set_type"] = inf_fs[bad_fs & (inf_fs != "")]
+    except Exception:
+        pass
 
     def normalize_file_set(v):
         s = str(v or "")
@@ -6517,7 +8909,10 @@ def load_auto_trend_as_manual_like_df():
     # Use table values if present, otherwise use mapping
     out["Total_Files"] = out["total_files_table"].fillna(pd.to_numeric(out["objects_scanned"], errors="coerce"))
     out["Total_Folders"] = pd.NA
-    out["Total_Catalog_Items"] = pd.to_numeric(out["total_classification"], errors="coerce")
+    # benchmarks.total_catalog_items in the manual trend schema means "New Attributes"
+    out["New_Attributes"] = pd.to_numeric(out.get("new_attributes"), errors="coerce")
+    out["Total_Classification"] = pd.to_numeric(out.get("total_classification"), errors="coerce")
+    out["Removed_Attributes"] = pd.to_numeric(out.get("removed_attributes"), errors="coerce")
     out["total_scan_hours"] = pd.to_numeric(out["total_scan_hours"], errors="coerce")
     out["is_active"] = 1
     out["is_acl"] = 0
@@ -6616,7 +9011,7 @@ def page_edit_benchmark(df):
         'Total_Files',
         'Total_Folders',
         'Total_Size_GB',
-        'Total_Catalog_Items',
+        'New_Attributes',
         'avg_file_size',
         'total_scan_hours',
         'throughput_cluster_gb_hr',
@@ -6666,7 +9061,7 @@ def page_edit_benchmark(df):
             "Total_Files": st.column_config.NumberColumn("Total Files", min_value=0, step=1000),
             "Total_Folders": st.column_config.NumberColumn("Total Folders", min_value=0, step=100),
             "Total_Size_GB": st.column_config.NumberColumn("Total Size (GB)", min_value=0.0, step=0.1),
-            "Total_Catalog_Items": st.column_config.NumberColumn("Total Catalog Items", min_value=0, step=1000),
+            "New_Attributes": st.column_config.NumberColumn("New Attributes", min_value=0, step=1000),
             "total_scan_hours": st.column_config.NumberColumn("Scan Hours", min_value=0.0, step=0.1, format="%.2f"),
             "throughput_cluster_gb_hr": st.column_config.NumberColumn("Cluster GB/hr", min_value=0.0, step=0.1, format="%.2f"),
             "throughput_scanner_gb_hr": st.column_config.NumberColumn("Scanner GB/hr", min_value=0.0, step=0.1, format="%.2f"),
@@ -6692,7 +9087,7 @@ def page_edit_benchmark(df):
 
             update_cols = [
                 'Date', 'Scenario_Type', 'Scan_Type', 'Data_Source_Type', 'Data_Type', 'file_set_type',
-                'Total_Files', 'Total_Folders', 'Total_Size_GB', 'Total_Catalog_Items', 'avg_file_size',
+                'Total_Files', 'Total_Folders', 'Total_Size_GB', 'New_Attributes', 'avg_file_size',
                 'throughput_cluster_gb_hr', 'throughput_scanner_gb_hr', 'throughput_thread_gb_hr',
                 'throughput_cluster_files_hr', 'throughput_scanner_files_hr', 'throughput_thread_files_hr',
                 'is_active'
@@ -6747,7 +9142,7 @@ def page_edit_benchmark(df):
                             'tf': clean_value(row.get('Total_Files')),
                             'tfo': clean_value(row.get('Total_Folders')),
                             'tgb': clean_value(row.get('Total_Size_GB')),
-                            'tcl': clean_value(row.get('Total_Catalog_Items')),
+                            'tcl': clean_value(row.get('New_Attributes')),
                             'sid': row_id
                         })
                     else:
@@ -6771,7 +9166,7 @@ def page_edit_benchmark(df):
                             'tf': clean_value(row.get('Total_Files')),
                             'tfo': clean_value(row.get('Total_Folders')),
                             'tgb': clean_value(row.get('Total_Size_GB')),
-                            'tci': clean_value(row.get('Total_Catalog_Items')),
+                            'tci': clean_value(row.get('New_Attributes')),
                             'avg': clean_value(row.get('avg_file_size')),
                             'tpcg': clean_value(row.get('throughput_cluster_gb_hr')),
                             'tpsg': clean_value(row.get('throughput_scanner_gb_hr')),
@@ -6854,6 +9249,68 @@ def load_latest_scan_progress_state_map(scan_ids):
         return out
     except Exception:
         return {}
+
+
+def load_latest_scan_progress_rows_for_environments(environment_ids):
+    """
+    Returns latest scan_progress rows per scan_id for given environment_ids.
+    Used to ensure Scan Status cannot miss running scans even if scan_parents lags.
+    """
+    if not engine:
+        return []
+    env_ids = []
+    seen = set()
+    for eid in (environment_ids or []):
+        try:
+            v = int(eid)
+        except Exception:
+            continue
+        if v in seen:
+            continue
+        seen.add(v)
+        env_ids.append(v)
+    if not env_ids:
+        return []
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT sp.scan_id, sp.scan_name, sp.environment_id, sp.scan_state, sp.captured_at_utc, sp.timestamp, sp.id
+                    FROM scan_progress sp
+                    JOIN (
+                        SELECT z.scan_id, MAX(z.id) AS max_id
+                        FROM scan_progress z
+                        JOIN (
+                            SELECT scan_id, MAX(COALESCE(captured_at_utc, timestamp)) AS mx
+                            FROM scan_progress
+                            WHERE environment_id IN :eids
+                              AND scan_id IS NOT NULL AND scan_id <> ''
+                            GROUP BY scan_id
+                        ) t
+                          ON t.scan_id = z.scan_id
+                         AND COALESCE(z.captured_at_utc, z.timestamp) = t.mx
+                        WHERE z.environment_id IN :eids
+                        GROUP BY z.scan_id
+                    ) u ON u.max_id = sp.id
+                    ORDER BY COALESCE(sp.captured_at_utc, sp.timestamp) DESC, sp.id DESC
+                """).bindparams(bindparam("eids", expanding=True)),
+                {"eids": env_ids},
+            ).fetchall()
+        out = []
+        for r in rows or []:
+            out.append({
+                "scan_id": str(r[0] or "").strip(),
+                "scan_name": str(r[1] or "").strip(),
+                "environment_id": r[2],
+                "scan_state": str(r[3] or "").strip(),
+                "captured_at_utc": r[4],
+                "timestamp": r[5],
+                "id": r[6],
+            })
+        return [x for x in out if x.get("scan_id")]
+    except Exception:
+        return []
 
 def page_scan_progress():
     st.title("📈 Scan Progress Details")
@@ -7113,7 +9570,7 @@ def page_scan_progress():
     except Exception:
         pass
 
-    # ---------- AI Analysis (stats + narrative) ----------
+    # ---------- Analysis (stats + narrative) ----------
     try:
         # Normalize numeric columns
         for col in [
@@ -7165,10 +9622,6 @@ def page_scan_progress():
     cur_failed_parts = int(_safe_num(last.get("failed_parts"), 0)) if last is not None else 0
     cur_state = str(last.get("scan_state") or "").strip() if last is not None else ""
 
-    pct_files = None
-    if expected_total_files and expected_total_files > 0:
-        pct_files = min(100.0, max(0.0, (cur_objects / expected_total_files) * 100.0))
-
     pct_parts = None
     if cur_parts_total and cur_parts_total > 0:
         pct_parts = min(100.0, max(0.0, (cur_parts_done / cur_parts_total) * 100.0))
@@ -7187,10 +9640,6 @@ def page_scan_progress():
             d_parts = _safe_num(tail.iloc[-1].get("completed_parts"), 0) - _safe_num(tail.iloc[0].get("completed_parts"), 0)
             files_per_min = d_files / dt_min if d_files is not None else None
             parts_per_min = d_parts / dt_min if d_parts is not None else None
-
-            if expected_total_files and expected_total_files > 0 and files_per_min and files_per_min > 0:
-                remaining = max(0.0, float(expected_total_files) - float(cur_objects))
-                eta_minutes = remaining / files_per_min
     except Exception:
         pass
 
@@ -7200,12 +9649,22 @@ def page_scan_progress():
     last_change_at = None
     completion_lag_minutes = None
     completion_lag_summary = ""
+    false_removed_delta = None
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
             b = df_ai.iloc[-1]
             if int(_safe_num(a.get("objects_scanned"), 0)) == int(_safe_num(b.get("objects_scanned"), 0)) and int(_safe_num(a.get("completed_parts"), 0)) == int(_safe_num(b.get("completed_parts"), 0)):
                 flags.append("No progress change across last snapshots (possible stall).")
+            # falseRemoved delta over last window
+            try:
+                fr0 = _safe_num(a.get("false_removed_classifications"), 0) or 0
+                fr1 = _safe_num(b.get("false_removed_classifications"), 0) or 0
+                false_removed_delta = int(fr1 - fr0)
+                if false_removed_delta > 0:
+                    flags.append(f"falseRemoved classifications increased by {false_removed_delta}.")
+            except Exception:
+                pass
         # Find last time objects_scanned changed (for stall age)
         if len(df_ai) >= 2 and "objects_scanned" in df_ai.columns:
             prev = None
@@ -7227,8 +9686,6 @@ def page_scan_progress():
                 stall_minutes = None
         if cur_failed_parts > 0:
             flags.append(f"Failed parts present: {cur_failed_parts}.")
-        if expected_total_files and cur_objects > expected_total_files:
-            flags.append("Objects scanned exceeds expected total (check file_set_types total_files).")
     except Exception:
         pass
 
@@ -7325,21 +9782,11 @@ def page_scan_progress():
         fs = str(exp.get("file_set_type") or "").strip()
         if ds or fs:
             bits.append(f"Scan looks like `{ds} {fs}` based on scan name.")
-        if lookup_key and expected_total_files:
-            bits.append(f"Ground-truth total files from `file_set_types` (`{lookup_key}`): **{expected_total_files:,}**.")
-        if pct_files is not None:
-            bits.append(f"Current objects scanned: **{cur_objects:,}** (**{pct_files:.1f}%** of expected).")
-        else:
-            bits.append(f"Current objects scanned: **{cur_objects:,}** (expected total not found in `file_set_types`).")
+        bits.append(f"Current objects scanned: **{cur_objects:,}**.")
         if pct_parts is not None:
             bits.append(f"Parts completed: **{cur_parts_done:,} / {cur_parts_total:,}** (**{pct_parts:.1f}%**).")
         if files_per_min is not None and files_per_min >= 0:
             bits.append(f"Recent throughput: **{files_per_min:,.0f} objects/min**.")
-        if eta_minutes is not None and eta_minutes >= 0:
-            if eta_minutes >= 120:
-                bits.append(f"ETA (rough): **{eta_minutes/60.0:.1f} hours**.")
-            else:
-                bits.append(f"ETA (rough): **{eta_minutes:.0f} minutes**.")
         if cur_state:
             bits.append(f"Latest state: `{cur_state}`.")
         if completion_lag_summary:
@@ -7350,19 +9797,15 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
-    with st.expander("🧠 AI Analysis (stats + narrative)", expanded=True):
+    with st.expander("🧠 Analysis (stats + narrative)", expanded=True):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Objects scanned", f"{cur_objects:,}")
-        if expected_total_files:
-            m2.metric("Expected total files", f"{expected_total_files:,}")
-            m3.metric("% complete (files)", f"{(pct_files or 0):.1f}%")
+        m2.metric("Parts progress", f"{(pct_parts or 0):.1f}%" if pct_parts is not None else "N/A")
+        m3.metric("Failed parts", f"{cur_failed_parts:,}")
+        if false_removed_delta is not None:
+            m4.metric("falseRemoved (Δ)", f"{false_removed_delta:+,}")
         else:
-            m2.metric("Expected total files", "N/A")
-            m3.metric("% complete (files)", "N/A")
-        if files_per_min is not None:
-            m4.metric("Throughput (obj/min)", f"{files_per_min:,.0f}")
-        else:
-            m4.metric("Throughput (obj/min)", "N/A")
+            m4.metric("falseRemoved (Δ)", "N/A")
 
         # Optional Local LLM narrative (Windows-ready later)
         llm_enabled = st.toggle("Generate LLM narrative (local)", value=False, help="Uses LOCAL_LLM_* env vars when configured.")
@@ -7382,19 +9825,15 @@ def page_scan_progress():
                     Scan id: {scan_id}
                     Latest state: {cur_state}
 
-                    Expected totals (file_set_types):
-                    - lookup_key: {lookup_key or 'N/A'}
-                    - expected_total_files: {expected_total_files if expected_total_files is not None else 'N/A'}
-
                     Latest snapshot:
                     - objects_scanned: {cur_objects}
                     - parts: {cur_parts_done}/{cur_parts_total}
                     - failed_parts: {cur_failed_parts}
-                    - pct_files: {pct_files if pct_files is not None else 'N/A'}
                     - pct_parts: {pct_parts if pct_parts is not None else 'N/A'}
                     - files_per_min: {files_per_min if files_per_min is not None else 'N/A'}
                     - eta_minutes: {eta_minutes if eta_minutes is not None else 'N/A'}
                     - stall_minutes: {stall_minutes if stall_minutes is not None else 'N/A'}
+                    - false_removed_delta: {false_removed_delta if false_removed_delta is not None else 'N/A'}
 
                     Completion lag (if detected): {completion_lag_summary or 'N/A'}
                     Flags: {', '.join(flags) if flags else 'None'}
@@ -7421,19 +9860,48 @@ def page_scan_progress():
         except Exception:
             pass
 
-        # Red warning when files show 100% but scan still running
+        # Red warning when scan appears done but still running
         try:
             running_states_local = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending"}
             is_running = str(cur_state or "").strip().lower().replace(" ", "") in {s.replace(" ", "") for s in running_states_local}
-            if is_running and pct_files is not None and pct_files >= 99.9:
+            # IMPORTANT:
+            # - Do not claim "finished" based on percent rounding (99.9%) or object-only stalls.
+            # - Treat "done" only when parts are actually complete OR expected object total is reached.
+            done_parts = bool(cur_parts_total and cur_parts_total > 0 and cur_parts_done >= cur_parts_total)
+            done_objects = bool(expected_total_files and expected_total_files > 0 and cur_objects >= int(expected_total_files))
+
+            # "No scanning progress" should consider BOTH parts + objects.
+            no_progress_last3 = False
+            try:
+                if len(df_ai) >= 3:
+                    a = df_ai.iloc[-3]
+                    b = df_ai.iloc[-1]
+                    no_progress_last3 = (
+                        int(_safe_num(a.get("objects_scanned"), 0) or 0) == int(_safe_num(b.get("objects_scanned"), 0) or 0)
+                        and int(_safe_num(a.get("completed_parts"), 0) or 0) == int(_safe_num(b.get("completed_parts"), 0) or 0)
+                    )
+            except Exception:
+                no_progress_last3 = False
+
+            stalled = bool(no_progress_last3) or (
+                stall_minutes is not None and stall_minutes >= 30 and files_per_min is not None and abs(files_per_min) < 1e-9
+            )
+            scanning_done = bool(done_parts or done_objects)
+
+            if is_running and stalled:
                 extra = []
-                if pct_parts is not None and pct_parts < 99.9:
-                    extra.append(f"parts progress is only {pct_parts:.1f}% (parts not complete)")
-                if stall_minutes is not None and stall_minutes >= 30:
+                extra.append(f"parts: {cur_parts_done:,} / {cur_parts_total:,}" if cur_parts_total else f"parts: {cur_parts_done:,}")
+                extra.append(f"objects scanned: {cur_objects:,}")
+                if expected_total_files and expected_total_files > 0:
+                    extra.append(f"expected objects: {int(expected_total_files):,}")
+                if no_progress_last3:
+                    extra.append("no change in parts/objects across last snapshots")
+                elif stall_minutes is not None and stall_minutes >= 30:
                     extra.append(f"no object-count increase for ~{stall_minutes:.0f} minutes")
+
                 # Add classification/finalization diagnosis (no speculation about expected totals being wrong).
                 try:
-                    if len(df_ai) >= 3:
+                    if scanning_done and len(df_ai) >= 3:
                         t = df_ai.tail(3)
                         d_pi = _safe_num(t.iloc[-1].get("objects_with_pi"), 0) - _safe_num(t.iloc[0].get("objects_with_pi"), 0)
                         d_new = _safe_num(t.iloc[-1].get("newly_added_classifications"), 0) - _safe_num(t.iloc[0].get("newly_added_classifications"), 0)
@@ -7445,19 +9913,17 @@ def page_scan_progress():
                 except Exception:
                     pass
 
-                msg = "Objects scanned reached ~100% of expected total, but the scan is still InProgress."
-                if extra:
-                    msg += " Observations: " + "; ".join(extra) + "."
-                st.error(msg)
+                if scanning_done:
+                    msg = "Scan appears complete (scanning work looks done), but state is still InProgress."
+                    st.error(msg + (" Observations: " + "; ".join(extra) + "." if extra else ""))
+                else:
+                    msg = "Scan appears stalled (no recent progress), but scanning does not look complete yet."
+                    st.warning(msg + (" Observations: " + "; ".join(extra) + "." if extra else ""))
         except Exception:
             pass
 
         if narrative:
             st.markdown(narrative)
-        if lookup_key and not expected_total_files:
-            st.caption(f"Note: `file_set_types` has `{lookup_key}` but total_files is empty. Fill it to enable % complete/ETA.")
-        if not lookup_key:
-            st.caption("Note: Could not match scan to a `file_set_types` row. Add one like `S3 Large Files` with total_files.")
 
     c1, c2, c3 = st.columns(3)
     def _apply_snapshot_ticks(fig_obj, x_vals):
@@ -7647,6 +10113,725 @@ def page_scan_progress():
         st.rerun()
 
 
+def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]) -> List[Dict[str, Any]]:
+    """
+    UI plan (no side-effects). Backend runner will execute these sequentially.
+    Alternates env1/env2 per step.
+    """
+    envs = [env1_id, env2_id]
+    def _env_for_idx(i: int) -> Optional[int]:
+        if not envs or (envs[0] is None and envs[1] is None):
+            return None
+        return envs[i % 2] if envs[i % 2] is not None else envs[(i + 1) % 2]
+
+    base: List[Dict[str, Any]] = [
+        {"ds_kind": "postgres", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "Postgres Full Scan"},
+        {"ds_kind": "mssql", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "MSSQL Full Scan"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Small Files)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Small Files)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Large Files)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Large Files)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Small Files) ACL ON"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Small Files) ACL ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Large Files) ACL ON"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Large Files) ACL ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (CSV Files)"},
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": True,  "feature_flags": "Structured Files Discovery", "notes": "S3 Full Scan (CSV Files) Structured Discovery FF ON"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+    ]
+
+    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool) -> str:
+        k = str(ds_kind or "").strip().lower()
+        fs = str(file_set_type or "").strip()
+        if k in {"s3", "smb"}:
+            prefix = "S3" if k == "s3" else "SMB"
+            if fs:
+                nm = f"{prefix} {fs}"
+            else:
+                nm = prefix
+
+            # Only tag when ACL is enabled; default case stays clean (no "No ACL")
+            if fs in {"Small Files", "Large Files"} and bool(is_acl):
+                nm += " With ACL"
+
+            # Structured discovery naming (esp for CSV)
+            if bool(is_structured_ff):
+                nm += " Structured Files Discovery"
+
+            if bool(is_ols):
+                nm += " With OLS"
+
+            return nm.strip()
+
+        if k == "postgres":
+            return "Postgres"
+        if k == "mssql":
+            return "MSSQL"
+        if k == "mysql":
+            return "MySQL"
+        return str(ds_kind or "").strip().upper() or "DS"
+
+    steps: List[Dict[str, Any]] = []
+    for idx, stp in enumerate(base):
+        stp2 = dict(stp)
+        stp2["environment_id"] = _env_for_idx(idx)
+        stp2["ds_name"] = _standard_ds_name(
+            str(stp2.get("ds_kind") or ""),
+            stp2.get("file_set_type"),
+            bool(stp2.get("is_acl")),
+            bool(stp2.get("is_ols")),
+            bool(stp2.get("is_structured_ff")),
+        )
+        stp2["status"] = "pending"
+        steps.append(stp2)
+    return steps
+
+
+def page_workflow_automation():
+    st.title("🧪 Workflow Automation")
+    st.caption("UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially.")
+
+    ensure_test_environments_table()
+    ensure_scan_tracking_tables()
+    ensure_scan_progress_table()
+    ensure_workflow_tables()
+
+    env_df = load_test_environments()
+    if env_df.empty:
+        st.info("No test environments found. Add them in `Manage Test Environments` first.")
+        return
+
+    work_df = env_df.copy()
+    work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
+    active_df = work_df[work_df["is_active"] == True].copy()
+    active_df = active_df.sort_values(by=["env_name"], ascending=[True]).reset_index(drop=True)
+    if active_df.empty:
+        st.warning("No active environments. Mark at least two environments active to run this workflow.")
+        return
+
+    # --- Create new workflow plan ---
+    st.markdown("### Create Workflow Plan")
+    c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
+    env_labels = [f"{r.env_name} (id={int(r.id)})" for r in active_df.itertuples()]
+    env_ids = [int(r.id) for r in active_df.itertuples()]
+    env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1")
+    env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2")
+    cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd"))
+    env1_id = env_ids[env_labels.index(env1_label)]
+    env2_id = env_ids[env_labels.index(env2_label)]
+    wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name")
+
+    create_disabled = False
+    if int(env1_id) == int(env2_id):
+        st.error("Env 1 and Env 2 must be different. Pick two different environments so scans can be balanced.")
+        create_disabled = True
+
+    preview_steps = _build_default_workflow_steps(env1_id, env2_id)
+    for stp in preview_steps or []:
+        if isinstance(stp, dict) and "is_enabled" not in stp:
+            stp["is_enabled"] = True
+    with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
+        prev_df = pd.DataFrame(preview_steps)
+        show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
+        show_cols = [c for c in show_cols if c in prev_df.columns]
+        editable_df = st.data_editor(
+            prev_df[show_cols],
+            width="stretch",
+            hide_index=True,
+            key="wf_preview_steps_editor",
+            column_config={
+                "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+            },
+            disabled=[c for c in show_cols if c != "is_enabled"],
+        )
+        try:
+            preview_steps = editable_df.to_dict("records")
+        except Exception:
+            pass
+
+    if st.button("Create workflow plan", type="primary", disabled=create_disabled):
+        rid = create_workflow_run(
+            wf_name,
+            env1_id=int(env1_id),
+            env2_id=int(env2_id),
+            steps=preview_steps,
+            cooldown_minutes=int(cooldown),
+        )
+        if rid:
+            st.success(f"Created workflow run id={rid}.")
+            st.query_params["page"] = "Workflow Automation"
+            st.query_params["run_id"] = str(int(rid))
+            # Make the new run selected by default after rerun.
+            try:
+                st.session_state["wf_run_sel_id"] = int(rid)
+            except Exception:
+                pass
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
+        else:
+            st.error("Failed to create workflow plan.")
+
+    st.divider()
+
+    # --- Existing runs ---
+    st.markdown("### Workflow Runs")
+    runs_df = load_workflow_runs(limit=50)
+    if runs_df.empty:
+        st.info("No workflow runs yet. Create one above.")
+        return
+
+    try:
+        run_id_qp = str(st.query_params.get("run_id", "") or "").strip()
+    except Exception:
+        run_id_qp = ""
+    run_options = []
+    run_map = {}
+    for r in runs_df.itertuples():
+        rid = int(r.id)
+        label = f"{rid} | {str(r.status or '').strip() or 'unknown'} | {str(r.name or '').strip()}"
+        run_options.append(label)
+        run_map[label] = rid
+    default_idx = 0
+    want = None
+    try:
+        if str(st.session_state.get("wf_run_sel_id", "")).strip():
+            want = int(st.session_state.get("wf_run_sel_id"))
+    except Exception:
+        want = None
+    if want is None and run_id_qp.isdigit():
+        want = int(run_id_qp)
+    if want is not None:
+        for i, lab in enumerate(run_options):
+            if run_map.get(lab) == int(want):
+                default_idx = i
+                break
+    selected_run_label = st.selectbox("Select run", run_options, index=default_idx, key="wf_run_sel")
+    run_id = int(run_map[selected_run_label])
+    try:
+        st.session_state["wf_run_sel_id"] = int(run_id)
+    except Exception:
+        pass
+
+    # Disable starting/resuming multiple workflows at once (prevents conflicts).
+    try:
+        tmp = runs_df.copy()
+        tmp["status_norm"] = tmp["status"].astype(str).str.strip().str.lower()
+        running_rows = tmp[tmp["status_norm"] == "running"].copy()
+        any_running = not running_rows.empty
+        running_ids = sorted({int(x) for x in running_rows["id"].tolist() if str(x).strip().isdigit()})
+    except Exception:
+        any_running = False
+        running_ids = []
+
+    try:
+        selected_status = str(runs_df[runs_df["id"] == run_id].iloc[0]["status"] or "").strip().lower()
+    except Exception:
+        selected_status = ""
+    selected_is_running = selected_status == "running"
+    other_running_ids = [x for x in running_ids if int(x) != int(run_id)]
+    if any_running and other_running_ids:
+        st.warning(f"Another workflow is already running (run id(s): {', '.join([str(x) for x in other_running_ids])}). Pause/Stop it before starting another.")
+    elif selected_is_running:
+        st.info("This workflow run is currently running.")
+
+    # Controls
+    b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3, 1.0])
+    start_disabled = bool(any_running)  # requirement: only one running workflow at a time
+    pause_disabled = (selected_status != "running")
+    resume_disabled = (selected_status != "paused") or (bool(any_running) and not selected_is_running)
+    stop_disabled = (selected_status not in {"running", "paused"})
+    if b1.button("Start Workflow", type="primary", disabled=start_disabled):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    UPDATE workflow_runs
+                    SET status = 'running',
+                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+                        next_eligible_at = COALESCE(next_eligible_at, CURRENT_TIMESTAMP)
+                    WHERE id = :rid
+                """), {"rid": int(run_id)})
+                conn.commit()
+            # Ensure background runner is started (so workflow continues unattended).
+            try:
+                if callable(ensure_workflow_runner_running):
+                    ensure_workflow_runner_running(engine)
+            except Exception:
+                pass
+            st.rerun()
+        except Exception as ex:
+            st.error(f"Start failed: {ex}")
+    if b2.button("Pause", disabled=pause_disabled):
+        set_workflow_run_status(int(run_id), "paused")
+        st.rerun()
+    if b3.button("Resume Workflow", disabled=resume_disabled):
+        set_workflow_run_status(int(run_id), "running")
+        try:
+            if callable(ensure_workflow_runner_running):
+                ensure_workflow_runner_running(engine)
+        except Exception:
+            pass
+        st.rerun()
+    if b6.button("Stop Workflow", disabled=stop_disabled):
+        set_workflow_run_status(int(run_id), "stopped")
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("UPDATE workflow_runs SET finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": int(run_id)})
+                conn.commit()
+        except Exception:
+            pass
+        st.rerun()
+    if b4.button("Refresh"):
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+    if b5.button("Reconcile from DB"):
+        res = reconcile_workflow_run(int(run_id))
+        st.caption(f"Reconciled: updated_steps={res.get('updated_steps')} completed_run={res.get('completed_run')}")
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.rerun()
+
+    # Run meta
+    try:
+        rrow = runs_df[runs_df["id"] == run_id].iloc[0].to_dict()
+    except Exception:
+        rrow = {}
+    st.caption(
+        f"Run id={run_id} | status={str(rrow.get('status') or '').strip() or 'unknown'}"
+        + (f" | next_eligible_at={rrow.get('next_eligible_at')}" if rrow.get("next_eligible_at") else "")
+        + (f" | cooldown={rrow.get('cooldown_minutes')}m" if rrow.get("cooldown_minutes") is not None else "")
+    )
+    last_err = str(rrow.get("last_error") or "").strip()
+    if last_err:
+        # When a run is running, last_error is historical (previous failure) and can be misleading.
+        # Only show as a blocking error when the run is paused/stopped.
+        if selected_status in {"paused", "stopped"}:
+            st.error(last_err)
+        else:
+            st.caption(f"Last failure (history): {last_err}")
+
+    # Extra visibility into why "nothing is happening"
+    try:
+        ne = rrow.get("next_eligible_at")
+        now_utc = datetime.utcnow()
+        ne_dt = None
+        if isinstance(ne, datetime):
+            ne_dt = ne
+        elif isinstance(ne, str) and ne.strip():
+            ne_dt = _parse_utc_dt(ne.strip())
+        if selected_is_running and ne_dt and ne_dt > now_utc:
+            remaining_s = int(max(0, (ne_dt - now_utc).total_seconds()))
+            remaining_m = remaining_s // 60
+            st.info(f"Cooldown active. Next step will be eligible in ~{remaining_m} min (at {ne_dt} UTC).")
+    except Exception:
+        pass
+    try:
+        if str(os.getenv("WORKFLOW_CREATE_ONLY", "") or "").strip():
+            st.warning("Runner is in CREATE-ONLY mode (`WORKFLOW_CREATE_ONLY` is set). It will NOT trigger scans.")
+        if str(os.getenv("WORKFLOW_SKIP_WAIT_FOR_TERMINAL", "") or "").strip():
+            st.warning("Runner is in SKIP-WAIT mode (`WORKFLOW_SKIP_WAIT_FOR_TERMINAL` is set). It will not wait for scans to finish (reconcile needed).")
+    except Exception:
+        pass
+
+    # If run is running, show (and trigger) runner autostart status so it's obvious what's happening.
+    if selected_is_running:
+        try:
+            if callable(ensure_workflow_runner_running):
+                ok, msg = ensure_workflow_runner_running(engine)
+                st.caption(f"Runner: {msg}")
+        except Exception:
+            pass
+        # Runner heartbeat (shows why it might be idle: cooldown/waiting/blocked/error)
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(
+                    text("""
+                        SELECT last_started_at_utc, last_finished_at_utc, last_status, last_message
+                        FROM tracker_heartbeat
+                        WHERE name = 'workflow_runner'
+                        LIMIT 1
+                    """)
+                ).fetchone()
+            if row:
+                st.caption(f"Runner heartbeat: status={row[2]} started={row[0]} finished={row[1]} msg={row[3]}")
+        except Exception:
+            pass
+        # DB-wide lock holder (useful when multiple machines share the same DB)
+        try:
+            with engine.connect() as conn:
+                row2 = conn.execute(
+                    text("""
+                        SELECT v, updated_at
+                        FROM tracker_kv
+                        WHERE k = 'workflow_runner_lock'
+                        LIMIT 1
+                    """)
+                ).fetchone()
+            if row2:
+                st.caption(f"Runner lock: holder={row2[0]} updated_at={row2[1]}")
+        except Exception:
+            pass
+
+    steps_df = load_workflow_steps(int(run_id))
+    if steps_df.empty:
+        st.info("No steps found for this run.")
+        return
+
+    # Current activity summary
+    try:
+        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
+        counts = stv.value_counts().to_dict()
+        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
+        active_df = steps_df[active_mask].copy()
+        if active_df.empty:
+            active_df = steps_df[stv.isin(["pending"])].copy()
+        # Prefer the most relevant/most recently updated active step.
+        # (Avoid always showing seq=1 when later steps are actually running.)
+        _prio = {
+            "running": 100,
+            "scan_running": 90,
+            "scan_created": 80,
+            "ds_test_ok": 70,
+            "ds_created": 60,
+            "pre_action_done": 50,
+            "pending": 10,
+        }
+        try:
+            active_df["_status_norm"] = active_df["status"].fillna("").astype(str).str.strip().str.lower()
+            active_df["_prio"] = active_df["_status_norm"].map(lambda s: int(_prio.get(str(s), 0)))
+        except Exception:
+            active_df["_prio"] = 0
+        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df.columns]
+        active_row = active_df.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df.empty else {}
+    except Exception:
+        counts = {}
+        active_row = {}
+
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Pending", int(counts.get("pending", 0)))
+    a2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
+    a3.metric("Completed", int(counts.get("completed", 0)))
+    a4.metric("Disabled", int(counts.get("disabled", 0)))
+    a5.metric("Errors", int(counts.get("error", 0)))
+    try:
+        if active_row:
+            st.caption(
+                f"Current step: {int(active_row.get('seq'))} | status={str(active_row.get('status') or '').strip()} | "
+                f"ds=`{str(active_row.get('ds_name') or '').strip()}` | file_set=`{str(active_row.get('file_set_type') or '').strip()}` | "
+                f"env={str(active_row.get('environment') or active_row.get('environment_id') or '').strip()} | updated_at={active_row.get('updated_at')}"
+            )
+    except Exception:
+        pass
+
+    # Convenience display columns
+    disp = steps_df.copy()
+    # Phase column to avoid confusion between "step running" vs "scan running"
+    try:
+        _phase_map = {
+            "pending": "Pending",
+            "disabled": "Disabled",
+            "error": "Error",
+            "running": "Executing step",
+            "pre_action_done": "Pre-action done",
+            "ds_created": "DS created",
+            "ds_test_ok": "DS test OK",
+            "scan_created": "Scan profile created",
+            "scan_running": "Scan running",
+            "completed": "Completed",
+        }
+        disp["_status_norm"] = disp["status"].fillna("").astype(str).str.strip().str.lower()
+        disp["Phase"] = disp["_status_norm"].map(lambda s: _phase_map.get(str(s), str(s or "").strip() or ""))
+    except Exception:
+        disp["Phase"] = disp.get("status")
+    disp["Flags"] = disp.apply(
+        lambda r: ", ".join([x for x in [
+            "ACL" if bool(r.get("is_acl")) else "",
+            "STRUCT" if bool(r.get("is_structured_ff")) else "",
+            "OLS" if bool(r.get("is_ols")) else "",
+        ] if x]),
+        axis=1,
+    )
+    # Visual progress flow (only show reached stages; don't spam the whole chain for pending rows).
+    def _render_progress_flow(row: Dict[str, Any]) -> str:
+        s = str(row.get("status") or "").strip().lower()
+        if s == "disabled":
+            return "🚫 Disabled"
+
+        ds_id = str(row.get("ds_id") or "").strip()
+        spid = str(row.get("scan_profile_id") or "").strip()
+        sid = str(row.get("scan_id") or "").strip()
+
+        # Determine the furthest reached stage from status + ids.
+        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"})
+        has_test = (s in {"ds_test_ok", "scan_created", "scan_running", "completed"})
+        has_profile = bool(spid) or (s in {"scan_created", "scan_running", "completed"})
+        has_scan = bool(sid) or (s in {"scan_running", "completed"})
+
+        parts: List[str] = []
+
+        if s in {"pending", ""}:
+            return "➖ DS"
+        if s in {"running", "pre_action_done"}:
+            return "⏳ DS"
+
+        if s == "error":
+            # Show where it failed based on what we already have.
+            if not has_ds:
+                return "❌ DS"
+            if has_ds and not has_test:
+                return "✅ DS ➔ ❌ Test"
+            if has_test and not has_profile:
+                return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
+            if has_profile and not has_scan:
+                return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
+            return "❌ Error"
+
+        # Non-error, reached stages only.
+        if has_ds:
+            parts.append("✅ DS")
+        if has_test:
+            parts.append("✅ Test")
+        if has_profile:
+            parts.append("✅ Profile")
+        if has_scan:
+            parts.append("⏳ Scan" if s == "scan_running" else "✅ Scan")
+
+        # If somehow we have no signals, default to DS.
+        return " ➔ ".join(parts) if parts else "➖ DS"
+
+    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow(r.to_dict()), axis=1)
+    disp["Run ID"] = disp["run_id"] if "run_id" in disp.columns else run_id
+    
+    try:
+        disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
+    except Exception:
+        disp["Scan Link"] = ""
+        
+    disp = disp.rename(columns={
+        "seq": "Step",
+        "environment": "Environment",
+        "ds_kind": "DS Type",
+        "ds_name": "DS Name",
+        "scan_kind": "Scan Type",
+        "file_set_type": "File Set",
+        "scan_id": "Scan Id",
+        "notes": "Notes",
+    })
+    
+    st.markdown("### Step Details")
+    try:
+        _run_status = str(rrow.get("status") or "").strip().lower()
+    except Exception:
+        _run_status = ""
+    if _run_status in {"created", ""}:
+        st.info("This run is not started yet. Click **Start Workflow** to begin (then both environments will be used according to the step plan).")
+    
+    # Wrap in expander for master-detail feel
+    with st.expander(f"View Step Progress for Run {run_id}", expanded=True):
+        # Columns to show in the cleaned up table (Removed Phase, Scan Started, Step Status, build_prefix, DS Id)
+        # Added Run ID, Progress Flow
+        cols = ["Run ID", "Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Progress Flow", "build_version", "Scan Id", "Scan Link", "Notes", "last_error", "updated_at"]
+        cols = [c for c in cols if c in disp.columns]
+        
+        st.dataframe(
+            disp[cols],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View in Progress"),
+            },
+        )
+
+    with st.expander("Edit steps (before run)", expanded=False):
+        st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
+        if selected_status == "running":
+            st.info("Pause/Stop the workflow run to edit steps.")
+        else:
+            edit_df = steps_df.copy()
+            if "is_enabled" not in edit_df.columns:
+                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
+            try:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
+            except Exception:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
+            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
+            show_cols = [c for c in show_cols if c in edit_df.columns]
+            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Environment", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
+            editor = st.data_editor(
+                view,
+                width="stretch",
+                hide_index=True,
+                key=f"wf_edit_steps_{run_id}",
+                column_config={
+                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                },
+                disabled=[c for c in view.columns if c != "is_enabled"],
+            )
+            if st.button("Save step selection", type="primary", key=f"wf_save_steps_{run_id}"):
+                try:
+                    desired = editor[["id", "is_enabled"]].copy()
+                    desired["id"] = desired["id"].astype(int)
+                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
+                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
+                    from sqlalchemy import bindparam
+                    with engine.connect() as conn:
+                        if disable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": disable_ids},
+                            )
+                        if enable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=1,
+                                        status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END,
+                                        last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END,
+                                        updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": enable_ids},
+                            )
+                        conn.commit()
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Saved.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+    with st.expander("Maintenance (reset stale status)", expanded=False):
+        st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans; it only resets DB state for the run.")
+        st.caption("This reset keeps DS + scan profile ids so the runner will NOT recreate them.")
+        if st.button("Reset unfinished steps", key="wf_reset_steps_soft"):
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("""
+                        UPDATE workflow_steps
+                        SET status='pending',
+                            last_error=NULL,
+                            started_at=NULL,
+                            finished_at=NULL,
+                            scan_id=NULL,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE run_id=:rid
+                          AND COALESCE(status,'') NOT IN ('completed','disabled')
+                    """), {"rid": int(run_id)})
+                    conn.execute(text("""
+                        UPDATE workflow_runs
+                        SET last_error=NULL,
+                            next_eligible_at=CURRENT_TIMESTAMP,
+                            updated_at=CURRENT_TIMESTAMP
+                        WHERE id=:rid
+                    """), {"rid": int(run_id)})
+                    conn.commit()
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.success("Soft reset done. Click Start/Resume to run again.")
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Soft reset failed: {ex}")
+
+    # Hide manual template editing in normal mode (workflow should be automatic).
+    # If needed for troubleshooting, enable debug view via ?debug=true
+    if st.query_params.get("debug") == "true":
+        st.divider()
+        st.markdown("### Templates (Debug)")
+        st.caption("Debug-only: manual editing of workflow templates stored in DB.")
+
+        # Pick a step to derive keys
+        try:
+            step_nums = [int(x) for x in steps_df["seq"].tolist() if str(x).strip()]
+            step_nums = sorted(set(step_nums))
+        except Exception:
+            step_nums = list(range(1, 17))
+        pick_step = st.selectbox("Select step to edit templates", step_nums, index=0, key="wf_tpl_step")
+        try:
+            step_row = steps_df[steps_df["seq"] == int(pick_step)].iloc[0].to_dict()
+        except Exception:
+            step_row = {}
+
+        ds_key = _workflow_ds_template_key(step_row or {})
+        scan_key = _workflow_scan_template_key(step_row or {})
+
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            st.markdown("**DS template**")
+            st.code(ds_key)
+            ds_existing = get_workflow_template_payload(ds_key)
+            ds_text = st.text_area(
+                "DS JSON (PUT /ds_connections/<name>)",
+                value=ds_existing or "{\n  \"ds_connection\": {\n    \"name\": \"{{DS_NAME}}\",\n    \"type\": \"{{DS_TYPE}}\",\n    \"enabled\": true\n  }\n}\n",
+                height=220,
+                key="wf_ds_json",
+            )
+            if st.button("Save DS template", key="wf_save_ds"):
+                upsert_workflow_template(ds_key, "ds", ds_text)
+                st.success("Saved DS template.")
+        with t2:
+            st.markdown("**Scan template**")
+            st.code(scan_key)
+            scan_existing = get_workflow_template_payload(scan_key)
+            scan_text = st.text_area(
+                "Scan JSON (POST /scanProfiles)",
+                value=scan_existing or "{\n  \"name\": \"{{SCAN_PROFILE_NAME}}\",\n  \"description\": \"{{NOTES}}\",\n  \"dataSourceList\": [\"{{DS_ID}}\"],\n  \"scanTemplateId\": \"{{SCAN_TEMPLATE_ID}}\",\n  \"isSingleRunScan\": true\n}\n",
+                height=220,
+                key="wf_scan_json",
+            )
+            if st.button("Save Scan template", key="wf_save_scan"):
+                upsert_workflow_template(scan_key, "scan", scan_text)
+                st.success("Saved Scan template.")
+        with t3:
+            st.markdown("**Pre-OLS action (FF change)**")
+            st.caption("Executed automatically before OLS steps. Use env-specific key if needed.")
+            action_key_global = "action::pre_ols"
+            action_key_env = f"action::pre_ols::env={int(step_row.get('environment_id'))}" if step_row.get("environment_id") is not None else ""
+            st.code(action_key_env or action_key_global)
+            existing = get_workflow_template_payload(action_key_env) if action_key_env else ""
+            if not existing:
+                existing = get_workflow_template_payload(action_key_global)
+            action_text = st.text_area(
+                "Action JSON (method/path/body)",
+                value=existing or "{\n  \"method\": \"POST\",\n  \"path\": \"/api/v1/REPLACE_ME\",\n  \"params\": {},\n  \"body\": {}\n}\n",
+                height=220,
+                key="wf_action_json",
+            )
+            if st.button("Save Pre-OLS action", key="wf_save_action"):
+                upsert_workflow_template(action_key_env or action_key_global, "action", action_text)
+                st.success("Saved Pre-OLS action template.")
+
+
 def page_create_data_source():
     """
     Wizard-like tool:
@@ -7672,6 +10857,137 @@ def page_create_data_source():
     selected_label = st.selectbox("Environment", labels, index=0)
     selected_env = work_df.iloc[labels.index(selected_label)].to_dict()
 
+    ensure_workflow_tables()
+    st.markdown("### Environment Info")
+    base_url = str(selected_env.get("base_url") or "").strip()
+    env_id_val = selected_env.get("id")
+    env_name_val = str(selected_env.get("env_name") or "").strip()
+    current_version = str(selected_env.get("version") or "").strip()
+
+    def _build_prefix_from_version(v: str) -> str:
+        s = str(v or "").strip()
+        if not s:
+            return ""
+        # 248.1 -> 248-1
+        if "." in s:
+            parts = s.split(".")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                return f"{parts[0]}-{parts[1]}"
+        if s.lower().startswith("release-"):
+            s = s[len("release-"):].strip()
+        return s.replace(".", "-")
+
+    b1, b2, b3 = st.columns([1.0, 1.0, 1.4])
+    if b1.button("Fetch build (/about)", type="primary"):
+        try:
+            tok = fetch_auth_token_for_env(selected_env)
+        except Exception:
+            tok = ""
+        try:
+            clean_version, raw_version, about_url = fetch_core_version_from_api(base_url, tok, INTERNAL_ABOUT_API_PATH)
+            if clean_version:
+                try:
+                    record_environment_version(env_id_val, env_name_val, clean_version)
+                except Exception:
+                    pass
+                selected_env["version"] = clean_version
+                st.session_state["create_ds_env_version"] = clean_version
+                st.success(f"Build version: `{clean_version}`")
+                st.caption(f"API: `{about_url}`")
+            else:
+                st.warning("Could not extract releaseVersion from /about response.")
+        except Exception as ex:
+            st.error(f"Failed to fetch /about: {ex}")
+
+    effective_version = str(st.session_state.get("create_ds_env_version") or current_version or "").strip()
+    b2.metric("Build version", effective_version or "—")
+    b3.metric("Build prefix", _build_prefix_from_version(effective_version) or "—")
+
+    st.markdown("### Automation Defaults")
+    st.caption("Saved to DB (used by workflow runner).")
+    key_env = f"config::scan_template_id::env={int(env_id_val)}" if env_id_val is not None else ""
+    key_global = "config::scan_template_id"
+    # Automatic: try to populate env scanTemplateId from API (Data source scan).
+    try:
+        auto_id = ensure_env_default_scan_template_id(selected_env)
+    except Exception:
+        auto_id = ""
+    existing_id = (get_workflow_template_payload(key_env) if key_env else "") or get_workflow_template_payload(key_global) or ""
+    if (not existing_id) and auto_id:
+        existing_id = auto_id
+    c1, c2, c3 = st.columns([1.6, 1.0, 1.0])
+    scan_template_id = c1.text_input("Default Scan Template ID", value=str(existing_id or "").strip(), key="create_ds_scan_template_id")
+    if c2.button("Save (this env)"):
+        if not key_env:
+            st.error("Missing environment id.")
+        elif not str(scan_template_id or "").strip():
+            st.error("Scan Template ID is required.")
+        else:
+            upsert_workflow_template(key_env, "config", str(scan_template_id).strip())
+            st.success("Saved env scanTemplateId.")
+    if c3.button("Save (global)"):
+        if not str(scan_template_id or "").strip():
+            st.error("Scan Template ID is required.")
+        else:
+            upsert_workflow_template(key_global, "config", str(scan_template_id).strip())
+            st.success("Saved global scanTemplateId.")
+
+    # Default scanner group for automation
+    st.markdown("**Default scanner group (automation)**")
+    sg_key_env = f"config::scanner_group::env={int(env_id_val)}" if env_id_val is not None else ""
+    sg_key_global = "config::scanner_group"
+    sg_existing = (get_workflow_template_payload(sg_key_env) if sg_key_env else "") or get_workflow_template_payload(sg_key_global) or ""
+    try:
+        groups_cached = st.session_state.get("scanner_groups_last") or []
+        group_names_cached = []
+        for g in groups_cached:
+            if isinstance(g, dict):
+                nm = str(g.get("name") or g.get("scanner_group") or g.get("id") or g.get("_id") or "").strip()
+                if nm:
+                    group_names_cached.append(nm)
+        group_names_cached = sorted(set(group_names_cached))
+    except Exception:
+        group_names_cached = []
+    sg_options = group_names_cached or ["default"]
+    default_idx = 0
+    try:
+        if str(sg_existing).strip() and str(sg_existing).strip() in sg_options:
+            default_idx = sg_options.index(str(sg_existing).strip())
+    except Exception:
+        default_idx = 0
+    sg_val = st.selectbox("Scanner group (default for runner)", sg_options, index=default_idx, key="create_ds_default_scanner_group")
+    s1, s2 = st.columns([1.0, 1.0])
+    if s1.button("Save scanner group (this env)"):
+        if not sg_key_env:
+            st.error("Missing environment id.")
+        else:
+            upsert_workflow_template(sg_key_env, "config", str(sg_val).strip())
+            st.success("Saved env scanner group.")
+    if s2.button("Save scanner group (global)"):
+        upsert_workflow_template(sg_key_global, "config", str(sg_val).strip())
+        st.success("Saved global scanner group.")
+
+    st.markdown("**Scan template id (automatic)**")
+    st.caption("Auto-detected from Scan Templates API by picking template name `Data source scan`.")
+    if st.query_params.get("debug") == "true":
+        if st.button("Debug: show templates list"):
+            with st.spinner("Fetching scan templates..."):
+                try:
+                    items, _total, url = fetch_scan_templates_with_auth_retry(selected_env, limit=200, skip=0)
+                    rows = []
+                    for it in items or []:
+                        if isinstance(it, dict):
+                            rows.append({
+                                "name": str(it.get("name") or "").strip(),
+                                "_id": str(it.get("_id") or it.get("id") or "").strip(),
+                                "updated_at": it.get("updated_at") or it.get("updatedAt") or it.get("updated") or "",
+                            })
+                    st.caption(f"API: `{url}`")
+                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                except Exception as ex:
+                    st.error(f"Failed: {ex}")
+
+    st.divider()
     st.markdown("**Step 1: Fetch scanner groups**")
     if st.button("Get scanner groups", type="primary"):
         with st.spinner("Fetching scanner groups..."):
@@ -7912,6 +11228,8 @@ def main():
                 "Overview": "Overview",
                 "Build Analysis": "Build Analysis",
                 "Comparison": "Comparison",
+                "Build DS Runs": "Build DS Runs",
+                "Data Source Trend Comparison": "Data Source Trend Comparison",
                 "Add New Benchmark": "Add New Benchmark",
                 "Small Files Trend Analysis": "Small Files Trend Analysis",
                 "Large Files Trend Analysis": "Large Files Trend Analysis",
@@ -7927,8 +11245,10 @@ def main():
                 "Run Comparison Tool": "Comparison",
                 "Edit Records": "Edit Records",
                 "Manage Classifiers": "Manage Classifiers",
+                "Classifier Changes": "Classifier Changes",
                 "Manage Test Environments": "Manage Test Environments",
                 "Version Comparison": "Version Comparison",
+                "Workflow Automation": "Workflow Automation",
                 "Create Data Source": "Create Data Source",
                 "Scan Status": "Scan Status",
                 "Scan Progress": "Scan Progress"
@@ -8147,6 +11467,8 @@ def main():
             <span style="font-size: 1rem;">⚖️</span> <b style="color: #ffffff !important; font-size: 0.9rem;">Expert Comparisons</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Head-to-Head</div>
+                <a href="?page=Build+DS+Runs" target="_self" class="flyout-item"><span>🧪</span> <span>Build + DS Runs</span></a>
+                <a href="?page=Data+Source+Trend+Comparison" target="_self" class="flyout-item"><span>📈</span> <span>DS Trend Comparison</span></a>
                 <a href="?page=OLS+vs+Full+Scan+(Small)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Small)</span></a>
                 <a href="?page=OLS+vs+Full+Scan+(Large)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Large)</span></a>
                 <a href="?page=Discover+File+FF+On+vs+Off" target="_self" class="flyout-item"><span>⚙️</span> <span>Discover FF: On/Off</span></a>
@@ -8159,12 +11481,13 @@ def main():
             <span style="font-size: 1rem;">🛠️</span> <b style="color: #ffffff !important; font-size: 0.9rem;">System Tools</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Administration</div>
-                <a href="?page=Run+Comparison+Tool" target="_self" class="flyout-item"><span>🔄</span> <span>Run Head-to-Head</span></a>
+                <a href="?page=Run+Comparison+Tool" target="_self" class="flyout-item"><span>🔄</span> <span>Run Comparison Tool</span></a>
+                <a href="?page=Classifier+Changes" target="_self" class="flyout-item"><span>🧬</span> <span>Classifier Comparison</span></a>
                 <a href="?page=Add+New+Benchmark" target="_self" class="flyout-item"><span>➕</span> <span>Add New Data Record</span></a>
                 <a href="?page=Edit+Records" target="_self" class="flyout-item"><span>🛠️</span> <span>Edit Existing Records</span></a>
-                <a href="?page=Manage+Classifiers" target="_self" class="flyout-item"><span>🧩</span> <span>Manage Classifiers</span></a>
                 <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
                 <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
+                <a href="?page=Workflow+Automation" target="_self" class="flyout-item"><span>🧪</span> <span>Workflow Automation</span></a>
                 <a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>
                 <a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>
                 <a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>
@@ -8177,7 +11500,7 @@ def main():
     st.sidebar.markdown(sidebar_html.replace("__LOGO__", logo_html), unsafe_allow_html=True)
     
     st.sidebar.markdown("<br><br>", unsafe_allow_html=True)
-    if st.sidebar.button("Clear Cache & Refresh Data", use_container_width=True): 
+    if st.sidebar.button("Clear Cache & Refresh Data", width="stretch"): 
         st.cache_data.clear()
         st.rerun()
 
@@ -8192,6 +11515,10 @@ def main():
         page_build_analysis(data)
     elif page == "Comparison":
         page_comparison(data)
+    elif page == "Build DS Runs":
+        page_build_ds_runs()
+    elif page == "Data Source Trend Comparison":
+        page_data_source_trend_comparison(data)
     elif page == "Small Files Trend Analysis":
         render_trend_analysis(data, "Small Files Trend Analysis", file_set_filter="Small Files")
     elif page == "Large Files Trend Analysis":
@@ -8236,10 +11563,14 @@ def main():
             page_edit_benchmark(full_data)
     elif page == "Manage Classifiers":
         page_manage_classifiers()
+    elif page == "Classifier Changes":
+        page_classifier_build_diffs()
     elif page == "Manage Test Environments":
         page_manage_test_environments()
     elif page == "Version Comparison":
         page_version_comparison()
+    elif page == "Workflow Automation":
+        page_workflow_automation()
     elif page == "Create Data Source":
         page_create_data_source()
     elif page == "Scan Status":
