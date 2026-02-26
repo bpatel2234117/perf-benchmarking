@@ -1144,25 +1144,44 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
             ds_conn["authenticationProperties"] = ap
 
     # Generic fallback for current + future DS kinds:
-    # If the DS payload already contains a credential key, and .env provides
-    # "<ds_kind>_<that_key>", override it.
-    # (We only touch keys that already exist in the payload to avoid accidental injections.)
+    # Recursively override credential-ish keys when .env provides "<ds_kind>_<key>".
+    # This handles connectors that nest secrets under various sub-objects.
     try:
-        for target in [ds_conn, ap]:
-            if not isinstance(target, dict):
+        pref = f"{k}_"
+        pref_map: Dict[str, str] = {}
+        for kk, vv in (secret_vars or {}).items():
+            kkl = str(kk or "").strip().lower()
+            if not kkl.startswith(pref):
                 continue
-            for key in list(target.keys()):
-                v = _get_prefixed_field(str(key))
-                if v:
-                    target[key] = v
-            # common convenience fallbacks
-            if "password" in target and not str(target.get("password") or "").strip():
-                v = _get_prefixed_field("password")
-                if v:
-                    target["password"] = v
-            if "password" in target and not _get_prefixed_field("password") and _get_prefixed_field("password_enc"):
-                # if template uses password but env provides password_enc, use it as-is
-                target["password"] = _get_prefixed_field("password_enc")
+            suffix = kkl[len(pref):].strip()
+            vvs = str(vv or "").strip()
+            if suffix and vvs:
+                pref_map[suffix] = vvs
+
+        allow = {
+            "username","user","userid","user_id","account","accountname","domain",
+            "password","password_enc","passwd","pwd",
+            "secret","secret_enc","secret_key","secret_key_enc","clientsecret","client_secret",
+            "accesskey","access_key","accesskeyid","access_key_id",
+            "token","api_key","apikey","private_key","privatekey",
+            "tenantid","tenant_id",
+        }
+
+        def _walk(obj: Any) -> None:
+            if isinstance(obj, dict):
+                for key in list(obj.keys()):
+                    kl = str(key or "").strip().lower()
+                    if kl in pref_map and (kl in allow):
+                        obj[key] = pref_map[kl]
+                    # common: template has password but env provides password_enc
+                    if kl == "password" and ("password_enc" in pref_map) and ("password_enc" in allow):
+                        obj[key] = pref_map["password_enc"]
+                    _walk(obj.get(key))
+            elif isinstance(obj, list):
+                for it in obj:
+                    _walk(it)
+
+        _walk(ds_payload)
     except Exception:
         pass
 
@@ -1765,9 +1784,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # IMPORTANT: DS name must be stable per step.
     # Otherwise, a failing DS connection test would create N new DS connections.
     existing_ds_name = str(step_dict.get("ds_name") or "").strip()
-    desired_ds_name = existing_ds_name
-    if (not desired_ds_name) or (not _has_yyyymmddhhmmss_suffix(desired_ds_name)):
-        # First time this step is executed (or legacy plan name without timestamp) -> generate once.
+    if existing_ds_name:
+        desired_ds_name = existing_ds_name
+    else:
         attempt_ts = _now_utc().strftime("%Y%m%d%H%M%S")
         base_ds_name = _standard_ds_base_name(step_dict)
         desired_ds_name = _apply_build_prefix(f"{base_ds_name} {attempt_ts}".strip(), build_prefix)
