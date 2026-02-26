@@ -699,11 +699,104 @@ def _extract_build_version_from_about_payload(payload: Dict[str, Any]) -> str:
             if isinstance(v, str) and v.strip():
                 candidates.append(v.strip())
 
+        about_block = data_block.get("about")
+        if isinstance(about_block, dict):
+            for k in ["releaseVersion", "coreVersion", "version", "build", "buildVersion", "release", "tag"]:
+                v = about_block.get(k)
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v.strip())
+
     for s in candidates:
         bv = _parse_build_version_from_text(s)
         if bv:
             return bv
     return ""
+
+
+def _parse_iso_dt(s: str) -> Optional[datetime]:
+    try:
+        if not s:
+            return None
+        ss = str(s).strip().replace('Z','')
+        for fmt in ('%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%d %H:%M:%S.%f'):
+            try:
+                return datetime.strptime(ss, fmt)
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
+
+def sync_env_version_from_about(engine, env_row: Dict[str, Any], token: str, *, ttl_minutes: int = 60, force: bool = False) -> Tuple[bool, str]:
+    """
+    Best-effort: fetch /about and update test_environments.version when changed.
+    Throttled by tracker_kv so we don't call /about too frequently.
+    Returns (ok, message).
+    """
+    try:
+        env_id = env_row.get('id')
+        base_url = str(env_row.get('base_url') or '').strip().rstrip('/')
+        key = str(env_id if env_id is not None else base_url)
+        if not key:
+            return False, 'no_env_key'
+        ttl_m = int(ttl_minutes) if ttl_minutes is not None else 60
+    except Exception:
+        return False, 'bad_env'
+
+    last = ''
+    try:
+        last = _kv_get(engine, f'env_about_last::{key}')
+    except Exception:
+        last = ''
+    if not force:
+        last_dt = _parse_iso_dt(last)
+        if last_dt is not None:
+            age_min = (datetime.utcnow() - last_dt).total_seconds() / 60.0
+            if age_min >= 0 and age_min < float(ttl_m):
+                return True, 'ttl_skip'
+
+    # Record attempt time so failures don't hot-loop
+    try:
+        _kv_set(engine, f'env_about_last::{key}', datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S'))
+    except Exception:
+        pass
+
+    try:
+        about = fetch_about(base_url, token)
+        bv = _extract_build_version_from_about_payload(about)
+    except Exception as ex:
+        return False, f'about_failed: {ex}'
+
+    bv = str(bv or '').strip()
+    if not bv:
+        return False, 'about_no_version'
+
+    cur = _parse_build_version_from_text(env_row.get('version') or '')
+    if not cur:
+        cur = str(env_row.get('version') or '').strip()
+    if cur == bv:
+        return True, f'no_change:{bv}'
+
+    # Update DB (and history if table exists)
+    try:
+        if env_id is not None:
+            with engine.connect() as conn:
+                conn.execute(text('UPDATE test_environments SET version=:v WHERE id=:id'), {'v': bv, 'id': int(env_id)})
+                try:
+                    conn.execute(
+                        text('INSERT INTO test_environment_version_history (environment_id, version_value, change_note) VALUES (:eid, :v, :n)'),
+                        {'eid': int(env_id), 'v': bv, 'n': 'tracker:/about'}
+                    )
+                except Exception:
+                    pass
+                conn.commit()
+            env_row['version'] = bv
+            return True, f'updated:{cur}->{bv}'
+    except Exception as ex:
+        return False, f'update_failed:{ex}'
+
+    return True, f'no_env_id:{bv}'
 
 
 def _count_build_classifier_mappings(engine, build_version: str, environment_id: Optional[int]) -> int:
@@ -1516,6 +1609,9 @@ def track_once(engine) -> Dict[str, Any]:
         "global_classifier_sync_ok": 0,
         "global_classifier_sync_fail": 0,
         "global_builds_seen": [],
+        "env_version_sync_ok": 0,
+        "env_version_sync_fail": 0,
+        "env_version_updated": 0,
     }
 
     def get_token_for_env(env_row: Dict[str, Any]) -> str:
@@ -1754,9 +1850,22 @@ def track_once(engine) -> Dict[str, Any]:
             print(f"[{_now_utc_naive().isoformat()}Z] env={env_name} auth_failed: {ex}", flush=True)
             continue
 
-        # NOTE:
-        # We do NOT call /about every cycle (wasteful). Version + classifier sync is
-        # done when we see running scans (build inferred from scan name/insights).
+        # Keep environment version updated from /about (throttled).
+        try:
+            ttl = int(os.getenv('TRACKER_ABOUT_TTL_MINUTES', '60') or '60')
+        except Exception:
+            ttl = 60
+        try:
+            okv, msgv = sync_env_version_from_about(engine, env, token, ttl_minutes=ttl, force=False)
+            if okv:
+                metrics['env_version_sync_ok'] += 1
+                if str(msgv).startswith('updated:'):
+                    metrics['env_version_updated'] += 1
+            else:
+                metrics['env_version_sync_fail'] += 1
+        except Exception:
+            pass
+
 
         try:
             scans = _fetch_running_parent_scans(base_url, token)

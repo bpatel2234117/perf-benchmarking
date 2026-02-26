@@ -10237,6 +10237,11 @@ def page_workflow_automation():
     env2_id = env_ids[env_labels.index(env2_label)]
     wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name")
 
+    create_disabled = False
+    if int(env1_id) == int(env2_id):
+        st.error("Env 1 and Env 2 must be different. Pick two different environments so scans can be balanced.")
+        create_disabled = True
+
     preview_steps = _build_default_workflow_steps(env1_id, env2_id)
     for stp in preview_steps or []:
         if isinstance(stp, dict) and "is_enabled" not in stp:
@@ -10260,7 +10265,7 @@ def page_workflow_automation():
         except Exception:
             pass
 
-    if st.button("Create workflow plan", type="primary"):
+    if st.button("Create workflow plan", type="primary", disabled=create_disabled):
         rid = create_workflow_run(
             wf_name,
             env1_id=int(env1_id),
@@ -10569,11 +10574,62 @@ def page_workflow_automation():
         ] if x]),
         axis=1,
     )
+    # Visual progress flow (only show reached stages; don't spam the whole chain for pending rows).
+    def _render_progress_flow(row: Dict[str, Any]) -> str:
+        s = str(row.get("status") or "").strip().lower()
+        if s == "disabled":
+            return "🚫 Disabled"
+
+        ds_id = str(row.get("ds_id") or "").strip()
+        spid = str(row.get("scan_profile_id") or "").strip()
+        sid = str(row.get("scan_id") or "").strip()
+
+        # Determine the furthest reached stage from status + ids.
+        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"})
+        has_test = (s in {"ds_test_ok", "scan_created", "scan_running", "completed"})
+        has_profile = bool(spid) or (s in {"scan_created", "scan_running", "completed"})
+        has_scan = bool(sid) or (s in {"scan_running", "completed"})
+
+        parts: List[str] = []
+
+        if s in {"pending", ""}:
+            return "➖ DS"
+        if s in {"running", "pre_action_done"}:
+            return "⏳ DS"
+
+        if s == "error":
+            # Show where it failed based on what we already have.
+            if not has_ds:
+                return "❌ DS"
+            if has_ds and not has_test:
+                return "✅ DS ➔ ❌ Test"
+            if has_test and not has_profile:
+                return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
+            if has_profile and not has_scan:
+                return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
+            return "❌ Error"
+
+        # Non-error, reached stages only.
+        if has_ds:
+            parts.append("✅ DS")
+        if has_test:
+            parts.append("✅ Test")
+        if has_profile:
+            parts.append("✅ Profile")
+        if has_scan:
+            parts.append("⏳ Scan" if s == "scan_running" else "✅ Scan")
+
+        # If somehow we have no signals, default to DS.
+        return " ➔ ".join(parts) if parts else "➖ DS"
+
+    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow(r.to_dict()), axis=1)
+    disp["Run ID"] = disp["run_id"] if "run_id" in disp.columns else run_id
+    
     try:
-        disp["Scan Started"] = disp["scan_id"].map(lambda sid: "yes" if str(sid or "").strip() else "")
+        disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
     except Exception:
-        disp["Scan Started"] = ""
-    disp["Progress"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
+        disp["Scan Link"] = ""
+        
     disp = disp.rename(columns={
         "seq": "Step",
         "environment": "Environment",
@@ -10581,22 +10637,33 @@ def page_workflow_automation():
         "ds_name": "DS Name",
         "scan_kind": "Scan Type",
         "file_set_type": "File Set",
-        "status": "Step Status",
         "scan_id": "Scan Id",
-        "ds_id": "DS Id",
         "notes": "Notes",
     })
-    st.markdown("### Steps")
-    cols = ["Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Phase", "Scan Started", "Step Status", "build_version", "build_prefix", "DS Id", "Scan Id", "Progress", "Notes", "last_error", "updated_at"]
-    cols = [c for c in cols if c in disp.columns]
-    st.dataframe(
-        disp[cols],
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Progress": st.column_config.LinkColumn("Progress", display_text="View"),
-        },
-    )
+    
+    st.markdown("### Step Details")
+    try:
+        _run_status = str(rrow.get("status") or "").strip().lower()
+    except Exception:
+        _run_status = ""
+    if _run_status in {"created", ""}:
+        st.info("This run is not started yet. Click **Start Workflow** to begin (then both environments will be used according to the step plan).")
+    
+    # Wrap in expander for master-detail feel
+    with st.expander(f"View Step Progress for Run {run_id}", expanded=True):
+        # Columns to show in the cleaned up table (Removed Phase, Scan Started, Step Status, build_prefix, DS Id)
+        # Added Run ID, Progress Flow
+        cols = ["Run ID", "Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Progress Flow", "build_version", "Scan Id", "Scan Link", "Notes", "last_error", "updated_at"]
+        cols = [c for c in cols if c in disp.columns]
+        
+        st.dataframe(
+            disp[cols],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View in Progress"),
+            },
+        )
 
     with st.expander("Edit steps (before run)", expanded=False):
         st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
