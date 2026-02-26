@@ -2024,7 +2024,8 @@ def track_once(engine) -> Dict[str, Any]:
 
             # Attribute delta fetch can be slow; only do it when useful.
             try:
-                if _is_terminal_state(state) or _needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id):
+                fetch_attrs_running = str(os.getenv('TRACKER_FETCH_ATTRS_FOR_RUNNING', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
+                if _is_terminal_state(state) or (fetch_attrs_running and (_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))):
                     attrs = fetch_scan_classifier_attributes(base_url, scan_id, get_token_for_env(env_row))
                     upsert_scan_attribute_deltas(engine, scan_id, attrs)
             except Exception:
