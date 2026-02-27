@@ -8056,38 +8056,68 @@ def page_build_ds_runs():
                 if c in cmp.columns:
                     cmp[c] = pd.to_numeric(cmp[c], errors="coerce")
 
-            # Parts chart
-            fig1 = go.Figure()
-            if all(c in cmp.columns for c in ["completed_parts","failed_parts","total_parts_scanned"]):
-                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["completed_parts"], mode="lines+markers", name="completed_parts", line=dict(color="#10B981", width=3)))
-                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["failed_parts"], mode="lines+markers", name="failed_parts", line=dict(color="#EF4444", width=2)))
-                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["total_parts_scanned"], mode="lines+markers", name="total_parts", line=dict(color="#3B82F6", width=2)))
-                fig1.update_layout(title="Parts (Totals)", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
-                fig1.update_yaxes(title_text="Count", rangemode="tozero")
-                st.plotly_chart(fig1, width="stretch")
+            # 3 charts in one row (bar charts are better for comparing runs)
+            c1, c2, c3 = st.columns(3)
 
-            # Objects chart
-            fig2 = go.Figure()
-            if all(c in cmp.columns for c in ["objects_scanned","objects_failed"]):
-                fig2.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_scanned"], mode="lines+markers", name="objects_scanned", line=dict(color="#8B5CF6", width=3)))
-                fig2.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_failed"], mode="lines+markers", name="objects_failed", line=dict(color="#EF4444", width=2)))
-                fig2.update_layout(title="Objects (Totals)", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
-                fig2.update_yaxes(title_text="Count", rangemode="tozero")
-                st.plotly_chart(fig2, width="stretch")
+            with c1:
+                fig1 = go.Figure()
+                if all(c in cmp.columns for c in ["completed_parts", "failed_parts", "total_parts_scanned"]):
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["completed_parts"], name="completed_parts", marker_color="#10B981"))
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["failed_parts"], name="failed_parts", marker_color="#EF4444"))
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_parts_scanned"], name="total_parts", marker_color="#3B82F6"))
+                    fig1.update_layout(
+                        title="Parts (Totals)",
+                        barmode="group",
+                        height=320,
+                        margin=dict(l=10, r=10, t=40, b=90),
+                        legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
+                    )
+                    fig1.update_xaxes(type="category", tickangle=-30)
+                    fig1.update_yaxes(title_text="Count", rangemode="tozero")
+                    st.plotly_chart(fig1, width="stretch")
 
-            # ObjectsWithPi + Classifications chart
-            fig3 = go.Figure()
-            if "objects_with_pi" in cmp.columns:
-                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_with_pi"], mode="lines+markers", name="objectsWithPi", line=dict(color="#10B981", width=3)))
-            if "total_classifications" in cmp.columns:
-                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["total_classifications"], mode="lines+markers", name="classifications.total", line=dict(color="#3B82F6", width=3)))
-            if "New_Attributes" in cmp.columns:
-                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["New_Attributes"], mode="lines+markers", name="attributes_added(delta)", line=dict(color="#F59E0B", width=2)))
-            if "Removed_Attributes" in cmp.columns:
-                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["Removed_Attributes"], mode="lines+markers", name="attributes_removed(delta)", line=dict(color="#EF4444", width=2)))
-            fig3.update_layout(title="ObjectsWithPi + Classifications", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
-            fig3.update_yaxes(title_text="Count", rangemode="tozero")
-            st.plotly_chart(fig3, width="stretch")
+            with c2:
+                fig2 = go.Figure()
+                if all(c in cmp.columns for c in ["objects_scanned", "objects_failed"]):
+                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_scanned"], name="objects_scanned", marker_color="#8B5CF6"))
+                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_failed"], name="objects_failed", marker_color="#EF4444"))
+                    fig2.update_layout(
+                        title="Objects (Totals)",
+                        barmode="group",
+                        height=320,
+                        margin=dict(l=10, r=10, t=40, b=90),
+                        legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
+                    )
+                    fig2.update_xaxes(type="category", tickangle=-30)
+                    fig2.update_yaxes(title_text="Count", rangemode="tozero")
+                    st.plotly_chart(fig2, width="stretch")
+
+            with c3:
+                fig3 = go.Figure()
+                added_any = False
+                if "objects_with_pi" in cmp.columns:
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_with_pi"], name="objectsWithPi", marker_color="#10B981"))
+                    added_any = True
+                if "total_classifications" in cmp.columns:
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_classifications"], name="classifications.total", marker_color="#3B82F6"))
+                    added_any = True
+                if "New_Attributes" in cmp.columns:
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["New_Attributes"], name="attrs_added(delta)", marker_color="#F59E0B"))
+                    added_any = True
+                if "Removed_Attributes" in cmp.columns:
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["Removed_Attributes"], name="attrs_removed(delta)", marker_color="#EF4444"))
+                    added_any = True
+                if added_any:
+                    fig3.update_layout(
+                        title="ObjectsWithPi + Classifications",
+                        barmode="group",
+                        height=320,
+                        margin=dict(l=10, r=10, t=40, b=90),
+                        legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
+                    )
+                    fig3.update_xaxes(type="category", tickangle=-30)
+                    fig3.update_yaxes(title_text="Count", rangemode="tozero")
+                    st.plotly_chart(fig3, width="stretch")
 
             # Observations table
             st.markdown("### Observations (per run)")
