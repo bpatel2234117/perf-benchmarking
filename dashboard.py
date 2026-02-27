@@ -7489,6 +7489,45 @@ def page_build_analysis(df):
     detail_df.columns = ["Scan Type", "Source", "File Set", "GB/hr", "Scanners", "Threads", "ACL"]
     render_centered_table(detail_df)
 
+    # --- AI Build Quality Assessment ---
+    if _local_llm_is_configured():
+        st.divider()
+        st.subheader("🤖 AI Build Quality Assessment")
+        
+        # Prepare context for the prompt
+        context = f"Analyzing build {selected_build}.\n"
+        context += f"Current Build Average Throughput: {avg_tp:.2f} GB/hr, {avg_file_tp:,.0f} Files/hr.\n"
+        context += f"Total Scans Performed: {total_scans}.\n"
+        context += f"Primary Data Source: {primary_ds}.\n"
+        
+        if idx < len(all_versions) - 1:
+            context += f"\nPrevious Build ({prev_build}) Average Throughput: {prev_avg:.2f} GB/hr.\n"
+            context += f"Throughput Difference: {diff:.2f} GB/hr ({pct:+.1f}%).\n"
+            if diff < 0:
+                context += "NOTE: The current build shows a performance regression compared to the previous build.\n"
+            elif diff > 0:
+                context += "NOTE: The current build shows a performance improvement compared to the previous build.\n"
+        else:
+            context += "\nNo previous build data available for comparison.\n"
+
+        system_prompt = (
+            "You are a Senior Performance QA Engineer analyzing build performance metrics for data scans. "
+            "You provide concise, actionable insights into the build's overall quality. Highlight any critical "
+            "regressions, commend improvements, and synthesize the numbers into a readable summary for technical management. "
+            "Do not output markdown code blocks. Give 2-3 brief bullet points."
+        )
+        
+        user_prompt = f"Please analyze the following build and provide an overall build quality summary:\n\n{context}"
+        
+        if st.button("Generate AI Assessment"):
+            with st.spinner("Analyzing build metrics with AI..."):
+                analysis_result = generate_local_llm_analysis(system_prompt, user_prompt, timeout_s=45)
+                if analysis_result:
+                    st.info(analysis_result)
+                else:
+                    st.warning("Could not generate AI assessment at this time. Please check your LLM configuration or try again.")
+
+
 # --- Comparison Page (V4.1 Enhanced) ---
 def page_comparison(df):
     st.markdown("## ⚖️ Head-to-Head Comparison")
@@ -7792,11 +7831,11 @@ def page_comparison(df):
 # --- Build + Data Source Runs (same build) ---
 def page_build_ds_runs():
     st.markdown("## 🧪 Build + Data Source Runs")
-    st.caption("Compare **all runs** for a selected Build + File Set across **two Data Sources** (e.g. 247.7 + Small Files + S3 vs SMB).")
+    st.caption("Compare **all runs** for a selected Build + DS (e.g. 248.1 + Small Files + S3), and optionally compare across two DS types.")
 
     src = st.radio(
         "Runs source",
-        ["Auto Scans (recommended)", "Manual Benchmarks", "Both"],
+        ["Scan Status DB (all runs)", "Auto Scans", "Manual Benchmarks", "Both"],
         horizontal=True,
         index=0,
         key="build_ds_runs_source",
@@ -7804,6 +7843,14 @@ def page_build_ds_runs():
     include_inactive = st.checkbox("Include inactive runs (manual only)", value=False, key="build_ds_runs_inactive")
 
     frames = []
+    if src in {"Scan Status DB (all runs)", "Both"}:
+        sp = load_scan_parents_runs_as_manual_like_df(include_inactive_envs=include_inactive)
+        if not sp.empty:
+            sp = sp.copy()
+            sp["_source"] = "scan_db"
+            sp["_run_key"] = "sp:" + sp.get("scan_id").astype(str)
+            frames.append(sp)
+
     if src in {"Manual Benchmarks", "Both"}:
         m = load_data(include_inactive=include_inactive)
         if not m.empty:
@@ -7966,6 +8013,127 @@ def page_build_ds_runs():
         format_func=lambda k: run_label_map.get(k, str(k)),
     )
     show_df = filtered[filtered["_run_key"].isin(selected_ids)] if selected_ids and "_run_key" in filtered.columns else filtered
+
+
+    # --- Run-by-run charts for a single DS (compare multiple runs within same build + DS) ---
+    try:
+        single_ds = (len(selected_ds_list) == 1)
+    except Exception:
+        single_ds = False
+
+    if single_ds:
+        st.markdown("### Run-by-run charts (same Build + DS)")
+        try:
+            cmp = show_df.copy()
+            # Ensure we only compare scan-id-backed runs (auto/scan_db)
+            if "scan_id" in cmp.columns:
+                cmp = cmp[cmp["scan_id"].astype(str).str.strip().ne("")]
+            cmp["Date"] = pd.to_datetime(cmp.get("Date"), errors="coerce")
+            cmp = cmp.sort_values(["Date", "scan_id"], ascending=[True, True])
+
+            def _run_label(row):
+                sid = str(row.get("scan_id") or "").strip()
+                dt = row.get("Date")
+                dts = ""
+                try:
+                    if pd.notna(dt):
+                        dts = pd.to_datetime(dt).strftime("%m-%d %H:%M")
+                except Exception:
+                    dts = ""
+                tail = sid[-6:] if len(sid) >= 6 else sid
+                return (f"{dts} | {tail}" if dts else tail) or sid
+
+            cmp["Run"] = cmp.apply(_run_label, axis=1)
+
+            # Pull numeric metrics
+            num_cols = [
+                "completed_parts","failed_parts","total_parts_scanned",
+                "objects_scanned","objects_failed",
+                "objects_with_pi","total_classifications","newly_added_classifications","false_removed_classifications",
+                "distinct_classification_attributes","New_Attributes","Removed_Attributes","total_scan_hours",
+            ]
+            for c in num_cols:
+                if c in cmp.columns:
+                    cmp[c] = pd.to_numeric(cmp[c], errors="coerce")
+
+            # Parts chart
+            fig1 = go.Figure()
+            if all(c in cmp.columns for c in ["completed_parts","failed_parts","total_parts_scanned"]):
+                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["completed_parts"], mode="lines+markers", name="completed_parts", line=dict(color="#10B981", width=3)))
+                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["failed_parts"], mode="lines+markers", name="failed_parts", line=dict(color="#EF4444", width=2)))
+                fig1.add_trace(go.Scatter(x=cmp["Run"], y=cmp["total_parts_scanned"], mode="lines+markers", name="total_parts", line=dict(color="#3B82F6", width=2)))
+                fig1.update_layout(title="Parts (Totals)", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
+                fig1.update_yaxes(title_text="Count", rangemode="tozero")
+                st.plotly_chart(fig1, width="stretch")
+
+            # Objects chart
+            fig2 = go.Figure()
+            if all(c in cmp.columns for c in ["objects_scanned","objects_failed"]):
+                fig2.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_scanned"], mode="lines+markers", name="objects_scanned", line=dict(color="#8B5CF6", width=3)))
+                fig2.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_failed"], mode="lines+markers", name="objects_failed", line=dict(color="#EF4444", width=2)))
+                fig2.update_layout(title="Objects (Totals)", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
+                fig2.update_yaxes(title_text="Count", rangemode="tozero")
+                st.plotly_chart(fig2, width="stretch")
+
+            # ObjectsWithPi + Classifications chart
+            fig3 = go.Figure()
+            if "objects_with_pi" in cmp.columns:
+                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["objects_with_pi"], mode="lines+markers", name="objectsWithPi", line=dict(color="#10B981", width=3)))
+            if "total_classifications" in cmp.columns:
+                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["total_classifications"], mode="lines+markers", name="classifications.total", line=dict(color="#3B82F6", width=3)))
+            if "New_Attributes" in cmp.columns:
+                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["New_Attributes"], mode="lines+markers", name="attributes_added(delta)", line=dict(color="#F59E0B", width=2)))
+            if "Removed_Attributes" in cmp.columns:
+                fig3.add_trace(go.Scatter(x=cmp["Run"], y=cmp["Removed_Attributes"], mode="lines+markers", name="attributes_removed(delta)", line=dict(color="#EF4444", width=2)))
+            fig3.update_layout(title="ObjectsWithPi + Classifications", hovermode="x unified", margin=dict(l=10,r=10,t=40,b=40), legend=dict(orientation="h"))
+            fig3.update_yaxes(title_text="Count", rangemode="tozero")
+            st.plotly_chart(fig3, width="stretch")
+
+            # Observations table
+            st.markdown("### Observations (per run)")
+
+            def _compact_state(x: str) -> str:
+                return str(x or '').strip().lower().replace(' ', '')
+
+            obs_rows = []
+            for _, r in cmp.iterrows():
+                sid = str(r.get('scan_id') or '').strip()
+                nm = str(r.get('scan_name') or '').strip()
+                exp = resolve_expected_totals_for_scan(nm)
+                exp_files = exp.get('expected_total_files')
+                cur_obj = int(r.get('objects_scanned') or 0) if str(r.get('objects_scanned') or '').strip() != '' else 0
+                short_by = (int(exp_files) - cur_obj) if exp_files and cur_obj < int(exp_files) else 0
+                stv = str(r.get('scan_status') or r.get('scan_state_progress') or '').strip()
+                failed_parts = int(r.get('failed_parts') or 0)
+                obj_failed = int(r.get('objects_failed') or 0)
+                term = _compact_state(stv) in {'completed','completedwithfailures','failed'}
+
+                notes = []
+                if exp_files:
+                    notes.append(f"objects {cur_obj:,}/{int(exp_files):,}")
+                if short_by > 0:
+                    notes.append(f"short {short_by:,}")
+                if term and short_by > 0 and failed_parts == 0 and obj_failed == 0:
+                    notes.append("terminal but short with no failures")
+                if _compact_state(stv) == 'completedwithfailures' and failed_parts == 0 and obj_failed == 0:
+                    notes.append("CompletedWithFailures but failures=0 (likely rescanned)")
+                obs_rows.append({
+                    'Run': str(r.get('Run') or ''),
+                    'scan_id': sid,
+                    'status': stv,
+                    'hours': r.get('total_scan_hours'),
+                    'objects_scanned': cur_obj,
+                    'expected_objects': exp_files,
+                    'short_by': short_by,
+                    'distinct_classifications': r.get('distinct_classification_attributes'),
+                    'attrs_added': r.get('New_Attributes'),
+                    'attrs_removed': r.get('Removed_Attributes'),
+                    'notes': '; '.join([x for x in notes if x]),
+                })
+
+            st.dataframe(pd.DataFrame(obs_rows), width="stretch", hide_index=True)
+        except Exception as ex:
+            st.warning(f"Run-by-run charts unavailable: {ex}")
 
     cols = [
         "_source",
@@ -9018,6 +9186,196 @@ def load_auto_trend_as_manual_like_df():
     out["Build_Version"] = out["Build_Version"].apply(lambda x: x if str(x).strip() else "Unknown")
     return out
 
+def load_latest_scan_progress_map_for_scan_ids(scan_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Batch-load latest scan_progress metrics for scan_ids."""
+    if not engine:
+        return {}
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for sid in (scan_ids or []):
+        x = str(sid or '').strip()
+        if not x or x in seen:
+            continue
+        seen.add(x)
+        cleaned.append(x)
+    if not cleaned:
+        return {}
+    try:
+        from sqlalchemy import bindparam
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT sp.scan_id,
+                           sp.scan_state,
+                           sp.completed_parts, sp.failed_parts, sp.total_parts_scanned,
+                           sp.objects_scanned, sp.objects_failed, sp.objects_with_pi,
+                           sp.total_classifications, sp.newly_added_classifications, sp.false_removed_classifications,
+                           sp.timestamp, sp.captured_at_utc
+                    FROM scan_progress sp
+                    JOIN (
+                        SELECT z.scan_id, MAX(z.id) AS max_id
+                        FROM scan_progress z
+                        JOIN (
+                            SELECT scan_id, MAX(COALESCE(captured_at_utc, timestamp)) AS mx
+                            FROM scan_progress
+                            WHERE scan_id IN :ids
+                            GROUP BY scan_id
+                        ) t
+                          ON t.scan_id = z.scan_id
+                         AND COALESCE(z.captured_at_utc, z.timestamp) = t.mx
+                        WHERE z.scan_id IN :ids
+                        GROUP BY z.scan_id
+                    ) u ON u.max_id = sp.id
+                """).bindparams(bindparam('ids', expanding=True)),
+                {'ids': cleaned},
+            ).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows or []:
+            sid = str(r[0] or '').strip()
+            if not sid:
+                continue
+            out[sid] = {
+                'scan_state': str(r[1] or '').strip(),
+                'completed_parts': r[2],
+                'failed_parts': r[3],
+                'total_parts_scanned': r[4],
+                'objects_scanned': r[5],
+                'objects_failed': r[6],
+                'objects_with_pi': r[7],
+                'total_classifications': r[8],
+                'newly_added_classifications': r[9],
+                'false_removed_classifications': r[10],
+                'timestamp': r[11],
+                'captured_at_utc': r[12],
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def load_scan_parents_runs_as_manual_like_df(*, include_inactive_envs: bool = False, limit: int = 2000) -> pd.DataFrame:
+    """Use scan_parents + latest scan_progress + scan_insights to build a runs dataset."""
+    if not engine:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            where_env = '' if include_inactive_envs else 'AND COALESCE(te.is_active,1)=1'
+            rows = conn.execute(text(f"""
+                SELECT
+                    sp.scan_id,
+                    sp.scan_name,
+                    sp.environment_id,
+                    sp.scan_type,
+                    sp.scan_status,
+                    sp.started_at,
+                    sp.completed_at,
+                    sp.updated_at,
+                    COALESCE(te.env_name,'') AS env_name
+                FROM scan_parents sp
+                LEFT JOIN test_environments te ON te.id = sp.environment_id
+                WHERE LOWER(COALESCE(sp.scan_status,'')) NOT IN ('stopped','aborted')
+                  AND LOWER(COALESCE(sp.scan_name,'')) NOT LIKE 'instant scan data%'
+                  {where_env}
+                ORDER BY sp.updated_at DESC
+                LIMIT :lim
+            """), {'lim': int(limit)}).fetchall()
+        cols = ['scan_id','scan_name','environment_id','scan_type_raw','scan_status','started_at','completed_at','updated_at','env_name']
+        df = pd.DataFrame(rows, columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # Parse basics from scan_name
+    try:
+        parsed = df['scan_name'].astype(str).apply(lambda x: infer_add_benchmark_defaults_from_scan_name(x) if str(x).strip() else {})
+        df['Build_Version'] = parsed.apply(lambda d: str((d or {}).get('build_version') or '').strip())
+        df['Data_Source_Type'] = parsed.apply(lambda d: str((d or {}).get('data_source_type') or '').strip())
+        df['Scan_Type'] = parsed.apply(lambda d: str((d or {}).get('scan_type') or '').strip())
+        df['file_set_type'] = parsed.apply(lambda d: str((d or {}).get('file_set_type') or '').strip())
+        df['Scenario_Type'] = parsed.apply(lambda d: str((d or {}).get('scenario_type') or '').strip())
+    except Exception:
+        df['Build_Version'] = ''
+        df['Data_Source_Type'] = ''
+        df['Scan_Type'] = ''
+        df['file_set_type'] = ''
+        df['Scenario_Type'] = ''
+
+    def _norm_fs(v: str) -> str:
+        u = str(v or '').upper()
+        if 'SMALL FILE' in u:
+            return 'Small Files'
+        if 'LARGE FILE' in u:
+            return 'Large Files'
+        if 'CSV' in u:
+            return 'CSV Files'
+        if 'MIXED' in u:
+            return 'Mixed Files'
+        return str(v or '').strip()
+    df['file_set_type'] = df['file_set_type'].apply(_norm_fs)
+
+    df['started_at_dt'] = pd.to_datetime(df['started_at'], errors='coerce', utc=True)
+    df['completed_at_dt'] = pd.to_datetime(df['completed_at'], errors='coerce', utc=True)
+    df['Date'] = df['completed_at_dt'].fillna(df['started_at_dt'])
+
+    try:
+        df['total_scan_hours'] = (df['completed_at_dt'] - df['started_at_dt']).dt.total_seconds() / 3600.0
+    except Exception:
+        df['total_scan_hours'] = pd.NA
+
+    scan_ids = df['scan_id'].astype(str).tolist()
+    pmap = load_latest_scan_progress_map_for_scan_ids(scan_ids)
+
+    def _pget(sid: str, k: str):
+        try:
+            return (pmap.get(str(sid), {}) or {}).get(k)
+        except Exception:
+            return None
+
+    for col, key in [
+        ('scan_state_progress','scan_state'),
+        ('completed_parts','completed_parts'),
+        ('failed_parts','failed_parts'),
+        ('total_parts_scanned','total_parts_scanned'),
+        ('objects_scanned','objects_scanned'),
+        ('objects_failed','objects_failed'),
+        ('objects_with_pi','objects_with_pi'),
+        ('total_classifications','total_classifications'),
+        ('newly_added_classifications','newly_added_classifications'),
+        ('false_removed_classifications','false_removed_classifications'),
+    ]:
+        df[col] = df['scan_id'].apply(lambda sid: _pget(sid, key))
+
+    try:
+        imap = load_scan_insight_map_for_scan_ids(scan_ids)
+    except Exception:
+        imap = {}
+
+    def _iget(sid: str, k: str):
+        try:
+            return (imap.get(str(sid), {}) or {}).get(k)
+        except Exception:
+            return None
+
+    df['distinct_classification_attributes'] = df['scan_id'].apply(lambda sid: _iget(sid, 'distinct_classification_attributes'))
+    df['New_Attributes'] = df['scan_id'].apply(lambda sid: _iget(sid, 'new_attributes_count'))
+    df['Removed_Attributes'] = df['scan_id'].apply(lambda sid: _iget(sid, 'removed_attributes_count'))
+    df['Total_Classification'] = df['scan_id'].apply(lambda sid: _iget(sid, 'total_classification'))
+
+    mask_tc = df['Total_Classification'].isna() | (df['Total_Classification'].astype(str).str.strip() == '')
+    df.loc[mask_tc, 'Total_Classification'] = df.loc[mask_tc, 'total_classifications']
+
+    df['Total_Files'] = df['objects_scanned']
+    df['Total_Size_GB'] = pd.NA
+    df['Total_Folders'] = pd.NA
+    df['Data_Type'] = ''
+    df['is_active'] = 1
+    df['id'] = df['scan_id'].astype(str)
+
+    return df
+
+
 
 def render_auto_trend_analysis(title, file_set_keyword=None, scan_type_filter=None):
     auto_like = load_auto_trend_as_manual_like_df()
@@ -9739,6 +10097,7 @@ def page_scan_progress():
     cur_parts_total = int(_safe_num(last.get("total_parts_scanned"), 0)) if last is not None else 0
     cur_failed_parts = int(_safe_num(last.get("failed_parts"), 0)) if last is not None else 0
     cur_state = str(last.get("scan_state") or "").strip() if last is not None else ""
+    cur_objects_failed = int(_safe_num(last.get("objects_failed"), 0)) if last is not None else 0
 
     pct_parts = None
     if cur_parts_total and cur_parts_total > 0:
@@ -9850,6 +10209,92 @@ def page_scan_progress():
                 flags.append("Classification metrics are 0 so far (check classification enablement + insights).")
     except Exception:
         pass
+
+
+    # Observations (rule-based): highlight inconsistencies like "Completed but objects < expected".
+    observations = []
+    try:
+        def _cstate(x: str) -> str:
+            return str(x or '').strip().lower().replace(' ', '')
+
+        exp_files = int(expected_total_files) if expected_total_files is not None and str(expected_total_files).strip() != '' else None
+        short_by = (int(exp_files) - int(cur_objects)) if (exp_files is not None and cur_objects is not None and int(cur_objects) < int(exp_files)) else 0
+
+        # Duration / timestamps from scan_parents when available
+        try:
+            dur = format_scan_duration(db_started_at, db_completed_at)
+            if db_started_at:
+                observations.append(f"Start: `{str(db_started_at)}`")
+            if db_completed_at:
+                observations.append(f"End: `{str(db_completed_at)}`")
+            if dur:
+                observations.append(f"Duration: **{dur}**")
+        except Exception:
+            pass
+
+        # Expected totals compare
+        if exp_files is not None and exp_files > 0:
+            lk = str(lookup_key or '').strip()
+            observations.append(
+                f"Objects scanned: **{int(cur_objects):,} / {int(exp_files):,}**" + (f" (expected from `{lk}`)" if lk else "")
+            )
+            if short_by > 0:
+                observations.append(f"Object shortfall: **{short_by:,}**")
+
+        # Pull scan_insights summary when available
+        try:
+            ins = load_scan_insight_from_db(str(scan_id))
+        except Exception:
+            ins = None
+        if isinstance(ins, dict) and ins:
+            try:
+                dca = ins.get('distinct_classification_attributes')
+                if dca not in (None, '', '0'):
+                    observations.append(f"Distinct classifications: **{int(dca):,}**")
+            except Exception:
+                pass
+            try:
+                nac = ins.get('new_attributes_count')
+                rac = ins.get('removed_attributes_count')
+                if nac not in (None, ''):
+                    observations.append(f"Attributes added (delta sum): **{int(nac):,}**")
+                if rac not in (None, ''):
+                    observations.append(f"Attributes removed (delta sum): **{int(rac):,}**")
+            except Exception:
+                pass
+
+        # Inconsistency rules
+        stc = _cstate(cur_state)
+        terminal = stc in {'completed','completedwithfailures','failed','stopped','aborted','cancelled','canceled'}
+        comp = stc in {'completed'}
+        comp_fail = stc in {'completedwithfailures'}
+
+        if terminal and short_by > 0 and int(cur_failed_parts) == 0 and int(cur_objects_failed) == 0:
+            observations.append(
+                "Inconsistency: scan is terminal but objects are below expected and no failed parts/objects are reported."
+            )
+
+        if comp_fail and int(cur_failed_parts) == 0 and int(cur_objects_failed) == 0:
+            observations.append(
+                "Note: `CompletedWithFailures` but failed parts/objects are 0. BigID often shows this when failures were rescanned/cleared."
+            )
+
+        if comp and short_by > 0:
+            observations.append(
+                "Note: `Completed` despite object shortfall. This can be caused by filtering/sampling/enumeration changes, or missing insight signals."
+            )
+
+        # Parts at 100% but objects short
+        try:
+            if cur_parts_total and cur_parts_done >= cur_parts_total and short_by > 0:
+                observations.append(
+                    "Parts show 100% complete but object count is short vs expected. Treat completion based on API state, not percent." 
+                )
+        except Exception:
+            pass
+
+    except Exception:
+        observations = observations or []
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
@@ -10080,6 +10525,16 @@ def page_scan_progress():
                 st.error("Possible regression detected in classification metrics:")
                 for w in regression_warnings:
                     st.caption(f"- {w}")
+        except Exception:
+            pass
+
+        # Observations for this scan (DB-only)
+        try:
+            if observations:
+                st.markdown("**Observations**")
+                for o in observations:
+                    if str(o or '').strip():
+                        st.caption(f"- {o}")
         except Exception:
             pass
 
