@@ -670,6 +670,45 @@ def load_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
         return []
 
 
+def load_workflow_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
+    """
+    Safety net: scans started by workflow_runner may not be present in scan_parents yet.
+    Track any scan_id referenced by workflow_steps with status='scan_running'.
+    Returns rows with: scan_id, scan_name, environment_id, env_name, base_url
+    """
+    if not engine:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    ws.scan_id,
+                    COALESCE(ws.scan_profile_name, ws.ds_name, '') AS scan_name,
+                    ws.environment_id,
+                    te.env_name,
+                    te.base_url
+                FROM workflow_steps ws
+                JOIN test_environments te ON te.id = ws.environment_id
+                WHERE te.is_active = 1
+                  AND COALESCE(ws.is_enabled,1)=1
+                  AND COALESCE(ws.status,'') = 'scan_running'
+                  AND ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> ''
+            """)).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                'scan_id': str(r[0] or '').strip(),
+                'scan_name': str(r[1] or '').strip(),
+                'environment_id': r[2],
+                'env_name': str(r[3] or '').strip(),
+                'base_url': str(r[4] or '').strip(),
+                'scan_status': 'In Progress',
+            })
+        return [x for x in out if x.get('scan_id') and x.get('base_url')]
+    except Exception:
+        return []
+
+
 def _request_get(
     url: str,
     token: str,
@@ -1338,6 +1377,49 @@ def upsert_scan_progress_record(
         env_id_int = None
 
     with engine.connect() as conn:
+        # start-marker row (scan start time): write the real BigID startedAt as the first DB row for this scan
+        try:
+            sp0 = si.get('scanProfile') if isinstance(si.get('scanProfile'), dict) else {}
+            started_raw = sp0.get('startedAt') or sp0.get('startTime') or sp0.get('createdAt')
+            started_dt = _parse_iso_dt(str(started_raw or '')) if started_raw else None
+            if started_dt is not None:
+                row = conn.execute(text('SELECT 1 FROM scan_progress WHERE scan_id=:sid LIMIT 1'), {'sid': str(scan_id)}).fetchone()
+                if not row:
+                    cau = started_dt.replace(microsecond=0)
+                    slot_m = int(_slot_minutes())
+                    # Avoid colliding with slot-aligned snapshots (seconds=0 at slot boundaries)
+                    if (cau.second == 0) and (cau.minute % slot_m == 0):
+                        cau = cau + timedelta(seconds=1)
+                    ts0 = started_dt.replace(microsecond=0)
+                    conn.execute(text("""
+                        INSERT IGNORE INTO scan_progress (
+                            captured_at_utc, `timestamp`,
+                            scan_id, scan_name, environment_id,
+                            scan_state,
+                            completed_sub_scans, failed_sub_scans, total_sub_scans,
+                            completed_parts, failed_parts, total_parts_scanned,
+                            total_classifications, newly_added_classifications, false_removed_classifications,
+                            objects_scanned, objects_failed, objects_with_pi
+                        ) VALUES (
+                            :cau, :ts,
+                            :sid, :sname, :eid,
+                            :sst,
+                            0,0,0,
+                            0,0,0,
+                            0,0,0,
+                            0,0,0
+                        )
+                    """), {
+                        'cau': cau,
+                        'ts': ts0,
+                        'sid': str(scan_id),
+                        'sname': str(scan_name or ''),
+                        'eid': env_id_int,
+                        'sst': 'Started',
+                    })
+        except Exception:
+            pass
+
         conn.execute(
             text("""
                 INSERT INTO scan_progress (
@@ -2039,6 +2121,7 @@ def track_once(engine) -> Dict[str, Any]:
 
     # DB-driven safety net: keep tracking scans that DB believes are still running
     db_running = load_running_scan_env_rows(engine)
+    wf_running = load_workflow_running_scan_env_rows(engine)
     metrics["db_running_seen"] = len(db_running)
     for r in db_running:
         sid = str(r.get("scan_id") or "").strip()
@@ -2057,6 +2140,28 @@ def track_once(engine) -> Dict[str, Any]:
                 sid,
                 str(r.get("scan_name") or ""),
                 str(r.get("scan_status") or ""),
+            )
+        )
+        seen_scan_ids.add(sid)
+
+    # Workflow-driven safety net: track scans referenced by workflow_steps scan_running
+    for r in (wf_running or []):
+        sid = str(r.get("scan_id") or "").strip()
+        if not sid or sid in seen_scan_ids:
+            continue
+        base = str(r.get("base_url") or "").strip().rstrip("/")
+        env_row = env_by_id.get(r.get("environment_id")) or env_by_base.get(base) or {
+            "id": r.get("environment_id"),
+            "env_name": r.get("env_name"),
+            "base_url": r.get("base_url"),
+        }
+        jobs.append(
+            (
+                str(env_row.get("base_url") or "").strip(),
+                env_row,
+                sid,
+                str(r.get("scan_name") or ""),
+                str(r.get("scan_status") or "In Progress"),
             )
         )
         seen_scan_ids.add(sid)

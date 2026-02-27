@@ -3961,6 +3961,49 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
         else:
             captured_at_utc = now_utc.replace(microsecond=0)
         with engine.connect() as conn:
+            # start-marker row (scan start time): write the real BigID startedAt as the first DB row for this scan
+            try:
+                sp0 = si.get("scanProfile") if isinstance(si.get("scanProfile"), dict) else {}
+                started_raw = sp0.get("startedAt") or sp0.get("startTime") or sp0.get("createdAt")
+                started_dt = pd.to_datetime(started_raw, errors="coerce", utc=True) if started_raw else None
+                if started_dt is not None and pd.notnull(started_dt):
+                    row = conn.execute(text("SELECT 1 FROM scan_progress WHERE scan_id=:sid LIMIT 1"), {"sid": str(scan_id)}).fetchone()
+                    if not row:
+                        from datetime import timedelta
+                        cau = started_dt.to_pydatetime().replace(tzinfo=None, microsecond=0)
+                        # Avoid colliding with slot-aligned snapshots (seconds=0 at 10-min boundaries)
+                        if (cau.second == 0) and (cau.minute % 10 == 0):
+                            cau = cau + timedelta(seconds=1)
+                        ts0 = started_dt.to_pydatetime().replace(tzinfo=None, microsecond=0)
+                        conn.execute(text("""
+                            INSERT IGNORE INTO scan_progress (
+                                captured_at_utc, `timestamp`,
+                                scan_id, scan_name, environment_id,
+                                scan_state,
+                                completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                completed_parts, failed_parts, total_parts_scanned,
+                                total_classifications, newly_added_classifications, false_removed_classifications,
+                                objects_scanned, objects_failed, objects_with_pi
+                            ) VALUES (
+                                :cau, :ts,
+                                :sid, :sname, :eid,
+                                :sst,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0
+                            )
+                        """), {
+                            "cau": cau,
+                            "ts": ts0,
+                            "sid": str(scan_id),
+                            "sname": str(scan_name or ""),
+                            "eid": env_id,
+                            "sst": "Started",
+                        })
+            except Exception:
+                pass
+
             conn.execute(text("""
                 INSERT INTO scan_progress (
                     captured_at_utc,
@@ -4247,7 +4290,7 @@ def get_scan_parent_details(scan_id):
     try:
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT scan_id, scan_name, environment_id, scan_type, scan_status, is_active
+                SELECT scan_id, scan_name, environment_id, scan_type, scan_status, is_active, started_at, completed_at
                 FROM scan_parents WHERE scan_id = :sid
             """), {"sid": scan_id}).fetchone()
             if row:
@@ -4257,7 +4300,9 @@ def get_scan_parent_details(scan_id):
                     "environment_id": row[2],
                     "type": row[3],
                     "scan_status": row[4],
-                    "is_active": row[5]
+                    "is_active": row[5],
+                    "started_at": str(row[6] or "").strip(),
+                    "completed_at": str(row[7] or "").strip(),
                 }
     except Exception:
         pass
@@ -9386,8 +9431,12 @@ def page_scan_progress():
     try:
         parent = get_scan_parent_details(str(scan_id)) or {}
         db_name = str(parent.get("name") or "").strip()
+        db_started_at = str(parent.get("started_at") or "").strip()
+        db_completed_at = str(parent.get("completed_at") or "").strip()
     except Exception:
         db_name = ""
+        db_started_at = ""
+        db_completed_at = ""
     display_name = db_name
     if display_name:
         st.caption(f"Scan: **{display_name}** | Scan ID: `{scan_id}`")
@@ -9448,6 +9497,13 @@ def page_scan_progress():
                             "state": state,
                         }
                         upsert_scan_parent_record(sync_env_row.get("id"), scan_row, state)
+                        try:
+                            st.caption(
+                                f"Manual sync used env: `{str(sync_env_row.get('env_name') or sync_env_row.get('id') or '')}` | "
+                                f"API state: `{state or 'unknown'}` | updatedAt: `{str(updated_at or '')}` | completedAt: `{str(completed_at or '')}`"
+                            )
+                        except Exception:
+                            pass
                     except Exception:
                         scan_name = db_name
 
@@ -9464,6 +9520,10 @@ def page_scan_progress():
                     else:
                         cau = write_res.get("captured_at_utc")
                         st.caption(f"Wrote snapshot slot: `{str(cau)}`")
+                        try:
+                            st.caption(f"Wrote scan_state: `{str(write_res.get('scan_state') or '')}`")
+                        except Exception:
+                            pass
 
                     # Full normalized scan_insights + attributes delta map (for Add New Benchmark prefill)
                     sync_single_scan_insight(str(scan_id), sync_env_row)
@@ -9938,7 +9998,7 @@ def page_scan_progress():
         narrative = ""
 
     with st.expander("🧠 Analysis (stats + narrative)", expanded=True):
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Objects scanned", f"{cur_objects:,}")
         m2.metric("Parts progress", f"{(pct_parts or 0):.1f}%" if pct_parts is not None else "N/A")
         m3.metric("Failed parts", f"{cur_failed_parts:,}")
@@ -9946,6 +10006,29 @@ def page_scan_progress():
             m4.metric("falseRemoved (Δ)", f"{false_removed_delta:+,}")
         else:
             m4.metric("falseRemoved (Δ)", "N/A")
+        # Total scan time (so far)
+        try:
+            started_dt = None
+            if db_started_at:
+                started_dt = pd.to_datetime(db_started_at, errors='coerce', utc=True)
+            if started_dt is None or pd.isna(started_dt):
+                # Fallback: earliest saved snapshot time
+                try:
+                    started_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).min() if isinstance(df_ai, pd.DataFrame) and ('captured_at_actual' in df_ai.columns) else None
+                except Exception:
+                    started_dt = None
+            now_ts = pd.Timestamp.utcnow()
+            if started_dt is not None and pd.notnull(started_dt):
+                mins = max(0.0, (now_ts - started_dt).total_seconds() / 60.0)
+                h = int(mins // 60)
+                m = int(mins % 60)
+                runtime_str = (f"{h}h {m}m" if h > 0 else f"{m}m")
+            else:
+                runtime_str = 'N/A'
+        except Exception:
+            runtime_str = 'N/A'
+        m5.metric("Scan time (so far)", runtime_str)
+
 
         # Optional Local LLM narrative (Windows-ready later)
         llm_enabled = st.toggle("Generate LLM narrative (local)", value=False, help="Uses LOCAL_LLM_* env vars when configured.")
@@ -10246,7 +10329,7 @@ def page_scan_progress():
         st.plotly_chart(fig3, width="stretch")
 
     st.subheader("Raw Progress Data")
-    # Show newest first (includes scan_state, so terminal updates show here)
+    # Show oldest first so the first row shows scan start time.
     show_df = df.copy()
     try:
         show_df = show_df.rename(columns={
@@ -10255,7 +10338,8 @@ def page_scan_progress():
         })
     except Exception:
         pass
-    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=False), width="stretch")
+
+    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=True), width="stretch")
     
     if st.button("Back to Scan Status"):
         st.query_params["page"] = "Scan Status"

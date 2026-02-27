@@ -630,6 +630,42 @@ def _scan_name_from_parent_scan(sc: Dict[str, Any]) -> str:
     return ''
 
 
+def find_running_parent_scan_id(base_url: str, token: str, *, exact_name: str, wf_tag: str = "", limit: int = 80) -> str:
+    """
+    Find a running parent scan id by exact scan name.
+    If wf_tag is provided (e.g. "(wf 6-3)"), require it in the name too.
+    """
+    nm = str(exact_name or "").strip()
+    if not nm:
+        return ""
+    needle = nm.lower()
+    wf = str(wf_tag or "").strip().lower()
+    try:
+        items = fetch_parent_scans(
+            base_url,
+            token,
+            states=["Started", "Awaiting", "In Progress", "InProgress", "Running", "Queued", "Pending", "Stop Requested", "StopRequested", "Stopping"],
+            limit=int(limit),
+            skip=0,
+        )
+    except Exception:
+        items = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        sid = str(it.get('_id') or it.get('id') or '').strip()
+        name = _scan_name_from_parent_scan(it).strip()
+        if not sid or not name:
+            continue
+        nml = name.lower()
+        if nml != needle:
+            continue
+        if wf and wf not in nml:
+            continue
+        return sid
+    return ""
+
+
 def _is_workflow_scan_name(name: str, *, run_id: Optional[int] = None) -> bool:
     nm = str(name or '').strip()
     if not nm:
@@ -656,6 +692,7 @@ def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = N
         scans = fetch_parent_scans(base_url, token, states=states, limit=50, skip=0)
     except Exception:
         return False
+
     for sc in scans or []:
         if not isinstance(sc, dict):
             continue
@@ -671,16 +708,6 @@ def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = N
             return True
         nm = _scan_name_from_parent_scan(sc)
         if _is_workflow_scan_name(nm, run_id=run_id):
-            return True
-    return False
-    for sc in scans or []:
-        if not isinstance(sc, dict):
-            continue
-        st = str(sc.get('state') or sc.get('status') or '').strip()
-        if _compact(st) in RUNNING_STATES:
-            return True
-        prog = sc.get('progress')
-        if isinstance(prog, dict) and _compact(prog.get('state') or '') in RUNNING_STATES:
             return True
     return False
 
@@ -1760,16 +1787,37 @@ def trigger_scan(base_url: str, token: str, scan_profile_name: str, *, scan_type
     return resp.json() if resp.content else {}
 
 
-def guess_latest_scan_id(base_url: str, token: str, *, name_contains: str = "", limit: int = 80) -> str:
+def guess_latest_scan_id(base_url: str, token: str, *, name_contains: str = "", limit: int = 80, wf_tag: str = "") -> str:
     """
     If start response doesn't include scan_id, try to find the newest running parent scan
     matching a name substring.
+
+    Hardened:
+    - Prefer exact scan name match (case-insensitive)
+    - If wf_tag provided (e.g. "(wf 6-3)"), require it in name for contains-matches
     """
     needle = str(name_contains or "").strip().lower()
+    wf = str(wf_tag or "").strip().lower()
     try:
-        items = fetch_parent_scans(base_url, token, states=["Started", "Awaiting", "In Progress", "InProgress", "Running", "Queued", "Pending", "Stop Requested", "StopRequested", "Stopping"], limit=int(limit), skip=0)
+        items = fetch_parent_scans(
+            base_url,
+            token,
+            states=["Started", "Awaiting", "In Progress", "InProgress", "Running", "Queued", "Pending", "Stop Requested", "StopRequested", "Stopping"],
+            limit=int(limit),
+            skip=0,
+        )
     except Exception:
         items = []
+
+    # First pass: exact name match
+    if needle:
+        for it in items or []:
+            sid = str(it.get("_id") or it.get("id") or "").strip()
+            nm = str(it.get("name") or it.get("scanName") or it.get("displayName") or "").strip().lower()
+            if sid and nm == needle:
+                return sid
+
+    # Second pass: contains match (optionally require wf tag)
     for it in items or []:
         sid = str(it.get("_id") or it.get("id") or "").strip()
         nm = str(it.get("name") or it.get("scanName") or it.get("displayName") or "").strip().lower()
@@ -1777,8 +1825,11 @@ def guess_latest_scan_id(base_url: str, token: str, *, name_contains: str = "", 
             continue
         if needle and needle not in nm:
             continue
+        if wf and wf not in nm:
+            continue
         return sid
     return ""
+
 
 
 def fetch_scan_insights(base_url: str, token: str, scan_id: str) -> Dict[str, Any]:
@@ -1959,7 +2010,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                       AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
                       AND (
                         (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
-                        OR COALESCE(ws.status,'') = 'scan_running'
+                        OR COALESCE(ws.status,'') IN ('scan_running','scan_waiting')
                       )
                     ORDER BY ws.updated_at DESC
                 """),
@@ -2181,10 +2232,20 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     base_url = str(env_row.get("base_url") or "").strip()
     try:
         token = Get_auth_token(base_url, env_row)
+        # pipeline_guard: if this env already has a running workflow scan, do not create more DS/profiles.
     except Exception as ex:
         set_step_error(engine, step_id, f"Auth failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: auth failed")
         return True
+
+    # Do not pipeline on a busy environment (prevents creating profiles when scan is actually still running).
+    try:
+        if env_has_running_scan(base_url, token, run_id=run_id) and str(cur_status or '').strip().lower() not in {'scan_running'}:
+            set_step_status(engine, step_id, 'scan_waiting', last_error='Env has a running workflow scan; waiting')
+            set_runner_heartbeat(engine, status='idle', message=f'run={run_id} step={seq} env_busy_wait', started=False)
+            return True
+    except Exception:
+        pass
 
     step_dict = {
         "ds_kind": step[3],
@@ -2200,6 +2261,52 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     }
 
     cur_status = str(step[19] or "").strip().lower()
+
+    # If this step is already in scan_running/scan_waiting, NEVER trigger again.
+    # Instead, try to recover the real running scan_id (DB or API) and keep waiting.
+    try:
+        sid_db = str(step[18] or "").strip()
+    except Exception:
+        sid_db = ""
+    try:
+        wf_tag = f"(wf {int(run_id)}-{int(seq)})"
+    except Exception:
+        wf_tag = "(wf )"
+
+    if cur_status in {"scan_running", "scan_waiting"}:
+        # If scan_id already known, just keep it in scan_running.
+        if sid_db:
+            set_step_status(engine, step_id, "scan_running", scan_id=sid_db)
+            set_runner_heartbeat(engine, status="idle", message=f"run={run_id} step={seq} scan_running scan_id_known", started=False)
+            return False
+        # Try to recover scan_profile_name from DB
+        try:
+            with engine.connect() as conn:
+                rowx = conn.execute(text("SELECT scan_profile_name, ds_name FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
+            scan_profile_name_db = str((rowx[0] if rowx else '') or '').strip()
+            ds_name_db = str((rowx[1] if rowx else '') or '').strip()
+        except Exception:
+            scan_profile_name_db = ""
+            ds_name_db = ""
+
+        # Prefer exact-name match on scan_profile_name (includes wf tag).
+        recovered = ""
+        if scan_profile_name_db:
+            recovered = find_running_parent_scan_id(base_url, token, exact_name=scan_profile_name_db, wf_tag=wf_tag)
+        # Fallback: if profile name missing, try DS name contains wf tag via hardened guess
+        if (not recovered) and ds_name_db:
+            recovered = guess_latest_scan_id(base_url, token, name_contains=ds_name_db, wf_tag=wf_tag)
+
+        if recovered:
+            set_step_status(engine, step_id, "scan_running", scan_id=str(recovered), last_error=None)
+            set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} recovered_scan_id={recovered}", started=False)
+            return True
+
+        # Still unknown: keep waiting; do NOT pipeline or trigger.
+        set_step_status(engine, step_id, "scan_waiting", last_error="scan running but scan_id not yet resolved; waiting")
+        set_runner_heartbeat(engine, status="idle", message=f"run={run_id} step={seq} waiting_for_scan_id", started=False)
+        return False
+
     # Preserve stable phases so retries resume where they left off.
     stable_phases = {'scan_running','scan_created','ds_test_ok','ds_created','scan_waiting'}
     if cur_status in stable_phases:
@@ -2617,6 +2724,22 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         except Exception:
             pass
 
+        # If a scan is already running for this exact scan profile name, reuse it (idempotent).
+        try:
+            wf_tag = f"(wf {int(run_id)}-{int(seq)})"
+        except Exception:
+            wf_tag = ""
+        already_running_sid = ""
+        try:
+            if scan_profile_name:
+                already_running_sid = find_running_parent_scan_id(base_url, token, exact_name=scan_profile_name, wf_tag=wf_tag)
+        except Exception:
+            already_running_sid = ""
+        if already_running_sid:
+            set_step_status(engine, step_id, "scan_running", scan_id=str(already_running_sid), last_error=None)
+            set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} already_running scan={already_running_sid}", started=False)
+            return True
+
         # Preferred (matches MegaScale): trigger by scan profile name (no scheduling).
         out3: Dict[str, Any] = {}
         if scan_profile_name:
@@ -2628,10 +2751,11 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         else:
             # No name stored; fallback to id-based start.
             out3 = start_scan_profile(base_url, token, spid)
-        scan_id = _extract_id(out3, ["scanId", "scan_id", "parentScanId", "parent_scan_id", "_id", "id"])
+        scan_id = _extract_id(out3, ["scanId", "scan_id", "parentScanId", "parent_scan_id"])
         if not scan_id:
             # Fallback: infer from running parent scans list
-            scan_id = guess_latest_scan_id(base_url, token, name_contains=scan_profile_name) or guess_latest_scan_id(base_url, token, name_contains=desired_ds_name)
+            wf_tag = f"(wf {int(run_id)}-{int(seq)})"
+            scan_id = guess_latest_scan_id(base_url, token, name_contains=scan_profile_name, wf_tag=wf_tag) or guess_latest_scan_id(base_url, token, name_contains=desired_ds_name, wf_tag=wf_tag)
         if scan_id:
             set_step_status(engine, step_id, "scan_running", scan_id=str(scan_id))
         else:
