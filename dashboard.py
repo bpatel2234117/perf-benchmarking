@@ -2927,6 +2927,10 @@ def ensure_scan_progress_table():
             """))
             # Non-breaking schema upgrades for existing DBs
             try:
+                conn.execute(text("ALTER TABLE scan_progress MODIFY COLUMN `timestamp` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"))
+            except Exception:
+                pass
+            try:
                 conn.execute(text("ALTER TABLE scan_progress ADD COLUMN scan_state VARCHAR(64) NULL"))
             except Exception:
                 pass
@@ -3435,6 +3439,11 @@ def _is_terminal_state_anywhere(state: Any) -> bool:
     return s in {"failed","completedwithfailures","completed","stopped","aborted","cancelled","canceled"}
 
 
+def _is_running_state_anywhere(state: Any) -> bool:
+    s = str(state or "").strip().lower().replace(" ", "")
+    return s in {"started","awaiting","inprogress","inprogress","running","queued","pending","stoprequested","pauserequested"}
+
+
 def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
     """
     Best-effort reconciliation using DB scan status.
@@ -3454,7 +3463,7 @@ def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
 
     # Find steps that have scan_id and are not completed yet.
     try:
-        pending = steps_df[steps_df["status"].astype(str).isin(["pending", "running", "created", "scan_running", "ds_created", "scan_created"])]
+        pending = steps_df[steps_df["status"].astype(str).isin(["pending", "running", "created", "scan_running", "ds_created", "scan_created", "error"])]
     except Exception:
         pending = steps_df
     scan_ids = [str(x).strip() for x in pending.get("scan_id", pd.Series(dtype=str)).tolist() if str(x).strip()]
@@ -3512,6 +3521,17 @@ def reconcile_workflow_run(run_id: int) -> Dict[str, Any]:
                         continue
                     stv = status_map.get(sid, "")
                     if not _is_terminal_state_anywhere(stv):
+                        # If scan is still running, ensure step reflects that (even if it was previously marked error).
+                        if _is_running_state_anywhere(stv):
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET status = 'scan_running', updated_at = CURRENT_TIMESTAMP
+                                    WHERE id = :id
+                                """),
+                                {"id": int(getattr(row, "id"))},
+                            )
+                            updated += 1
                         continue
                     # Mark step completed
                     conn.execute(
@@ -3969,7 +3989,8 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
                     false_removed_classifications = VALUES(false_removed_classifications),
                     objects_scanned = VALUES(objects_scanned),
                     objects_failed = VALUES(objects_failed),
-                    objects_with_pi = VALUES(objects_with_pi)
+                    objects_with_pi = VALUES(objects_with_pi),
+                    `timestamp` = CURRENT_TIMESTAMP
             """), {
                 "cau": captured_at_utc,
                 "sid": scan_id, "sname": scan_name, "eid": env_id,
@@ -9682,11 +9703,93 @@ def page_scan_progress():
 
     # Health flags
     flags = []
+    regression_warnings = []
     stall_minutes = None
     last_change_at = None
     completion_lag_minutes = None
     completion_lag_summary = ""
     false_removed_delta = None
+
+    # Regression check: if ObjectsWithPi / Classifications stay 0, compare vs last previous-build run (DB-only)
+    try:
+        cur_max_pi = 0
+        cur_max_cls = 0
+        if isinstance(df_ai, pd.DataFrame) and not df_ai.empty:
+            if "objects_with_pi" in df_ai.columns:
+                cur_max_pi = int(pd.to_numeric(df_ai["objects_with_pi"], errors="coerce").fillna(0).max() or 0)
+            if "total_classifications" in df_ai.columns:
+                cur_max_cls = int(pd.to_numeric(df_ai["total_classifications"], errors="coerce").fillna(0).max() or 0)
+
+        def _wf_ctx_for_scan(_sid: str) -> dict:
+            if not engine:
+                return {}
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(text('SELECT ds_kind, file_set_type, is_acl, is_ols, is_structured_ff, build_version, environment_id\nFROM workflow_steps\nWHERE scan_id = :sid\nORDER BY updated_at DESC, id DESC\nLIMIT 1'), {"sid": str(_sid or "").strip()}).fetchone()
+                if not row:
+                    return {}
+                return {
+                    "ds_kind": str(row[0] or "").strip(),
+                    "file_set_type": (str(row[1]).strip() if row[1] is not None else None),
+                    "is_acl": int(row[2] or 0),
+                    "is_ols": int(row[3] or 0),
+                    "is_structured_ff": int(row[4] or 0),
+                    "build_version": str(row[5] or "").strip(),
+                    "environment_id": (int(row[6]) if row[6] is not None else None),
+                }
+            except Exception:
+                return {}
+
+        def _find_prev_scan(ctx: dict, cur_scan_id: str) -> tuple:
+            if not engine:
+                return ("", "")
+            dk = str(ctx.get("ds_kind") or "").strip()
+            if not dk:
+                return ("", "")
+            fst = ctx.get("file_set_type")
+            eid = ctx.get("environment_id")
+            params = {
+                "cur": str(cur_scan_id or "").strip(),
+                "dk": dk,
+                "fst": fst,
+                "acl": int(ctx.get("is_acl") or 0),
+                "ols": int(ctx.get("is_ols") or 0),
+                "sff": int(ctx.get("is_structured_ff") or 0),
+                "eid": int(eid) if eid is not None else -1,
+            }
+            try:
+                with engine.connect() as conn:
+                    row = conn.execute(text("SELECT ws.scan_id, ws.build_version\nFROM workflow_steps ws\nWHERE ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> ''\n  AND ws.scan_id <> :cur\n  AND ws.ds_kind = :dk\n  AND ((:fst IS NULL AND ws.file_set_type IS NULL) OR ws.file_set_type = :fst)\n  AND COALESCE(ws.is_acl, 0) = :acl\n  AND COALESCE(ws.is_ols, 0) = :ols\n  AND COALESCE(ws.is_structured_ff, 0) = :sff\nORDER BY (ws.environment_id = :eid) DESC, ws.updated_at DESC, ws.id DESC\nLIMIT 1"), params).fetchone()
+                if not row:
+                    return ("", "")
+                return (str(row[0] or "").strip(), str(row[1] or "").strip())
+            except Exception:
+                return ("", "")
+
+        # Only warn if scanning has started (objects > 0) and classification metrics remain 0
+        if cur_objects > 0 and cur_max_pi == 0 and cur_max_cls == 0:
+            ctx = _wf_ctx_for_scan(str(scan_id))
+            prev_sid, prev_build = _find_prev_scan(ctx or {}, str(scan_id))
+            if prev_sid:
+                prev_df = load_scan_progress_history(prev_sid)
+                if isinstance(prev_df, pd.DataFrame) and not prev_df.empty:
+                    prev_max_pi = int(pd.to_numeric(prev_df.get("objects_with_pi", 0), errors="coerce").fillna(0).max() or 0)
+                    prev_max_cls = int(pd.to_numeric(prev_df.get("total_classifications", 0), errors="coerce").fillna(0).max() or 0)
+                else:
+                    prev_max_pi = 0
+                    prev_max_cls = 0
+                if prev_max_pi > 0 or prev_max_cls > 0:
+                    regression_warnings.append(
+                        f"ObjectsWithPi/Classifications are 0 so far, but previous run (build `{prev_build or 'unknown'}`) had objects_with_pi={prev_max_pi:,}, total_classifications={prev_max_cls:,}."
+                    )
+                    flags.append("Classification metrics missing vs previous build (possible regression / classification disabled / insights gap).")
+            else:
+                regression_warnings.append(
+                    "ObjectsWithPi/Classifications are 0 so far. No previous workflow run found to compare; this can indicate classification disabled or insights payload missing."
+                )
+                flags.append("Classification metrics are 0 so far (check classification enablement + insights).")
+    except Exception:
+        pass
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
@@ -9887,6 +9990,15 @@ def page_scan_progress():
                         st.warning("Local LLM call returned empty output (or failed).")
                 except Exception as ex:
                     st.warning(f"LLM narrative failed: {ex}")
+
+        # Regression warnings (DB-only compare vs previous build run)
+        try:
+            if regression_warnings:
+                st.error("Possible regression detected in classification metrics:")
+                for w in regression_warnings:
+                    st.caption(f"- {w}")
+        except Exception:
+            pass
 
         # Highlight completion lag (the issue you mentioned: scan hit 100% but status took hours to flip)
         try:
@@ -10340,33 +10452,43 @@ def page_workflow_automation():
         run_id_qp = str(st.query_params.get("run_id", "") or "").strip()
     except Exception:
         run_id_qp = ""
-    run_options = []
-    run_map = {}
-    for r in runs_df.itertuples():
-        rid = int(r.id)
-        label = f"{rid} | {str(r.status or '').strip() or 'unknown'} | {str(r.name or '').strip()}"
-        run_options.append(label)
-        run_map[label] = rid
-    default_idx = 0
+
     want = None
     try:
         if str(st.session_state.get("wf_run_sel_id", "")).strip():
             want = int(st.session_state.get("wf_run_sel_id"))
     except Exception:
-        want = None
+        pass
     if want is None and run_id_qp.isdigit():
         want = int(run_id_qp)
-    if want is not None:
-        for i, lab in enumerate(run_options):
-            if run_map.get(lab) == int(want):
-                default_idx = i
-                break
-    selected_run_label = st.selectbox("Select run", run_options, index=default_idx, key="wf_run_sel")
-    run_id = int(run_map[selected_run_label])
-    try:
-        st.session_state["wf_run_sel_id"] = int(run_id)
-    except Exception:
-        pass
+        
+    st.caption("Click a row to view its step details")
+    
+    disp_runs = runs_df.copy()
+    # Format the table a bit nicer where possible
+    
+    event = st.dataframe(
+        disp_runs[["id", "name", "status", "started_at", "finished_at", "last_error", "next_eligible_at"]],
+        use_container_width=True,
+        hide_index=True,
+        selection_mode="single-row",
+        on_select="rerun",
+        key="wf_runs_table"
+    )
+    
+    sel_rows = event.selection.rows
+    if sel_rows:
+        idx = sel_rows[0]
+        run_id = int(disp_runs.iloc[idx]["id"])
+        st.session_state["wf_run_sel_id"] = run_id
+    else:
+        # If nothing is selected actively in the dataframe, fall back to "want" or the most recent run
+        if want is not None and want in disp_runs["id"].values:
+            run_id = int(want)
+        else:
+            run_id = int(disp_runs.iloc[0]["id"])
+            
+    st.session_state["wf_run_sel_id"] = run_id
 
     # Disable starting/resuming multiple workflows at once (prevents conflicts).
     try:
@@ -10622,10 +10744,11 @@ def page_workflow_automation():
         sid = str(row.get("scan_id") or "").strip()
 
         # Determine the furthest reached stage from status + ids.
-        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"})
-        has_test = (s in {"ds_test_ok", "scan_created", "scan_running", "completed"})
-        has_profile = bool(spid) or (s in {"scan_created", "scan_running", "completed"})
+        # IMPORTANT: ids imply stages even if status is stale/error.
         has_scan = bool(sid) or (s in {"scan_running", "completed"})
+        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
+        has_test = has_profile or has_scan or (s in {"ds_test_ok", "scan_created", "scan_running", "completed"})
+        has_ds = bool(ds_id) or has_test or has_profile or has_scan or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"})
 
         parts: List[str] = []
 
@@ -10636,6 +10759,9 @@ def page_workflow_automation():
 
         if s == "error":
             # Show where it failed based on what we already have.
+            # If ids indicate later stages, show them (status may be stale).
+            if has_scan:
+                return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
             if not has_ds:
                 return "❌ DS"
             if has_ds and not has_test:
@@ -10654,7 +10780,7 @@ def page_workflow_automation():
         if has_profile:
             parts.append("✅ Profile")
         if has_scan:
-            parts.append("⏳ Scan" if s == "scan_running" else "✅ Scan")
+            parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
 
         # If somehow we have no signals, default to DS.
         return " ➔ ".join(parts) if parts else "➖ DS"

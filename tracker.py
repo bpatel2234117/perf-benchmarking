@@ -580,6 +580,7 @@ def ensure_scan_progress_table(engine) -> None:
         """))
         # schema upgrades for existing DBs
         for stmt in [
+            "ALTER TABLE scan_progress MODIFY COLUMN `timestamp` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
             "ALTER TABLE scan_progress ADD COLUMN captured_at_utc DATETIME NULL",
             "ALTER TABLE scan_progress ADD COLUMN scan_state VARCHAR(64) NULL",
             "ALTER TABLE scan_progress ADD COLUMN false_removed_classifications BIGINT DEFAULT 0",
@@ -1371,7 +1372,8 @@ def upsert_scan_progress_record(
                     false_removed_classifications = VALUES(false_removed_classifications),
                     objects_scanned = VALUES(objects_scanned),
                     objects_failed = VALUES(objects_failed),
-                    objects_with_pi = VALUES(objects_with_pi)
+                    objects_with_pi = VALUES(objects_with_pi),
+                    `timestamp` = CURRENT_TIMESTAMP
             """),
             {
                 "cau": captured_at_utc,
