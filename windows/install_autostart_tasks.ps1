@@ -5,53 +5,57 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 
 $DashScript = Join-Path $PSScriptRoot "run_dashboard.ps1"
 $TrackerScript = Join-Path $PSScriptRoot "run_tracker.ps1"
+$RunnerScript = Join-Path $PSScriptRoot "run_workflow_runner.ps1"
 
 if (-not (Test-Path $DashScript)) { throw "Missing $DashScript" }
 if (-not (Test-Path $TrackerScript)) { throw "Missing $TrackerScript" }
+if (-not (Test-Path $RunnerScript)) { throw "Missing $RunnerScript" }
 
 $taskDash = "ScanPerfDashboard"
 $taskTracker = "ScanPerfTracker"
+$taskRunner = "ScanPerfWorkflowRunner"
 
-function Test-TaskExists {
-  param([string]$TaskName)
-  # schtasks.exe prints "ERROR: The system cannot find the file specified." for missing tasks.
-  # In newer PowerShell, native command failures can be treated as terminating errors.
-  # Use cmd.exe and redirect output to avoid hard-failing the script.
-  cmd.exe /c "schtasks.exe /Query /TN ""$TaskName"" >nul 2>nul"
-  return ($LASTEXITCODE -eq 0)
+$userId = $env:USERNAME
+if ($env:USERDOMAIN) { $userId = "$env:USERDOMAIN\$env:USERNAME" }
+
+function To-IsoDelay {
+  param([int]$Seconds)
+  $s = [Math]::Max(0, [int]$Seconds)
+  $h = [Math]::Floor($s / 3600)
+  $s = $s % 3600
+  $m = [Math]::Floor($s / 60)
+  $s = $s % 60
+  $out = "PT"
+  if ($h -gt 0) { $out += "${h}H" }
+  if ($m -gt 0) { $out += "${m}M" }
+  if ($s -gt 0 -or ($h -eq 0 -and $m -eq 0)) { $out += "${s}S" }
+  return $out
 }
 
-function Register-StartupTask {
+function Register-LogonTask {
   param(
     [string]$TaskName,
     [string]$ScriptPath,
     [int]$DelaySeconds = 30
   )
 
-  $cmd = "powershell.exe"
-  $cmdArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`""
+  $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ("-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"{0}`"" -f $ScriptPath)
+  $trigger = New-ScheduledTaskTrigger -AtLogOn
+  if ($DelaySeconds -gt 0) { $trigger.Delay = (To-IsoDelay -Seconds $DelaySeconds) }
+  $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
 
-  # Remove existing task if present (idempotent)
-  if (Test-TaskExists -TaskName $TaskName) {
-    schtasks.exe /Delete /TN $TaskName /F | Out-Null
-  }
-
-  # schtasks.exe expects /DELAY in mmmm:ss format (4-digit minutes)
-  $delay = ("{0:0000}:{1:00}" -f [Math]::Floor($DelaySeconds / 60), ($DelaySeconds % 60))
-  # Run at startup, run whether user is logged on or not, with highest privileges
-  schtasks.exe /Create /TN $TaskName /SC ONSTART /DELAY $delay /RL HIGHEST /F `
-    /TR "`"$cmd`" $cmdArgs" | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    throw "Failed to create task: $TaskName (exit=$LASTEXITCODE)"
-  }
+  try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch {}
+  Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 }
 
-Register-StartupTask -TaskName $taskTracker -ScriptPath $TrackerScript -DelaySeconds 20
-Register-StartupTask -TaskName $taskDash -ScriptPath $DashScript -DelaySeconds 30
+Register-LogonTask -TaskName $taskTracker -ScriptPath $TrackerScript -DelaySeconds 10
+Register-LogonTask -TaskName $taskRunner -ScriptPath $RunnerScript -DelaySeconds 20
+Register-LogonTask -TaskName $taskDash -ScriptPath $DashScript -DelaySeconds 30
 
-Write-Host "Installed startup tasks:"
+Write-Host "Installed logon tasks (interactive user session):"
 Write-Host " - $taskTracker"
+Write-Host " - $taskRunner"
 Write-Host " - $taskDash"
 Write-Host ""
 Write-Host "Logs are written under: $(Join-Path $RepoRoot 'logs')"
-

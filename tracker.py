@@ -20,6 +20,8 @@ import os
 import re
 import sys
 import time
+from pathlib import Path
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -30,6 +32,56 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_config import DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token
+
+
+ENV_FILE_PATH = Path(__file__).parent / ".env"
+
+_DOTENV_MAP: Dict[str, str] = {}
+_DOTENV_MTIME: Optional[float] = None
+
+
+def _read_dotenv_map() -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    try:
+        if not ENV_FILE_PATH.exists():
+            return values
+        text_value = ENV_FILE_PATH.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return values
+    for line in text_value.splitlines():
+        ss = line.strip()
+        if not ss or ss.startswith("#") or "=" not in ss:
+            continue
+        k, v = ss.split("=", 1)
+        key = k.strip()
+        val = v.strip().strip('"').strip("'")
+        if key:
+            values[key] = val
+    return values
+
+
+def _maybe_reload_dotenv() -> None:
+    global _DOTENV_MAP, _DOTENV_MTIME
+    try:
+        st = ENV_FILE_PATH.stat()
+        mtime = float(st.st_mtime)
+    except Exception:
+        return
+    if _DOTENV_MTIME is None or (mtime != _DOTENV_MTIME):
+        try:
+            _DOTENV_MAP = _read_dotenv_map()
+            _DOTENV_MTIME = mtime
+        except Exception:
+            pass
+
+
+def _getenv_str(name: str, default: str = "") -> str:
+    _maybe_reload_dotenv()
+    v = str(os.getenv(name, "") or "").strip()
+    if v:
+        return v
+    v2 = str(_DOTENV_MAP.get(name, "") or "").strip()
+    return v2 or str(default or "")
 
 
 PARENT_SCANS_PATH = os.getenv("BIGID_PARENT_SCANS_API_PATH", "/api/v1/scans/parent-scans").strip() or "/api/v1/scans/parent-scans"
@@ -131,6 +183,22 @@ def _choose_best_state(parent_state: Any, insight_state: Any) -> str:
 def _now_utc_naive() -> datetime:
     # Naive UTC datetime suitable for MySQL DATETIME
     return datetime.utcnow()
+
+
+def _slot_minutes() -> int:
+    """Slot size in minutes for progress snapshots and main loop alignment.
+
+    Controlled by TRACKER_SLOT_MINUTES (default 10).
+    """
+    try:
+        m = int(_getenv_str('TRACKER_SLOT_MINUTES', '10') or '10')
+    except Exception:
+        m = 10
+    if m <= 0:
+        m = 10
+    if m > 60:
+        m = 60
+    return m
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -512,6 +580,7 @@ def ensure_scan_progress_table(engine) -> None:
         """))
         # schema upgrades for existing DBs
         for stmt in [
+            "ALTER TABLE scan_progress MODIFY COLUMN `timestamp` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
             "ALTER TABLE scan_progress ADD COLUMN captured_at_utc DATETIME NULL",
             "ALTER TABLE scan_progress ADD COLUMN scan_state VARCHAR(64) NULL",
             "ALTER TABLE scan_progress ADD COLUMN false_removed_classifications BIGINT DEFAULT 0",
@@ -601,12 +670,18 @@ def load_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
         return []
 
 
-def _request_get(url: str, token: str, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+def _request_get(
+    url: str,
+    token: str,
+    params: Optional[Dict[str, Any]] = None,
+    *,
+    timeout_seconds: int = 20,
+) -> requests.Response:
     headers_raw = {"authorization": token} if token else {}
     headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
-    resp = requests.get(url, params=params or {}, headers=headers_raw, timeout=20)
+    resp = requests.get(url, params=params or {}, headers=headers_raw, timeout=int(timeout_seconds))
     if resp.status_code in (401, 403) and token:
-        resp = requests.get(url, params=params or {}, headers=headers_bearer, timeout=20)
+        resp = requests.get(url, params=params or {}, headers=headers_bearer, timeout=int(timeout_seconds))
     return resp
 
 
@@ -1111,7 +1186,16 @@ def upsert_build_classifier_set(engine, build_version: str, template_name: str, 
             )
         conn.commit()
 
-def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, limit: int = 200) -> List[Dict[str, Any]]:
+def fetch_scan_classifier_attributes(
+    base_url: str,
+    scan_id: str,
+    token: str,
+    *,
+    limit: int = 200,
+    max_pages: int = 10,
+    request_timeout_seconds: int = 20,
+    max_seconds_total: Optional[int] = None,
+) -> List[Dict[str, Any]]:
     """
     Fetch per-scan classifier attributes delta list.
     Endpoint: {INSIGHTS_PATH}/{scan_id}/attributes?type=classifier
@@ -1121,7 +1205,13 @@ def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, li
     all_items: List[Dict[str, Any]] = []
     skip = 0
     total_count: Optional[int] = None
-    for _ in range(10):
+    started = time.time()
+    for _ in range(int(max_pages) if int(max_pages) > 0 else 0):
+        try:
+            if max_seconds_total is not None and (time.time() - started) > float(max_seconds_total):
+                break
+        except Exception:
+            pass
         params = {
             "skip": int(skip),
             "limit": int(limit),
@@ -1129,7 +1219,7 @@ def fetch_scan_classifier_attributes(base_url: str, scan_id: str, token: str, li
             "sort": json.dumps([{"field": "new", "order": "desc"}], separators=(",", ":")),
             "type": "classifier",
         }
-        resp = _request_get(url, token, params=params)
+        resp = _request_get(url, token, params=params, timeout_seconds=int(request_timeout_seconds))
         if resp.status_code in (401, 403):
             raise RuntimeError(f"Unauthorized scan attributes API: {resp.status_code}")
         resp.raise_for_status()
@@ -1239,7 +1329,8 @@ def upsert_scan_progress_record(
 
     # Align to 10-minute marks in UTC for clean chart axis (11:10, 11:20, ...)
     now_utc = _now_utc_naive()
-    captured_at_utc = now_utc.replace(minute=(now_utc.minute // 10) * 10, second=0, microsecond=0)
+    slot_m = _slot_minutes()
+    captured_at_utc = now_utc.replace(minute=(now_utc.minute // slot_m) * slot_m, second=0, microsecond=0)
 
     try:
         env_id_int = int(env_id) if env_id is not None and str(env_id).strip() != "" else None
@@ -1281,7 +1372,8 @@ def upsert_scan_progress_record(
                     false_removed_classifications = VALUES(false_removed_classifications),
                     objects_scanned = VALUES(objects_scanned),
                     objects_failed = VALUES(objects_failed),
-                    objects_with_pi = VALUES(objects_with_pi)
+                    objects_with_pi = VALUES(objects_with_pi),
+                    `timestamp` = CURRENT_TIMESTAMP
             """),
             {
                 "cau": captured_at_utc,
@@ -1613,6 +1705,57 @@ def track_once(engine) -> Dict[str, Any]:
         "env_version_sync_fail": 0,
         "env_version_updated": 0,
     }
+
+    # Attribute-delta fetch can be heavy. Keep it enabled for running scans,
+    # but throttle it so it never blocks progress snapshots.
+    try:
+        attrs_running_ttl_min = int(_getenv_str('TRACKER_ATTRS_RUNNING_TTL_MINUTES', '60') or '60')
+    except Exception:
+        attrs_running_ttl_min = 60
+    try:
+        attrs_max_running_per_cycle = int(_getenv_str('TRACKER_ATTRS_MAX_RUNNING_PER_CYCLE', '1') or '1')
+    except Exception:
+        attrs_max_running_per_cycle = 1
+    try:
+        attrs_timeout_running_s = int(_getenv_str('TRACKER_ATTRS_TIMEOUT_SECONDS_RUNNING', '8') or '8')
+    except Exception:
+        attrs_timeout_running_s = 8
+    try:
+        attrs_timeout_terminal_s = int(_getenv_str('TRACKER_ATTRS_TIMEOUT_SECONDS_TERMINAL', '20') or '20')
+    except Exception:
+        attrs_timeout_terminal_s = 20
+    try:
+        attrs_max_pages_running = int(_getenv_str('TRACKER_ATTRS_MAX_PAGES_RUNNING', '2') or '2')
+    except Exception:
+        attrs_max_pages_running = 2
+    try:
+        attrs_max_pages_terminal = int(_getenv_str('TRACKER_ATTRS_MAX_PAGES_TERMINAL', '10') or '10')
+    except Exception:
+        attrs_max_pages_terminal = 10
+    try:
+        attrs_max_seconds_running = int(_getenv_str('TRACKER_ATTRS_MAX_SECONDS_RUNNING', '12') or '12')
+    except Exception:
+        attrs_max_seconds_running = 12
+    try:
+        attrs_max_seconds_terminal = int(_getenv_str('TRACKER_ATTRS_MAX_SECONDS_TERMINAL', '60') or '60')
+    except Exception:
+        attrs_max_seconds_terminal = 60
+
+    attrs_running_sem = threading.Semaphore(max(0, int(attrs_max_running_per_cycle)))
+
+    def _should_fetch_attrs_for_running(scan_id: str) -> bool:
+        if attrs_running_ttl_min <= 0:
+            return True
+        key = f'attrs_running_last::{str(scan_id)}'
+        last = _parse_iso_dt(_kv_get(engine, key))
+        if not last:
+            return True
+        try:
+            age_min = (datetime.utcnow() - last).total_seconds() / 60.0
+            return bool(age_min >= float(attrs_running_ttl_min))
+        except Exception:
+            return True
+
 
     def get_token_for_env(env_row: Dict[str, Any]) -> str:
         base_url = str(env_row.get("base_url") or "").strip()
@@ -2024,9 +2167,39 @@ def track_once(engine) -> Dict[str, Any]:
 
             # Attribute delta fetch can be slow; only do it when useful.
             try:
-                if _is_terminal_state(state) or _needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id):
-                    attrs = fetch_scan_classifier_attributes(base_url, scan_id, get_token_for_env(env_row))
-                    upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                needs_terminal_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
+                if _is_terminal_state(state):
+                    if needs_terminal_attrs:
+                        attrs = fetch_scan_classifier_attributes(
+                            base_url,
+                            scan_id,
+                            get_token_for_env(env_row),
+                            max_pages=int(attrs_max_pages_terminal),
+                            request_timeout_seconds=int(attrs_timeout_terminal_s),
+                            max_seconds_total=int(attrs_max_seconds_terminal),
+                        )
+                        upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                else:
+                    acquired = False
+                    try:
+                        acquired = bool(attrs_running_sem.acquire(blocking=False))
+                        if acquired and _should_fetch_attrs_for_running(scan_id):
+                            _kv_set(engine, f"attrs_running_last::{str(scan_id)}", _now_utc_naive().strftime('%Y-%m-%dT%H:%M:%S'))
+                            attrs = fetch_scan_classifier_attributes(
+                                base_url,
+                                scan_id,
+                                get_token_for_env(env_row),
+                                max_pages=int(attrs_max_pages_running),
+                                request_timeout_seconds=int(attrs_timeout_running_s),
+                                max_seconds_total=int(attrs_max_seconds_running),
+                            )
+                            upsert_scan_attribute_deltas(engine, scan_id, attrs)
+                    finally:
+                        try:
+                            if acquired:
+                                attrs_running_sem.release()
+                        except Exception:
+                            pass
             except Exception:
                 return True, "ok_attrs_failed", attempted
 
@@ -2210,13 +2383,13 @@ def main() -> int:
         "--align-10min",
         action="store_true",
         default=True,
-        help="Align runs to UTC 10-minute boundaries (default: on)",
+        help="Align runs to UTC slot boundaries (TRACKER_SLOT_MINUTES, default 10)",
     )
     ap.add_argument(
         "--no-align-10min",
         action="store_false",
         dest="align_10min",
-        help="Disable alignment to 10-minute boundaries",
+        help="Disable alignment to slot boundaries",
     )
     ap.add_argument("--once", action="store_true", help="Run one cycle then exit")
     ap.add_argument("--scan-id", type=str, default="", help="Force-update a specific scan id (try all envs)")
@@ -2278,10 +2451,10 @@ def main() -> int:
             )
         return 0
 
-    def seconds_until_next_10min_boundary() -> int:
+    def seconds_until_next_slot_boundary(slot_minutes: int) -> int:
         now = _now_utc_naive()
         base = now.replace(second=0, microsecond=0)
-        next_min = ((base.minute // 10) + 1) * 10
+        next_min = ((base.minute // slot_minutes) + 1) * slot_minutes
         if next_min >= 60:
             target = base.replace(minute=0) + timedelta(hours=1)
         else:
@@ -2290,13 +2463,14 @@ def main() -> int:
         return max(1, int(delta))
 
     last_slot_key = None
+    slot_minutes = _slot_minutes()
     while True:
         if args.align_10min:
             now = _now_utc_naive()
-            slot = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
+            slot = now.replace(minute=(now.minute // slot_minutes) * slot_minutes, second=0, microsecond=0)
             slot_key = slot.strftime("%Y-%m-%dT%H:%M")
             if slot_key == last_slot_key:
-                time.sleep(seconds_until_next_10min_boundary())
+                time.sleep(seconds_until_next_slot_boundary(slot_minutes))
                 continue
             last_slot_key = slot_key
         started = _now_utc_naive()
@@ -2347,7 +2521,7 @@ def main() -> int:
         if args.once:
             return 0
         if args.align_10min:
-            time.sleep(seconds_until_next_10min_boundary())
+            time.sleep(seconds_until_next_slot_boundary(slot_minutes))
         else:
             time.sleep(max(5, int(args.interval_seconds)))
 
