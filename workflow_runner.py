@@ -46,6 +46,7 @@ SCAN_TEMPLATES_PATH = os.getenv("BIGID_SCAN_TEMPLATES_API_PATH", "/api/v1/scan-t
 SCANS_TRIGGER_PATH = os.getenv("BIGID_SCANS_TRIGGER_API_PATH", "/api/v1/scans").strip() or "/api/v1/scans"
 DS_CONNECTION_TEST_PATH = os.getenv("BIGID_DS_CONNECTION_TEST_API_PATH", "/api/v1/ds-connection-test/client").strip() or "/api/v1/ds-connection-test/client"
 DS_CONNECTIONS_TEST_PATH = os.getenv("BIGID_DS_CONNECTIONS_TEST_API_PATH", "/api/v1/ds-connections/test").strip() or "/api/v1/ds-connections/test"
+DS_GROUPED_STATUSES_PATH = os.getenv("BIGID_DS_GROUPED_STATUSES_API_PATH", "/api/v1/ds-connections/grouped-statuses").strip() or "/api/v1/ds-connections/grouped-statuses"
 
 DEFAULT_SCAN_OWNER_EMAIL = str(os.getenv("WORKFLOW_SCAN_OWNER_EMAIL", "admin@bigid.com") or "").strip()
 
@@ -129,17 +130,17 @@ def _env_int(name: str, default: int) -> int:
 def _ds_kind_timeout_seconds(ds_kind: Any) -> int:
     """
     DS connection test can be slow (esp MSSQL). Allow per-DS override:
-      WORKFLOW_DS_TEST_TIMEOUT_SECONDS_MSSQL=420
-    Fallback: WORKFLOW_DS_TEST_TIMEOUT_SECONDS (default 180)
+      WORKFLOW_DS_TEST_TIMEOUT_SECONDS_MSSQL=600
+    Fallback: WORKFLOW_DS_TEST_TIMEOUT_SECONDS (default 180; MSSQL default 600)
     """
     k = str(ds_kind or "").strip().upper()
     if k:
         v = _env_int(f"WORKFLOW_DS_TEST_TIMEOUT_SECONDS_{k}", -1)
         if v and v > 0:
             return int(max(30, min(1800, v)))
-    # Default MSSQL test timeout is higher (3-5 min is common).
+    # MSSQL default 600s (10 min); others 180s.
     if k == 'MSSQL':
-        v2 = _env_int('WORKFLOW_DS_TEST_TIMEOUT_SECONDS', 420)
+        v2 = _env_int('WORKFLOW_DS_TEST_TIMEOUT_SECONDS', 600)
     else:
         v2 = _env_int('WORKFLOW_DS_TEST_TIMEOUT_SECONDS', 180)
     return int(max(30, min(1800, v2)))
@@ -1536,6 +1537,45 @@ def fetch_ds_connection(base_url: str, token: str, ds_name: str, *, timeout_seco
     resp = _request("GET", url, token)
     return resp.json() if resp.content else {}
 
+def fetch_ds_grouped_statuses(base_url: str, token: str, name_filter: str) -> Dict[str, Any]:
+    """POST /api/v1/ds-connections/grouped-statuses with query filter by name (exact or partial). Used when poll times out to confirm test success."""
+    url = build_api_url(base_url, DS_GROUPED_STATUSES_PATH)
+    val = str(name_filter or "").strip()
+    # Match UI: filter by name and other fields with same value (textSearch)
+    body = {"query": {"filter": [
+        {"field": "name", "value": val, "operator": "textSearch"},
+        {"field": "friendly_name", "value": val, "operator": "textSearch"},
+        {"field": "comment", "value": val, "operator": "textSearch"},
+        {"field": "rdb_comma_sep_table_list", "value": val, "operator": "textSearch"},
+        {"field": "rdb_name", "value": val, "operator": "textSearch"},
+        {"field": "discoveryAppPresetId", "value": val, "operator": "textSearch"},
+    ]}}
+    try:
+        resp = _request("POST", url, token, json_body=body, timeout_seconds=min(15.0, float(HTTP_TIMEOUT)))
+        return resp.json() if resp.content else {}
+    except Exception:
+        return {}
+
+def _grouped_statuses_reports_success(payload: Dict[str, Any], ds_name: str) -> bool:
+    """Return True if payload contains a DS matching ds_name with connection test success."""
+    name = str(ds_name or "").strip()
+    if not name:
+        return False
+    items = payload.get("data") or payload.get("result") or payload.get("ds_connections") or (payload if isinstance(payload, list) else [])
+    if not isinstance(items, list):
+        return False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        n = str(item.get("name") or item.get("ds_name") or "").strip()
+        if n != name and name not in n:
+            continue
+        cst = item.get("connectionStatusTest") or item.get("connection_status_test")
+        if isinstance(cst, dict) and (cst.get("is_success") is True or str(cst.get("is_success") or "").strip().lower() in ("true", "1", "yes")):
+            return True
+        if item.get("lastTestSuccess") is True or str(item.get("connection_status") or "").strip().lower() in ("connected", "success"):
+            return True
+    return False
 
 def _parse_utc_dt(v: Any) -> Optional[datetime]:
     s = str(v or "").strip()
@@ -1570,6 +1610,13 @@ def wait_for_ds_connection_test_result(
     Poll DS until connectionStatusTest.last_connection is updated after test_started_at.
     Return (ok, message).
     """
+    # last_conn from API is naive UTC; normalize test_started_at for comparison to avoid TypeError
+    _test_started = test_started_at
+    if getattr(_test_started, "tzinfo", None) is not None:
+        try:
+            _test_started = _test_started.replace(tzinfo=None)
+        except Exception:
+            pass
     deadline = _now_utc() + timedelta(seconds=max(10, int(timeout_seconds)))
     last_seen = None
     grace_decide_at = test_started_at + timedelta(seconds=15)
@@ -1579,13 +1626,17 @@ def wait_for_ds_connection_test_result(
             dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
             cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
             if cst is None and (_now_utc() >= grace_decide_at):
-                return True, "no connectionStatusTest field; proceeding"
+                # BigID often does not return connectionStatusTest in GET for MSSQL/S3/SMB. Test was already triggered (POST).
+                # Default: proceed so workflow continues; set WORKFLOW_DS_TEST_STRICT=1 to require connectionStatusTest.
+                if os.getenv("WORKFLOW_DS_TEST_STRICT", "").strip().lower() in ("1", "true", "yes"):
+                    return False, "connectionStatusTest missing; cannot confirm success (DS may stay Draft in BigID)"
+                return True, "no connectionStatusTest in response; test was triggered, proceeding so workflow can continue"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
                     last_seen = last_conn
-                # only decide once we see an updated last_connection after we started the test
-                if last_conn and last_conn >= (test_started_at - timedelta(seconds=2)):
+                # only decide once we see an updated last_connection after we started the test (use naive UTC for comparison)
+                if last_conn and last_conn >= (_test_started - timedelta(seconds=2)):
                     is_success = cst.get("is_success")
                     if isinstance(is_success, bool):
                         return is_success, json.dumps({k: cst.get(k) for k in ["is_success", "last_connection", "is_connection_ever_succeeded"]}, separators=(",", ":"))[:500]
@@ -1595,6 +1646,14 @@ def wait_for_ds_connection_test_result(
                         return True, "success"
                     if s in {"false", "0", "no", "fail", "failed", "error"}:
                         return False, "failed"
+                # Fallback: last_connection may be in server/local time or update slowly; accept success within 15 min window
+                if last_conn and last_conn >= (_test_started - timedelta(minutes=15)) and (_now_utc() >= grace_decide_at):
+                    is_success = cst.get("is_success")
+                    if isinstance(is_success, bool) and is_success:
+                        return True, "success (within 15 min window)"
+                    s = str(is_success or "").strip().lower()
+                    if s in {"true", "1", "yes", "ok", "success"}:
+                        return True, "success (within 15 min window)"
                 # Fallback: sometimes is_success flips before last_connection is updated.
                 if (not last_conn) and (_now_utc() >= grace_decide_at):
                     is_success = cst.get("is_success")
@@ -1603,7 +1662,17 @@ def wait_for_ds_connection_test_result(
         except Exception:
             pass
         time.sleep(max(2, int(poll_seconds)))
-    msg = f"Timed out waiting for DS connection test result (last_seen={last_seen.isoformat() if last_seen else 'none'})"
+    # On timeout: poll grouped-statuses (filter) API up to 3 times before marking failed
+    for attempt in range(1, 4):
+        try:
+            gs = fetch_ds_grouped_statuses(base_url, token, ds_name)
+            if _grouped_statuses_reports_success(gs, ds_name):
+                return True, "success (from grouped-statuses after timeout)"
+        except Exception:
+            pass
+        if attempt < 3:
+            time.sleep(10)
+    msg = f"Timed out waiting for DS connection test result (last_seen={last_seen.isoformat() if last_seen else 'none'}); grouped-statuses polled 3 times, not successful"
     return False, msg
 
 def create_scan_profile(base_url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1612,10 +1681,11 @@ def create_scan_profile(base_url: str, token: str, payload: Dict[str, Any]) -> D
     return resp.json() if resp.content else {}
 
 
-def test_ds_connection(base_url: str, token: str, *, ds_connection: Dict[str, Any], broadcast_event: str) -> Dict[str, Any]:
+def test_ds_connection(base_url: str, token: str, *, ds_connection: Dict[str, Any], broadcast_event: str, is_first_attempt: bool = False) -> Dict[str, Any]:
     """
     Best-effort DS connection test.
-    Mirrors UI curl: POST /api/v1/ds-connection-test/client?broadcastEvent=...
+    Mirrors UI: POST /api/v1/ds-connection-test/client?broadcastEvent=...
+    UI sends isFirstAttempt: true on first Connect click; we pass it for first attempt.
     """
     url = build_api_url(base_url, DS_CONNECTION_TEST_PATH)
     params = {"broadcastEvent": str(broadcast_event or "").strip()}
@@ -1623,7 +1693,7 @@ def test_ds_connection(base_url: str, token: str, *, ds_connection: Dict[str, An
         "ds_connection": ds_connection,
         "broadcastEvent": str(broadcast_event or "").strip(),
         "isNewSessionToken": False,
-        "isFirstAttempt": False,
+        "isFirstAttempt": bool(is_first_attempt),
         "isNewConnection": True,
     }
     resp = _request("POST", url, token, params=params, json_body=body)
@@ -1657,10 +1727,11 @@ def test_ds_connection_auto(
     ds_id: str = "",
     ds_connection: Dict[str, Any],
     broadcast_event: str,
+    is_first_attempt: bool = False,
 ) -> Dict[str, Any]:
     """
     Try ids-based endpoint first (doesn't require passing full DS),
-    fallback to client endpoint.
+    fallback to client endpoint (same as UI: ds-connection-test/client).
     """
     name = str(ds_name or "").strip()
     did = str(ds_id or "").strip()
@@ -1671,8 +1742,8 @@ def test_ds_connection_auto(
         allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
         if did and (not allow_fallback):
             raise
-    # 2) client-style test (fallback)
-    return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event)
+    # 2) client-style test (fallback) — matches UI POST body
+    return test_ds_connection(base_url, token, ds_connection=ds_connection, broadcast_event=broadcast_event, is_first_attempt=is_first_attempt)
 
 
 def _extract_ds_id_from_payload(payload: Dict[str, Any]) -> str:
@@ -2480,6 +2551,11 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Apply ACL/Structured flags at runtime (so one base template is enough).
         ds_payload = _apply_runtime_flags(step_dict, ds_payload)
 
+        # Match BigID UI: PUT body must include isSavedAsDraft=false so DS is not left in Draft.
+        if isinstance(ds_payload, dict):
+            ds_payload = dict(ds_payload)
+            ds_payload["isSavedAsDraft"] = False
+
         # Idempotency: if DS already exists for this step (ds_id stored) and name matches,
         # avoid re-PUT to prevent accidental duplicate DS artifacts.
         existing_ds_id = str(step[13] or '').strip()
@@ -2556,6 +2632,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     ds_id=ds_id_val,
                     ds_connection=ds_conn_obj,
                     broadcast_event=broadcast,
+                    is_first_attempt=(attempt == 1),
                 )
                 timeout_s = _ds_kind_timeout_seconds(step_dict.get("ds_kind"))
                 poll_s = _ds_kind_poll_seconds(step_dict.get("ds_kind"))
