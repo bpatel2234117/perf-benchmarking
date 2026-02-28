@@ -479,16 +479,29 @@ def load_data(include_inactive=False):
             b.scan_end_time,
             b.total_scan_hours,
             b.avg_file_size,
-            b.is_active
+            b.is_active,
+            b.scan_id,
+            COALESCE(sp.scan_status, 'Completed') as Scan_Status,
+            COALESCE(si.objects_scanned, 0) as objects_scanned
         FROM benchmarks b
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
         LEFT JOIN classifiers c ON b.classifier_id = c.id
+        LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
         LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
         {where_clause}
     """
     try:
         df = pd.read_sql(query, engine)
+
+        # Normalize classification metric columns (avoid mixed str/int like '' that breaks Arrow)
+        for _c in ["New_Attributes", "Total_Classification", "Removed_Attributes"]:
+            if _c in df.columns:
+                try:
+                    df[_c] = pd.to_numeric(df[_c], errors="coerce").astype("Int64")
+                except Exception:
+                    pass
+
         # Recalculate per-scanner and per-thread throughput for display consistency
         if not df.empty:
             if 'scan_start_time' in df.columns and 'scan_end_time' in df.columns:
@@ -4521,15 +4534,15 @@ def load_scan_insight_from_db(scan_id):
             map_removed_count = int(delta_counts[1]) if delta_counts and delta_counts[1] is not None else 0
 
             return {
-                "distinct_classification_attributes": row[0] if row[0] is not None else "",
+                "distinct_classification_attributes": int(row[0]) if row[0] is not None and str(row[0]).strip() != "" else None,
                 "classifier_attribute_names": classifier_attribute_names,
                 "data_source_names": data_source_names,
-                "objects_with_pi": row[1] if row[1] is not None else "",
-                "objects_scanned": row[2] if row[2] is not None else "",
-                "objects_enumerated": row[3] if row[3] is not None else "",
-                "total_classification": row[4] if row[4] is not None else "",
-                "new_attributes_count": map_new_count if map_new_count else (row[5] if row[5] is not None else ""),
-                "removed_attributes_count": map_removed_count if map_removed_count else (row[6] if row[6] is not None else ""),
+                "objects_with_pi": int(row[1]) if row[1] is not None and str(row[1]).strip() != "" else None,
+                "objects_scanned": int(row[2]) if row[2] is not None and str(row[2]).strip() != "" else None,
+                "objects_enumerated": int(row[3]) if row[3] is not None and str(row[3]).strip() != "" else None,
+                "total_classification": int(row[4]) if row[4] is not None and str(row[4]).strip() != "" else None,
+                "new_attributes_count": int(map_new_count) if int(map_new_count or 0) != 0 else (int(row[5]) if row[5] is not None and str(row[5]).strip() != "" else None),
+                "removed_attributes_count": int(map_removed_count) if int(map_removed_count or 0) != 0 else (int(row[6]) if row[6] is not None and str(row[6]).strip() != "" else None),
             }
     except Exception:
         return None
@@ -4564,7 +4577,8 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                     objects_enumerated,
                     total_classification,
                     new_attributes_count,
-                    removed_attributes_count
+                    removed_attributes_count,
+                    total_size_gb
                 FROM scan_insights
                 WHERE scan_id IN :ids
             """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
@@ -4639,21 +4653,22 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                     return int(si_val)
                 if int(prog_val or 0) > 0:
                     return int(prog_val)
-                # If everything is zero but si has explicit 0, keep 0; else empty string.
+                # If everything is zero and we have no explicit value, return None (keeps Arrow types stable).
                 if si_val is not None:
                     return int(si_val)
-                return ""
+                return None
 
             result[sid] = {
-                "distinct_classification_attributes": r[1] if r[1] is not None else "",
+                "distinct_classification_attributes": int(r[1]) if r[1] is not None and str(r[1]).strip() != "" else None,
                 "classifier_attribute_names": str(r[2] or "").strip(),
                 "data_source_names": str(r[3] or "").strip(),
-                "objects_with_pi": r[4] if r[4] is not None else "",
-                "objects_scanned": r[5] if r[5] is not None else "",
-                "objects_enumerated": r[6] if r[6] is not None else "",
-                "total_classification": r[7] if r[7] is not None else "",
+                "objects_with_pi": int(r[4]) if r[4] is not None and str(r[4]).strip() != "" else None,
+                "objects_scanned": int(r[5]) if r[5] is not None and str(r[5]).strip() != "" else None,
+                "objects_enumerated": int(r[6]) if r[6] is not None and str(r[6]).strip() != "" else None,
+                "total_classification": int(r[7]) if r[7] is not None and str(r[7]).strip() != "" else None,
                 "new_attributes_count": _pick_count(d_new, si_new_i, p_new),
                 "removed_attributes_count": _pick_count(d_removed, si_removed_i, p_removed),
+                "total_size_gb": float(r[10]) if r[10] is not None and str(r[10]).strip() != "" else None,
             }
     except Exception:
         return {}
@@ -7435,98 +7450,124 @@ def page_build_analysis(df):
     all_versions = sorted(df['Build_Version'].astype(str).unique(), reverse=True)
     selected_build = st.selectbox("Select Build to Analyze", all_versions)
     
-    build_df = df[df['Build_Version'].astype(str) == selected_build]
+    build_df = df[df['Build_Version'].astype(str) == selected_build].copy()
     
-    st.markdown(f"### Build Performance Deep-Dive: `{selected_build}`")
-    
-    # KPIs for this specific build
-    k1, k2, k3, k4 = st.columns(4)
-    avg_tp = build_df['throughput_cluster_gb_hr'].mean()
-    avg_file_tp = build_df['throughput_cluster_files_hr'].mean()
-    total_scans = len(build_df)
-    primary_ds = build_df['Data_Source_Type'].mode()[0] if not build_df.empty else "N/A"
-    
-    k1.metric("Average GB/hr", f"{avg_tp:.2f}")
-    k2.metric("Average Files/hr", f"{avg_file_tp:,.0f}")
-    k3.metric("Scans Performed", total_scans)
-    k4.metric("Primary Data Source", primary_ds)
-    
-    st.divider()
-    
-    # Comparison with prior build if available
+    # Pre-calculate previous build data for regressions
     idx = all_versions.index(selected_build)
-    if idx < len(all_versions) - 1:
-        prev_build = all_versions[idx+1]
-        prev_df = df[df['Build_Version'].astype(str) == prev_build]
-        prev_avg = prev_df['throughput_cluster_gb_hr'].mean()
-        
-        diff = avg_tp - prev_avg if pd.notnull(avg_tp) and pd.notnull(prev_avg) else 0
-        pct = (diff / prev_avg * 100) if prev_avg else 0
-        
-        if diff != 0:
-            st.info(f"✨ Compared to previous build `{prev_build}`, this build is **{abs(pct):.1f}% {'faster' if diff > 0 else 'slower'}** on average.")
-    
-    # Charts for this build
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Performance by Scan Type")
-        fig = px.bar(build_df, x='Scan_Type', y='throughput_cluster_gb_hr', color='File_Set_Type',
-                     barmode='group', title="Throughput (GB/hr) per Scan Category")
-        st.plotly_chart(fig, width="stretch")
-        
-    with c2:
-        st.subheader("Scanner Scaling Efficiency")
-        # Throughput vs Scanner Count
-        fig2 = px.scatter(build_df, x='scanner_count', y='throughput_cluster_gb_hr', 
-                          size='Total_Size_GB', color='Scan_Type',
-                          title="Throughput vs Scanners (Size = Volume)")
-        st.plotly_chart(fig2, width="stretch")
-        
-    st.subheader("Individual Run Details")
-    detail_df = build_df[['Scan_Type', 'Data_Source_Type', 'File_Set_Type', 'throughput_cluster_gb_hr', 'scanner_count', 'thread_count', 'is_acl']].copy()
-    
-    # Clean column names for display
-    detail_df.columns = ["Scan Type", "Source", "File Set", "GB/hr", "Scanners", "Threads", "ACL"]
-    render_centered_table(detail_df)
+    prev_build = all_versions[idx+1] if idx < len(all_versions) - 1 else None
+    prev_df = df[df['Build_Version'].astype(str) == prev_build].copy() if prev_build else pd.DataFrame()
 
-    # --- AI Build Quality Assessment ---
-    if _local_llm_is_configured():
-        st.divider()
-        st.subheader("🤖 AI Build Quality Assessment")
+    # TABS
+    tab_overview, tab_regressions, tab_ai, tab_details = st.tabs([
+        "📊 Overview", "⚠️ Regression Hunter", "🤖 AI Diagnostics", "📋 Full Details"
+    ])
+
+    with tab_overview:
+        st.markdown(f"### Performance Summary: `{selected_build}`")
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        avg_tp = build_df['throughput_cluster_gb_hr'].mean()
+        avg_file_tp = build_df['throughput_cluster_files_hr'].mean()
+        total_scans = len(build_df)
         
-        # Prepare context for the prompt
-        context = f"Analyzing build {selected_build}.\n"
-        context += f"Current Build Average Throughput: {avg_tp:.2f} GB/hr, {avg_file_tp:,.0f} Files/hr.\n"
-        context += f"Total Scans Performed: {total_scans}.\n"
-        context += f"Primary Data Source: {primary_ds}.\n"
-        
-        if idx < len(all_versions) - 1:
-            context += f"\nPrevious Build ({prev_build}) Average Throughput: {prev_avg:.2f} GB/hr.\n"
-            context += f"Throughput Difference: {diff:.2f} GB/hr ({pct:+.1f}%).\n"
-            if diff < 0:
-                context += "NOTE: The current build shows a performance regression compared to the previous build.\n"
-            elif diff > 0:
-                context += "NOTE: The current build shows a performance improvement compared to the previous build.\n"
+        # Stability: Pass Rate
+        fail_statuses = ['failed', 'error', 'aborted', 'stopped']
+        total_runs = len(build_df)
+        if total_runs > 0:
+            failed_runs = build_df[build_df['Scan_Status'].astype(str).str.lower().isin(fail_statuses)]
+            success_rate = ((total_runs - len(failed_runs)) / total_runs) * 100
         else:
-            context += "\nNo previous build data available for comparison.\n"
+            success_rate = 0
 
-        system_prompt = (
-            "You are a Senior Performance QA Engineer analyzing build performance metrics for data scans. "
-            "You provide concise, actionable insights into the build's overall quality. Highlight any critical "
-            "regressions, commend improvements, and synthesize the numbers into a readable summary for technical management. "
-            "Do not output markdown code blocks. Give 2-3 brief bullet points."
-        )
+        k1.metric("Avg Throughput", f"{avg_tp:.2f} GB/hr")
+        k2.metric("Avg Speed", f"{avg_file_tp:,.0f} files/hr")
+        k3.metric("Scans Performed", total_scans)
+        k4.metric("Stability (Pass %)", f"{success_rate:.1f}%")
+
+        # Historical Trend Line (last 5 builds)
+        st.subheader("Historical Benchmark Trend (Overall)")
+        recent_versions = all_versions[idx:idx+5]
+        trend_df = df[df['Build_Version'].astype(str).isin(recent_versions)].copy()
+        v_sorted = sorted(recent_versions) 
+        trend_df['Build_Version'] = pd.Categorical(trend_df['Build_Version'], categories=v_sorted, ordered=True)
+        trend_summary = trend_df.groupby('Build_Version', observed=True)['throughput_cluster_gb_hr'].mean().reset_index()
         
-        user_prompt = f"Please analyze the following build and provide an overall build quality summary:\n\n{context}"
-        
-        if st.button("Generate AI Assessment"):
-            with st.spinner("Analyzing build metrics with AI..."):
-                analysis_result = generate_local_llm_analysis(system_prompt, user_prompt, timeout_s=45)
-                if analysis_result:
-                    st.info(analysis_result)
+        fig_trend = px.line(trend_summary, x='Build_Version', y='throughput_cluster_gb_hr', 
+                            markers=True, title="Throughput Trend (Last 5 Builds)",
+                            labels={'Build_Version': 'Build', 'throughput_cluster_gb_hr': 'GB/hr'})
+        fig_trend.update_layout(height=400)
+        st.plotly_chart(fig_trend, width='stretch')
+
+        # Basic distribution charts
+        c1, c2 = st.columns(2)
+        with c1:
+            fig1 = px.bar(build_df, x='Scan_Type', y='throughput_cluster_gb_hr', color='file_set_type',
+                         barmode='group', title="Throughput (GB/hr) per Scan Category")
+            st.plotly_chart(fig1, width='stretch')
+        with c2:
+            fig2 = px.scatter(build_df, x='scanner_count', y='throughput_cluster_gb_hr', 
+                              size='Total_Size_GB', color='Scan_Type',
+                              title="Scanner Scaling Efficiency")
+            st.plotly_chart(fig2, width='stretch')
+
+    with tab_regressions:
+        st.subheader("⚠️ Regression Hunter")
+        if prev_build:
+            st.caption(f"Comparing current build `{selected_build}` vs previous `{prev_build}`")
+            
+            # Group by config to find regressions
+            cur_grp = build_df.groupby(['Scan_Type', 'Data_Source_Type', 'file_set_type'])['throughput_cluster_gb_hr'].mean().reset_index()
+            prv_grp = prev_df.groupby(['Scan_Type', 'Data_Source_Type', 'file_set_type'])['throughput_cluster_gb_hr'].mean().reset_index()
+            
+            merged = pd.merge(cur_grp, prv_grp, on=['Scan_Type', 'Data_Source_Type', 'file_set_type'], suffixes=('_cur', '_prv'))
+            merged['Delta %'] = ((merged['throughput_cluster_gb_hr_cur'] - merged['throughput_cluster_gb_hr_prv']) / merged['throughput_cluster_gb_hr_prv'] * 100)
+            
+            regressions = merged[merged['Delta %'] < -5].sort_values(by='Delta %')
+            improvements = merged[merged['Delta %'] > 5].sort_values(by='Delta %', ascending=False)
+            
+            if not regressions.empty:
+                st.error(f"Found {len(regressions)} configurations with >5% performance drop!")
+                disp_reg = regressions.copy()
+                disp_reg.columns = ["Scan Type", "Source", "File Set", "Current GB/hr", "Prev GB/hr", "Delta %"]
+                st.dataframe(disp_reg.style.format({'Delta %': '{:.1f}%', 'Current GB/hr': '{:.2f}', 'Prev GB/hr': '{:.2f}'}), width='stretch', hide_index=True)
+            else:
+                st.success("No significant regressions detected!")
+
+            if not improvements.empty:
+                with st.expander("Show Performance Improvements"):
+                    disp_imp = improvements.copy()
+                    disp_imp.columns = ["Scan Type", "Source", "File Set", "Current GB/hr", "Prev GB/hr", "Delta %"]
+                    st.dataframe(disp_imp.style.format({'Delta %': '{:.1f}%', 'Current GB/hr': '{:.2f}', 'Prev GB/hr': '{:.2f}'}), width='stretch', hide_index=True)
+        else:
+            st.info("No previous build data available for regression analysis.")
+
+    with tab_ai:
+        st.subheader("🤖 AI Diagnostic Assessment")
+        if _local_llm_is_configured():
+            context_text = f"Build: {selected_build}\nAvg Throughput: {avg_tp:.2f} GB/hr\nStability: {success_rate:.1f}%\n"
+            if prev_build:
+                reg_list = regressions.to_dict('records')[:8] if 'regressions' in locals() else []
+                context_text += f"Comparison with {prev_build}:\n"
+                if reg_list:
+                    for r in reg_list:
+                        context_text += f"- {r['Data_Source_Type']} ({r['Scan_Type']}): {r['Delta %']:.1f}% drop ({r['throughput_cluster_gb_hr_cur']:.2f} vs {r['throughput_cluster_gb_hr_prv']:.2f} GB/hr)\n"
                 else:
-                    st.warning("Could not generate AI assessment at this time. Please check your LLM configuration or try again.")
+                    context_text += "- No significant regressions found.\n"
+            
+            if st.button("Generate Diagnostic Report", type="primary"):
+                with st.spinner("Analyzing build diagnostics and performance anomalies..."):
+                    sys_prompt = "You are a Senior Performance Architect. Analyze the benchmark deltas between builds and provide concise, high-impact diagnostic insights. Focus on potential root causes for regressions."
+                    usr_prompt = f"Data Summary:\n{context_text}\n\nPlease provide: 1) Executive Assessment (1-2 sentences), 2) Top 3 Performance Anomalies/Risks, 3) Suggested architectural areas to investigate."
+                    report = generate_local_llm_analysis(sys_prompt, usr_prompt)
+                    st.info(report)
+        else:
+            st.warning("Local LLM not configured. Set LOCAL_LLM_PROVIDER to enable AI insights.")
 
+    with tab_details:
+        st.subheader("Raw Run Details")
+        detail_cols = ['Scan_Type', 'Data_Source_Type', 'file_set_type', 'throughput_cluster_gb_hr', 'scanner_count', 'thread_count', 'is_acl', 'Scan_Status']
+        detail_df = build_df[[c for c in detail_cols if c in build_df.columns]].copy()
+        st.dataframe(detail_df, width='stretch', hide_index=True)
 
 # --- Comparison Page (V4.1 Enhanced) ---
 def page_comparison(df):
@@ -7858,7 +7899,7 @@ def page_build_ds_runs():
             m["_source"] = "manual"
             m["_run_key"] = "m:" + m.get("id").astype(str)
             frames.append(m)
-    if src in {"Auto Scans (recommended)", "Both"}:
+    if src in {"Auto Scans", "Both"}:
         a = load_auto_trend_as_manual_like_df()
         if not a.empty:
             a = a.copy()
@@ -7866,10 +7907,19 @@ def page_build_ds_runs():
             a["_run_key"] = "a:" + a.get("scan_id", a.get("id")).astype(str)
             frames.append(a)
 
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
     if df.empty:
         st.warning("No runs found for the selected source(s) yet.")
         return
+
+    # Standardize column for dashboard consumption
+    for old_col, new_col in [("scan_status", "Scan_Status"), ("build_version", "Build_Version")]:
+        if old_col in df.columns:
+            if new_col not in df.columns:
+                df[new_col] = df[old_col]
+            else:
+                df[new_col] = df[new_col].fillna(df[old_col])
+
     df = _ensure_throughput_columns(df)
     # Avoid Arrow type issues when mixing manual numeric ids + auto scan_id strings.
     try:
@@ -7926,7 +7976,8 @@ def page_build_ds_runs():
         s = str(v or "").strip()
         if not s or s.lower() == "nan":
             continue
-        if len(s) > 20 or "scanner" in s.lower() or "thread" in s.lower() or " " in s:
+        # Relaxed filter: allow spaces and slightly longer names
+        if len(s) > 40 or "scanner" in s.lower() or "thread" in s.lower():
             continue
         ds_options.append(s)
     ds_options = sorted(set(ds_options)) if ds_options else raw_ds_options
@@ -7952,10 +8003,13 @@ def page_build_ds_runs():
     selected_fs = st.selectbox("File Set Type", fs_options, index=fs_options.index(default_fs) if default_fs in fs_options else 0)
     fs_df = ds_df[ds_df["file_set_type"].astype(str).str.contains(str(selected_fs), case=False, na=False)]
 
+    if fs_df.empty:
+        fs_df = ds_df.copy() # fall back if the file set is invalid for the new selection
+
     scan_type_options = _uniq_sorted(fs_df["Scan_Type"]) if not fs_df.empty else _uniq_sorted(ds_df["Scan_Type"])
     selected_scan_type = st.selectbox("Scan Type", ["(All)"] + scan_type_options)
 
-    filtered = fs_df.copy() if not fs_df.empty else ds_df.copy()
+    filtered = fs_df.copy()
     if selected_scan_type != "(All)":
         filtered = filtered[filtered["Scan_Type"].astype(str) == str(selected_scan_type)]
 
@@ -8056,20 +8110,37 @@ def page_build_ds_runs():
                 if c in cmp.columns:
                     cmp[c] = pd.to_numeric(cmp[c], errors="coerce")
 
+            def _bar_text(vals):
+                out = []
+                for v in list(vals):
+                    try:
+                        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+                            out.append("")
+                            continue
+                    except Exception:
+                        if v is None:
+                            out.append("")
+                            continue
+                    try:
+                        out.append(f"{int(v):,}")
+                    except Exception:
+                        out.append(str(v))
+                return out
+
             # 3 charts in one row (bar charts are better for comparing runs)
             c1, c2, c3 = st.columns(3)
 
             with c1:
                 fig1 = go.Figure()
                 if all(c in cmp.columns for c in ["completed_parts", "failed_parts", "total_parts_scanned"]):
-                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["completed_parts"], name="completed_parts", marker_color="#10B981"))
-                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["failed_parts"], name="failed_parts", marker_color="#EF4444"))
-                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_parts_scanned"], name="total_parts", marker_color="#3B82F6"))
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["completed_parts"], name="completed_parts", marker_color="#10B981", text=_bar_text(cmp["completed_parts"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["failed_parts"], name="failed_parts", marker_color="#EF4444", text=_bar_text(cmp["failed_parts"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
+                    fig1.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_parts_scanned"], name="total_parts", marker_color="#3B82F6", text=_bar_text(cmp["total_parts_scanned"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     fig1.update_layout(
                         title="Parts (Totals)",
                         barmode="group",
                         height=320,
-                        margin=dict(l=10, r=10, t=40, b=90),
+                        margin=dict(l=10, r=10, t=55, b=90),
                         legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
                     )
                     fig1.update_xaxes(type="category", tickangle=-30)
@@ -8079,13 +8150,13 @@ def page_build_ds_runs():
             with c2:
                 fig2 = go.Figure()
                 if all(c in cmp.columns for c in ["objects_scanned", "objects_failed"]):
-                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_scanned"], name="objects_scanned", marker_color="#8B5CF6"))
-                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_failed"], name="objects_failed", marker_color="#EF4444"))
+                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_scanned"], name="objects_scanned", marker_color="#8B5CF6", text=_bar_text(cmp["objects_scanned"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
+                    fig2.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_failed"], name="objects_failed", marker_color="#EF4444", text=_bar_text(cmp["objects_failed"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     fig2.update_layout(
                         title="Objects (Totals)",
                         barmode="group",
                         height=320,
-                        margin=dict(l=10, r=10, t=40, b=90),
+                        margin=dict(l=10, r=10, t=55, b=90),
                         legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
                     )
                     fig2.update_xaxes(type="category", tickangle=-30)
@@ -8096,23 +8167,23 @@ def page_build_ds_runs():
                 fig3 = go.Figure()
                 added_any = False
                 if "objects_with_pi" in cmp.columns:
-                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_with_pi"], name="objectsWithPi", marker_color="#10B981"))
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["objects_with_pi"], name="objectsWithPi", marker_color="#10B981", text=_bar_text(cmp["objects_with_pi"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     added_any = True
                 if "total_classifications" in cmp.columns:
-                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_classifications"], name="classifications.total", marker_color="#3B82F6"))
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["total_classifications"], name="classifications.total", marker_color="#3B82F6", text=_bar_text(cmp["total_classifications"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     added_any = True
                 if "New_Attributes" in cmp.columns:
-                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["New_Attributes"], name="attrs_added(delta)", marker_color="#F59E0B"))
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["New_Attributes"], name="attrs_added(delta)", marker_color="#F59E0B", text=_bar_text(cmp["New_Attributes"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     added_any = True
                 if "Removed_Attributes" in cmp.columns:
-                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["Removed_Attributes"], name="attrs_removed(delta)", marker_color="#EF4444"))
+                    fig3.add_trace(go.Bar(x=cmp["Run"], y=cmp["Removed_Attributes"], name="attrs_removed(delta)", marker_color="#EF4444", text=_bar_text(cmp["Removed_Attributes"]), textposition="outside", cliponaxis=False, textfont=dict(size=10)))
                     added_any = True
                 if added_any:
                     fig3.update_layout(
                         title="ObjectsWithPi + Classifications",
                         barmode="group",
                         height=320,
-                        margin=dict(l=10, r=10, t=40, b=90),
+                        margin=dict(l=10, r=10, t=55, b=90),
                         legend=dict(orientation="h", yanchor="top", y=-0.35, xanchor="left", x=0),
                     )
                     fig3.update_xaxes(type="category", tickangle=-30)
@@ -9212,8 +9283,10 @@ def load_auto_trend_as_manual_like_df():
     out["throughput_cluster_gb_hr"] = size_gb / hours
 
     # Relax filtering for build version but keep hours requirement
-    out = out[(hours.notna()) & (hours > 0)]
     out["Build_Version"] = out["Build_Version"].apply(lambda x: x if str(x).strip() else "Unknown")
+    out["Scan_Status"] = "Completed"
+    if "scan_id" not in out.columns and "id" in out.columns:
+        out["scan_id"] = out["id"]
     return out
 
 def load_latest_scan_progress_map_for_scan_ids(scan_ids: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -9345,8 +9418,15 @@ def load_scan_parents_runs_as_manual_like_df(*, include_inactive_envs: bool = Fa
         return str(v or '').strip()
     df['file_set_type'] = df['file_set_type'].apply(_norm_fs)
 
-    df['started_at_dt'] = pd.to_datetime(df['started_at'], errors='coerce', utc=True)
-    df['completed_at_dt'] = pd.to_datetime(df['completed_at'], errors='coerce', utc=True)
+    try:
+        df['started_at_dt'] = pd.to_datetime(df['started_at'], errors='coerce', utc=True, format='mixed')
+    except TypeError:
+        df['started_at_dt'] = pd.to_datetime(df['started_at'], errors='coerce', utc=True)
+
+    try:
+        df['completed_at_dt'] = pd.to_datetime(df['completed_at'], errors='coerce', utc=True, format='mixed')
+    except TypeError:
+        df['completed_at_dt'] = pd.to_datetime(df['completed_at'], errors='coerce', utc=True)
     df['Date'] = df['completed_at_dt'].fillna(df['started_at_dt'])
 
     try:
@@ -9397,11 +9477,26 @@ def load_scan_parents_runs_as_manual_like_df(*, include_inactive_envs: bool = Fa
     df.loc[mask_tc, 'Total_Classification'] = df.loc[mask_tc, 'total_classifications']
 
     df['Total_Files'] = df['objects_scanned']
-    df['Total_Size_GB'] = pd.NA
+
+    # For throughput, prefer actual scan_insights.total_size_gb; fall back to expected size from file_set_types.
+    df['Total_Size_GB'] = df['scan_id'].apply(lambda sid: _iget(sid, 'total_size_gb'))
+    try:
+        missing = df['Total_Size_GB'].isna()
+        if missing.any():
+            df.loc[missing, 'Total_Size_GB'] = df.loc[missing, 'scan_name'].astype(str).apply(
+                lambda nm: (resolve_expected_totals_for_scan(nm) or {}).get('expected_total_size_gb')
+            )
+    except Exception:
+        pass
+
     df['Total_Folders'] = pd.NA
     df['Data_Type'] = ''
     df['is_active'] = 1
     df['id'] = df['scan_id'].astype(str)
+    
+    # Standardize column for dashboard consumption
+    if 'scan_status' in df.columns:
+        df['Scan_Status'] = df['scan_status']
 
     return df
 
@@ -9486,7 +9581,10 @@ def page_edit_benchmark(df):
     cols_to_show = [c for c in editable_cols if c in edit_df.columns]
     table_df = edit_df[cols_to_show].copy()
     if 'Date' in table_df.columns:
-        table_df['Date'] = pd.to_datetime(table_df['Date'], errors='coerce')
+        try:
+            table_df['Date'] = pd.to_datetime(table_df['Date'], errors='coerce', format='mixed')
+        except TypeError:
+            table_df['Date'] = pd.to_datetime(table_df['Date'], errors='coerce')
         table_df['Date'] = table_df['Date'].dt.date
     if 'total_scan_hours' in table_df.columns:
         table_df['total_scan_hours'] = table_df['total_scan_hours'].apply(
@@ -9527,7 +9625,7 @@ def page_edit_benchmark(df):
         }
     )
 
-    submitted = st.button("Save Table Changes", type="primary", use_container_width=True)
+    submitted = st.button("Save Table Changes", type="primary", width='stretch')
     if submitted:
         try:
             from sqlalchemy import text, bindparam
@@ -9574,7 +9672,10 @@ def page_edit_benchmark(df):
                     if not changed:
                         continue
 
-                    run_date_val = pd.to_datetime(row.get('Date'), errors='coerce')
+                    try:
+                        run_date_val = pd.to_datetime(row.get('Date'), errors='coerce', format='mixed')
+                    except TypeError:
+                        run_date_val = pd.to_datetime(row.get('Date'), errors='coerce')
                     run_date_str = str(run_date_val.date()) if pd.notnull(run_date_val) else None
 
                     is_auto = "scan_id" in updated.columns or (isinstance(row_id, str) and "-" in str(row_id))
@@ -10921,7 +11022,108 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
     return steps
 
 
+@st.dialog("Workflow Run Details", width='stretch')
+def show_workflow_run_details_modal(run_id):
+    """
+    Shows a floating modal with step-by-step progress and status for a specific workflow run.
+    This replaces the static expander and is triggered by clicking a row in the runs table.
+    """
+    engine = create_engine(DB_CONNECTION_STRING)
+    st.header(f"View Step Progress for Run {run_id}")
+    
+    # 1. Load run metadata
+    with engine.connect() as conn:
+        rrow = conn.execute(text("SELECT * FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
+        if not rrow:
+            st.error(f"Run {run_id} not found.")
+            return
+        rrow = dict(rrow._mapping)
+        
+    # 2. Load steps
+    steps_df = load_workflow_steps(int(run_id))
+    if steps_df.empty:
+        st.info("No steps found for this run.")
+        return
+
+    # 3. Summary metrics cards
+    try:
+        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
+        counts = stv.value_counts().to_dict()
+        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
+        active_df = steps_df[active_mask].copy()
+        if active_df.empty:
+            active_df = steps_df[stv.isin(["pending"])].copy()
+        
+        _prio = {"running": 100, "scan_running": 90, "scan_created": 80, "ds_test_ok": 70, "ds_created": 60, "pre_action_done": 50, "pending": 10}
+        active_df["_prio"] = active_df["status"].fillna("").astype(str).str.strip().str.lower().map(lambda s: int(_prio.get(str(s), 0)))
+        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df.columns]
+        active_row = active_df.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df.empty else {}
+    except Exception:
+        counts = {}
+        active_row = {}
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Pending", int(counts.get("pending", 0)))
+    m2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
+    m3.metric("Completed", int(counts.get("completed", 0)))
+    m4.metric("Disabled", int(counts.get("disabled", 0)))
+    m5.metric("Errors", int(counts.get("error", 0)))
+
+    if active_row:
+        st.caption(f"**Current step:** {int(active_row.get('seq'))} | {active_row.get('ds_name')} | {active_row.get('status')}")
+
+    # 4. Prepare details table
+    def _render_progress_flow_modal(row: Dict[str, Any]) -> str:
+        s = str(row.get("status") or "").strip().lower()
+        if s == "disabled": return "🚫 Disabled"
+        ds_id, spid, sid = [str(row.get(k) or "").strip() for k in ["ds_id", "scan_profile_id", "scan_id"]]
+        has_scan = bool(sid) or (s in {"scan_running", "completed"})
+        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
+        has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
+        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
+        
+        if s in {"pending", ""}: return "➖ DS"
+        if s in {"running", "pre_action_done"}: return "⏳ DS"
+        if s == "error":
+            if has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
+            if not has_ds: return "❌ DS"
+            if has_ds and not has_test: return "✅ DS ➔ ❌ Test"
+            if has_test and not has_profile: return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
+            return "❌ Error"
+        parts = []
+        if has_ds: parts.append("✅ DS")
+        if has_test: parts.append("✅ Test")
+        if has_profile: parts.append("✅ Profile")
+        if has_scan: parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
+        return " ➔ ".join(parts) if parts else "➖ DS"
+
+    disp = steps_df.copy()
+    disp["Flags"] = disp.apply(lambda r: ", ".join([x for x in ["ACL" if bool(r.get("is_acl")) else "", "STRUCT" if bool(r.get("is_structured_ff")) else "", "OLS" if bool(r.get("is_ols")) else ""] if x]), axis=1)
+    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow_modal(r.to_dict()), axis=1)
+    disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
+    
+    cols = ["seq", "environment", "ds_kind", "ds_name", "scan_kind", "file_set_type", "Flags", "Progress Flow", "Scan Id", "Scan Link", "last_error", "updated_at"]
+    final_cols = [c for c in cols if c in disp.columns]
+    
+    st.dataframe(
+        disp[final_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "Type", "ds_name": "DS Name"}),
+        width="stretch",
+        hide_index=True,
+        column_config={"Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View")},
+    )
+
+    # 5. Nested expanders for maintenance
+    with st.expander("Edit steps or Reset status"):
+        st.info("You can disable steps or reset them if they get stuck.")
+        # Simplified reset logic inside the modal for specific run context
+        if st.button("Soft Reset (keep DS IDs)", key=f"wf_modal_soft_{run_id}"):
+            with engine.connect() as conn:
+                conn.execute(text("UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL WHERE run_id=:rid AND status <> 'completed'"), {"rid": run_id})
+                conn.commit()
+            st.rerun()
+
 def page_workflow_automation():
+
     st.title("🧪 Workflow Automation")
     st.caption("UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially.")
 
@@ -11038,7 +11240,7 @@ def page_workflow_automation():
     
     event = st.dataframe(
         disp_runs[["id", "name", "status", "started_at", "finished_at", "last_error", "next_eligible_at"]],
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         selection_mode="single-row",
         on_select="rerun",
@@ -11050,6 +11252,8 @@ def page_workflow_automation():
         idx = sel_rows[0]
         run_id = int(disp_runs.iloc[idx]["id"])
         st.session_state["wf_run_sel_id"] = run_id
+        # Trigger the details modal immediately on click
+        show_workflow_run_details_modal(run_id)
     else:
         # If nothing is selected actively in the dataframe, fall back to "want" or the most recent run
         if want is not None and want in disp_runs["id"].values:
@@ -11142,6 +11346,71 @@ def page_workflow_automation():
             pass
         st.rerun()
 
+    st.markdown("**Reset** — Only clears step progress in this app's DB. **Does NOT delete DS or Scans in BigID.** Resetting while a scan is running would **lose tracking** of that scan; reset is blocked until no step has a scan running.")
+    br1, br2 = st.columns(2)
+    with br1:
+        if st.button("Reset unfinished steps", key="wf_reset_soft_top"):
+            st.session_state["wf_confirm_reset"] = "soft"
+            st.rerun()
+    with br2:
+        if st.button("Full reset (re-test DS connection)", key="wf_reset_full_top"):
+            st.session_state["wf_confirm_reset"] = "full"
+            st.rerun()
+    if st.session_state.get("wf_confirm_reset") in ("soft", "full"):
+        kind = st.session_state["wf_confirm_reset"]
+        # Block reset if any step has a scan running — otherwise we lose tracking of that scan.
+        running_scan_steps = []
+        try:
+            with engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT id, seq, status, scan_id, ds_name FROM workflow_steps
+                    WHERE run_id = :rid AND COALESCE(status,'') IN ('scan_running','scan_waiting') AND TRIM(COALESCE(scan_id,'')) <> ''
+                """), {"rid": int(run_id)}).fetchall()
+                running_scan_steps = [{"seq": r[1], "scan_id": r[3], "ds_name": r[4]} for r in (rows or [])]
+        except Exception:
+            pass
+        if running_scan_steps:
+            step_str = ", ".join(f"Step {s['seq']} ({s['ds_name'] or s['scan_id']})" for s in running_scan_steps)
+            st.error(
+                "**Cannot reset:** The following step(s) have a scan running. Resetting would clear scan_id and **you would lose tracking** of that scan. "
+                "Wait for the scan to finish (or stop it in BigID), then reset if needed. "
+                f"Steps with running scan: {step_str}"
+            )
+            if st.button("Cancel", key="wf_confirm_cancel"):
+                del st.session_state["wf_confirm_reset"]
+                st.rerun()
+        else:
+            st.warning("Confirm: This will clear step progress **in the dashboard DB only**. Data Sources and Scans in BigID are NOT deleted. Click **Confirm** to proceed or **Cancel**.")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Confirm reset (DB only)", key="wf_confirm_do"):
+                    try:
+                        with engine.connect() as conn:
+                            if kind == "full":
+                                conn.execute(text("""
+                                    UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL,
+                                        scan_id=NULL, ds_id=NULL, scan_profile_id=NULL, scan_profile_name=NULL, updated_at=CURRENT_TIMESTAMP
+                                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')
+                                """), {"rid": int(run_id)})
+                            else:
+                                conn.execute(text("""
+                                    UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL, updated_at=CURRENT_TIMESTAMP
+                                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')
+                                """), {"rid": int(run_id)})
+                            conn.execute(text("UPDATE workflow_runs SET last_error=NULL, next_eligible_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
+                            conn.commit()
+                        del st.session_state["wf_confirm_reset"]
+                        try: st.cache_data.clear()
+                        except Exception: pass
+                        st.success("Reset done. BigID DS/Scans unchanged. Click Start/Resume to re-run.")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(str(ex))
+            with c2:
+                if st.button("Cancel", key="wf_confirm_cancel"):
+                    del st.session_state["wf_confirm_reset"]
+                    st.rerun()
+
     # Run meta
     try:
         rrow = runs_df[runs_df["id"] == run_id].iloc[0].to_dict()
@@ -11223,277 +11492,8 @@ def page_workflow_automation():
         except Exception:
             pass
 
-    steps_df = load_workflow_steps(int(run_id))
-    if steps_df.empty:
-        st.info("No steps found for this run.")
-        return
-
-    # Current activity summary
-    try:
-        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
-        counts = stv.value_counts().to_dict()
-        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
-        active_df = steps_df[active_mask].copy()
-        if active_df.empty:
-            active_df = steps_df[stv.isin(["pending"])].copy()
-        # Prefer the most relevant/most recently updated active step.
-        # (Avoid always showing seq=1 when later steps are actually running.)
-        _prio = {
-            "running": 100,
-            "scan_running": 90,
-            "scan_created": 80,
-            "ds_test_ok": 70,
-            "ds_created": 60,
-            "pre_action_done": 50,
-            "pending": 10,
-        }
-        try:
-            active_df["_status_norm"] = active_df["status"].fillna("").astype(str).str.strip().str.lower()
-            active_df["_prio"] = active_df["_status_norm"].map(lambda s: int(_prio.get(str(s), 0)))
-        except Exception:
-            active_df["_prio"] = 0
-        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df.columns]
-        active_row = active_df.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df.empty else {}
-    except Exception:
-        counts = {}
-        active_row = {}
-
-    a1, a2, a3, a4, a5 = st.columns(5)
-    a1.metric("Pending", int(counts.get("pending", 0)))
-    a2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
-    a3.metric("Completed", int(counts.get("completed", 0)))
-    a4.metric("Disabled", int(counts.get("disabled", 0)))
-    a5.metric("Errors", int(counts.get("error", 0)))
-    try:
-        if active_row:
-            st.caption(
-                f"Current step: {int(active_row.get('seq'))} | status={str(active_row.get('status') or '').strip()} | "
-                f"ds=`{str(active_row.get('ds_name') or '').strip()}` | file_set=`{str(active_row.get('file_set_type') or '').strip()}` | "
-                f"env={str(active_row.get('environment') or active_row.get('environment_id') or '').strip()} | updated_at={active_row.get('updated_at')}"
-            )
-    except Exception:
-        pass
-
-    # Convenience display columns
-    disp = steps_df.copy()
-    # Phase column to avoid confusion between "step running" vs "scan running"
-    try:
-        _phase_map = {
-            "pending": "Pending",
-            "disabled": "Disabled",
-            "error": "Error",
-            "running": "Executing step",
-            "pre_action_done": "Pre-action done",
-            "ds_created": "DS created",
-            "ds_test_ok": "DS test OK",
-            "scan_created": "Scan profile created",
-            "scan_running": "Scan running",
-            "completed": "Completed",
-        }
-        disp["_status_norm"] = disp["status"].fillna("").astype(str).str.strip().str.lower()
-        disp["Phase"] = disp["_status_norm"].map(lambda s: _phase_map.get(str(s), str(s or "").strip() or ""))
-    except Exception:
-        disp["Phase"] = disp.get("status")
-    disp["Flags"] = disp.apply(
-        lambda r: ", ".join([x for x in [
-            "ACL" if bool(r.get("is_acl")) else "",
-            "STRUCT" if bool(r.get("is_structured_ff")) else "",
-            "OLS" if bool(r.get("is_ols")) else "",
-        ] if x]),
-        axis=1,
-    )
-    # Visual progress flow (only show reached stages; don't spam the whole chain for pending rows).
-    def _render_progress_flow(row: Dict[str, Any]) -> str:
-        s = str(row.get("status") or "").strip().lower()
-        if s == "disabled":
-            return "🚫 Disabled"
-
-        ds_id = str(row.get("ds_id") or "").strip()
-        spid = str(row.get("scan_profile_id") or "").strip()
-        sid = str(row.get("scan_id") or "").strip()
-
-        # Determine the furthest reached stage from status + ids.
-        # IMPORTANT: ids imply stages even if status is stale/error.
-        has_scan = bool(sid) or (s in {"scan_running", "completed"})
-        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
-        has_test = has_profile or has_scan or (s in {"ds_test_ok", "scan_created", "scan_running", "completed"})
-        has_ds = bool(ds_id) or has_test or has_profile or has_scan or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"})
-
-        parts: List[str] = []
-
-        if s in {"pending", ""}:
-            return "➖ DS"
-        if s in {"running", "pre_action_done"}:
-            return "⏳ DS"
-
-        if s == "error":
-            # Show where it failed based on what we already have.
-            # If ids indicate later stages, show them (status may be stale).
-            if has_scan:
-                return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
-            if not has_ds:
-                return "❌ DS"
-            if has_ds and not has_test:
-                return "✅ DS ➔ ❌ Test"
-            if has_test and not has_profile:
-                return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
-            if has_profile and not has_scan:
-                return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
-            return "❌ Error"
-
-        # Non-error, reached stages only.
-        if has_ds:
-            parts.append("✅ DS")
-        if has_test:
-            parts.append("✅ Test")
-        if has_profile:
-            parts.append("✅ Profile")
-        if has_scan:
-            parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
-
-        # If somehow we have no signals, default to DS.
-        return " ➔ ".join(parts) if parts else "➖ DS"
-
-    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow(r.to_dict()), axis=1)
-    disp["Run ID"] = disp["run_id"] if "run_id" in disp.columns else run_id
-    
-    try:
-        disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
-    except Exception:
-        disp["Scan Link"] = ""
-        
-    disp = disp.rename(columns={
-        "seq": "Step",
-        "environment": "Environment",
-        "ds_kind": "DS Type",
-        "ds_name": "DS Name",
-        "scan_kind": "Scan Type",
-        "file_set_type": "File Set",
-        "scan_id": "Scan Id",
-        "notes": "Notes",
-    })
-    
-    st.markdown("### Step Details")
-    try:
-        _run_status = str(rrow.get("status") or "").strip().lower()
-    except Exception:
-        _run_status = ""
-    if _run_status in {"created", ""}:
-        st.info("This run is not started yet. Click **Start Workflow** to begin (then both environments will be used according to the step plan).")
-    
-    # Wrap in expander for master-detail feel
-    with st.expander(f"View Step Progress for Run {run_id}", expanded=True):
-        # Columns to show in the cleaned up table (Removed Phase, Scan Started, Step Status, build_prefix, DS Id)
-        # Added Run ID, Progress Flow
-        cols = ["Run ID", "Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Progress Flow", "build_version", "Scan Id", "Scan Link", "Notes", "last_error", "updated_at"]
-        cols = [c for c in cols if c in disp.columns]
-        
-        st.dataframe(
-            disp[cols],
-            width="stretch",
-            hide_index=True,
-            column_config={
-                "Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View in Progress"),
-            },
-        )
-
-    with st.expander("Edit steps (before run)", expanded=False):
-        st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
-        if selected_status == "running":
-            st.info("Pause/Stop the workflow run to edit steps.")
-        else:
-            edit_df = steps_df.copy()
-            if "is_enabled" not in edit_df.columns:
-                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
-            try:
-                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
-            except Exception:
-                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
-            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
-            show_cols = [c for c in show_cols if c in edit_df.columns]
-            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Environment", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
-            editor = st.data_editor(
-                view,
-                width="stretch",
-                hide_index=True,
-                key=f"wf_edit_steps_{run_id}",
-                column_config={
-                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
-                },
-                disabled=[c for c in view.columns if c != "is_enabled"],
-            )
-            if st.button("Save step selection", type="primary", key=f"wf_save_steps_{run_id}"):
-                try:
-                    desired = editor[["id", "is_enabled"]].copy()
-                    desired["id"] = desired["id"].astype(int)
-                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
-                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
-                    from sqlalchemy import bindparam
-                    with engine.connect() as conn:
-                        if disable_ids:
-                            conn.execute(
-                                text("""
-                                    UPDATE workflow_steps
-                                    SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP
-                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
-                                """).bindparams(bindparam("ids", expanding=True)),
-                                {"ids": disable_ids},
-                            )
-                        if enable_ids:
-                            conn.execute(
-                                text("""
-                                    UPDATE workflow_steps
-                                    SET is_enabled=1,
-                                        status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END,
-                                        last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END,
-                                        updated_at=CURRENT_TIMESTAMP
-                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
-                                """).bindparams(bindparam("ids", expanding=True)),
-                                {"ids": enable_ids},
-                            )
-                        conn.commit()
-                    try:
-                        st.cache_data.clear()
-                    except Exception:
-                        pass
-                    st.success("Saved.")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Save failed: {ex}")
-
-    with st.expander("Maintenance (reset stale status)", expanded=False):
-        st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans; it only resets DB state for the run.")
-        st.caption("This reset keeps DS + scan profile ids so the runner will NOT recreate them.")
-        if st.button("Reset unfinished steps", key="wf_reset_steps_soft"):
-            try:
-                with engine.connect() as conn:
-                    conn.execute(text("""
-                        UPDATE workflow_steps
-                        SET status='pending',
-                            last_error=NULL,
-                            started_at=NULL,
-                            finished_at=NULL,
-                            scan_id=NULL,
-                            updated_at=CURRENT_TIMESTAMP
-                        WHERE run_id=:rid
-                          AND COALESCE(status,'') NOT IN ('completed','disabled')
-                    """), {"rid": int(run_id)})
-                    conn.execute(text("""
-                        UPDATE workflow_runs
-                        SET last_error=NULL,
-                            next_eligible_at=CURRENT_TIMESTAMP,
-                            updated_at=CURRENT_TIMESTAMP
-                        WHERE id=:rid
-                    """), {"rid": int(run_id)})
-                    conn.commit()
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                st.success("Soft reset done. Click Start/Resume to run again.")
-                st.rerun()
-            except Exception as ex:
-                st.error(f"Soft reset failed: {ex}")
+    # Details, Steps, and Maintenance are now in the modal
+    pass
 
     # Hide manual template editing in normal mode (workflow should be automatic).
     # If needed for troubleshooting, enable debug view via ?debug=true
@@ -12194,11 +12194,11 @@ def main():
                 <a href="?page=Large+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Large Files OLS</span></a>
             </div>
         </div>
-
         <div class="nav-category">
             <span style="font-size: 1rem;">⚖️</span> <b style="color: #ffffff !important; font-size: 0.9rem;">Expert Comparisons</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Head-to-Head</div>
+                <a href="?page=Build+Analysis" target="_self" class="flyout-item"><span>📉</span> <span>Build Analysis</span></a>
                 <a href="?page=Build+DS+Runs" target="_self" class="flyout-item"><span>🧪</span> <span>Build + DS Runs</span></a>
                 <a href="?page=Data+Source+Trend+Comparison" target="_self" class="flyout-item"><span>📈</span> <span>DS Trend Comparison</span></a>
                 <a href="?page=OLS+vs+Full+Scan+(Small)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Small)</span></a>
@@ -12225,7 +12225,6 @@ def main():
                 <a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>
                 <div class="flyout-header" style="margin-top: 10px;">Archived / Disabled</div>
                 <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📁</span> <span>Overview Dashboard (Off)</span></a>
-                <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📉</span> <span>Build Analysis (Off)</span></a>
             </div>
         </div>
     """
