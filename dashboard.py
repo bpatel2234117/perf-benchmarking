@@ -11022,105 +11022,6 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
     return steps
 
 
-@st.dialog("Workflow Run Details", width='stretch')
-def show_workflow_run_details_modal(run_id):
-    """
-    Shows a floating modal with step-by-step progress and status for a specific workflow run.
-    This replaces the static expander and is triggered by clicking a row in the runs table.
-    """
-    engine = create_engine(DB_CONNECTION_STRING)
-    st.header(f"View Step Progress for Run {run_id}")
-    
-    # 1. Load run metadata
-    with engine.connect() as conn:
-        rrow = conn.execute(text("SELECT * FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
-        if not rrow:
-            st.error(f"Run {run_id} not found.")
-            return
-        rrow = dict(rrow._mapping)
-        
-    # 2. Load steps
-    steps_df = load_workflow_steps(int(run_id))
-    if steps_df.empty:
-        st.info("No steps found for this run.")
-        return
-
-    # 3. Summary metrics cards
-    try:
-        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
-        counts = stv.value_counts().to_dict()
-        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
-        active_df = steps_df[active_mask].copy()
-        if active_df.empty:
-            active_df = steps_df[stv.isin(["pending"])].copy()
-        
-        _prio = {"running": 100, "scan_running": 90, "scan_created": 80, "ds_test_ok": 70, "ds_created": 60, "pre_action_done": 50, "pending": 10}
-        active_df["_prio"] = active_df["status"].fillna("").astype(str).str.strip().str.lower().map(lambda s: int(_prio.get(str(s), 0)))
-        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df.columns]
-        active_row = active_df.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df.empty else {}
-    except Exception:
-        counts = {}
-        active_row = {}
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Pending", int(counts.get("pending", 0)))
-    m2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
-    m3.metric("Completed", int(counts.get("completed", 0)))
-    m4.metric("Disabled", int(counts.get("disabled", 0)))
-    m5.metric("Errors", int(counts.get("error", 0)))
-
-    if active_row:
-        st.caption(f"**Current step:** {int(active_row.get('seq'))} | {active_row.get('ds_name')} | {active_row.get('status')}")
-
-    # 4. Prepare details table
-    def _render_progress_flow_modal(row: Dict[str, Any]) -> str:
-        s = str(row.get("status") or "").strip().lower()
-        if s == "disabled": return "🚫 Disabled"
-        ds_id, spid, sid = [str(row.get(k) or "").strip() for k in ["ds_id", "scan_profile_id", "scan_id"]]
-        has_scan = bool(sid) or (s in {"scan_running", "completed"})
-        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
-        has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
-        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
-        
-        if s in {"pending", ""}: return "➖ DS"
-        if s in {"running", "pre_action_done"}: return "⏳ DS"
-        if s == "error":
-            if has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
-            if not has_ds: return "❌ DS"
-            if has_ds and not has_test: return "✅ DS ➔ ❌ Test"
-            if has_test and not has_profile: return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
-            return "❌ Error"
-        parts = []
-        if has_ds: parts.append("✅ DS")
-        if has_test: parts.append("✅ Test")
-        if has_profile: parts.append("✅ Profile")
-        if has_scan: parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
-        return " ➔ ".join(parts) if parts else "➖ DS"
-
-    disp = steps_df.copy()
-    disp["Flags"] = disp.apply(lambda r: ", ".join([x for x in ["ACL" if bool(r.get("is_acl")) else "", "STRUCT" if bool(r.get("is_structured_ff")) else "", "OLS" if bool(r.get("is_ols")) else ""] if x]), axis=1)
-    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow_modal(r.to_dict()), axis=1)
-    disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
-    
-    cols = ["seq", "environment", "ds_kind", "ds_name", "scan_kind", "file_set_type", "Flags", "Progress Flow", "Scan Id", "Scan Link", "last_error", "updated_at"]
-    final_cols = [c for c in cols if c in disp.columns]
-    
-    st.dataframe(
-        disp[final_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "Type", "ds_name": "DS Name"}),
-        width="stretch",
-        hide_index=True,
-        column_config={"Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View")},
-    )
-
-    # 5. Nested expanders for maintenance
-    with st.expander("Edit steps or Reset status"):
-        st.info("You can disable steps or reset them if they get stuck.")
-        # Simplified reset logic inside the modal for specific run context
-        if st.button("Soft Reset (keep DS IDs)", key=f"wf_modal_soft_{run_id}"):
-            with engine.connect() as conn:
-                conn.execute(text("UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL WHERE run_id=:rid AND status <> 'completed'"), {"rid": run_id})
-                conn.commit()
-            st.rerun()
 
 def page_workflow_automation():
 
@@ -11233,35 +11134,186 @@ def page_workflow_automation():
     if want is None and run_id_qp.isdigit():
         want = int(run_id_qp)
         
-    st.caption("Click a row to view its step details")
-    
     disp_runs = runs_df.copy()
-    # Format the table a bit nicer where possible
-    
-    event = st.dataframe(
-        disp_runs[["id", "name", "status", "started_at", "finished_at", "last_error", "next_eligible_at"]],
-        width='stretch',
-        hide_index=True,
-        selection_mode="single-row",
-        on_select="rerun",
-        key="wf_runs_table"
-    )
-    
-    sel_rows = event.selection.rows
-    if sel_rows:
-        idx = sel_rows[0]
-        run_id = int(disp_runs.iloc[idx]["id"])
-        st.session_state["wf_run_sel_id"] = run_id
-        # Trigger the details modal immediately on click
-        show_workflow_run_details_modal(run_id)
-    else:
-        # If nothing is selected actively in the dataframe, fall back to "want" or the most recent run
-        if want is not None and want in disp_runs["id"].values:
-            run_id = int(want)
+
+    # --- Pre-load step data for all visible runs for the expandable table ---
+    def _progress_flow_str(row_dict):
+        """Compute a progress flow string for a single step row dict."""
+        s = str(row_dict.get("status") or "").strip().lower()
+        if s == "disabled": return "🚫 Disabled"
+        ds_id = str(row_dict.get("ds_id") or "").strip()
+        spid = str(row_dict.get("scan_profile_id") or "").strip()
+        sid = str(row_dict.get("scan_id") or "").strip()
+        has_scan = bool(sid) or (s in {"scan_running", "completed"})
+        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
+        has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
+        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
+        if s in {"pending", ""}: return "➖ DS"
+        if s in {"running", "pre_action_done"}: return "⏳ DS"
+        if s == "error":
+            if has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
+            if not has_ds: return "❌ DS"
+            if has_ds and not has_test: return "✅ DS ➔ ❌ Test"
+            if has_test and not has_profile: return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
+            if has_profile and not has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
+            return "❌ Error"
+        parts = []
+        if has_ds: parts.append("✅ DS")
+        if has_test: parts.append("✅ Test")
+        if has_profile: parts.append("✅ Profile")
+        if has_scan: parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
+        return " ➔ ".join(parts) if parts else "➖ DS"
+
+    all_run_steps = {}  # run_id -> list of step dicts
+    for rid in disp_runs["id"].tolist():
+        try:
+            sdf = load_workflow_steps(int(rid))
+            step_rows = []
+            for _, sr in sdf.iterrows():
+                rd = sr.to_dict()
+                flags = ", ".join([x for x in [
+                    "ACL" if bool(rd.get("is_acl")) else "",
+                    "STRUCT" if bool(rd.get("is_structured_ff")) else "",
+                    "OLS" if bool(rd.get("is_ols")) else "",
+                ] if x])
+                step_rows.append({
+                    "seq": rd.get("seq", ""),
+                    "env": str(rd.get("environment") or "").strip(),
+                    "ds_type": str(rd.get("ds_kind") or "").strip(),
+                    "ds_name": str(rd.get("ds_name") or "").strip(),
+                    "scan_type": str(rd.get("scan_kind") or "").strip(),
+                    "file_set": str(rd.get("file_set_type") or "").strip(),
+                    "flags": flags,
+                    "progress": _progress_flow_str(rd),
+                    "last_error": str(rd.get("last_error") or "").strip()[:80],
+                })
+            all_run_steps[int(rid)] = step_rows
+        except Exception:
+            all_run_steps[int(rid)] = []
+
+    # --- Status badge helpers ---
+    def _status_badge(status_val):
+        s = str(status_val or "").strip().lower()
+        colors = {
+            "running": ("#dcfce7", "#16a34a"), "completed": ("#dbeafe", "#2563eb"),
+            "created": ("#f3f4f6", "#6b7280"), "paused": ("#fef9c3", "#ca8a04"),
+            "stopped": ("#fee2e2", "#dc2626"), "failed": ("#fee2e2", "#dc2626"),
+        }
+        bg, fg = colors.get(s, ("#f3f4f6", "#6b7280"))
+        return f'<span style="background:{bg};color:{fg};padding:2px 8px;border-radius:10px;font-size:0.8rem;font-weight:600;">{html.escape(str(status_val or ""))}</span>'
+
+    # --- Build the HTML/JS expandable table ---
+    # Default expanded run
+    default_expanded = want if want is not None else int(disp_runs.iloc[0]["id"])
+
+    table_rows_html = ""
+    for _, rr in disp_runs.iterrows():
+        rid = int(rr["id"])
+        is_default = (rid == default_expanded)
+        arrow_char = "▾" if is_default else "▸"
+        detail_display = "table-row" if is_default else "none"
+        highlight = f"background:#f5f3ff;" if is_default else ""
+
+        # Main row
+        table_rows_html += f'''<tr class="wf-run-row" data-run-id="{rid}" style="cursor:pointer;{highlight}" onclick="toggleRunDetail({rid})">
+            <td style="padding:8px 10px;font-weight:600;color:{PRIMARY_COLOR};"><span id="arrow-{rid}">{arrow_char}</span>&nbsp;{rid}</td>
+            <td style="padding:8px 10px;">{html.escape(str(rr["name"] or ""))}</td>
+            <td style="padding:8px 10px;">{_status_badge(rr["status"])}</td>
+            <td style="padding:8px 10px;font-size:0.85rem;">{html.escape(str(rr.get("started_at") or "—"))}</td>
+            <td style="padding:8px 10px;font-size:0.85rem;">{html.escape(str(rr.get("finished_at") or "—"))}</td>
+            <td style="padding:8px 10px;font-size:0.85rem;color:#dc2626;">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
+        </tr>\n'''
+
+        # Detail row (hidden by default unless it's the default expanded)
+        steps = all_run_steps.get(rid, [])
+        if steps:
+            step_table_rows = ""
+            for sr in steps:
+                err_cell = f'<span style="color:#dc2626;font-size:0.8rem;">{html.escape(str(sr["last_error"]))}</span>' if sr["last_error"] else ""
+                step_table_rows += f'''<tr>
+                    <td style="padding:4px 8px;text-align:center;">{sr["seq"]}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["env"])}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["ds_type"])}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["ds_name"])}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["scan_type"])}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["file_set"])}</td>
+                    <td style="padding:4px 8px;">{html.escape(sr["flags"])}</td>
+                    <td style="padding:4px 8px;">{sr["progress"]}</td>
+                    <td style="padding:4px 8px;">{err_cell}</td>
+                </tr>\n'''
+            # Count metrics
+            statuses = [s.get("progress", "") for s in steps]
+            detail_html = f'''
+            <td colspan="6" style="padding:0;border-top:none;">
+                <div style="border-left:4px solid {PRIMARY_COLOR};margin:0 0 0 20px;padding:10px 14px;background:#faf8ff;">
+                    <div style="font-weight:600;font-size:1rem;color:{PRIMARY_COLOR};margin-bottom:8px;">Step Progress for Run {rid}</div>
+                    <table style="width:100%;border-collapse:collapse;font-size:0.85rem;">
+                        <thead><tr style="background:#e8e4f0;">
+                            <th style="padding:5px 8px;text-align:center;">Step</th>
+                            <th style="padding:5px 8px;">Env</th>
+                            <th style="padding:5px 8px;">DS Type</th>
+                            <th style="padding:5px 8px;">DS Name</th>
+                            <th style="padding:5px 8px;">Scan</th>
+                            <th style="padding:5px 8px;">File Set</th>
+                            <th style="padding:5px 8px;">Flags</th>
+                            <th style="padding:5px 8px;">Progress</th>
+                            <th style="padding:5px 8px;">Error</th>
+                        </tr></thead>
+                        <tbody>{step_table_rows}</tbody>
+                    </table>
+                </div>
+            </td>'''
         else:
-            run_id = int(disp_runs.iloc[0]["id"])
-            
+            detail_html = f'<td colspan="6" style="padding:12px 20px;color:#6b7280;"><em>No steps found.</em></td>'
+
+        table_rows_html += f'<tr id="detail-{rid}" class="wf-detail-row" style="display:{detail_display};">{detail_html}</tr>\n'
+
+    expandable_html = f'''
+    <style>
+        .wf-runs-table {{ width:100%; border-collapse:collapse; font-family:'Inter',sans-serif; }}
+        .wf-runs-table thead th {{ background:{PRIMARY_COLOR}; color:white; padding:10px 10px; font-size:0.85rem; font-weight:600; text-align:left; }}
+        .wf-run-row:hover {{ background:#f5f3ff !important; }}
+        .wf-run-row td {{ border-bottom:1px solid #e2e8f0; }}
+        .wf-detail-row td {{ border-bottom:2px solid {PRIMARY_COLOR}; }}
+    </style>
+    <table class="wf-runs-table">
+        <thead><tr>
+            <th>ID</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th>
+        </tr></thead>
+        <tbody>{table_rows_html}</tbody>
+    </table>
+    <script>
+        function toggleRunDetail(rid) {{
+            var detail = document.getElementById('detail-' + rid);
+            var arrow = document.getElementById('arrow-' + rid);
+            if (detail.style.display === 'none') {{
+                // Close all other details first
+                document.querySelectorAll('.wf-detail-row').forEach(function(el) {{ el.style.display = 'none'; }});
+                document.querySelectorAll('.wf-run-row').forEach(function(el) {{ el.style.background = ''; }});
+                document.querySelectorAll('[id^="arrow-"]').forEach(function(el) {{ el.textContent = '▸'; }});
+                // Open this one
+                detail.style.display = 'table-row';
+                arrow.textContent = '▾';
+                document.querySelector('.wf-run-row[data-run-id="' + rid + '"]').style.background = '#f5f3ff';
+            }} else {{
+                detail.style.display = 'none';
+                arrow.textContent = '▸';
+                document.querySelector('.wf-run-row[data-run-id="' + rid + '"]').style.background = '';
+            }}
+        }}
+    </script>
+    '''
+
+    # Calculate height based on number of runs + expanded detail
+    num_runs = len(disp_runs)
+    table_height = max(400, num_runs * 45 + 350)
+    import streamlit.components.v1 as components
+    components.html(expandable_html, height=table_height, scrolling=True)
+
+    # Keep run_id in session state for controls below (default to the expanded one)
+    run_id = default_expanded
     st.session_state["wf_run_sel_id"] = run_id
+
 
     # Disable starting/resuming multiple workflows at once (prevents conflicts).
     try:
@@ -11492,8 +11544,270 @@ def page_workflow_automation():
         except Exception:
             pass
 
-    # Details, Steps, and Maintenance are now in the modal
-    pass
+    # --- Inline step details (sub-table below selected run) ---
+    steps_df = load_workflow_steps(int(run_id))
+    if steps_df.empty:
+        st.info("No steps found for this run.")
+        return
+
+    # Summary metrics
+    try:
+        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
+        counts = stv.value_counts().to_dict()
+        active_mask = stv.isin(["running", "pre_action_done", "ds_created", "ds_test_ok", "scan_created", "scan_running"])
+        active_df2 = steps_df[active_mask].copy()
+        if active_df2.empty:
+            active_df2 = steps_df[stv.isin(["pending"])].copy()
+        _prio = {"running": 100, "scan_running": 90, "scan_created": 80, "ds_test_ok": 70, "ds_created": 60, "pre_action_done": 50, "pending": 10}
+        try:
+            active_df2["_status_norm"] = active_df2["status"].fillna("").astype(str).str.strip().str.lower()
+            active_df2["_prio"] = active_df2["_status_norm"].map(lambda s: int(_prio.get(str(s), 0)))
+        except Exception:
+            active_df2["_prio"] = 0
+        sort_cols = [c for c in ["_prio", "updated_at", "seq"] if c in active_df2.columns]
+        active_row = active_df2.sort_values(by=sort_cols, ascending=[False, False, True]).iloc[0].to_dict() if not active_df2.empty else {}
+    except Exception:
+        counts = {}
+        active_row = {}
+
+    # Visual connector — styled container for the inline sub-table
+    st.markdown(
+        f"""<div style="border-left: 4px solid {PRIMARY_COLOR}; padding: 4px 0 0 12px; margin: -8px 0 16px 20px;">
+            <span style="font-weight:600; font-size:1.05rem; color:{PRIMARY_COLOR};">▸ Step Progress for Run {run_id}</span>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    a1, a2, a3, a4, a5 = st.columns(5)
+    a1.metric("Pending", int(counts.get("pending", 0)))
+    a2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
+    a3.metric("Completed", int(counts.get("completed", 0)))
+    a4.metric("Disabled", int(counts.get("disabled", 0)))
+    a5.metric("Errors", int(counts.get("error", 0)))
+    try:
+        if active_row:
+            st.caption(
+                f"Current step: {int(active_row.get('seq'))} | status={str(active_row.get('status') or '').strip()} | "
+                f"ds=`{str(active_row.get('ds_name') or '').strip()}` | file_set=`{str(active_row.get('file_set_type') or '').strip()}` | "
+                f"env={str(active_row.get('environment') or active_row.get('environment_id') or '').strip()} | updated_at={active_row.get('updated_at')}"
+            )
+    except Exception:
+        pass
+
+    # Prepare step display table
+    disp = steps_df.copy()
+    try:
+        _phase_map = {
+            "pending": "Pending", "disabled": "Disabled", "error": "Error",
+            "running": "Executing step", "pre_action_done": "Pre-action done",
+            "ds_created": "DS created", "ds_test_ok": "DS test OK",
+            "scan_created": "Scan profile created", "scan_running": "Scan running",
+            "completed": "Completed",
+        }
+        disp["_status_norm"] = disp["status"].fillna("").astype(str).str.strip().str.lower()
+        disp["Phase"] = disp["_status_norm"].map(lambda s: _phase_map.get(str(s), str(s or "").strip() or ""))
+    except Exception:
+        disp["Phase"] = disp.get("status")
+    disp["Flags"] = disp.apply(
+        lambda r: ", ".join([x for x in [
+            "ACL" if bool(r.get("is_acl")) else "",
+            "STRUCT" if bool(r.get("is_structured_ff")) else "",
+            "OLS" if bool(r.get("is_ols")) else "",
+        ] if x]),
+        axis=1,
+    )
+    # Visual progress flow
+    def _render_progress_flow(row: Dict[str, Any]) -> str:
+        s = str(row.get("status") or "").strip().lower()
+        if s == "disabled":
+            return "🚫 Disabled"
+        ds_id = str(row.get("ds_id") or "").strip()
+        spid = str(row.get("scan_profile_id") or "").strip()
+        sid = str(row.get("scan_id") or "").strip()
+        has_scan = bool(sid) or (s in {"scan_running", "completed"})
+        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
+        has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
+        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
+        if s in {"pending", ""}: return "➖ DS"
+        if s in {"running", "pre_action_done"}: return "⏳ DS"
+        if s == "error":
+            if has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
+            if not has_ds: return "❌ DS"
+            if has_ds and not has_test: return "✅ DS ➔ ❌ Test"
+            if has_test and not has_profile: return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
+            if has_profile and not has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
+            return "❌ Error"
+        parts = []
+        if has_ds: parts.append("✅ DS")
+        if has_test: parts.append("✅ Test")
+        if has_profile: parts.append("✅ Profile")
+        if has_scan: parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
+        return " ➔ ".join(parts) if parts else "➖ DS"
+
+    disp["Progress Flow"] = disp.apply(lambda r: _render_progress_flow(r.to_dict()), axis=1)
+    disp["Run ID"] = disp["run_id"] if "run_id" in disp.columns else run_id
+    try:
+        disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
+    except Exception:
+        disp["Scan Link"] = ""
+    disp = disp.rename(columns={
+        "seq": "Step", "environment": "Environment", "ds_kind": "DS Type",
+        "ds_name": "DS Name", "scan_kind": "Scan Type", "file_set_type": "File Set",
+        "scan_id": "Scan Id", "notes": "Notes",
+    })
+
+    try:
+        _run_status = str(rrow.get("status") or "").strip().lower()
+    except Exception:
+        _run_status = ""
+    if _run_status in {"created", ""}:
+        st.info("This run is not started yet. Click **Start Workflow** to begin (then both environments will be used according to the step plan).")
+
+    cols = ["Run ID", "Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Progress Flow", "build_version", "Scan Id", "Scan Link", "Notes", "last_error", "updated_at"]
+    cols = [c for c in cols if c in disp.columns]
+    st.dataframe(
+        disp[cols],
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View in Progress"),
+        },
+    )
+
+    with st.expander("Edit steps (before run)", expanded=False):
+        st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
+        if selected_status == "running":
+            st.info("Pause/Stop the workflow run to edit steps.")
+        else:
+            edit_df = steps_df.copy()
+            if "is_enabled" not in edit_df.columns:
+                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
+            try:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
+            except Exception:
+                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
+            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
+            show_cols = [c for c in show_cols if c in edit_df.columns]
+            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Environment", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
+            editor = st.data_editor(
+                view,
+                width="stretch",
+                hide_index=True,
+                key=f"wf_edit_steps_{run_id}",
+                column_config={
+                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                },
+                disabled=[c for c in view.columns if c != "is_enabled"],
+            )
+            if st.button("Save step selection", type="primary", key=f"wf_save_steps_{run_id}"):
+                try:
+                    desired = editor[["id", "is_enabled"]].copy()
+                    desired["id"] = desired["id"].astype(int)
+                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
+                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
+                    from sqlalchemy import bindparam
+                    with engine.connect() as conn:
+                        if disable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": disable_ids},
+                            )
+                        if enable_ids:
+                            conn.execute(
+                                text("""
+                                    UPDATE workflow_steps
+                                    SET is_enabled=1,
+                                        status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END,
+                                        last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END,
+                                        updated_at=CURRENT_TIMESTAMP
+                                    WHERE id IN :ids AND COALESCE(status,'') <> 'completed'
+                                """).bindparams(bindparam("ids", expanding=True)),
+                                {"ids": enable_ids},
+                            )
+                        conn.commit()
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Saved.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+    with st.expander("Maintenance (reset stale status)", expanded=False):
+        st.caption("If you restarted a workflow and old step states/errors are confusing, use reset below. This does not delete DS or scans in BigID; it only resets DB state for the run.")
+        col_reset1, col_reset2 = st.columns(2)
+        with col_reset1:
+            if st.button("Reset unfinished steps (keep DS/Profile ids)", key="wf_reset_steps_soft"):
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(text("""
+                            UPDATE workflow_steps
+                            SET status='pending',
+                                last_error=NULL,
+                                started_at=NULL,
+                                finished_at=NULL,
+                                scan_id=NULL,
+                                updated_at=CURRENT_TIMESTAMP
+                            WHERE run_id=:rid
+                              AND COALESCE(status,'') NOT IN ('completed','disabled')
+                        """), {"rid": int(run_id)})
+                        conn.execute(text("""
+                            UPDATE workflow_runs
+                            SET last_error=NULL,
+                                next_eligible_at=CURRENT_TIMESTAMP,
+                                updated_at=CURRENT_TIMESTAMP
+                            WHERE id=:rid
+                        """), {"rid": int(run_id)})
+                        conn.commit()
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Soft reset done. Runner will reuse existing DS/Profile. Click Start/Resume to run again.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Soft reset failed: {ex}")
+        with col_reset2:
+            st.caption("Use **Full reset** when DS shows **Draft** in BigID (test never passed) so the runner re-runs the connection test.")
+            if st.button("Full reset unfinished (clear DS/Profile ids → re-test)", key="wf_reset_steps_full"):
+                try:
+                    with engine.connect() as conn:
+                        conn.execute(text("""
+                            UPDATE workflow_steps
+                            SET status='pending',
+                                last_error=NULL,
+                                started_at=NULL,
+                                finished_at=NULL,
+                                scan_id=NULL,
+                                ds_id=NULL,
+                                scan_profile_id=NULL,
+                                scan_profile_name=NULL,
+                                updated_at=CURRENT_TIMESTAMP
+                            WHERE run_id=:rid
+                              AND COALESCE(status,'') NOT IN ('completed','disabled')
+                        """), {"rid": int(run_id)})
+                        conn.execute(text("""
+                            UPDATE workflow_runs
+                            SET last_error=NULL,
+                                next_eligible_at=CURRENT_TIMESTAMP,
+                                updated_at=CURRENT_TIMESTAMP
+                            WHERE id=:rid
+                        """), {"rid": int(run_id)})
+                        conn.commit()
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.success("Full reset done. Runner will re-create DS, re-run connection test, then create profile. Click Start/Resume.")
+                    st.rerun()
+                except Exception as ex:
+                    st.error(f"Full reset failed: {ex}")
+
 
     # Hide manual template editing in normal mode (workflow should be automatic).
     # If needed for troubleshooting, enable debug view via ?debug=true
