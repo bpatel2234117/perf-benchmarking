@@ -2088,6 +2088,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 {"rid": int(run_id)},
             ).fetchall()
         completed_any = False
+        completed_success_any = False  # True only when we marked a step as completed (success), not error
         for rr in inflight_rows or []:
             step_id = int(rr[0])
             seq = int(rr[1])
@@ -2095,25 +2096,35 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             sid = str(rr[3] or "").strip()
             st_status = str(rr[4] or "").strip().lower()
             scan_status = str(rr[5] or "").strip()
-            if env_id is not None:
-                try:
-                    inflight_envs.add(int(env_id))
-                except Exception:
-                    pass
             if scan_status and _is_terminal_state(scan_status):
                 if _compact(scan_status) in {"completed", "completedwithfailures"}:
                     set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
+                    completed_success_any = True
                 else:
                     set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
+                    set_run_next_eligible(engine, run_id, _now_utc())  # allow next step to run immediately
                 completed_any = True
                 set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={scan_status}", started=False)
+            elif sid and not scan_status:
+                # Scan was deleted from DB (e.g. user marked Aborted and removed from scan_parents).
+                # Clear step so workflow can start a new scan on next tick (same or other env).
+                set_step_status(engine, step_id, "pending", scan_id=None, last_error="Scan aborted/deleted; reset for retry")
+                set_run_next_eligible(engine, run_id, _now_utc())  # allow this step or next to run immediately
+                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} missing_from_db cleared_for_retry", started=False)
+                completed_any = True
             else:
+                # Only add to inflight when we have a scan_id and it's still present and non-terminal.
+                if env_id is not None and sid and scan_status:
+                    try:
+                        inflight_envs.add(int(env_id))
+                    except Exception:
+                        pass
                 # Only normalize to scan_running when a scan_id exists; 'running' may just be DS/test/profile work.
                 if sid and st_status != "scan_running":
                     set_step_status(engine, step_id, "scan_running")
-        if completed_any:
-            # After reconciling terminal scans, enforce cooldown timestamp.
-            # IMPORTANT: do not return early — we may still be able to run a step on a different env.
+        if completed_any and completed_success_any:
+            # Only enforce cooldown after a successful step completion. When a step ended in error
+            # (e.g. Aborted) or was cleared (scan deleted), do not block the next step with cooldown.
             set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
     except Exception:
         pass
@@ -2183,7 +2194,13 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # Cooldown gate:
     # If any environment is currently running a scan, do not block reconciliation.
     # Also, allow starting work on a different environment even during cooldown.
-    next_eligible = run_row[3]
+    # Re-fetch next_eligible_at so we see updates from reconciliation (e.g. cleared on error).
+    try:
+        with engine.connect() as conn:
+            next_row = conn.execute(text("SELECT next_eligible_at FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)}).fetchone()
+        next_eligible = next_row[0] if next_row else run_row[3]
+    except Exception:
+        next_eligible = run_row[3]
     if next_eligible is not None and isinstance(next_eligible, datetime):
         if next_eligible > now:
             # If we have an idle environment with eligible work, proceed despite cooldown.
@@ -2401,10 +2418,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             if stv and _is_terminal_state(stv):
                 if _compact(stv) in {"completed", "completedwithfailures"}:
                     set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
+                    set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={stv}", started=False)
+                    set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
                 else:
                     set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {stv}")
-                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={stv}", started=False)
-                set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
+                    set_run_next_eligible(engine, run_id, _now_utc())  # allow next step to run immediately
+                    set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={stv}", started=False)
                 return True
     except Exception:
         pass
