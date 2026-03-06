@@ -677,7 +677,7 @@ def _is_workflow_scan_name(name: str, *, run_id: Optional[int] = None) -> bool:
     return '(wf ' in nm
 
 
-def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = None) -> bool:
+def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = None, exclude_wf_tag: str = "") -> bool:
     """
     Hard safety. By default, only blocks if a *workflow-created* scan is running
     (identified by name containing '(wf ... )').
@@ -697,6 +697,13 @@ def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = N
     for sc in scans or []:
         if not isinstance(sc, dict):
             continue
+        nm = _scan_name_from_parent_scan(sc)
+        
+        # If we have an exclusion tag (e.g. "(wf 9-4)"), and this running scan matches it,
+        # then it is likely the current step itself, so we don't block.
+        if exclude_wf_tag and str(exclude_wf_tag).lower().strip() in nm.lower():
+            continue
+
         st = str(sc.get('state') or sc.get('status') or '').strip()
         prog = sc.get('progress')
         pst = ''
@@ -707,7 +714,6 @@ def env_has_running_scan(base_url: str, token: str, *, run_id: Optional[int] = N
             continue
         if block_any:
             return True
-        nm = _scan_name_from_parent_scan(sc)
         if _is_workflow_scan_name(nm, run_id=run_id):
             return True
     return False
@@ -1471,12 +1477,16 @@ def _apply_runtime_flags(step: Dict[str, Any], ds_payload: Dict[str, Any]) -> Di
 
     is_acl = bool(step.get("is_acl"))
     is_struct = bool(step.get("is_structured_ff"))
+    is_ocr = bool(step.get("is_ocr"))
 
     # Common connector fields for unstructured connectors (s3/smb)
     if ds_kind in {"s3", "smb"}:
         # BigID sometimes stores these as strings "true"/"false"
-        ds_conn["metadataAclScanEnabled"] = "true" if is_acl else "false"
-        ds_conn["dsAclScanEnabled"] = "true" if is_acl else "false"
+        # Use booleans for newer connector compatibility
+        ds_conn["metadataAclScanEnabled"] = bool(is_acl)
+        ds_conn["dsAclScanEnabled"] = bool(is_acl)
+        ds_conn["ocrEnabled"] = bool(is_ocr)
+        
         trp = ds_conn.get("typeRequestProperties")
         if isinstance(trp, dict):
             trp["enableStructuredFilesDiscovery"] = bool(is_struct)
@@ -2057,6 +2067,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         set_runner_heartbeat(engine, status="idle", message="no running workflows", started=False)
         return False
 
+    # IMPORTANT: We will now attempt to process one step PER ENVIRONMENT for this run
+    # in a single tick, up to MAX_CONCURRENT_SCANS.
+
     run_id = int(run_row[0])
     status = str(run_row[1] or "").strip().lower()
     if status != "running":
@@ -2268,14 +2281,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         continue
             return cand
 
-        # Pass 2: allow scan_waiting if nothing else is runnable
+            return cand
+
+        # Pass 3: allow scan_waiting if nothing else is runnable
         for cand in candidates or []:
             cand_status = str(cand[19] or '').strip().lower()
             if cand_status != 'scan_waiting':
-                continue
-            if (not allow_scan_running) and cand_status == 'scan_running':
-                continue
-            if scans_at_capacity and (not allow_scan_running) and cand_status != 'scan_running':
                 continue
             cand_env = cand[2]
             if cand_env is not None:
@@ -2291,26 +2302,48 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             return cand
         return None
 
-    # Prefer running work on a FREE environment first.
-    step = _pick_candidate(allow_scan_running=False)
-    # If all envs are busy, fall back to selecting scan_running (for reconciliation/visibility).
-    if not step:
-        step = _pick_candidate(allow_scan_running=True)
-    if not step:
-        # If we had candidates but none were selectable due to scenario locks, just idle and try again later.
-        if candidates and avoid_parallel and running_keys:
-            set_runner_heartbeat(engine, status="idle", message="blocked by scenario lock (waiting for other scan_running steps)", started=False)
-            return False
-        # All done (no remaining eligible steps)
-        with engine.connect() as conn:
-            conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
-            conn.commit()
-        set_runner_heartbeat(engine, status="idle", message=f"run {run_id} completed", started=False)
-        return True
+    # --- EXECUTION LOOP ---
+    # We now loop up to N times (where N is free slots) to fill idle environments.
+    did_any_work = False
+    slots_to_fill = max(1, int(max_scans) - len(inflight_envs))
+    
+    # Track environments we've targeted in this tick to avoid duplicate processing
+    targeted_envs = set(inflight_envs)
 
+    for _ in range(slots_to_fill):
+        step = _pick_candidate(allow_scan_running=False)
+        if not step:
+            # If no free env work, try to reconcile one existing scan_running step
+            step = _pick_candidate(allow_scan_running=True)
+            if not step:
+                break
+
+        step_id = int(step[0])
+        seq = int(step[seq_idx := 1])
+        env_id = step[2]
+        
+        # Don't try the same env twice in one tick
+        if env_id is not None:
+            if int(env_id) in targeted_envs:
+                # If we picked a step on an already targeted env, we must be in reconciliation loop.
+                # Stop here to prevent infinite loop or over-processing.
+                break
+            targeted_envs.add(int(env_id))
+
+        # Process the step... (Logic continues by calling a sub-processor or inline)
+        # For simplicity in this diff, we'll keep the processing inline but wrap it.
+        # However, run_once returns True if it did "any" work.
+        
+        res = _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet)
+        if res:
+            did_any_work = True
+        
+    return did_any_work
+
+def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) -> bool:
+    """Helper to process a single step. Extracted from original run_once."""
     step_id = int(step[0])
     seq = int(step[1])
-    env_id = step[2]
     env_row = load_env(engine, int(env_id)) if env_id is not None else {}
     if not env_row or not str(env_row.get("base_url") or "").strip():
         set_step_error(engine, step_id, f"Missing environment/base_url for env_id={env_id}")
@@ -2320,21 +2353,14 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     base_url = str(env_row.get("base_url") or "").strip()
     try:
         token = Get_auth_token(base_url, env_row)
-        # pipeline_guard: if this env already has a running workflow scan, do not create more DS/profiles.
     except Exception as ex:
         set_step_error(engine, step_id, f"Auth failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: auth failed")
         return True
 
-    # Do not pipeline on a busy environment (prevents creating profiles when scan is actually still running).
-    try:
-        if env_has_running_scan(base_url, token, run_id=run_id) and str(cur_status or '').strip().lower() not in {'scan_running'}:
-            set_step_status(engine, step_id, 'scan_waiting', last_error='Env has a running workflow scan; waiting')
-            set_runner_heartbeat(engine, status='idle', message=f'run={run_id} step={seq} env_busy_wait', started=False)
-            return True
-    except Exception:
-        pass
-
+    cur_status = str(step[19] or "").strip().lower()
+    
+    # Prep step_dict and wf_tag for recovery/tracking
     step_dict = {
         "ds_kind": step[3],
         "ds_name": step[4],
@@ -2347,27 +2373,27 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         "feature_flags": step[11],
         "notes": step[12],
     }
-
-    cur_status = str(step[19] or "").strip().lower()
-
-    # If this step is already in scan_running/scan_waiting, NEVER trigger again.
-    # Instead, try to recover the real running scan_id (DB or API) and keep waiting.
-    try:
-        sid_db = str(step[18] or "").strip()
-    except Exception:
-        sid_db = ""
     try:
         wf_tag = f"(wf {int(run_id)}-{int(seq)})"
     except Exception:
         wf_tag = "(wf )"
 
+    # --- RECOVERY LOGIC (PRIORITY) ---
+    # If this step is already in scan_running/scan_waiting, try to recover the scan_id immediately.
+    # This prevents the "Busy Environment" check from stalling a step that has actually already started.
     if cur_status in {"scan_running", "scan_waiting"}:
+        try:
+            sid_db = str(step[18] or "").strip()
+        except Exception:
+            sid_db = ""
+
         # If scan_id already known, just keep it in scan_running.
         if sid_db:
             set_step_status(engine, step_id, "scan_running", scan_id=sid_db)
             set_runner_heartbeat(engine, status="idle", message=f"run={run_id} step={seq} scan_running scan_id_known", started=False)
             return False
-        # Try to recover scan_profile_name from DB
+
+        # Try to recover by name/profile
         try:
             with engine.connect() as conn:
                 rowx = conn.execute(text("SELECT scan_profile_name, ds_name FROM workflow_steps WHERE id=:id"), {"id": int(step_id)}).fetchone()
@@ -2377,11 +2403,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             scan_profile_name_db = ""
             ds_name_db = ""
 
-        # Prefer exact-name match on scan_profile_name (includes wf tag).
         recovered = ""
         if scan_profile_name_db:
             recovered = find_running_parent_scan_id(base_url, token, exact_name=scan_profile_name_db, wf_tag=wf_tag)
-        # Fallback: if profile name missing, try DS name contains wf tag via hardened guess
         if (not recovered) and ds_name_db:
             recovered = guess_latest_scan_id(base_url, token, name_contains=ds_name_db, wf_tag=wf_tag)
 
@@ -2390,10 +2414,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} recovered_scan_id={recovered}", started=False)
             return True
 
-        # Still unknown: keep waiting; do NOT pipeline or trigger.
-        set_step_status(engine, step_id, "scan_waiting", last_error="scan running but scan_id not yet resolved; waiting")
-        set_runner_heartbeat(engine, status="idle", message=f"run={run_id} step={seq} waiting_for_scan_id", started=False)
-        return False
+    # --- BUSY ENVIRONMENT CHECK ---
+    # Do not pipeline on a busy environment (prevents creating profiles when scan is actually still running).
+    # Note: If we just recovered a scan above, we won't reach here for that step.
+    # We pass exclude_wf_tag=wf_tag to prevent the step from blocking on "itself" if it's already in-flight.
+    try:
+        if env_has_running_scan(base_url, token, run_id=run_id, exclude_wf_tag=wf_tag) and cur_status not in {'scan_running'}:
+            set_step_status(engine, step_id, 'scan_waiting', last_error='Env has a running workflow scan; waiting')
+            set_runner_heartbeat(engine, status='idle', message=f'run={run_id} step={seq} env_busy_wait', started=False)
+            return True
+    except Exception:
+        pass
 
     # Preserve stable phases so retries resume where they left off.
     stable_phases = {'scan_running','scan_created','ds_test_ok','ds_created','scan_waiting'}
@@ -2722,7 +2753,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             # Scan profile name uniqueness comes from DS name (which is unique per wf step).
             scan_kind_raw = str(step_dict.get("scan_kind") or "").strip().lower().replace(" ", "")
             scan_kind_label = "Full Scan" if scan_kind_raw in {"full_scan", "fullscan", "dsscan", "dsscanprofile", "dsscanjob"} else (str(step_dict.get("scan_kind") or "Scan").strip() or "Scan")
-            scan_profile_name = (f"{desired_ds_name} {scan_kind_label}").strip()[:240] or f"{desired_ds_name}".strip()[:240]
+            
+            # Explicitly include ACL status in scan name
+            acl_suffix = " ACL ON" if bool(step_dict.get("is_acl")) else ""
+            scan_profile_name = (f"{desired_ds_name} {scan_kind_label}{acl_suffix}").strip()[:240] or f"{desired_ds_name}".strip()[:240]
 
             # If a reset/restart cleared scan_profile_id but BigID already has this profile, reuse it.
             found = find_scan_profile_id_by_name(base_url, token, scan_profile_name)

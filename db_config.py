@@ -166,5 +166,45 @@ DDL_STATEMENTS = {
             finding_count BIGINT,
             FOREIGN KEY (benchmark_id) REFERENCES benchmarks(id)
         );
+    """,
+    'classifier_details_snapshots': """
+        CREATE TABLE IF NOT EXISTS classifier_details_snapshots (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            environment_id INT NULL,
+            build_id INT NOT NULL,
+            bigid_classifier_id VARCHAR(64) NOT NULL,
+            classifier_name VARCHAR(500) NOT NULL,
+            snapshot_json LONGTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_env_build_classifier (environment_id, build_id, bigid_classifier_id),
+            FOREIGN KEY (build_id) REFERENCES builds(id),
+            FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+        );
+    """,
+    'app_roles': """
+        CREATE TABLE IF NOT EXISTS app_roles (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            role_name VARCHAR(50) UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """,
+    'app_users': """
+        CREATE TABLE IF NOT EXISTS app_users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            role_id INT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (role_id) REFERENCES app_roles(id)
+        );
+    """,
+    'app_role_pages': """
+        CREATE TABLE IF NOT EXISTS app_role_pages (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            role_id INT NOT NULL,
+            page_name VARCHAR(100) NOT NULL,
+            UNIQUE KEY uniq_role_page (role_id, page_name),
+            FOREIGN KEY (role_id) REFERENCES app_roles(id)
+        );
     """
 }

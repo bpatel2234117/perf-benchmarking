@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from db_config import DB_CONFIG, DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
+from dashboard_auth import ensure_rbac_tables, login_user, logout_user, check_access, get_user_permissions, hash_password, verify_password
 try:
     # Optional: auto-start tracker when available (same folder as dashboard.py).
     from tracker_autostart import ensure_tracker_running  # type: ignore
@@ -262,6 +263,9 @@ def get_engine():
         return None
 
 engine = get_engine()
+
+if engine:
+    ensure_rbac_tables(engine)
 
 # Best-effort: auto-start tracker when Streamlit runs (no manual commands).
 # Can be disabled via DISABLE_TRACKER_AUTOSTART=1.
@@ -954,12 +958,26 @@ def load_classifier_snapshots_for_build(environment_id, build_id):
     import json
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT bigid_classifier_id, classifier_name, snapshot_json
-                FROM classifier_details_snapshots
-                WHERE build_id = :bid AND (environment_id = :eid OR (:eid IS NULL AND environment_id IS NULL))
-                ORDER BY classifier_name
-            """), {"bid": int(build_id), "eid": environment_id}).fetchall()
+            # If environment_id is None (All environments), we take the latest snapshot for this build from ANY environment.
+            if environment_id is None:
+                query = """
+                    SELECT bigid_classifier_id, classifier_name, snapshot_json
+                    FROM classifier_details_snapshots
+                    WHERE build_id = :bid
+                    GROUP BY bigid_classifier_id
+                    ORDER BY classifier_name
+                """
+                params = {"bid": int(build_id)}
+            else:
+                query = """
+                    SELECT bigid_classifier_id, classifier_name, snapshot_json
+                    FROM classifier_details_snapshots
+                    WHERE build_id = :bid AND environment_id = :eid
+                    ORDER BY classifier_name
+                """
+                params = {"bid": int(build_id), "eid": int(environment_id)}
+            
+            rows = conn.execute(text(query), params).fetchall()
             out = []
             for r in (rows or []):
                 try:
@@ -1008,7 +1026,7 @@ def load_test_environments():
             rows = conn.execute(text("""
                 SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
                 FROM test_environments
-                ORDER BY env_name
+                ORDER BY is_active DESC, env_name ASC
             """)).fetchall()
             cols = ["id", "env_name", "base_url", "version", "auth_module_path", "auth_function_name", "classifiers_api_path", "is_active"]
             return pd.DataFrame(rows, columns=cols)
@@ -1030,6 +1048,22 @@ def build_api_url(base_url, api_path):
     if not path.startswith("/"):
         path = "/" + path
     return f"{base}{path}"
+
+
+def fetch_about(base_url: str, token: str):
+    """GET /api/v1/about from environment."""
+    url = build_api_url(base_url, "/api/v1/about")
+    headers_raw = {"authorization": token} if token else {}
+    headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        resp = requests.get(url, headers=headers_raw, timeout=20)
+        if resp.status_code in (401, 403) and token:
+            resp = requests.get(url, headers=headers_bearer, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return {}
 
 
 def extract_token_from_result(result):
@@ -1229,19 +1263,30 @@ CLASSIFIER_DETAIL_KEYS = [
 
 
 def fetch_classifier_detail_from_api(base_url, classifier_id, token):
-    """GET /api/v1/all-classifications/{id} -> detail data dict or None."""
-    url = build_api_url(base_url, f"{ALL_CLASSIFICATIONS_DETAIL_BASE.rstrip('/')}/{classifier_id}")
+    """GET /api/v1/all-classifications/{id} OR /api/v1/classifications/{id} -> detail data dict or None."""
+    paths = [
+        f"{ALL_CLASSIFICATIONS_DETAIL_BASE.rstrip('/')}/{classifier_id}",
+        f"/api/v1/classifications/{classifier_id}"
+    ]
+    
     headers_raw = {"authorization": token} if token else {}
     headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
-    resp = requests.get(url, headers=headers_raw, timeout=30)
-    if resp.status_code in (401, 403) and token:
-        resp = requests.get(url, headers=headers_bearer, timeout=30)
-    if resp.status_code != 200:
-        return None
-    data = resp.json()
-    if isinstance(data, dict) and isinstance(data.get("data"), dict):
-        return data.get("data")
-    return data if isinstance(data, dict) else None
+    
+    for path in paths:
+        url = build_api_url(base_url, path)
+        try:
+            resp = requests.get(url, headers=headers_raw, timeout=20)
+            if resp.status_code in (401, 403) and token:
+                resp = requests.get(url, headers=headers_bearer, timeout=20)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                    return data.get("data")
+                return data if isinstance(data, dict) else None
+        except Exception:
+            continue
+    return None
 
 
 def fetch_classifiers_with_auth_retry(env_row):
@@ -6662,7 +6707,7 @@ def page_manage_test_environments():
                     except Exception as ex:
                         st.warning(f"Environment saved, but classifier sync failed: {ex}")
 
-                st.cache_data.clear()
+                st.rerun()
             except Exception as e:
                 st.error(f"Error saving environment: {e}")
 
@@ -6766,15 +6811,32 @@ def page_manage_test_environments():
 
         for _, r in show_df.iterrows():
             row_dict = r.to_dict()
+            is_env_active = bool(row_dict.get("is_active"))
+            opacity = "1.0" if is_env_active else "0.4"
+            row_style = f'opacity: {opacity};'
+            if not is_env_active:
+                row_style += ' filter: grayscale(80%); transition: opacity 0.3s;'
+            
             row_dict["classifiers_api_path"] = str(row_dict.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH).strip()
+            
+            # Use a container for styling if possible, but columns in Streamlit are tricky with CSS.
+            # We'll apply styling to markdown where we can, or just keep it simple with text color if needed.
+            # For now, we'll prefix names to indicate status and use opacity in the columns.
+            
             c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 3.2, 0.8, 0.7, 2.2, 1.1, 1.2])
-            c1.write(str(row_dict.get("env_name") or ""))
-            c2.write(str(row_dict.get("base_url") or ""))
-            c3.write(str(row_dict.get("version") or ""))
-            c4.write("Yes" if bool(row_dict.get("is_active")) else "No")
+            
+            name_display = str(row_dict.get("env_name") or "")
+            if not is_env_active:
+                name_display = f"~~{name_display}~~ (Inactive)"
+            
+            c1.markdown(f'<div style="{row_style}">{name_display}</div>', unsafe_allow_html=True)
+            c2.markdown(f'<div style="{row_style} font-size: 0.85rem;">{str(row_dict.get("base_url") or "")}</div>', unsafe_allow_html=True)
+            c3.markdown(f'<div style="{row_style}">{str(row_dict.get("version") or "")}</div>', unsafe_allow_html=True)
+            c4.markdown(f'<div style="{row_style}">{"✅ Yes" if is_env_active else "❌ No"}</div>', unsafe_allow_html=True)
+            
             env_id = row_dict.get("id")
             path_text = build_paths.get(int(env_id), f"None -> {str(row_dict.get('version') or '').strip()}") if env_id is not None else f"None -> {str(row_dict.get('version') or '').strip()}"
-            c5.write(path_text)
+            c5.markdown(f'<div style="{row_style} font-size: 0.8rem; color: #64748b;">{path_text}</div>', unsafe_allow_html=True)
             c6.markdown(
                 """
                 <style>
@@ -9228,89 +9290,171 @@ def page_classifier_build_diffs():
                 st.dataframe(pd.DataFrame({"Classifier": removed}) if removed else pd.DataFrame({"Classifier": []}), width="stretch", hide_index=True)
 
     st.divider()
-    st.markdown("### Classifier details comparison (build vs build)")
-    st.caption("Fetch and store classifier details from BigID API, then compare two builds. Rows with changes are highlighted.")
+    st.markdown("### 🔍 Classifier Deep-Dive Comparison")
+    st.caption("Compare full metadata snapshots for the selected builds. Any differences in proximity, sensitivity, or enabled status will be highlighted below.")
+    
     ensure_classifier_details_snapshots_table()
     build_versions = sorted(build_map.keys(), key=_build_key)
+    
     if len(build_versions) < 2:
-        st.info("Need at least two builds to compare details. Sync classifiers for multiple builds first.")
+        st.info("Need at least two builds with snapshot data to perform a deep-dive comparison.")
     else:
-        col_a, col_b, col_btn = st.columns([1, 1, 1])
-        with col_a:
-            build_a = st.selectbox("Build A", build_versions, key="cl_detail_build_a")
-        with col_b:
-            build_b = st.selectbox("Build B", [v for v in build_versions if v != build_a] or build_versions, key="cl_detail_build_b")
-        with col_btn:
-            fetch_btn = st.button("Fetch & store classifier details for both builds", key="cl_detail_fetch")
-        if fetch_btn and sel_env_id is not None:
-            env_row = get_test_environment_by_id(sel_env_id)
-            if not env_row:
-                st.error("Environment not found.")
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            build_a = st.selectbox("Compare Build (Baseline)", build_versions, index=max(0, len(build_versions)-2), key="cl_detail_build_a")
+        with c2:
+            build_b = st.selectbox("To Build (Newer)", [v for v in build_versions if v != build_a] + [build_a], index=0, key="cl_detail_build_b")
+        with c3:
+            st.write("") # spacing
+            fetch_btn = st.button("Manual Refresh Snapshots", use_container_width=True, type="secondary", help="Triggers manual capture of current classifier metadata from environment API.")
+
+        # Local environment override for refresh if "All" is selected globally
+        refresh_env_id = sel_env_id
+        if sel_env_id is None:
+            st.info("💡 To refresh snapshots manually, please select an environment below.")
+            local_env_options = [lbl for lbl, eid in env_options if eid is not None]
+            if local_env_options:
+                sel_local = st.selectbox("Refresh From Environment", local_env_options, key="cl_refresh_local_env")
+                for lbl, eid in env_options:
+                    if lbl == sel_local:
+                        refresh_env_id = eid
+                        break
             else:
-                try:
-                    token = fetch_auth_token_for_env(env_row)
-                    base_url = env_row.get("base_url")
-                    api_path = env_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH
-                    url = build_api_url(base_url, api_path)
-                    headers = {"authorization": token} if token else {}
-                    resp = requests.get(url, headers=headers, timeout=60)
-                    if resp.status_code != 200:
-                        st.error(f"List API returned {resp.status_code}")
-                    else:
-                        list_with_ids = extract_classifier_list_with_ids(resp.json())
-                        if not list_with_ids:
-                            st.warning("No classifiers with IDs in list response.")
-                        else:
-                            with engine.connect() as conn:
-                                bid_a = get_or_create_id(conn, "builds", "version", build_a)
-                                bid_b = get_or_create_id(conn, "builds", "version", build_b)
-                            progress = st.progress(0.0)
-                            total = len(list_with_ids) * 2
-                            done = 0
-                            for i, item in enumerate(list_with_ids):
-                                detail = fetch_classifier_detail_from_api(base_url, item["id"], token)
-                                if detail:
-                                    save_classifier_details_snapshot(sel_env_id, bid_a, item["id"], item["name"], detail)
-                                    save_classifier_details_snapshot(sel_env_id, bid_b, item["id"], item["name"], detail)
-                                done += 2
-                                progress.progress(min(1.0, done / total))
-                            progress.progress(1.0)
-                            st.success(f"Stored details for {len(list_with_ids)} classifiers for Build A and B.")
-                except Exception as e:
-                    st.error(str(e))
-        snap_a = load_classifier_snapshots_for_build(sel_env_id, None)
-        snap_b = load_classifier_snapshots_for_build(sel_env_id, None)
+                st.warning("No environments configured for manual refresh.")
+
+        if fetch_btn:
+            if refresh_env_id is None:
+                st.error("Please select a specific Environment to refresh snapshots from.")
+            else:
+                env_row = get_test_environment_by_id(refresh_env_id)
+                if env_row:
+                    with st.spinner(f"Capturing classifier metadata from {env_row['env_name']}..."):
+                        try:
+                            token = fetch_auth_token_for_env(env_row)
+                            base_url = env_row.get("base_url")
+                            api_path = env_row.get("classifiers_api_path") or "/api/v1/classifications"
+                            
+                            # Get the actual current version from /about to ensure we save to the right build_id
+                            about = fetch_about(base_url, token)
+                            if not about:
+                                st.error(f"Failed to connect to {base_url}. Please check if the environment is up and reachable.")
+                            else:
+                                env_version = about.get("releaseVersion") or about.get("version") or env_row.get("version")
+                                
+                                url = build_api_url(base_url, api_path)
+                                headers_raw = {"authorization": token} if token else {}
+                                headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+                                
+                                resp = requests.get(url, headers=headers_raw, timeout=60)
+                                if resp.status_code in (401, 403) and token:
+                                    resp = requests.get(url, headers=headers_bearer, timeout=60)
+                                
+                                if resp.status_code == 200:
+                                    list_with_ids = extract_classifier_list_with_ids(resp.json())
+                                    if list_with_ids:
+                                        with engine.connect() as conn:
+                                            # Map the environment's current version to a build_id
+                                            target_bid = get_or_create_id(conn, "builds", "version", str(env_version))
+                                            
+                                            success_count = 0
+                                            for item in list_with_ids:
+                                                detail = fetch_classifier_detail_from_api(base_url, item["id"], token)
+                                                if detail:
+                                                    save_classifier_details_snapshot(refresh_env_id, target_bid, item["id"], item["name"], detail)
+                                                    success_count += 1
+                                        if success_count > 0:
+                                            st.success(f"Successfully captured {success_count} classifier snapshots for version {env_version}")
+                                            st.rerun()
+                                        else:
+                                            st.error("Fetched classifier list, but failed to retrieve details for any individual classifier. Check API permissions.")
+                                    else:
+                                        st.warning("API returned success but found 0 classifiers in this environment.")
+                                else:
+                                    st.error(f"API Error ({resp.status_code}): Could not fetch classifier list from {url}")
+                        except Exception as e:
+                            st.error(f"Manual sync failed: {e}")
+
+        # Loading snapshots
         with engine.connect() as conn:
             bid_a = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_a}).scalar() if build_a else None
             bid_b = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_b}).scalar() if build_b else None
-        if bid_a:
-            snap_a = load_classifier_snapshots_for_build(sel_env_id, bid_a)
-        if bid_b:
-            snap_b = load_classifier_snapshots_for_build(sel_env_id, bid_b)
-        if not snap_a and not snap_b:
-            st.caption("No stored details yet. Click 'Fetch & store classifier details' (requires Environment selected).")
+        
+        snap_a = load_classifier_snapshots_for_build(sel_env_id, bid_a) if bid_a else []
+        snap_b = load_classifier_snapshots_for_build(sel_env_id, bid_b) if bid_b else []
+        
+        if not snap_a or not snap_b:
+            st.info("No detailed snapshots found for the selected builds yet. The background tracker will capture these automatically, or you can click 'Manual Refresh Snapshots' above.")
         else:
             map_a = {s["classifier_name"]: s["snapshot"] for s in snap_a}
             map_b = {s["classifier_name"]: s["snapshot"] for s in snap_b}
             all_names = sorted(set(map_a.keys()) | set(map_b.keys()))
+            
             diff_rows = []
             for name in all_names:
                 sa, sb = map_a.get(name, {}), map_b.get(name, {})
+                changed_keys = []
                 for key in CLASSIFIER_DETAIL_KEYS:
-                    va, vb = sa.get(key), sb.get(key)
-                    if va is None:
-                        va = ""
-                    if vb is None:
-                        vb = ""
-                    try:
-                        va, vb = str(va).strip(), str(vb).strip()
-                    except Exception:
-                        va, vb = str(va), str(vb)
-                    diff_rows.append({"Classifier": name, "Field": key, "Build A": va, "Build B": vb, "_changed": va != vb})
-            df_diff = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in diff_rows])
-            if diff_rows and any(r["_changed"] for r in diff_rows):
-                st.markdown("**Rows with differences are highlighted.**")
-            st.dataframe(df_diff.style.apply(lambda row: ["background-color: #fef3c7" if str(row.get("Build A", "")) != str(row.get("Build B", "")) else "" for _ in row], axis=1), width="stretch", hide_index=True)
+                    val_a = str(sa.get(key) if sa.get(key) is not None else "").strip()
+                    val_b = str(sb.get(key) if sb.get(key) is not None else "").strip()
+                    if val_a != val_b:
+                        changed_keys.append(key)
+                
+                status = "Identical"
+                if name not in map_a: status = "Added"
+                elif name not in map_b: status = "Removed"
+                elif changed_keys: status = "Changed"
+                
+                diff_rows.append({
+                    "Classifier": name,
+                    "Status": status,
+                    "Changes": ", ".join(changed_keys) if changed_keys else "-",
+                    "_map_a": sa,
+                    "_map_b": sb,
+                    "_changed_keys": changed_keys
+                })
+
+            # Filter for changes by default?
+            show_all = st.checkbox("Show identical classifiers", value=False)
+            if not show_all:
+                display_rows = [r for r in diff_rows if r["Status"] != "Identical"]
+            else:
+                display_rows = diff_rows
+
+            if not display_rows:
+                st.success("No differences found between these two builds.")
+            else:
+                # Premium Table with expansion for details
+                for r in display_rows:
+                    status_color = "#10b981" if r["Status"] == "Added" else "#ef4444" if r["Status"] == "Removed" else "#f59e0b" if r["Status"] == "Changed" else "#6b7280"
+                    
+                    with st.expander(f"**{r['Classifier']}** — {r['Status']}", expanded=(r["Status"] != "Identical")):
+                        if r["Status"] == "Added":
+                            st.write("Newly added in this build version.")
+                            st.json(r["_map_b"])
+                        elif r["Status"] == "Removed":
+                            st.write("Removed/Disabled in this build version.")
+                            st.json(r["_map_a"])
+                        else:
+                            # Side-by-side diff
+                            cols = st.columns(2)
+                            with cols[0]:
+                                st.markdown(f"**{build_a} (Baseline)**")
+                            with cols[1]:
+                                st.markdown(f"**{build_b} (Newer)**")
+                            
+                            for k in CLASSIFIER_DETAIL_KEYS:
+                                va = str(r["_map_a"].get(k) if r["_map_a"].get(k) is not None else "").strip()
+                                vb = str(r["_map_b"].get(k) if r["_map_b"].get(k) is not None else "").strip()
+                                
+                                if va != vb:
+                                    c1, c2 = st.columns(2)
+                                    with c1:
+                                        st.error(f"**{k}**: {va}")
+                                    with c2:
+                                        st.success(f"**{k}**: {vb}")
+                                else:
+                                    if show_all:
+                                        st.text(f"{k}: {va}")
 
 
 def load_auto_trend_dataset():
@@ -11265,6 +11409,70 @@ def page_workflow_automation():
     _engine = create_engine(DB_CONNECTION_STRING)
 
     st.divider()
+    with st.expander("➕ Create New Workflow Run", expanded=False):
+        st.subheader("Create Workflow Plan")
+        env_labels = [f"{r.env_name} (id={int(r.id)})" for r in active_df.itertuples()]
+        env_ids = [int(r.id) for r in active_df.itertuples()]
+
+        c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
+        env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_new_expander")
+        env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2_new_expander")
+        cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_new_expander"))
+        env1_id = env_ids[env_labels.index(env1_label)]
+        env2_id = env_ids[env_labels.index(env2_label)]
+        wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_new_expander")
+
+        create_disabled = False
+        if int(env1_id) == int(env2_id):
+            st.error("Env 1 and Env 2 must be different. Pick two different environments so scans can be balanced.")
+            create_disabled = True
+
+        preview_steps = _build_default_workflow_steps(env1_id, env2_id)
+        for stp in preview_steps or []:
+            if isinstance(stp, dict) and "is_enabled" not in stp:
+                stp["is_enabled"] = True
+        with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
+            prev_df = pd.DataFrame(preview_steps)
+            show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
+            show_cols = [c for c in show_cols if c in prev_df.columns]
+            editable_df = st.data_editor(
+                prev_df[show_cols],
+                width="stretch",
+                hide_index=True,
+                key="wf_preview_steps_editor_new_expander",
+                column_config={
+                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                },
+                disabled=[c for c in show_cols if c != "is_enabled"],
+            )
+            try:
+                preview_steps = editable_df.to_dict("records")
+            except Exception:
+                pass
+
+        if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
+            rid = create_workflow_run(
+                wf_name,
+                env1_id=int(env1_id),
+                env2_id=int(env2_id),
+                steps=preview_steps,
+                cooldown_minutes=int(cooldown),
+            )
+            if rid:
+                st.success(f"Created workflow run id={rid}. Reloading…")
+                st.query_params["page"] = "Workflow Automation"
+                st.query_params["run_id"] = str(int(rid))
+                try:
+                    st.session_state["wf_run_sel_id"] = int(rid)
+                except Exception:
+                    pass
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.rerun()
+            else:
+                st.error("Failed to create workflow plan.")
 
     # --- Load runs ---
     st.markdown("### Workflow Runs")
@@ -11722,524 +11930,6 @@ def page_workflow_automation():
                 if st.button("Save Pre-OLS action", key="wf_save_action"):
                     upsert_workflow_template(action_key_env or action_key_global, "action", action_text); st.success("Saved.")
 
-    ensure_test_environments_table()
-    ensure_scan_tracking_tables()
-    ensure_scan_progress_table()
-    ensure_workflow_tables()
-
-    env_df = load_test_environments()
-    if env_df.empty:
-        st.info("No test environments found. Add them in `Manage Test Environments` first.")
-        return
-
-    work_df = env_df.copy()
-    work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
-    active_df = work_df[work_df["is_active"] == True].copy()
-    active_df = active_df.sort_values(by=["env_name"], ascending=[True]).reset_index(drop=True)
-    if active_df.empty:
-        st.warning("No active environments. Mark at least two environments active to run this workflow.")
-        return
-
-    engine = create_engine(DB_CONNECTION_STRING)
-    runs_df = load_workflow_runs(limit=20)
-
-    # Build tab labels: one per run + "New Run"
-    tab_labels = []
-    tab_run_ids = []
-    for _, rr in runs_df.iterrows():
-        rid = int(rr["id"])
-        status = str(rr["status"] or "").strip()
-        name = str(rr["name"] or "").strip()
-        # Truncate name for tab readability
-        short_name = (name[:30] + "…") if len(name) > 30 else name
-        tab_labels.append(f"Run {rid} — {short_name} ({status})")
-        tab_run_ids.append(rid)
-    tab_labels.append("➕ New Run")
-
-    if not tab_labels:
-        tab_labels = ["➕ New Run"]
-
-    tabs = st.tabs(tab_labels)
-
-    # --- Render each run tab ---
-    for i, rid in enumerate(tab_run_ids):
-        with tabs[i]:
-            _render_run_tab(rid, runs_df, engine)
-
-    # --- "New Run" tab (always the last tab) ---
-    with tabs[-1]:
-        _render_new_run_tab(active_df, engine)
-
-
-def _render_new_run_tab(active_df, engine):
-    """Render the 'Create Workflow Plan' form inside the New Run tab."""
-    st.subheader("Create Workflow Plan")
-    env_labels = [f"{r.env_name} (id={int(r.id)})" for r in active_df.itertuples()]
-    env_ids = [int(r.id) for r in active_df.itertuples()]
-
-    c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
-    env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_newtab")
-    env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2_newtab")
-    cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_newtab"))
-    env1_id = env_ids[env_labels.index(env1_label)]
-    env2_id = env_ids[env_labels.index(env2_label)]
-    wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_newtab")
-
-    create_disabled = False
-    if int(env1_id) == int(env2_id):
-        st.error("Env 1 and Env 2 must be different. Pick two different environments so scans can be balanced.")
-        create_disabled = True
-
-    preview_steps = _build_default_workflow_steps(env1_id, env2_id)
-    for stp in preview_steps or []:
-        if isinstance(stp, dict) and "is_enabled" not in stp:
-            stp["is_enabled"] = True
-    with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
-        prev_df = pd.DataFrame(preview_steps)
-        show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
-        show_cols = [c for c in show_cols if c in prev_df.columns]
-        editable_df = st.data_editor(
-            prev_df[show_cols],
-            width="stretch",
-            hide_index=True,
-            key="wf_preview_steps_editor_newtab",
-            column_config={
-                "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
-            },
-            disabled=[c for c in show_cols if c != "is_enabled"],
-        )
-        try:
-            preview_steps = editable_df.to_dict("records")
-        except Exception:
-            pass
-
-    if st.button("Create workflow plan", type="primary", disabled=create_disabled):
-        rid = create_workflow_run(
-            wf_name,
-            env1_id=int(env1_id),
-            env2_id=int(env2_id),
-            steps=preview_steps,
-            cooldown_minutes=int(cooldown),
-        )
-        if rid:
-            st.success(f"Created workflow run id={rid}. Reloading…")
-            st.query_params["page"] = "Workflow Automation"
-            st.query_params["run_id"] = str(int(rid))
-            try:
-                st.session_state["wf_run_sel_id"] = int(rid)
-            except Exception:
-                pass
-            try:
-                st.cache_data.clear()
-            except Exception:
-                pass
-            st.rerun()
-        else:
-            st.error("Failed to create workflow plan.")
-
-
-def _render_run_tab(run_id, runs_df, engine):
-    """Render everything for a single workflow run inside its tab."""
-    k = f"t{run_id}"  # key prefix for unique widget ids
-
-    try:
-        rrow = runs_df[runs_df["id"] == run_id].iloc[0].to_dict()
-    except Exception:
-        st.error(f"Run {run_id} not found.")
-        return
-
-    selected_status = str(rrow.get("status") or "").strip().lower()
-    selected_is_running = selected_status == "running"
-
-    # Check for other running workflows
-    try:
-        tmp = runs_df.copy()
-        tmp["status_norm"] = tmp["status"].astype(str).str.strip().str.lower()
-        running_rows = tmp[tmp["status_norm"] == "running"].copy()
-        any_running = not running_rows.empty
-        running_ids = sorted({int(x) for x in running_rows["id"].tolist() if str(x).strip().isdigit()})
-    except Exception:
-        any_running = False
-        running_ids = []
-    other_running_ids = [x for x in running_ids if int(x) != int(run_id)]
-
-    # --- Run header ---
-    st.caption(
-        f"Run id={run_id} | status=**{str(rrow.get('status') or '').strip()}**"
-        + (f" | next_eligible_at={rrow.get('next_eligible_at')}" if rrow.get("next_eligible_at") else "")
-        + (f" | cooldown={rrow.get('cooldown_minutes')}m" if rrow.get("cooldown_minutes") is not None else "")
-    )
-
-    if any_running and other_running_ids:
-        st.warning(f"Another workflow is already running (run id(s): {', '.join([str(x) for x in other_running_ids])}). Pause/Stop it before starting another.")
-    elif selected_is_running:
-        st.info("This workflow run is currently running.")
-
-    last_err = str(rrow.get("last_error") or "").strip()
-    if last_err:
-        if selected_status in {"paused", "stopped"}:
-            st.error(last_err)
-        else:
-            st.caption(f"Last failure (history): {last_err}")
-
-    # --- Controls ---
-    b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3, 1.0])
-    start_disabled = bool(any_running)
-    pause_disabled = (selected_status != "running")
-    resume_disabled = (selected_status != "paused") or (bool(any_running) and not selected_is_running)
-    stop_disabled = (selected_status not in {"running", "paused"})
-
-    if b1.button("Start Workflow", type="primary", disabled=start_disabled, key=f"{k}_start"):
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("""
-                    UPDATE workflow_runs
-                    SET status = 'running',
-                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
-                        next_eligible_at = COALESCE(next_eligible_at, CURRENT_TIMESTAMP)
-                    WHERE id = :rid
-                """), {"rid": int(run_id)})
-                conn.commit()
-            try:
-                if callable(ensure_workflow_runner_running):
-                    ensure_workflow_runner_running(engine)
-            except Exception:
-                pass
-            st.rerun()
-        except Exception as ex:
-            st.error(f"Start failed: {ex}")
-    if b2.button("Pause", disabled=pause_disabled, key=f"{k}_pause"):
-        set_workflow_run_status(int(run_id), "paused")
-        st.rerun()
-    if b3.button("Resume Workflow", disabled=resume_disabled, key=f"{k}_resume"):
-        set_workflow_run_status(int(run_id), "running")
-        try:
-            if callable(ensure_workflow_runner_running):
-                ensure_workflow_runner_running(engine)
-        except Exception:
-            pass
-        st.rerun()
-    if b6.button("Stop Workflow", disabled=stop_disabled, key=f"{k}_stop"):
-        set_workflow_run_status(int(run_id), "stopped")
-        try:
-            with engine.connect() as conn:
-                conn.execute(text("UPDATE workflow_runs SET finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": int(run_id)})
-                conn.commit()
-        except Exception:
-            pass
-        st.rerun()
-    if b4.button("Refresh", key=f"{k}_refresh"):
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        st.rerun()
-    if b5.button("Reconcile from DB", key=f"{k}_reconcile"):
-        res = reconcile_workflow_run(int(run_id))
-        st.caption(f"Reconciled: updated_steps={res.get('updated_steps')} completed_run={res.get('completed_run')}")
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
-        st.rerun()
-
-    # --- Reset buttons ---
-    st.markdown("**Reset** — Only clears step progress in this app's DB. **Does NOT delete DS or Scans in BigID.**")
-    br1, br2 = st.columns(2)
-    reset_key = f"wf_confirm_reset_{run_id}"
-    with br1:
-        if st.button("Reset unfinished steps", key=f"{k}_reset_soft"):
-            st.session_state[reset_key] = "soft"
-            st.rerun()
-    with br2:
-        if st.button("Full reset (re-test DS connection)", key=f"{k}_reset_full"):
-            st.session_state[reset_key] = "full"
-            st.rerun()
-
-    if st.session_state.get(reset_key) in ("soft", "full"):
-        kind = st.session_state[reset_key]
-        running_scan_steps = []
-        try:
-            with engine.connect() as conn:
-                rows = conn.execute(text("""
-                    SELECT id, seq, status, scan_id, ds_name FROM workflow_steps
-                    WHERE run_id = :rid AND COALESCE(status,'') IN ('scan_running','scan_waiting') AND TRIM(COALESCE(scan_id,'')) <> ''
-                """), {"rid": int(run_id)}).fetchall()
-                running_scan_steps = [{"seq": r[1], "scan_id": r[3], "ds_name": r[4]} for r in (rows or [])]
-        except Exception:
-            pass
-        if running_scan_steps:
-            step_str = ", ".join(f"Step {s['seq']} ({s['ds_name'] or s['scan_id']})" for s in running_scan_steps)
-            st.error(f"**Cannot reset:** steps with running scan: {step_str}")
-            if st.button("Cancel", key=f"{k}_reset_cancel"):
-                del st.session_state[reset_key]
-                st.rerun()
-        else:
-            st.warning("Confirm: This will clear step progress **in the dashboard DB only**. DS/Scans in BigID NOT deleted.")
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                if st.button("Confirm reset (DB only)", key=f"{k}_reset_confirm"):
-                    try:
-                        with engine.connect() as conn:
-                            if kind == "full":
-                                conn.execute(text("""
-                                    UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL,
-                                        scan_id=NULL, ds_id=NULL, scan_profile_id=NULL, scan_profile_name=NULL, updated_at=CURRENT_TIMESTAMP
-                                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')
-                                """), {"rid": int(run_id)})
-                            else:
-                                conn.execute(text("""
-                                    UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL, updated_at=CURRENT_TIMESTAMP
-                                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')
-                                """), {"rid": int(run_id)})
-                            conn.execute(text("UPDATE workflow_runs SET last_error=NULL, next_eligible_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
-                            conn.commit()
-                        del st.session_state[reset_key]
-                        try: st.cache_data.clear()
-                        except Exception: pass
-                        st.success("Reset done. Click Start/Resume to re-run.")
-                        st.rerun()
-                    except Exception as ex:
-                        st.error(str(ex))
-            with rc2:
-                if st.button("Cancel", key=f"{k}_reset_cancel2"):
-                    del st.session_state[reset_key]
-                    st.rerun()
-
-    # --- Cooldown / runner status ---
-    try:
-        ne = rrow.get("next_eligible_at")
-        now_utc = datetime.utcnow()
-        ne_dt = None
-        if isinstance(ne, datetime):
-            ne_dt = ne
-        elif isinstance(ne, str) and ne.strip():
-            ne_dt = _parse_utc_dt(ne.strip())
-        if selected_is_running and ne_dt and ne_dt > now_utc:
-            remaining_s = int(max(0, (ne_dt - now_utc).total_seconds()))
-            remaining_m = remaining_s // 60
-            st.info(f"Cooldown active. Next step eligible in ~{remaining_m} min (at {ne_dt} UTC).")
-    except Exception:
-        pass
-
-    if selected_is_running:
-        try:
-            if callable(ensure_workflow_runner_running):
-                ok, msg = ensure_workflow_runner_running(engine)
-                st.caption(f"Runner: {msg}")
-        except Exception:
-            pass
-        try:
-            with engine.connect() as conn:
-                row = conn.execute(text("SELECT last_started_at_utc, last_finished_at_utc, last_status, last_message FROM tracker_heartbeat WHERE name = 'workflow_runner' LIMIT 1")).fetchone()
-            if row:
-                st.caption(f"Runner heartbeat: status={row[2]} started={row[0]} finished={row[1]} msg={row[3]}")
-        except Exception:
-            pass
-
-    # --- Step progress ---
-    steps_df = load_workflow_steps(int(run_id))
-    if steps_df.empty:
-        st.info("No steps found for this run.")
-        return
-
-    # Summary metrics
-    try:
-        stv = steps_df["status"].fillna("").astype(str).str.strip().str.lower()
-        counts = stv.value_counts().to_dict()
-    except Exception:
-        counts = {}
-
-    a1, a2, a3, a4, a5 = st.columns(5)
-    a1.metric("Pending", int(counts.get("pending", 0)))
-    a2.metric("In progress", int(counts.get("running", 0) + counts.get("ds_created", 0) + counts.get("ds_test_ok", 0) + counts.get("scan_created", 0) + counts.get("scan_running", 0)))
-    a3.metric("Completed", int(counts.get("completed", 0)))
-    a4.metric("Disabled", int(counts.get("disabled", 0)))
-    a5.metric("Errors", int(counts.get("error", 0)))
-
-    if selected_status in {"created", ""}:
-        st.info("This run is not started yet. Click **Start Workflow** to begin.")
-
-    # Build display table
-    disp = steps_df.copy()
-    disp["Flags"] = disp.apply(
-        lambda r: ", ".join([x for x in [
-            "ACL" if bool(r.get("is_acl")) else "",
-            "STRUCT" if bool(r.get("is_structured_ff")) else "",
-            "OLS" if bool(r.get("is_ols")) else "",
-        ] if x]), axis=1,
-    )
-
-    def _pf(row_dict):
-        s = str(row_dict.get("status") or "").strip().lower()
-        if s == "disabled": return "🚫 Disabled"
-        ds_id = str(row_dict.get("ds_id") or "").strip()
-        spid = str(row_dict.get("scan_profile_id") or "").strip()
-        sid = str(row_dict.get("scan_id") or "").strip()
-        has_scan = bool(sid) or (s in {"scan_running", "completed"})
-        has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
-        has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
-        has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
-        if s in {"pending", ""}: return "➖ DS"
-        if s in {"running", "pre_action_done"}: return "⏳ DS"
-        if s == "error":
-            if has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ⏳ Scan ⚠️"
-            if not has_ds: return "❌ DS"
-            if has_ds and not has_test: return "✅ DS ➔ ❌ Test"
-            if has_test and not has_profile: return "✅ DS ➔ ✅ Test ➔ ❌ Profile"
-            if has_profile and not has_scan: return "✅ DS ➔ ✅ Test ➔ ✅ Profile ➔ ❌ Scan"
-            return "❌ Error"
-        parts = []
-        if has_ds: parts.append("✅ DS")
-        if has_test: parts.append("✅ Test")
-        if has_profile: parts.append("✅ Profile")
-        if has_scan: parts.append("✅ Scan" if s == "completed" else "⏳ Scan")
-        return " ➔ ".join(parts) if parts else "➖ DS"
-
-    disp["Progress Flow"] = disp.apply(lambda r: _pf(r.to_dict()), axis=1)
-    try:
-        disp["Scan Link"] = disp["scan_id"].map(lambda sid: f"?page=Scan+Progress&scan_id={sid}" if str(sid or "").strip() else "")
-    except Exception:
-        disp["Scan Link"] = ""
-    disp = disp.rename(columns={
-        "seq": "Step", "environment": "Environment", "ds_kind": "DS Type",
-        "ds_name": "DS Name", "scan_kind": "Scan Type", "file_set_type": "File Set",
-        "scan_id": "Scan Id", "notes": "Notes",
-    })
-
-    cols = ["Step", "Environment", "DS Type", "DS Name", "Scan Type", "File Set", "Flags", "Progress Flow", "Scan Id", "Scan Link", "Notes", "last_error", "updated_at"]
-    cols = [c for c in cols if c in disp.columns]
-    st.dataframe(
-        disp[cols],
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "Scan Link": st.column_config.LinkColumn("Scan Link", display_text="View in Progress"),
-        },
-    )
-
-    # --- Edit steps expander ---
-    with st.expander("Edit steps (before run)", expanded=False):
-        st.caption("Toggle which steps should execute. Allowed only when the run is not running.")
-        if selected_status == "running":
-            st.info("Pause/Stop the workflow run to edit steps.")
-        else:
-            edit_df = steps_df.copy()
-            if "is_enabled" not in edit_df.columns:
-                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
-            try:
-                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
-            except Exception:
-                edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
-            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
-            show_cols = [c for c in show_cols if c in edit_df.columns]
-            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
-            editor = st.data_editor(
-                view, width="stretch", hide_index=True,
-                key=f"{k}_edit_steps",
-                column_config={"is_enabled": st.column_config.CheckboxColumn("Execute", default=True)},
-                disabled=[c for c in view.columns if c != "is_enabled"],
-            )
-            if st.button("Save step selection", type="primary", key=f"{k}_save_steps"):
-                try:
-                    desired = editor[["id", "is_enabled"]].copy()
-                    desired["id"] = desired["id"].astype(int)
-                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
-                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
-                    from sqlalchemy import bindparam
-                    with engine.connect() as conn:
-                        if disable_ids:
-                            conn.execute(
-                                text("UPDATE workflow_steps SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'') <> 'completed'").bindparams(bindparam("ids", expanding=True)),
-                                {"ids": disable_ids},
-                            )
-                        if enable_ids:
-                            conn.execute(
-                                text("UPDATE workflow_steps SET is_enabled=1, status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END, last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END, updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'') <> 'completed'").bindparams(bindparam("ids", expanding=True)),
-                                {"ids": enable_ids},
-                            )
-                        conn.commit()
-                    try: st.cache_data.clear()
-                    except Exception: pass
-                    st.success("Saved.")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Save failed: {ex}")
-
-    # --- Maintenance expander ---
-    with st.expander("Maintenance (reset stale status)", expanded=False):
-        st.caption("Resets step progress in dashboard DB only. Does not touch BigID.")
-        col_r1, col_r2 = st.columns(2)
-        with col_r1:
-            if st.button("Soft reset (keep DS/Profile ids)", key=f"{k}_maint_soft"):
-                try:
-                    with engine.connect() as conn:
-                        conn.execute(text("UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL, updated_at=CURRENT_TIMESTAMP WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')"), {"rid": int(run_id)})
-                        conn.execute(text("UPDATE workflow_runs SET last_error=NULL, next_eligible_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
-                        conn.commit()
-                    try: st.cache_data.clear()
-                    except Exception: pass
-                    st.success("Soft reset done.")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Reset failed: {ex}")
-        with col_r2:
-            if st.button("Full reset (clear DS/Profile ids)", key=f"{k}_maint_full"):
-                try:
-                    with engine.connect() as conn:
-                        conn.execute(text("UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL, ds_id=NULL, scan_profile_id=NULL, scan_profile_name=NULL, updated_at=CURRENT_TIMESTAMP WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')"), {"rid": int(run_id)})
-                        conn.execute(text("UPDATE workflow_runs SET last_error=NULL, next_eligible_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
-                        conn.commit()
-                    try: st.cache_data.clear()
-                    except Exception: pass
-                    st.success("Full reset done.")
-                    st.rerun()
-                except Exception as ex:
-                    st.error(f"Reset failed: {ex}")
-
-    # --- Debug templates (only visible with ?debug=true) ---
-    if st.query_params.get("debug") == "true":
-        st.divider()
-        st.markdown("### Templates (Debug)")
-        try:
-            step_nums = sorted({int(x) for x in steps_df["seq"].tolist() if str(x).strip()})
-        except Exception:
-            step_nums = list(range(1, 17))
-        pick_step = st.selectbox("Select step to edit templates", step_nums, index=0, key=f"{k}_tpl_step")
-        try:
-            step_row = steps_df[steps_df["seq"] == int(pick_step)].iloc[0].to_dict()
-        except Exception:
-            step_row = {}
-        ds_key = _workflow_ds_template_key(step_row or {})
-        scan_key = _workflow_scan_template_key(step_row or {})
-        t1, t2, t3 = st.columns(3)
-        with t1:
-            st.markdown("**DS template**")
-            st.code(ds_key)
-            ds_existing = get_workflow_template_payload(ds_key)
-            ds_text = st.text_area("DS JSON", value=ds_existing or "{}", height=220, key=f"{k}_ds_json")
-            if st.button("Save DS template", key=f"{k}_save_ds"):
-                upsert_workflow_template(ds_key, "ds", ds_text)
-                st.success("Saved.")
-        with t2:
-            st.markdown("**Scan template**")
-            st.code(scan_key)
-            scan_existing = get_workflow_template_payload(scan_key)
-            scan_text = st.text_area("Scan JSON", value=scan_existing or "{}", height=220, key=f"{k}_scan_json")
-            if st.button("Save Scan template", key=f"{k}_save_scan"):
-                upsert_workflow_template(scan_key, "scan", scan_text)
-                st.success("Saved.")
-        with t3:
-            st.markdown("**Pre-OLS action (FF change)**")
-            action_key_global = "action::pre_ols"
-            action_key_env = f"action::pre_ols::env={int(step_row.get('environment_id'))}" if step_row.get("environment_id") is not None else ""
-            existing = get_workflow_template_payload(action_key_env) if action_key_env else ""
-            if not existing:
-                existing = get_workflow_template_payload(action_key_global)
-            action_text = st.text_area("Action JSON", value=existing or "{}", height=220, key=f"{k}_action_json")
-            if st.button("Save Pre-OLS action", key=f"{k}_save_action"):
-                upsert_workflow_template(action_key_env or action_key_global, "action", action_text)
-                st.success("Saved.")
 
 def page_create_data_source():
     """
@@ -12625,43 +12315,67 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
+    # --- Logout Action ---
+    query_params = st.query_params
+    if query_params.get("action") == "logout":
+        from dashboard_auth import logout_user
+        logout_user()
+        return
+
+    # --- Session Persistence Check ---
+    if not st.session_state.get("authenticated"):
+        from dashboard_auth import get_persisted_session, get_user_permissions
+        persisted = get_persisted_session()
+        if persisted:
+            st.session_state.authenticated = True
+            st.session_state.username = persisted["username"]
+            st.session_state.user_role = persisted["role"]
+            st.session_state.user_role_id = persisted["role_id"]
+            st.session_state.allowed_pages = get_user_permissions(engine, persisted["role_id"])
+
+    if not st.session_state.get("authenticated"):
+        render_login_page()
+        return
+
     from urllib.parse import unquote_plus
     query_params = st.query_params
+    page_map = {
+        "Overview": "Overview",
+        "Build Analysis": "Build Analysis",
+        "Comparison": "Comparison",
+        "Build DS Runs": "Build DS Runs",
+        "Data Source Trend Comparison": "Data Source Trend Comparison",
+        "Add New Benchmark": "Add New Benchmark",
+        "Small Files Trend Analysis": "Small Files Trend Analysis",
+        "Large Files Trend Analysis": "Large Files Trend Analysis",
+        "Small Files OLS Trend": "Small Files OLS Trend",
+        "Large Files OLS Trend": "Large Files OLS Trend",
+        "Small Files OLS Trend Analysis": "Small Files OLS Trend",
+        "Large Files OLS Trend Analysis": "Large Files OLS Trend",
+        "OLS vs Full Scan (Small)": "OLS vs Full Scan (Small)",
+        "OLS vs Full Scan (Large)": "OLS vs Full Scan (Large)",
+        "Discover File FF On vs Off": "Discover File FF On vs Off",
+        "ACL ON vs OLS (ACL ON)": "ACL ON vs OLS (ACL ON)",
+        "ACL OFF vs OLS (ACL OFF)": "ACL OFF vs OLS (ACL OFF)",
+        "Run Comparison Tool": "Comparison",
+        "Edit Records": "Edit Records",
+        "Manage Classifiers": "Manage Classifiers",
+        "Classifier Changes": "Classifier Changes",
+        "Manage Test Environments": "Manage Test Environments",
+        "Version Comparison": "Version Comparison",
+        "Workflow Automation": "Workflow Automation",
+        "Create Data Source": "Create Data Source",
+        "Scan Status": "Scan Status",
+        "Scan Progress": "Scan Progress",
+        "Manage RBAC": "Manage RBAC"
+    }
+
     if "page" in query_params:
         page_val = query_params["page"]
         if isinstance(page_val, list):
             page_val = page_val[0] if page_val else ""
         if isinstance(page_val, str) and page_val:
             normalized = unquote_plus(page_val)
-            page_map = {
-                "Overview": "Overview",
-                "Build Analysis": "Build Analysis",
-                "Comparison": "Comparison",
-                "Build DS Runs": "Build DS Runs",
-                "Data Source Trend Comparison": "Data Source Trend Comparison",
-                "Add New Benchmark": "Add New Benchmark",
-                "Small Files Trend Analysis": "Small Files Trend Analysis",
-                "Large Files Trend Analysis": "Large Files Trend Analysis",
-                "Small Files OLS Trend": "Small Files OLS Trend",
-                "Large Files OLS Trend": "Large Files OLS Trend",
-                "Small Files OLS Trend Analysis": "Small Files OLS Trend",
-                "Large Files OLS Trend Analysis": "Large Files OLS Trend",
-                "OLS vs Full Scan (Small)": "OLS vs Full Scan (Small)",
-                "OLS vs Full Scan (Large)": "OLS vs Full Scan (Large)",
-                "Discover File FF On vs Off": "Discover File FF On vs Off",
-                "ACL ON vs OLS (ACL ON)": "ACL ON vs OLS (ACL ON)",
-                "ACL OFF vs OLS (ACL OFF)": "ACL OFF vs OLS (ACL OFF)",
-                "Run Comparison Tool": "Comparison",
-                "Edit Records": "Edit Records",
-                "Manage Classifiers": "Manage Classifiers",
-                "Classifier Changes": "Classifier Changes",
-                "Manage Test Environments": "Manage Test Environments",
-                "Version Comparison": "Version Comparison",
-                "Workflow Automation": "Workflow Automation",
-                "Create Data Source": "Create Data Source",
-                "Scan Status": "Scan Status",
-                "Scan Progress": "Scan Progress"
-            }
             if normalized in page_map:
                 st.session_state.current_page = page_map[normalized]
 
@@ -12692,13 +12406,13 @@ def main():
     # Custom Flyout/Hover Menu (restored)
     logo_b64 = get_logo_base64()
     logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="width: 70%; border-radius: 4px; margin-bottom: 6px;" alt="BigID logo" />' if logo_b64 else '<div style="color:#ffffff;font-weight:700;">BigID</div>'
-    sidebar_html = """
+    sidebar_html = f"""
         <style>
         /* Sidebar Font & Logo */
-        [data-testid="stSidebar"] * {
+        [data-testid="stSidebar"] * {{
             font-family: 'Inter', 'Roboto', 'Segoe UI', sans-serif !important;
-        }
-        .material-icons, .material-symbols-outlined {
+        }}
+        .material-icons, .material-symbols-outlined {{
             font-family: 'Material Icons', 'Material Symbols Outlined', sans-serif !important;
             font-weight: normal;
             font-style: normal;
@@ -12712,30 +12426,30 @@ def main():
             direction: ltr;
             -webkit-font-feature-settings: 'liga';
             -webkit-font-smoothing: antialiased;
-        }
-        .sidebar-header {
+        }}
+        .sidebar-header {{
             text-align: left;
             padding-left: 10px;
             padding-bottom: 6px;
-        }
-        .sidebar-header h1 {
+        }}
+        .sidebar-header h1 {{
             color: #8B5CF6;
             margin-bottom: 0px;
             font-size: 1.2rem;
             font-weight: 700;
-        }
-        .sidebar-header p {
+        }}
+        .sidebar-header p {{
             font-size: 0.75rem !important;
-        }
+        }}
         
-        [data-testid="stSidebar"] > div:first-child {
+        [data-testid="stSidebar"] > div:first-child {{
             overflow: visible !important;
-        }
-        [data-testid="stSidebarNav"] {
+        }}
+        [data-testid="stSidebarNav"] {{
             display: none;
-        }
+        }}
 
-        .nav-category {
+        .nav-category {{
             position: relative;
             width: 100%;
             padding: 8px 10px;
@@ -12750,19 +12464,19 @@ def main():
             background: transparent;
             border: 1px solid transparent;
             z-index: 99;
-        }
-        .nav-category:hover {
+        }}
+        .nav-category:hover {{
             background-color: #f5f3ff;
             border-color: #8B5CF6;
             color: #8B5CF6 !important;
             z-index: 1000;
-        }
-        .nav-category b { 
+        }}
+        .nav-category b {{ 
             font-size: 0.9rem; 
             color: inherit;
-        }
+        }}
         
-        .flyout-menu {
+        .flyout-menu {{
             display: none;
             position: absolute;
             left: 100%; 
@@ -12775,8 +12489,8 @@ def main():
             border-radius: 12px;
             border: 1px solid #e2e8f0;
             margin-left: 6px;
-        }
-        .flyout-menu::before {
+        }}
+        .flyout-menu::before {{
             content: "";
             position: absolute;
             left: -8px;
@@ -12787,33 +12501,33 @@ def main():
             transform: rotate(45deg);
             border-left: 1px solid #e2e8f0;
             border-bottom: 1px solid #e2e8f0;
-        }
+        }}
 
-        .nav-category:hover .flyout-menu {
+        .nav-category:hover .flyout-menu {{
             display: block;
             animation: fadeIn 0.15s ease-out;
-        }
-        .flyout-menu:hover {
+        }}
+        .flyout-menu:hover {{
             display: block;
-        }
-        .nav-category::after {
+        }}
+        .nav-category::after {{
             content: "";
             position: absolute;
             right: -28px;
             top: 0;
             width: 28px;
             height: 100%;
-        }
-        .flyout-menu {
+        }}
+        .flyout-menu {{
             pointer-events: auto;
-        }
+        }}
         
         @keyframes fadeIn {{
             from {{ opacity: 0; transform: translateX(-5px); }}
             to {{ opacity: 1; transform: translateX(0); }}
         }}
 
-        .flyout-header {
+        .flyout-header {{
             font-size: 0.6rem;
             font-weight: 800;
             color: #94a3b8 !important;
@@ -12823,9 +12537,9 @@ def main():
             letter-spacing: 1px;
             border-bottom: 1px solid #f1f5f9;
             padding-bottom: 2px;
-        }
+        }}
         
-        .flyout-item {
+        .flyout-item {{
             display: flex !important;
             align-items: center;
             gap: 6px;
@@ -12839,50 +12553,55 @@ def main():
             font-weight: 600 !important;
             background: #ffffff !important;
             border: 1px solid transparent;
-        }
-        .flyout-item:hover {
+        }}
+        .flyout-item:hover {{
             background-color: #f1f5f9 !important;
             color: #8B5CF6 !important;
             border-color: #e2e8f0 !important;
-        }
-        .flyout-item span {
+        }}
+        .flyout-item span {{
             color: #000000 !important;
-        }
-        .flyout-item:hover span {
+        }}
+        .flyout-item:hover span {{
             color: #8B5CF6 !important;
-        }
+        }}
         
-        #MainMenu {visibility: hidden;}
-        header {visibility: hidden;}
+        #MainMenu {{visibility: hidden;}}
+        header {{visibility: hidden;}}
         </style>
         
         <div class="sidebar-header" style="text-align: left; padding: 6px 10px; background: rgba(255,255,255,0.05); border-radius: 10px; margin: 2px 8px 6px;">
-            __LOGO__
+            {logo_html}
             <p style="color: #e2e8f0; font-size: 0.8rem; margin: 0; font-weight: 600; padding-left: 2px;">Benchmark Explorer</p>
+        </div>
+        
+        <div style="padding: 0 16px 10px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); margin-bottom: 10px;">
+            <p style="color: #a78bfa; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px;">Logged in as</p>
+            <p style="color: white; font-weight: 600; font-size: 0.9rem; margin: 0;">{st.session_state.username} ({st.session_state.user_role})</p>
         </div>
 
         <div class="nav-category">
             <span style="font-size: 1rem;">📊</span> <b style="color: #ffffff !important; font-size: 0.9rem;">Standard Trends</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Trend Analysis</div>
-                <a href="?page=Small+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📄</span> <span>Small Files Trend</span></a>
-                <a href="?page=Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📦</span> <span>Large Files Trend</span></a>
-                <a href="?page=Small+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Small Files OLS</span></a>
-                <a href="?page=Large+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Large Files OLS</span></a>
+                {f'<a href="?page=Small+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📄</span> <span>Small Files Trend</span></a>' if check_access("Small Files Trend Analysis") else ""}
+                {f'<a href="?page=Large+Files+Trend+Analysis" target="_self" class="flyout-item"><span>📦</span> <span>Large Files Trend</span></a>' if check_access("Large Files Trend Analysis") else ""}
+                {f'<a href="?page=Small+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Small Files OLS</span></a>' if check_access("Small Files OLS Trend") else ""}
+                {f'<a href="?page=Large+Files+OLS+Trend+Analysis" target="_self" class="flyout-item"><span>⚡</span> <span>Large Files OLS</span></a>' if check_access("Large Files OLS Trend") else ""}
             </div>
         </div>
         <div class="nav-category">
             <span style="font-size: 1rem;">⚖️</span> <b style="color: #ffffff !important; font-size: 0.9rem;">Expert Comparisons</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Head-to-Head</div>
-                <a href="?page=Build+Analysis" target="_self" class="flyout-item"><span>📉</span> <span>Build Analysis</span></a>
-                <a href="?page=Build+DS+Runs" target="_self" class="flyout-item"><span>🧪</span> <span>Build + DS Runs</span></a>
-                <a href="?page=Data+Source+Trend+Comparison" target="_self" class="flyout-item"><span>📈</span> <span>DS Trend Comparison</span></a>
-                <a href="?page=OLS+vs+Full+Scan+(Small)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Small)</span></a>
-                <a href="?page=OLS+vs+Full+Scan+(Large)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Large)</span></a>
-                <a href="?page=Discover+File+FF+On+vs+Off" target="_self" class="flyout-item"><span>⚙️</span> <span>Discover FF: On/Off</span></a>
-                <a href="?page=ACL+ON+vs+OLS+(ACL+ON)" target="_self" class="flyout-item"><span>🔒</span> <span>ACL ON Comparison</span></a>
-                <a href="?page=ACL+OFF+vs+OLS+(ACL+OFF)" target="_self" class="flyout-item"><span>🔓</span> <span>ACL OFF Comparison</span></a>
+                {f'<a href="?page=Build+Analysis" target="_self" class="flyout-item"><span>📉</span> <span>Build Analysis</span></a>' if check_access("Build Analysis") else ""}
+                {f'<a href="?page=Build+DS+Runs" target="_self" class="flyout-item"><span>🧪</span> <span>Build + DS Runs</span></a>' if check_access("Build DS Runs") else ""}
+                {f'<a href="?page=Data+Source+Trend+Comparison" target="_self" class="flyout-item"><span>📈</span> <span>DS Trend Comparison</span></a>' if check_access("Data Source Trend Comparison") else ""}
+                {f'<a href="?page=OLS+vs+Full+Scan+(Small)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Small)</span></a>' if check_access("OLS vs Full Scan (Small)") else ""}
+                {f'<a href="?page=OLS+vs+Full+Scan+(Large)" target="_self" class="flyout-item"><span>⚖️</span> <span>OLS vs Full (Large)</span></a>' if check_access("OLS vs Full Scan (Large)") else ""}
+                {f'<a href="?page=Discover+File+FF+On+vs+Off" target="_self" class="flyout-item"><span>⚙️</span> <span>Discover FF: On/Off</span></a>' if check_access("Discover File FF On vs Off") else ""}
+                {f'<a href="?page=ACL+ON+vs+OLS+(ACL+ON)" target="_self" class="flyout-item"><span>🔒</span> <span>ACL ON Comparison</span></a>' if check_access("ACL ON vs OLS (ACL ON)") else ""}
+                {f'<a href="?page=ACL+OFF+vs+OLS+(ACL+OFF)" target="_self" class="flyout-item"><span>🔓</span> <span>ACL OFF Comparison</span></a>' if check_access("ACL OFF vs OLS (ACL OFF)") else ""}
             </div>
         </div>
 
@@ -12890,25 +12609,32 @@ def main():
             <span style="font-size: 1rem;">🛠️</span> <b style="color: #ffffff !important; font-size: 0.9rem;">System Tools</b>
             <div class="flyout-menu">
                 <div class="flyout-header">Administration</div>
-                <a href="?page=Run+Comparison+Tool" target="_self" class="flyout-item"><span>🔄</span> <span>Run Comparison Tool</span></a>
-                <a href="?page=Classifier+Changes" target="_self" class="flyout-item"><span>🧬</span> <span>Classifier Comparison</span></a>
-                <a href="?page=Add+New+Benchmark" target="_self" class="flyout-item"><span>➕</span> <span>Add New Data Record</span></a>
-                <a href="?page=Edit+Records" target="_self" class="flyout-item"><span>🛠️</span> <span>Edit Existing Records</span></a>
-                <a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>
-                <a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>
-                <a href="?page=Workflow+Automation" target="_self" class="flyout-item"><span>🧪</span> <span>Workflow Automation</span></a>
-                <a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>
-                <a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>
-                <a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>
-                <div class="flyout-header" style="margin-top: 10px;">Archived / Disabled</div>
-                <a href="#" class="flyout-item" style="opacity: 0.5; pointer-events: none; color: #94a3b8 !important;"><span>📁</span> <span>Overview Dashboard (Off)</span></a>
+                {f'<a href="?page=Run+Comparison+Tool" target="_self" class="flyout-item"><span>🔄</span> <span>Run Comparison Tool</span></a>' if check_access("Comparison") else ""}
+                {f'<a href="?page=Classifier+Changes" target="_self" class="flyout-item"><span>🧬</span> <span>Classifier Comparison</span></a>' if check_access("Classifier Changes") else ""}
+                {f'<a href="?page=Add+New+Benchmark" target="_self" class="flyout-item"><span>➕</span> <span>Add New Data Record</span></a>' if check_access("Add New Benchmark") else ""}
+                {f'<a href="?page=Edit+Records" target="_self" class="flyout-item"><span>🛠️</span> <span>Edit Existing Records</span></a>' if check_access("Edit Records") else ""}
+                {f'<a href="?page=Manage+Test+Environments" target="_self" class="flyout-item"><span>🌐</span> <span>Manage Test Environments</span></a>' if check_access("Manage Test Environments") else ""}
+                {f'<a href="?page=Version+Comparison" target="_self" class="flyout-item"><span>🧬</span> <span>Version Comparison</span></a>' if check_access("Version Comparison") else ""}
+                {f'<a href="?page=Workflow+Automation" target="_self" class="flyout-item"><span>🧪</span> <span>Workflow Automation</span></a>' if check_access("Workflow Automation") else ""}
+                {f'<a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>' if check_access("Create Data Source") else ""}
+                {f'<a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>' if check_access("Scan Status") else ""}
+                {f'<a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>' if check_access("Scan Progress") else ""}
+                {f'<a href="?page=Manage+RBAC" target="_self" class="flyout-item"><span>🛡️</span> <span>Manage RBAC</span></a>' if check_access("Manage RBAC") else ""}
             </div>
         </div>
+
+        <div style="margin-top: auto; padding: 10px 0;">
+            <a href="?action=logout" target="_self" style="text-decoration: none;">
+                <div class="nav-category" style="background: rgba(239, 68, 68, 0.1); border-color: rgba(239, 68, 68, 0.2);">
+                    <span style="font-size: 1rem;">🚪</span> <b style="color: #f87171 !important; font-size: 0.9rem;">Logout</b>
+                </div>
+            </a>
+        </div>
     """
-    st.sidebar.markdown(sidebar_html.replace("__LOGO__", logo_html), unsafe_allow_html=True)
+    st.sidebar.markdown(sidebar_html, unsafe_allow_html=True)
     
-    st.sidebar.markdown("<br><br>", unsafe_allow_html=True)
-    if st.sidebar.button("Clear Cache & Refresh Data", width="stretch"): 
+    st.sidebar.markdown("<br>", unsafe_allow_html=True)
+    if st.sidebar.button("Refresh", use_container_width=True): 
         st.cache_data.clear()
         st.rerun()
 
@@ -12985,6 +12711,164 @@ def main():
         page_scan_status()
     elif page == "Scan Progress":
         page_scan_progress()
+    elif page == "Manage RBAC":
+        if check_access("Manage RBAC"):
+            page_manage_rbac()
+        else:
+            st.error("Access Denied. Admin role required.")
+    
+    # Pre-check access for standard pages
+    if page in page_map.values() and page != "Manage RBAC":
+        if not check_access(page):
+            st.error(f"Access Denied. You do not have permission to view '{page}'.")
+            return
+
+
+def render_login_page():
+    """Renders a centered, premium login form."""
+    c1, c2, c3 = st.columns([1, 1.2, 1])
+    with c2:
+        st.markdown("<br><br><br>", unsafe_allow_html=True)
+        st.markdown(f"""
+            <div style="background: white; padding: 2.1rem; border-radius: 16px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <h1 style="text-align: center; color: {PRIMARY_COLOR}; margin-bottom: 0.5rem; font-size: 1.8rem;">Welcome Back</h1>
+                <p style="text-align: center; color: #64748b; margin-bottom: 0.5rem; font-size: 0.9rem;">Sign in to access Benchmark Dashboard</p>
+            </div>
+            <div style="height: 20px;"></div>
+        """, unsafe_allow_html=True)
+        
+        # No st.form so we can have reactive password visibility
+        email = st.text_input("Email Address", placeholder="name@bigid.com", key="login_email_input").strip().lower()
+        
+        # Admin is bpatel@bigid.com
+        is_admin_field = (email == "bpatel@bigid.com")
+        
+        password = ""
+        if is_admin_field:
+            password = st.text_input("Password", type="password", key="login_password_input")
+
+        st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
+        if st.button("Sign In", use_container_width=True, type="primary"):
+            if not email:
+                st.error("Please enter your email address.")
+            else:
+                ok, err = login_user(engine, email)
+                if ok:
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error(err or "Login failed")
+
+        st.markdown("<p style='text-align: center; color: #94a3b8; font-size: 0.75rem; margin-top: 2rem;'>© 2026 BigID Benchmark Tools</p>", unsafe_allow_html=True)
+
+
+def page_manage_rbac():
+    """Admin-only UI for managing users, roles, and permissions."""
+    if not st.session_state.get("user_role") == "Admin":
+        st.error("Admin access required.")
+        return
+
+    st.title("🛡️ RBAC & User Management")
+    
+    tab1, tab2, tab3 = st.tabs(["👤 Users", "👥 Roles", "🔐 Permissions"])
+    
+    with tab1:
+        st.subheader("Manage Users")
+        # List users
+        with engine.connect() as conn:
+            users_df = pd.read_sql(text("""
+                SELECT u.id, u.username, r.role_name, u.created_at 
+                FROM app_users u 
+                JOIN app_roles r ON u.role_id = r.id
+            """), conn)
+            roles_df = pd.read_sql(text("SELECT id, role_name FROM app_roles"), conn)
+        
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
+        
+        with st.expander("👤 Edit User Role / Add User"):
+            # List users for editing
+            user_to_edit = st.selectbox("Select User to Edit Role", ["-- Create New --"] + users_df['username'].tolist())
+            
+            roles_df = pd.read_sql(text("SELECT id, role_name FROM app_roles"), engine)
+            role_map = {r['role_name']: r['id'] for _, r in roles_df.iterrows()}
+            
+            if user_to_edit == "-- Create New --":
+                new_user = st.text_input("New Email Address")
+                new_role_name = st.selectbox("Assign Role", list(role_map.keys()), key="new_role_sel")
+                
+                if st.button("Create User"):
+                    if new_user and "@bigid.com" in new_user:
+                        try:
+                            with engine.connect() as conn:
+                                conn.execute(text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, 'PASSWORDLESS', :r)"),
+                                             {"u": new_user.strip().lower(), "r": role_map[new_role_name]})
+                                conn.commit()
+                            st.success(f"User {new_user} created.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                    else:
+                        st.warning("Please provide a valid @bigid.com email.")
+            else:
+                # Edit Existing
+                current_user_row = users_df[users_df['username'] == user_to_edit].iloc[0]
+                current_role = current_user_row['role_name']
+                new_role_name = st.selectbox("Update Role", list(role_map.keys()), index=list(role_map.keys()).index(current_role))
+                
+                if st.button("Update User Role"):
+                    from dashboard_auth import update_user_role
+                    update_user_role(engine, current_user_row['id'], role_map[new_role_name])
+                    st.success(f"Updated {user_to_edit} to {new_role_name}")
+                    st.rerun()
+
+    with tab2:
+        st.subheader("Manage Roles")
+        st.dataframe(roles_df, use_container_width=True, hide_index=True)
+        
+        with st.expander("➕ Add New Role"):
+            new_role = st.text_input("Role Name")
+            if st.button("Create Role"):
+                if new_role:
+                    try:
+                        with engine.connect() as conn:
+                            conn.execute(text("INSERT INTO app_roles (role_name) VALUES (:r)"), {"r": new_role})
+                            conn.commit()
+                        st.success(f"Role {new_role} created.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+    with tab3:
+        st.subheader("Role Permissions")
+        role_to_config = st.selectbox("Select Role to Configure", roles_df['role_name'].tolist())
+        target_role_id = roles_df[roles_df['role_name'] == role_to_config]['id'].iloc[0]
+        
+        # All available pages
+        all_pages = [
+            "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Data Source Trend Comparison",
+            "Small Files Trend Analysis", "Large Files Trend Analysis", "Small Files OLS Trend", "Large Files OLS Trend",
+            "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)", "Discover File FF On vs Off",
+            "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)", "Edit Records", "Manage Classifiers",
+            "Classifier Changes", "Manage Test Environments", "Version Comparison", "Workflow Automation",
+            "Create Data Source", "Scan Status", "Scan Progress"
+        ]
+        
+        current_perms = get_user_permissions(engine, target_role_id)
+        
+        selected_pages = st.multiselect("Allowed Pages", all_pages, default=current_perms)
+        
+        if st.button("Update Permissions"):
+            try:
+                with engine.connect() as conn:
+                    conn.execute(text("DELETE FROM app_role_pages WHERE role_id = :rid"), {"rid": int(target_role_id)})
+                    for p in selected_pages:
+                        conn.execute(text("INSERT INTO app_role_pages (role_id, page_name) VALUES (:rid, :p)"),
+                                     {"rid": int(target_role_id), "p": p})
+                    conn.commit()
+                st.success("Permissions updated.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
