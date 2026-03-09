@@ -590,34 +590,14 @@ def ensure_workflow_tables(engine) -> None:
         conn.commit()
 
 
-def fetch_parent_scans(base_url: str, token: str, states: Optional[List[str]] = None, *, limit: int = 50, skip: int = 0) -> List[Dict[str, Any]]:
+def fetch_parent_scan_by_id(base_url: str, token: str, scan_id: str) -> Dict[str, Any]:
     """
-    Best-effort parent scans listing using BigID filter query params.
+    GET /api/v1/scans/parent-scans/{id}
     """
-    url = build_api_url(base_url, PARENT_SCANS_PATH)
-    cleaned_states = [str(x).strip() for x in (states or []) if str(x).strip()]
-    filter_items: List[Dict[str, Any]] = []
-    if cleaned_states:
-        filter_items.append({"field": "state", "operator": "in", "value": cleaned_states})
-    params = {
-        "skip": int(skip),
-        "limit": int(limit),
-        "requireTotalCount": "true",
-        "filter": json.dumps(filter_items, separators=(",", ":")),
-        "sort": json.dumps([{"field": "_id", "order": "desc"}], separators=(",", ":")),
-    }
-    resp = _request("GET", url, token, params=params)
-    payload = resp.json() if resp.content else {}
-    items: List[Dict[str, Any]] = []
-    if isinstance(payload, dict):
-        data_block = payload.get("data")
-        root = data_block if isinstance(data_block, dict) else payload
-        for key in ["scanParents", "parentScans", "scans", "results", "items"]:
-            val = root.get(key)
-            if isinstance(val, list):
-                items = [x for x in val if isinstance(x, dict)]
-                break
-    return items
+    base_path = PARENT_SCANS_PATH.rstrip("/")
+    url = build_api_url(base_url, f"{base_path}/{str(scan_id).strip()}")
+    resp = _request("GET", url, token)
+    return resp.json() if resp.content else {}
 
 
 def _scan_name_from_parent_scan(sc: Dict[str, Any]) -> str:
@@ -2054,290 +2034,246 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         return False
     now = _now_utc()
     with engine.connect() as conn:
-        run_row = conn.execute(
+        run_rows = conn.execute(
             text("""
                 SELECT id, status, cooldown_minutes, next_eligible_at
                 FROM workflow_runs
                 WHERE status = 'running'
                 ORDER BY id ASC
-                LIMIT 1
             """)
-        ).fetchone()
-    if not run_row:
+        ).fetchall()
+    if not run_rows:
         set_runner_heartbeat(engine, status="idle", message="no running workflows", started=False)
         return False
 
-    # IMPORTANT: We will now attempt to process one step PER ENVIRONMENT for this run
-    # in a single tick, up to MAX_CONCURRENT_SCANS.
+    # Track global state across all running workflows
+    inflight_envs: Set[int] = set()
+    targeted_envs: Set[int] = set()
+    targeted_steps: Set[int] = set()
+    did_any_work = False
 
-    run_id = int(run_row[0])
-    status = str(run_row[1] or "").strip().lower()
-    if status != "running":
-        return False
-    try:
-        cooldown_m = int(run_row[2]) if run_row[2] is not None else 15
-    except Exception:
-        cooldown_m = 15
-
-    # Reconcile in-flight scans for this run, and prevent starting multiple scans
-    # on the same environment at once.
-    inflight_envs: set[int] = set()
+    # Load all active environments to allow dynamic selection/balancing
     try:
         with engine.connect() as conn:
-            inflight_rows = conn.execute(
-                text("""
-                    SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status
-                    FROM workflow_steps ws
-                    LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
-                    WHERE ws.run_id=:rid
-                      AND COALESCE(ws.is_enabled,1)=1
-                      AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
-                      AND (
-                        (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
-                        OR COALESCE(ws.status,'') IN ('scan_running','scan_waiting')
-                      )
-                    ORDER BY ws.updated_at DESC
-                """),
-                {"rid": int(run_id)},
-            ).fetchall()
-        completed_any = False
-        completed_success_any = False  # True only when we marked a step as completed (success), not error
-        for rr in inflight_rows or []:
-            step_id = int(rr[0])
-            seq = int(rr[1])
-            env_id = rr[2]
-            sid = str(rr[3] or "").strip()
-            st_status = str(rr[4] or "").strip().lower()
-            scan_status = str(rr[5] or "").strip()
-            if scan_status and _is_terminal_state(scan_status):
-                if _compact(scan_status) in {"completed", "completedwithfailures"}:
-                    set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
-                    completed_success_any = True
-                else:
-                    set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
-                    set_run_next_eligible(engine, run_id, _now_utc())  # allow next step to run immediately
-                completed_any = True
-                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} terminal={scan_status}", started=False)
-            elif sid and not scan_status:
-                # Scan was deleted from DB (e.g. user marked Aborted and removed from scan_parents).
-                # Clear step so workflow can start a new scan on next tick (same or other env).
-                set_step_status(engine, step_id, "pending", scan_id=None, last_error="Scan aborted/deleted; reset for retry")
-                set_run_next_eligible(engine, run_id, _now_utc())  # allow this step or next to run immediately
-                set_runner_heartbeat(engine, status="work", message=f"run={run_id} step={seq} scan={sid} missing_from_db cleared_for_retry", started=False)
-                completed_any = True
-            else:
-                # Only add to inflight when we have a scan_id and it's still present and non-terminal.
-                if env_id is not None and sid and scan_status:
-                    try:
-                        inflight_envs.add(int(env_id))
-                    except Exception:
-                        pass
-                # Only normalize to scan_running when a scan_id exists; 'running' may just be DS/test/profile work.
-                if sid and st_status != "scan_running":
-                    set_step_status(engine, step_id, "scan_running")
-        if completed_any and completed_success_any:
-            # Only enforce cooldown after a successful step completion. When a step ended in error
-            # (e.g. Aborted) or was cleared (scan deleted), do not block the next step with cooldown.
-            set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(cooldown_m)))
+            env_rows = conn.execute(text("SELECT id FROM test_environments WHERE is_active=1")).fetchall()
+            active_env_ids = [int(r[0]) for r in env_rows if r[0] is not None]
+            env_count = len(active_env_ids)
     except Exception:
-        pass
-
-    # Find next step for this run.
-    # Default behavior: continue past failures (do not retry errors forever).
-    # Set WORKFLOW_RETRY_ERROR_STEPS=1 to retry errors instead.
-    retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-    skip_errors = not retry_errors
-    if skip_errors:
-        # Default: continue past failures and also resume half-done steps.
-        # Terminal for our purposes: scan_created/completed/error/disabled.
-        # NOTE: Some older rows may have status='disabled' with is_enabled NULL/1; always exclude by status too.
-        where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
-    else:
-        # Retry mode: allow retrying errors.
-        where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
-
-    scan_running_exists = bool(inflight_envs)
-    # Capacity guard: when all workflow envs already have scan_running, don't start creating/testing
-    # the next DS/scan pipeline items. Only reconcile running scans until a slot frees up.
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(text("""
-                SELECT COUNT(DISTINCT environment_id)
-                FROM workflow_steps
-                WHERE run_id=:rid
-                  AND COALESCE(is_enabled,1)=1
-                  AND environment_id IS NOT NULL
-            """), {"rid": int(run_id)}).fetchone()
-        env_count = int(row[0]) if row and row[0] is not None else 0
-    except Exception:
+        active_env_ids = []
         env_count = 0
+
     try:
         max_scans = int(os.getenv('WORKFLOW_MAX_CONCURRENT_SCANS', '') or 0)
     except Exception:
         max_scans = 0
     if max_scans <= 0:
         max_scans = env_count if env_count > 0 else 2
+
+    # --- PASS 1: RECONCILIATION FOR ALL RUNS ---
+    for run_row in run_rows:
+        run_id = int(run_row[0])
+        try:
+            with engine.connect() as conn:
+                inflight_rows = conn.execute(
+                    text("""
+                        SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status
+                        FROM workflow_steps ws
+                        LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
+                        WHERE ws.run_id=:rid
+                          AND COALESCE(ws.is_enabled,1)=1
+                          AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
+                          AND (
+                            (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
+                            OR COALESCE(ws.status,'') IN ('scan_running','scan_waiting')
+                          )
+                        ORDER BY ws.updated_at DESC
+                    """),
+                    {"rid": int(run_id)},
+                ).fetchall()
+            
+            completed_any = False
+            completed_success_any = False
+            for rr in inflight_rows or []:
+                step_id = int(rr[0])
+                seq = int(rr[1])
+                env_id = rr[2]
+                sid = str(rr[3] or "").strip()
+                st_status = str(rr[4] or "").strip().lower()
+                scan_status = str(rr[5] or "").strip()
+                
+                if scan_status and _is_terminal_state(scan_status):
+                    if _compact(scan_status) in {"completed", "completedwithfailures"}:
+                        set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
+                        completed_success_any = True
+                    else:
+                        set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
+                        set_run_next_eligible(engine, run_id, _now_utc())
+                    completed_any = True
+                    did_any_work = True
+                elif sid and not scan_status:
+                    set_step_status(engine, step_id, "pending", scan_id=None, last_error="Scan aborted/deleted; reset for retry")
+                    set_run_next_eligible(engine, run_id, _now_utc())
+                    completed_any = True
+                    did_any_work = True
+                else:
+                    if env_id is not None and sid and scan_status:
+                        # Only consider an environment "inflight" if it's actively scanning.
+                        # scan_waiting means it's waiting for capacity, so it doesn't occupy a slot itself.
+                        if st_status != "scan_waiting":
+                            inflight_envs.add(int(env_id))
+                    if sid and st_status != "scan_running":
+                        set_step_status(engine, step_id, "scan_running")
+            
+            if completed_any and completed_success_any:
+                try:
+                    c_min = int(run_row[2]) if run_row[2] is not None else 15
+                except Exception:
+                    c_min = 15
+                set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(c_min)))
+        except Exception:
+            pass
+
+    # --- PASS 2: DISPATCH FOR ALL RUNS ---
     scans_at_capacity = bool(len(inflight_envs) >= int(max_scans))
-
-
-    # If there are no eligible steps left, mark the run completed immediately
-    # (even if next_eligible_at is set in the future).
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(f"""
-                    SELECT 1
-                    FROM workflow_steps
-                    WHERE run_id=:rid
-                      {where_status}
-                    LIMIT 1
-                """),
-                {"rid": int(run_id)},
-            ).fetchone()
-        has_eligible = bool(row and row[0] == 1)
-    except Exception:
-        has_eligible = True
-    if not has_eligible:
-        with engine.connect() as conn:
-            conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
-            conn.commit()
-        set_runner_heartbeat(engine, status="idle", message=f"run {run_id} completed (no eligible steps)", started=False)
-        return True
-
-    # Cooldown gate:
-    # If any environment is currently running a scan, do not block reconciliation.
-    # Also, allow starting work on a different environment even during cooldown.
-    # Re-fetch next_eligible_at so we see updates from reconciliation (e.g. cleared on error).
-    try:
-        with engine.connect() as conn:
-            next_row = conn.execute(text("SELECT next_eligible_at FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)}).fetchone()
-        next_eligible = next_row[0] if next_row else run_row[3]
-    except Exception:
-        next_eligible = run_row[3]
-    if next_eligible is not None and isinstance(next_eligible, datetime):
-        if next_eligible > now:
-            # If we have an idle environment with eligible work, proceed despite cooldown.
-            # Otherwise idle until cooldown expires.
-            if not inflight_envs:
-                set_runner_heartbeat(engine, status="idle", message=f"cooldown until {next_eligible.isoformat()}Z", started=False)
-                return False
-
-    # Scenario parallelism guard: don't start S3 Small Files variants together across envs, etc.
+    targeted_envs.update(inflight_envs)
+    
+    # Scenario parallelism guard
     avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-    running_keys: set[str] = set()
+    running_keys: Set[str] = set()
     if avoid_parallel:
         try:
             with engine.connect() as conn:
-                rrows = conn.execute(
-                    text("""
-                        SELECT ds_kind, file_set_type
-                        FROM workflow_steps
-                        WHERE COALESCE(status,'') = 'scan_running'
-                    """)
-                ).fetchall()
-            for rr in rrows or []:
-                running_keys.add(_scenario_lock_key(rr[0], rr[1]))
+                rrows = conn.execute(text("SELECT ds_kind, file_set_type FROM workflow_steps WHERE COALESCE(status,'') = 'scan_running'")).fetchall()
+                for rr in rrows or []:
+                    running_keys.add(_scenario_lock_key(rr[0], rr[1]))
         except Exception:
-            running_keys = set()
-    with engine.connect() as conn:
-        candidates = conn.execute(
-            text(f"""
-                SELECT
-                    id, seq, environment_id, ds_kind, ds_name,
-                    scan_kind, file_set_type, is_acl, is_ocr, is_structured_ff, is_ols,
-                    feature_flags, notes, ds_id, scan_profile_id, scan_profile_name, build_version, build_prefix, scan_id, status
-                FROM workflow_steps
-                WHERE run_id = :rid
-                  {where_status}
-                ORDER BY seq ASC
-                LIMIT 25
-            """),
-            {"rid": int(run_id)},
-        ).fetchall()
+            pass
 
-    def _pick_candidate(*, allow_scan_running: bool) -> Any:
-        # Pass 1: prefer non-waiting work on free envs
-        for cand in candidates or []:
-            cand_status = str(cand[19] or '').strip().lower()
-            if cand_status == 'scan_waiting':
-                continue
-            if (not allow_scan_running) and cand_status == 'scan_running':
-                continue
-            if scans_at_capacity and (not allow_scan_running) and cand_status != 'scan_running':
-                continue
-            cand_env = cand[2]
-            # Do not start a second scan/step on the same environment while a scan is in-flight.
-            if cand_status not in {'scan_running'} and cand_env is not None:
-                try:
-                    if int(cand_env) in inflight_envs:
-                        continue
-                except Exception:
-                    pass
-            if avoid_parallel and running_keys:
-                # Prevent starting *new* parallel scans for the same scenario.
-                if cand_status not in {'scan_running', 'running'}:
-                    key = _scenario_lock_key(cand[3], cand[6])  # ds_kind, file_set_type
-                    if key in running_keys:
-                        continue
-            return cand
-
-            return cand
-
-        # Pass 3: allow scan_waiting if nothing else is runnable
-        for cand in candidates or []:
-            cand_status = str(cand[19] or '').strip().lower()
-            if cand_status != 'scan_waiting':
-                continue
-            cand_env = cand[2]
-            if cand_env is not None:
-                try:
-                    if int(cand_env) in inflight_envs:
-                        continue
-                except Exception:
-                    pass
-            if avoid_parallel and running_keys:
-                key = _scenario_lock_key(cand[3], cand[6])  # ds_kind, file_set_type
-                if key in running_keys:
-                    continue
-            return cand
-        return None
-
-    # --- EXECUTION LOOP ---
-    # We now loop up to N times (where N is free slots) to fill idle environments.
-    did_any_work = False
-    slots_to_fill = max(1, int(max_scans) - len(inflight_envs))
+    slots_to_fill = max(0, int(max_scans) - len(inflight_envs))
     
-    # Track environments we've targeted in this tick to avoid duplicate processing
-    targeted_envs = set(inflight_envs)
+    for run_row in run_rows:
+        if slots_to_fill <= 0 and not inflight_envs: # Still check for work if we have capacity or need to reconcile
+            # However, we only continue if we have slots or if we want to do "zero slot" checks (like DS creation)
+            # Actually, if slots_to_fill is 0, we can't start NEW scans, but we might be able to do DS work?
+            # No, if scans_at_capacity is True, _pick_candidate will skip NEW work.
+            pass
+            
+        run_id = int(run_row[0])
+        try:
+            cooldown_m = int(run_row[2]) if run_row[2] is not None else 15
+        except Exception:
+            cooldown_m = 15
+            
+        # Re-fetch next_eligible_at
+        try:
+            with engine.connect() as conn:
+                nr = conn.execute(text("SELECT next_eligible_at FROM workflow_runs WHERE id=:rid"), {"rid": run_id}).fetchone()
+                next_eligible = nr[0] if nr else run_row[3]
+        except Exception:
+            next_eligible = run_row[3]
 
-    for _ in range(slots_to_fill):
-        step = _pick_candidate(allow_scan_running=False)
-        if not step:
-            # If no free env work, try to reconcile one existing scan_running step
-            step = _pick_candidate(allow_scan_running=True)
-            if not step:
-                break
+        if next_eligible and isinstance(next_eligible, datetime) and next_eligible > now:
+            # Skip this run if it's in cooldown, UNLESS it already has inflight work we might want to reconcile
+            # (But reconciliation happened in Pass 1).
+            continue
 
-        step_id = int(step[0])
-        seq = int(step[seq_idx := 1])
-        env_id = step[2]
-        
-        # Don't try the same env twice in one tick
-        if env_id is not None:
-            if int(env_id) in targeted_envs:
-                # If we picked a step on an already targeted env, we must be in reconciliation loop.
-                # Stop here to prevent infinite loop or over-processing.
-                break
-            targeted_envs.add(int(env_id))
+        # Strategy for status filter
+        retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not retry_errors:
+            where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
+        else:
+            where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
 
-        # Process the step... (Logic continues by calling a sub-processor or inline)
-        # For simplicity in this diff, we'll keep the processing inline but wrap it.
-        # However, run_once returns True if it did "any" work.
+        with engine.connect() as conn:
+            candidates = conn.execute(
+                text(f"""
+                    SELECT id, seq, environment_id, ds_kind, ds_name, scan_kind, file_set_type,
+                           is_acl, is_ocr, is_structured_ff, is_ols, feature_flags, notes,
+                           ds_id, scan_profile_id, scan_profile_name, build_version, build_prefix, scan_id, status
+                    FROM workflow_steps
+                    WHERE run_id = :rid {where_status}
+                    ORDER BY seq ASC LIMIT 10
+                """),
+                {"rid": run_id},
+            ).fetchall()
         
-        res = _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet)
-        if res:
-            did_any_work = True
-        
+        if not candidates:
+            # Check if run is done
+            try:
+                with engine.connect() as conn:
+                    any_left = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid {where_status} LIMIT 1"), {"rid": run_id}).fetchone()
+                if not any_left:
+                    with engine.connect() as conn:
+                        conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id})
+                        conn.commit()
+                    did_any_work = True
+            except Exception:
+                pass
+            continue
+
+        def _inner_pick(allow_scan_running: bool) -> Optional[Tuple[Any, Optional[int]]]:
+            for cand in candidates:
+                cand_id = int(cand[0])
+                if cand_id in targeted_steps: continue
+                c_status = str(cand[19] or '').strip().lower()
+                if c_status == 'scan_waiting': continue
+                if (not allow_scan_running) and c_status == 'scan_running': continue
+                if scans_at_capacity and (not allow_scan_running) and c_status != 'scan_running': continue
+                
+                c_env = cand[2]
+                if c_status == 'scan_running': return (cand, c_env)
+                
+                if c_status not in {'pending', 'running', ''}:
+                    if c_env is not None:
+                        if int(c_env) in targeted_envs: continue
+                        return (cand, c_env)
+                    continue
+
+                potential = []
+                if c_env is not None and int(c_env) in active_env_ids: potential.append(int(c_env))
+                for eid in active_env_ids:
+                    if eid not in potential: potential.append(eid)
+                
+                best = None
+                for eid in potential:
+                    if eid in targeted_envs: continue
+                    best = eid
+                    break
+                if best is None: continue
+                
+                if avoid_parallel and c_status not in {'scan_running', 'running'}:
+                    if _scenario_lock_key(cand[3], cand[6]) in running_keys: continue
+                
+                return (cand, best)
+            return None
+
+        # Determine how many steps we can try to start for THIS run in this tick
+        # To avoid starving later runs, we could limit this, but let's stick to filling available slots.
+        for _ in range(slots_to_fill + 1): # +1 to allow reconciliation of existing scan_running if slots are 0
+            pick = _inner_pick(allow_scan_running=False)
+            if not pick:
+                pick = _inner_pick(allow_scan_running=True)
+                if not pick: break
+            
+            step, env_id = pick
+            step_id = int(step[0])
+            targeted_steps.add(step_id)
+            if env_id is not None:
+                targeted_envs.add(int(env_id))
+                if step[2] is None or int(step[2]) != int(env_id):
+                    try:
+                        with engine.connect() as conn:
+                            conn.execute(text("UPDATE workflow_steps SET environment_id=:eid WHERE id=:sid"), {"eid": int(env_id), "sid": step_id})
+                            conn.commit()
+                    except Exception: pass
+
+            res = _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet)
+            if res:
+                did_any_work = True
+                # Decrement slots if we actually started something new (not just reconciling)
+                # But for simplicity, we'll just re-evaluate slots or limit by targeted_envs
+                if slots_to_fill > 0: slots_to_fill -= 1
+
     return did_any_work
 
 def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) -> bool:
@@ -2440,12 +2376,23 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     try:
         sid = str(step[18] or "").strip()
         if sid:
+            # 1. Check local DB (populated by tracker)
             with engine.connect() as conn:
                 row = conn.execute(
                     text("SELECT scan_status FROM scan_parents WHERE scan_id=:sid LIMIT 1"),
                     {"sid": sid},
                 ).fetchone()
             stv = str(row[0] or "").strip() if row else ""
+            
+            # 2. If DB doesn't know it's terminal, check API directly (immediate feedback)
+            if not stv or not _is_terminal_state(stv):
+                try:
+                    pinfo = fetch_parent_scan_by_id(base_url, token, sid)
+                    if isinstance(pinfo, dict) and pinfo:
+                        stv = str(pinfo.get("state") or pinfo.get("status") or "").strip()
+                except Exception:
+                    pass
+
             if stv and _is_terminal_state(stv):
                 if _compact(stv) in {"completed", "completedwithfailures"}:
                     set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)

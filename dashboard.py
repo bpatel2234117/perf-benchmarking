@@ -7653,8 +7653,8 @@ def page_build_analysis(df):
     prev_df = df[df['Build_Version'].astype(str) == prev_build].copy() if prev_build else pd.DataFrame()
 
     # TABS
-    tab_overview, tab_regressions, tab_ai, tab_details = st.tabs([
-        "📊 Overview", "⚠️ Regression Hunter", "🤖 AI Diagnostics", "📋 Full Details"
+    tab_overview, tab_scenario, tab_regressions, tab_ai, tab_details = st.tabs([
+        "📊 Overview", "🧩 Scenario Matrix", "⚠️ Regression Hunter", "🤖 AI Diagnostics", "📋 Full Details"
     ])
 
     with tab_overview:
@@ -7705,7 +7705,97 @@ def page_build_analysis(df):
                               title="Scanner Scaling Efficiency")
             st.plotly_chart(fig2, width='stretch')
 
+    with tab_scenario:
+        st.subheader(f"🧩 Scenario Matrix — Build `{selected_build}`")
+        st.caption("Side-by-side comparison of all scenario variations for each File Set Type. Compares Base (Full Scan, no flags), ACL On, OLS Scan, and Structured Discovery FF scans.")
+
+        # --- classify each row into a named scenario ---
+        def _classify_scenario(row):
+            scan_type = str(row.get("Scan_Type") or "").strip().lower()
+            is_acl = bool(row.get("is_acl"))
+            is_ff  = bool(row.get("is_feature_flags"))
+            if "ols" in scan_type:
+                return "OLS Scan"
+            if is_acl and is_ff:
+                return "ACL + Structured FF"
+            if is_acl:
+                return "ACL On"
+            if is_ff:
+                return "Structured FF"
+            return "Base (Full Scan)"
+
+        sm_df = build_df.copy()
+        sm_df["Scenario"] = sm_df.apply(_classify_scenario, axis=1)
+
+        # Pick best row per (DS type, file set, scenario)
+        metric_cols = ["throughput_cluster_gb_hr", "throughput_cluster_files_hr", "total_scan_hours", "objects_scanned"]
+        mgrp_cols   = ["Data_Source_Type", "file_set_type", "Scenario"]
+        sm_best = (
+            sm_df.groupby(mgrp_cols, group_keys=False, sort=False)
+            .apply(lambda g: g.loc[g["throughput_cluster_gb_hr"].idxmax()] if g["throughput_cluster_gb_hr"].notna().any() else g.iloc[0])
+            .reset_index(drop=True)
+        )
+
+        SCENARIO_ORDER = ["Base (Full Scan)", "ACL On", "OLS Scan", "Structured FF", "ACL + Structured FF"]
+
+        groups = sm_best.groupby(["Data_Source_Type", "file_set_type"])
+        if groups.ngroups == 0:
+            st.info("No benchmark records found for this build. Add scans via 'Add New Benchmark'.")
+        else:
+            for (ds_type, file_set), grp in groups:
+                with st.expander(f"**{ds_type}** — {file_set}  ({len(grp)} scenario(s))", expanded=True):
+                    # Build pivot table
+                    rows_out = []
+                    base_tp = None
+                    for scen in SCENARIO_ORDER:
+                        sr = grp[grp["Scenario"] == scen]
+                        if sr.empty:
+                            continue
+                        r = sr.iloc[0]
+                        tp   = r.get("throughput_cluster_gb_hr")
+                        ftp  = r.get("throughput_cluster_files_hr")
+                        hrs  = r.get("total_scan_hours")
+                        objs = r.get("objects_scanned")
+
+                        delta_str = ""
+                        if base_tp is None and scen == "Base (Full Scan)":
+                            base_tp = tp
+                        elif base_tp and tp and base_tp > 0:
+                            pct = (tp - base_tp) / base_tp * 100
+                            arrow = "▲" if pct >= 0 else "▼"
+                            delta_str = f"{arrow}{abs(pct):.1f}%"
+
+                        rows_out.append({
+                            "Scenario": scen,
+                            "GB/hr": f"{tp:.2f}" if pd.notna(tp) else "—",
+                            "Files/hr": f"{ftp:,.0f}" if pd.notna(ftp) else "—",
+                            "Scan Hrs": f"{hrs:.2f}" if pd.notna(hrs) else "—",
+                            "Objects": f"{int(objs):,}" if pd.notna(objs) and objs else "—",
+                            "vs Base": delta_str,
+                        })
+
+                    if rows_out:
+                        disp = pd.DataFrame(rows_out)
+
+                        def _color_delta(val):
+                            if not val or val == "":
+                                return ""
+                            if "▲" in str(val):
+                                return "color: green; font-weight: bold;"
+                            if "▼" in str(val):
+                                return "color: red; font-weight: bold;"
+                            return ""
+
+                        st.dataframe(
+                            disp.style.applymap(_color_delta, subset=["vs Base"]),
+                            hide_index=True,
+                            use_container_width=True,
+                        )
+                    else:
+                        st.caption("No scenario data for this group.")
+
     with tab_regressions:
+
         st.subheader("⚠️ Regression Hunter")
         if prev_build:
             st.caption(f"Comparing current build `{selected_build}` vs previous `{prev_build}`")
@@ -10951,9 +11041,20 @@ def page_scan_progress():
                     started_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).min() if isinstance(df_ai, pd.DataFrame) and ('captured_at_actual' in df_ai.columns) else None
                 except Exception:
                     started_dt = None
-            now_ts = pd.Timestamp.utcnow()
-            if started_dt is not None and pd.notnull(started_dt):
-                mins = max(0.0, (now_ts - started_dt).total_seconds() / 60.0)
+            end_dt = None
+            if db_completed_at:
+                end_dt = pd.to_datetime(db_completed_at, errors='coerce', utc=True)
+            if end_dt is None or pd.isna(end_dt):
+                if cur_state and _is_terminal_state(cur_state):
+                    try:
+                        end_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).max()
+                    except Exception:
+                        end_dt = pd.Timestamp.utcnow()
+                else:
+                    end_dt = pd.Timestamp.utcnow()
+
+            if started_dt is not None and pd.notnull(started_dt) and end_dt is not None and pd.notnull(end_dt):
+                mins = max(0.0, (end_dt - started_dt).total_seconds() / 60.0)
                 h = int(mins // 60)
                 m = int(mins % 60)
                 runtime_str = (f"{h}h {m}m" if h > 0 else f"{m}m")
@@ -11408,11 +11509,76 @@ def page_workflow_automation():
 
     _engine = create_engine(DB_CONNECTION_STRING)
 
+    # -------- Inline action dispatcher (from row icon buttons) --------
+    try:
+        _wf_action = str(st.query_params.get("wf_action", "") or "").strip().lower()
+        _wf_act_rid_str = str(st.query_params.get("run_id", "") or "").strip()
+    except Exception:
+        _wf_action = ""
+        _wf_act_rid_str = ""
+    if _wf_action and _wf_act_rid_str.isdigit():
+        _wf_act_rid = int(_wf_act_rid_str)
+        try:
+            if _wf_action == "start":
+                set_workflow_run_status(_wf_act_rid, "running")
+            elif _wf_action == "pause":
+                set_workflow_run_status(_wf_act_rid, "paused")
+            elif _wf_action == "resume":
+                set_workflow_run_status(_wf_act_rid, "running")
+            elif _wf_action == "stop":
+                set_workflow_run_status(_wf_act_rid, "stopped")
+                with _engine.connect() as conn:
+                    conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
+                    conn.commit()
+            elif _wf_action == "delete":
+                with _engine.connect() as conn:
+                    conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": _wf_act_rid})
+                    conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": _wf_act_rid})
+                    conn.commit()
+        except Exception as _e:
+            st.error(f"Action '{_wf_action}' failed for run {_wf_act_rid}: {_e}")
+        finally:
+            # Clear the action param and re-render cleanly
+            try:
+                del st.query_params["wf_action"]
+                if _wf_action == "delete":
+                    del st.query_params["run_id"]
+            except Exception: pass
+            try: st.cache_data.clear()
+            except Exception: pass
+            st.rerun()
+    # ------------------------------------------------------------------
+
     st.divider()
     with st.expander("➕ Create New Workflow Run", expanded=False):
-        st.subheader("Create Workflow Plan")
-        env_labels = [f"{r.env_name} (id={int(r.id)})" for r in active_df.itertuples()]
+        # Detect which envs are used by currently-running workflows
+        try:
+            with _engine.connect() as conn:
+                used_rows = conn.execute(text("""
+                    SELECT DISTINCT ws.environment_id
+                    FROM workflow_steps ws
+                    JOIN workflow_runs wr ON wr.id = ws.run_id
+                    WHERE LOWER(COALESCE(wr.status,'')) = 'running'
+                      AND ws.environment_id IS NOT NULL
+                """)).fetchall()
+            in_use_env_ids = {int(r[0]) for r in used_rows if r[0] is not None}
+        except Exception:
+            in_use_env_ids = set()
+
+        def _env_label(r):
+            lbl = f"{r.env_name} (id={int(r.id)})"
+            if int(r.id) in in_use_env_ids:
+                lbl = f"⚠️ {lbl} [IN USE]"
+            return lbl
+
+        env_labels = [_env_label(r) for r in active_df.itertuples()]
         env_ids = [int(r.id) for r in active_df.itertuples()]
+
+        if in_use_env_ids:
+            st.warning(
+                f"**Environments marked ⚠️ [IN USE]** are currently running another workflow. "
+                "You can still select them, but steps will be queued until that workflow finishes."
+            )
 
         c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
         env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_new_expander")
@@ -11424,8 +11590,7 @@ def page_workflow_automation():
 
         create_disabled = False
         if int(env1_id) == int(env2_id):
-            st.error("Env 1 and Env 2 must be different. Pick two different environments so scans can be balanced.")
-            create_disabled = True
+            st.info("Env 1 and Env 2 are the same. Workflow will run sequentially on this single machine.")
 
         preview_steps = _build_default_workflow_steps(env1_id, env2_id)
         for stp in preview_steps or []:
@@ -11502,24 +11667,36 @@ def page_workflow_automation():
             ds_id = str(row_dict.get("ds_id") or "").strip()
             spid = str(row_dict.get("scan_profile_id") or "").strip()
             sid = str(row_dict.get("scan_id") or "").strip()
-            has_scan = bool(sid) or (s in {"scan_running", "completed"})
+            
+            # Terminal states from workflow_runner.TERMINAL_STATES
+            terminals = {"failed", "completedwithfailures", "completed", "stopped", "aborted", "cancelled", "canceled"}
+            
+            # has_scan is true if we have a scan_id OR the workflow step itself is marked completed.
+            has_scan = bool(sid) or (s == "completed")
             has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
             has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
             has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
+            
             if s in {"pending", ""}: return "➖ DS"
             if s in {"running", "pre_action_done"}: return "⏳ DS"
+            
             if s == "error":
-                if has_scan: return "✅DS ➔ ✅Test ➔ ✅Profile ➔ ⏳Scan ⚠️"
+                if sid: return "✅DS ➔ ✅Test ➔ ✅Profile ➔ ⏳Scan ⚠️"
                 if not has_ds: return "❌ DS"
                 if has_ds and not has_test: return "✅DS ➔ ❌Test"
                 if has_test and not has_profile: return "✅DS ➔ ✅Test ➔ ❌Profile"
                 if has_profile and not has_scan: return "✅DS ➔ ✅Test ➔ ✅Profile ➔ ❌Scan"
                 return "❌ Error"
+                
             parts = []
             if has_ds: parts.append("✅DS")
             if has_test: parts.append("✅Test")
             if has_profile: parts.append("✅Profile")
-            if has_scan: parts.append("✅Scan" if s == "completed" else "⏳Scan")
+            if has_scan:
+                # If the step is 'completed', it's definitely ✅Scan.
+                # If it's scan_running, we might be terminal but not yet transitioned by runner.
+                parts.append("✅Scan" if s == "completed" else "⏳Scan")
+            
             return " ➔ ".join(parts) if parts else "➖ DS"
 
         # --- Pre-load all step data ---
@@ -11577,14 +11754,40 @@ def page_workflow_automation():
             arrow = "▾" if is_exp else "▸"
             d_disp = "table-row" if is_exp else "none"
             bg = "background:#f0ecff;" if is_exp else ""
+            rstatus = str(rr.get("status") or "").strip().lower()
 
-            rows_html += f'''<tr class="main-row" data-rid="{rid}" style="cursor:pointer;{bg}" onclick="toggle({rid})">
-      <td style="padding:8px 12px;font-weight:700;color:{PRIMARY_COLOR};white-space:nowrap;"><span id="a{rid}">{arrow}</span> Run {rid}</td>
-      <td style="padding:8px 12px;">{html.escape(str(rr["name"] or ""))}</td>
-      <td style="padding:8px 12px;">{_badge(rr["status"])}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;">{html.escape(str(rr.get("started_at") or "—"))}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;">{html.escape(str(rr.get("finished_at") or "—"))}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
+            # ---- Action icon buttons (context-sensitive) ----
+            btn_style = "background:none;border:none;cursor:pointer;font-size:1.1rem;padding:2px 4px;border-radius:4px;line-height:1;text-decoration:none;display:inline-block;"
+            disabled_style = "background:none;border:none;font-size:1.1rem;padding:2px 4px;opacity:0.3;cursor:default;display:inline-block;"
+            page_base = "?page=Workflow+Automation"
+
+            def _btn(emoji, action, tooltip, enabled):
+                if enabled:
+                    return f'<a href="{page_base}&run_id={rid}&wf_action={action}" title="{tooltip}" style="{btn_style}" onclick="event.stopPropagation();">{emoji}</a>'
+                return f'<span title="{tooltip}" style="{disabled_style}">{emoji}</span>'
+
+            can_start  = rstatus in {"created", "stopped", "paused"} and rstatus != "completed"
+            can_pause  = rstatus == "running"
+            can_resume = rstatus == "paused"
+            can_stop   = rstatus in {"running", "paused"}
+            can_delete = rstatus not in {"running"}
+
+            actions_html = (
+                _btn("▶️", "start",  "Start",          can_start)  +
+                _btn("⏸", "pause",  "Pause",          can_pause)  +
+                _btn("↩️", "resume", "Resume",         can_resume) +
+                _btn("⏹", "stop",   "Stop",           can_stop)   +
+                _btn("🗑️", "delete", "Delete",         can_delete)
+            )
+
+            rows_html += f'''<tr class="main-row" data-rid="{rid}" style="cursor:pointer;{bg}">
+      <td style="padding:8px 12px;font-weight:700;color:{PRIMARY_COLOR};white-space:nowrap;" onclick="toggle({rid})"><span id="a{rid}">{arrow}</span> Run {rid}</td>
+      <td style="padding:8px 12px;" onclick="toggle({rid})">{html.escape(str(rr["name"] or ""))}</td>
+      <td style="padding:8px 12px;" onclick="toggle({rid})">{_badge(rr["status"])}</td>
+      <td style="padding:8px 12px;font-size:0.82rem;" onclick="toggle({rid})">{html.escape(str(rr.get("started_at") or "—"))}</td>
+      <td style="padding:8px 12px;font-size:0.82rem;" onclick="toggle({rid})">{html.escape(str(rr.get("finished_at") or "—"))}</td>
+      <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;" onclick="toggle({rid})">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
+      <td style="padding:8px 12px;white-space:nowrap;">{actions_html}</td>
     </tr>\n'''
 
             # Sub-table (detail row)
@@ -11664,7 +11867,7 @@ def page_workflow_automation():
     </style>
     <table class="wf-tbl">
       <thead><tr>
-        <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th>
+        <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>
@@ -11702,7 +11905,32 @@ def page_workflow_automation():
         components.html(full_html, height=min(table_height, 1200), scrolling=True)
 
         # --- Controls section (for the selected/expanded run) ---
-        run_id = default_expanded if default_expanded is not None else int(runs_df.iloc[0]["id"])
+        # Build label list for selectbox (newest first = same order as table)
+        run_options = []
+        for _, rr in runs_df.iterrows():
+            rid_i = int(rr["id"])
+            rstatus = str(rr.get("status") or "").strip()
+            rname   = str(rr.get("name") or "").strip()[:40]
+            run_options.append(f"Run {rid_i} — {rname} [{rstatus}]")
+
+        # Determine default index from URL / session state
+        preferred_run_id = default_expanded if default_expanded is not None else None
+        sel_default_idx = 0
+        if preferred_run_id is not None:
+            try:
+                all_ids = [int(runs_df.iloc[i]["id"]) for i in range(len(runs_df))]
+                if preferred_run_id in all_ids:
+                    sel_default_idx = all_ids.index(preferred_run_id)
+            except Exception:
+                pass
+
+        sel_label = st.selectbox(
+            "🎛️ Select run to control",
+            run_options,
+            index=sel_default_idx,
+            key="wf_ctrl_run_sel",
+        )
+        run_id = int(runs_df.iloc[run_options.index(sel_label)]["id"])
         st.session_state["wf_run_sel_id"] = run_id
 
         try:
@@ -11731,8 +11959,8 @@ def page_workflow_automation():
             + (f" | cooldown={rrow.get('cooldown_minutes')}m" if rrow.get("cooldown_minutes") is not None else "")
         )
 
-        if any_running and other_running_ids:
-            st.warning(f"Another workflow is already running (id(s): {', '.join([str(x) for x in other_running_ids])}).")
+        if other_running_ids:
+            st.warning(f"Note: Workflow(s) {', '.join([str(x) for x in other_running_ids])} are also running. The runner will process all active runs across available environments.")
         elif selected_is_running:
             st.info("This workflow run is currently running.")
 
@@ -11744,18 +11972,16 @@ def page_workflow_automation():
                 st.caption(f"Last failure (history): {last_err}")
 
         b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3, 1.0])
-        start_disabled = bool(any_running)
+        # Allow starting if current run is not already running.
+        # The runner will handle global concurrency.
+        start_disabled = selected_is_running
         pause_disabled = (selected_status != "running")
-        resume_disabled = (selected_status != "paused") or (bool(any_running) and not selected_is_running)
+        resume_disabled = (selected_status != "paused")
         stop_disabled = (selected_status not in {"running", "paused"})
 
         if b1.button("Start Workflow", type="primary", disabled=start_disabled):
             try:
-                with _engine.connect() as conn:
-                    conn.execute(text("""
-                        UPDATE workflow_runs SET status='running', started_at=COALESCE(started_at,CURRENT_TIMESTAMP), next_eligible_at=COALESCE(next_eligible_at,CURRENT_TIMESTAMP) WHERE id=:rid
-                    """), {"rid": int(run_id)})
-                    conn.commit()
+                set_workflow_run_status(int(run_id), "running")
                 try:
                     if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
                 except Exception: pass
@@ -11788,6 +12014,30 @@ def page_workflow_automation():
             try: st.cache_data.clear()
             except Exception: pass
             st.rerun()
+
+        # --- Delete Workflow ---
+        st.divider()
+        delete_disabled = selected_status == "running"
+        with st.expander("🗑️ Delete Workflow Run", expanded=False):
+            if delete_disabled:
+                st.warning("Stop the workflow before deleting it.")
+            else:
+                st.error(f"**Danger!** This will permanently delete Run {run_id} and ALL its steps from the database. DS/Scans in BigID are NOT deleted.")
+                if st.button("⚠️ Confirm Delete Run", key=f"wf_delete_confirm_{run_id}", type="primary"):
+                    try:
+                        with _engine.connect() as conn:
+                            conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": int(run_id)})
+                            conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)})
+                            conn.commit()
+                        try:
+                            st.session_state.pop("wf_run_sel_id", None)
+                        except Exception: pass
+                        try: st.cache_data.clear()
+                        except Exception: pass
+                        st.success(f"Run {run_id} deleted.")
+                        st.rerun()
+                    except Exception as ex:
+                        st.error(f"Delete failed: {ex}")
 
         # Reset
         st.markdown("**Reset** — Clears step progress in DB only. Does NOT delete DS or Scans in BigID.")
@@ -11874,21 +12124,49 @@ def page_workflow_automation():
                     except Exception: edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
                     show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
                     show_cols = [c for c in show_cols if c in edit_df.columns]
+                    try:
+                        env_df = load_test_environments()
+                        if not env_df.empty and "is_active" in env_df.columns:
+                            active_envs = env_df[env_df["is_active"] == 1]["env_name"].tolist()
+                            env_map = {row["env_name"]: row["id"] for _, row in env_df.iterrows()}
+                        else:
+                            active_envs, env_map = [], {}
+                    except Exception:
+                        active_envs, env_map = [], {}
+
                     view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
                     editor = st.data_editor(view, width="stretch", hide_index=True, key=f"wf_edit_steps_{run_id}",
-                        column_config={"is_enabled": st.column_config.CheckboxColumn("Execute", default=True)},
-                        disabled=[c for c in view.columns if c != "is_enabled"])
-                    if st.button("Save step selection", type="primary", key=f"wf_save_steps_{run_id}"):
+                        column_config={
+                            "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                            "Env": st.column_config.SelectboxColumn("Env", options=active_envs, required=False),
+                        },
+                        disabled=[c for c in view.columns if c not in ("is_enabled", "Env")])
+                    
+                    if st.button("Save step modifications", type="primary", key=f"wf_save_steps_{run_id}"):
                         try:
+                            # 1. Handle Enable/Disable
                             desired = editor[["id", "is_enabled"]].copy(); desired["id"] = desired["id"].astype(int)
                             enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
                             disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
+                            
+                            # 2. Handle Env Changes
+                            desired_env = editor[["id", "Env"]].copy(); desired_env["id"] = desired_env["id"].astype(int)
+                            env_updates = []
+                            for _, r in desired_env.iterrows():
+                                if pd.notna(r["Env"]) and str(r["Env"]).strip() and str(r["Env"]).strip() in env_map:
+                                    env_updates.append({"id": int(r["id"]), "env_id": int(env_map[str(r["Env"]).strip()])})
+
                             from sqlalchemy import bindparam
                             with _engine.connect() as conn:
                                 if disable_ids:
                                     conn.execute(text("UPDATE workflow_steps SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": disable_ids})
                                 if enable_ids:
                                     conn.execute(text("UPDATE workflow_steps SET is_enabled=1, status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END, last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END, updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": enable_ids})
+                                
+                                # Process environment updates
+                                for u in env_updates:
+                                    conn.execute(text("UPDATE workflow_steps SET environment_id=:env_id, updated_at=CURRENT_TIMESTAMP WHERE id=:id AND COALESCE(status,'') NOT IN ('completed', 'scan_running')"), {"env_id": u["env_id"], "id": u["id"]})
+
                                 conn.commit()
                             try: st.cache_data.clear()
                             except Exception: pass
