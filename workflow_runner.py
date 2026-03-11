@@ -613,8 +613,9 @@ def _scan_name_from_parent_scan(sc: Dict[str, Any]) -> str:
 
 def find_running_parent_scan_id(base_url: str, token: str, *, exact_name: str, wf_tag: str = "", limit: int = 80) -> str:
     """
-    Find a running parent scan id by exact scan name.
-    If wf_tag is provided (e.g. "(wf 6-3)"), require it in the name too.
+    Find a running parent scan id by scan name.
+    Prefer exact match; if none, return first running scan whose name contains exact_name (and wf_tag if set).
+    This avoids creating duplicate scans when the API returns a display name that differs (e.g. appends " Full Scan ACL ON").
     """
     nm = str(exact_name or "").strip()
     if not nm:
@@ -631,6 +632,7 @@ def find_running_parent_scan_id(base_url: str, token: str, *, exact_name: str, w
         )
     except Exception:
         items = []
+    fallback_sid = ""
     for it in items or []:
         if not isinstance(it, dict):
             continue
@@ -639,12 +641,13 @@ def find_running_parent_scan_id(base_url: str, token: str, *, exact_name: str, w
         if not sid or not name:
             continue
         nml = name.lower()
-        if nml != needle:
-            continue
-        if wf and wf not in nml:
-            continue
-        return sid
-    return ""
+        if nml == needle:
+            if not wf or wf in nml:
+                return sid
+        if needle in nml and (not wf or wf in nml):
+            if not fallback_sid:
+                fallback_sid = sid
+    return fallback_sid
 
 
 def _is_workflow_scan_name(name: str, *, run_id: Optional[int] = None) -> bool:
@@ -2076,7 +2079,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             with engine.connect() as conn:
                 inflight_rows = conn.execute(
                     text("""
-                        SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status
+                        SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status, ws.updated_at
                         FROM workflow_steps ws
                         LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
                         WHERE ws.run_id=:rid
@@ -2093,6 +2096,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             
             completed_any = False
             completed_success_any = False
+            try:
+                grace_min = int(os.getenv('WORKFLOW_RESET_MISSING_SCAN_GRACE_MINUTES', '10') or '10')
+            except Exception:
+                grace_min = 10
+            grace_delta = timedelta(minutes=max(1, grace_min))
+
             for rr in inflight_rows or []:
                 step_id = int(rr[0])
                 seq = int(rr[1])
@@ -2100,6 +2109,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 sid = str(rr[3] or "").strip()
                 st_status = str(rr[4] or "").strip().lower()
                 scan_status = str(rr[5] or "").strip()
+                step_updated_at = rr[6] if len(rr) > 6 else None
                 
                 if scan_status and _is_terminal_state(scan_status):
                     if _compact(scan_status) in {"completed", "completedwithfailures"}:
@@ -2111,13 +2121,26 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     completed_any = True
                     did_any_work = True
                 elif sid and not scan_status:
+                    # Only reset to pending if scan has been missing from scan_parents for longer than grace period.
+                    # Newly started scans may not be in scan_parents until the tracker runs; resetting immediately
+                    # caused repeated triggers (scan loop).
+                    if step_updated_at and isinstance(step_updated_at, datetime):
+                        if (now - step_updated_at) < grace_delta:
+                            # Tracker likely hasn't synced yet; keep step as scan_running, do not clear scan_id
+                            if st_status != "scan_running":
+                                set_step_status(engine, step_id, "scan_running")
+                            # Count env as busy so we don't start another scan on same env before tracker syncs
+                            if env_id is not None and st_status != "scan_waiting":
+                                inflight_envs.add(int(env_id))
+                            continue
                     set_step_status(engine, step_id, "pending", scan_id=None, last_error="Scan aborted/deleted; reset for retry")
                     set_run_next_eligible(engine, run_id, _now_utc())
                     completed_any = True
                     did_any_work = True
                 else:
-                    if env_id is not None and sid and scan_status:
+                    if env_id is not None and sid and (scan_status or st_status == "scan_running"):
                         # Only consider an environment "inflight" if it's actively scanning.
+                        # Include scan_running even when scan_status is empty (tracker not synced yet).
                         # scan_waiting means it's waiting for capacity, so it doesn't occupy a slot itself.
                         if st_status != "scan_waiting":
                             inflight_envs.add(int(env_id))
