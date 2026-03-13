@@ -256,7 +256,16 @@ st.markdown(f"""
 @st.cache_resource
 def get_engine():
     try:
-        engine = create_engine(DB_CONNECTION_STRING)
+        # pool_recycle=3600: Reconnect every hour to avoid MySQL "gone away"
+        # pool_pre_ping=True: Verify connection health before usage
+        # pool_size=10, max_overflow=20: Standard pooling to avoid port exhaustion
+        engine = create_engine(
+            DB_CONNECTION_STRING,
+            pool_recycle=3600,
+            pool_pre_ping=True,
+            pool_size=10,
+            max_overflow=20
+        )
         with engine.connect() as conn: pass
         return engine
     except Exception as e:
@@ -264,8 +273,7 @@ def get_engine():
 
 engine = get_engine()
 
-if engine:
-    ensure_rbac_tables(engine)
+# --- Tracker / Runner Handlers ---
 
 # Best-effort: auto-start tracker when Streamlit runs (no manual commands).
 # Can be disabled via DISABLE_TRACKER_AUTOSTART=1.
@@ -804,11 +812,11 @@ def get_classifier_names_for_build(build_version):
         return []
 
 
-def ensure_test_environments_table():
-    if not engine:
+def ensure_test_environments_table(_eng):
+    if not _eng:
         return
     try:
-        with engine.connect() as conn:
+        with _eng.connect() as conn:
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS test_environments (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -831,6 +839,18 @@ def ensure_test_environments_table():
                 pass
             try:
                 conn.execute(text("ALTER TABLE test_environments MODIFY COLUMN classifiers_api_path VARCHAR(1200)"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE test_environments ADD COLUMN is_busy BOOLEAN DEFAULT FALSE"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE test_environments ADD COLUMN busy_by_run_id INT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE test_environments ADD COLUMN busy_since DATETIME NULL"))
             except Exception:
                 pass
 
@@ -905,6 +925,18 @@ def ensure_test_environments_table():
             conn.commit()
     except Exception:
         pass
+
+if engine:
+    @st.cache_resource
+    def initialize_app_tables(_eng):
+        """Run expensive DDL checks only once per application instance."""
+        ensure_rbac_tables(_eng)
+        ensure_test_environments_table(_eng)
+        # Other table checks will run if they don't exist during first loader hit,
+        # but these core ones are ensured at startup.
+        return True
+    
+    initialize_app_tables(engine)
 
 
 def ensure_classifier_details_snapshots_table():
@@ -1017,10 +1049,11 @@ def get_test_environment_by_id(env_id):
     return None
 
 
+@st.cache_data(ttl=60)
 def load_test_environments():
     if not engine:
         return pd.DataFrame()
-    ensure_test_environments_table()
+    ensure_test_environments_table(engine)
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
@@ -3434,7 +3467,6 @@ def create_workflow_run(
 
 
 def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
-    ensure_workflow_tables()
     if not engine:
         return pd.DataFrame()
     try:
@@ -3469,8 +3501,61 @@ def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
+    if not engine or not run_ids:
+        return pd.DataFrame()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                    SELECT
+                        ws.id,
+                        ws.run_id,
+                        ws.seq,
+                        ws.environment_id,
+                        te.env_name,
+                        ws.ds_kind,
+                        ws.ds_name,
+                        ws.scan_kind,
+                        ws.file_set_type,
+                        ws.is_enabled,
+                        ws.is_acl,
+                        ws.is_ocr,
+                        ws.is_structured_ff,
+                        ws.is_ols,
+                        ws.feature_flags,
+                        ws.notes,
+                        ws.ds_id,
+                        ws.scan_profile_id,
+                        ws.scan_profile_name,
+                        ws.build_version,
+                        ws.build_prefix,
+                        ws.scan_id,
+                        ws.status,
+                        ws.started_at,
+                        ws.finished_at,
+                        ws.updated_at,
+                        ws.last_error
+                    FROM workflow_steps ws
+                    LEFT JOIN test_environments te ON te.id = ws.environment_id
+                    WHERE ws.run_id IN :rids
+                    ORDER BY ws.run_id DESC, ws.seq ASC
+                """),
+                {"rids": tuple(run_ids)},
+            ).fetchall()
+        cols = [
+            "id","run_id","seq","environment_id","environment",
+            "ds_kind","ds_name","scan_kind","file_set_type",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
+            "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
+            "status","started_at","finished_at","updated_at","last_error",
+        ]
+        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    except Exception:
+        return pd.DataFrame()
+
+
 def load_workflow_steps(run_id: int) -> pd.DataFrame:
-    ensure_workflow_tables()
     if not engine or run_id is None:
         return pd.DataFrame()
     try:
@@ -6290,7 +6375,7 @@ def page_manage_test_environments():
         st.error("Database not connected.")
         return
 
-    ensure_test_environments_table()
+    ensure_test_environments_table(engine)
     env_df = load_test_environments()
 
     # Bulk: sync current versions for all active envs + global enabled classifiers (no manual follow-up steps).
@@ -9275,7 +9360,7 @@ def page_classifier_build_diffs():
         return
 
     ensure_build_templates_table()
-    ensure_test_environments_table()
+    ensure_test_environments_table(engine)
     try:
         with engine.connect() as conn:
             env_rows = conn.execute(text("SELECT id, env_name, is_active FROM test_environments ORDER BY is_active DESC, env_name")).fetchall()
@@ -11486,10 +11571,11 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
 
 
 def page_workflow_automation():
+    global engine
     st.title("🧪 Workflow Automation")
     st.caption("UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially.")
 
-    ensure_test_environments_table()
+    ensure_test_environments_table(engine)
     ensure_scan_tracking_tables()
     ensure_scan_progress_table()
     ensure_workflow_tables()
@@ -11507,7 +11593,7 @@ def page_workflow_automation():
         st.warning("No active environments. Mark at least two environments active to run this workflow.")
         return
 
-    _engine = create_engine(DB_CONNECTION_STRING)
+
 
     # -------- Inline action dispatcher (from row icon buttons) --------
     try:
@@ -11527,11 +11613,11 @@ def page_workflow_automation():
                 set_workflow_run_status(_wf_act_rid, "running")
             elif _wf_action == "stop":
                 set_workflow_run_status(_wf_act_rid, "stopped")
-                with _engine.connect() as conn:
+                with engine.connect() as conn:
                     conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
                     conn.commit()
             elif _wf_action == "delete":
-                with _engine.connect() as conn:
+                with engine.connect() as conn:
                     conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": _wf_act_rid})
                     conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": _wf_act_rid})
                     conn.commit()
@@ -11560,6 +11646,8 @@ def page_workflow_automation():
                     JOIN workflow_runs wr ON wr.id = ws.run_id
                     WHERE LOWER(COALESCE(wr.status,'')) = 'running'
                       AND ws.environment_id IS NOT NULL
+                    UNION
+                    SELECT id FROM test_environments WHERE is_busy = 1
                 """)).fetchall()
             in_use_env_ids = {int(r[0]) for r in used_rows if r[0] is not None}
         except Exception:
@@ -11659,6 +11747,12 @@ def page_workflow_automation():
             pass
         if want is None and run_id_qp.isdigit():
             want = int(run_id_qp)
+        # Keep session in sync when opening via URL so expansion and selectbox persist
+        if want is not None:
+            try:
+                st.session_state["wf_run_sel_id"] = int(want)
+            except Exception:
+                pass
 
         # --- Progress flow helper ---
         def _pf(row_dict):
@@ -11671,8 +11765,8 @@ def page_workflow_automation():
             # Terminal states from workflow_runner.TERMINAL_STATES
             terminals = {"failed", "completedwithfailures", "completed", "stopped", "aborted", "cancelled", "canceled"}
             
-            # has_scan is true if we have a scan_id OR the workflow step itself is marked completed.
-            has_scan = bool(sid) or (s == "completed")
+            # has_scan is true if we have a scan_id OR the workflow step itself is marked completed/running.
+            has_scan = bool(sid) or (s in {"scan_running", "completed"})
             has_profile = bool(spid) or has_scan or (s in {"scan_created", "scan_running", "completed"})
             has_test = s in {"ds_test_ok", "scan_created", "scan_running", "completed"}
             has_ds = bool(ds_id) or (s in {"ds_created", "ds_test_ok", "scan_created", "scan_running", "completed"}) or has_profile or has_scan
@@ -11693,20 +11787,45 @@ def page_workflow_automation():
             if has_test: parts.append("✅Test")
             if has_profile: parts.append("✅Profile")
             if has_scan:
-                # If the step is 'completed', it's definitely ✅Scan.
-                # If it's scan_running, we might be terminal but not yet transitioned by runner.
-                parts.append("✅Scan" if s == "completed" else "⏳Scan")
+                # Be VERY explicit: Only ✅ if status is 'completed'. Everything else is ⏳.
+                if s == "completed":
+                    parts.append("✅Scan")
+                else:
+                    parts.append("⏳Scan")
             
             return " ➔ ".join(parts) if parts else "➖ DS"
 
         # --- Pre-load all step data ---
         all_run_steps = {}
-        for rid in runs_df["id"].tolist():
+        run_ids_list = runs_df["id"].tolist()
+        batch_steps_df = load_workflow_steps_batch(run_ids_list)
+
+        for rid in run_ids_list:
             try:
-                sdf = load_workflow_steps(int(rid))
-                step_rows = []
+                sdf = batch_steps_df[batch_steps_df["run_id"] == rid]
+                steps_to_show = []
+                # Initialize counts for the summary bar
+                completed = 0
+                errors = 0
+                disabled = 0
+                in_prog = 0
+                total_steps = len(sdf)
+
                 for _, sr in sdf.iterrows():
                     rd = sr.to_dict()
+                    c_status = str(rd.get("status") or "").strip().lower()
+                    
+                    # Logic for counts (includes all steps)
+                    prog = _pf(rd)
+                    if "✅Scan" in prog or "✅ Scan" in prog: completed += 1
+                    elif "❌" in prog or "⚠️" in prog: errors += 1
+                    elif "🚫" in prog or c_status == "disabled": disabled += 1
+                    elif "⏳" in prog: in_prog += 1
+
+                    # Visibility filter: "no need to show disable steps"
+                    if c_status == "disabled": continue
+                    if not bool(rd.get("is_enabled", True)): continue
+
                     flags = ", ".join([x for x in [
                         "ACL" if bool(rd.get("is_acl")) else "",
                         "STRUCT" if bool(rd.get("is_structured_ff")) else "",
@@ -11716,7 +11835,7 @@ def page_workflow_automation():
                     sid_val = str(rd.get("scan_id") or "").strip()
                     if sid_val:
                         scan_link = f'<a href="?page=Scan+Progress&scan_id={html.escape(sid_val)}" target="_blank" rel="noopener noreferrer" style="color:{PRIMARY_COLOR};text-decoration:none;font-size:0.8rem;">View Progress</a>'
-                    step_rows.append({
+                    steps_to_show.append({
                         "seq": rd.get("seq", ""),
                         "env": str(rd.get("environment") or "").strip(),
                         "ds_type": str(rd.get("ds_kind") or "").strip(),
@@ -11724,15 +11843,24 @@ def page_workflow_automation():
                         "scan_type": str(rd.get("scan_kind") or "").strip(),
                         "file_set": str(rd.get("file_set_type") or "").strip(),
                         "flags": flags,
-                        "progress": _pf(rd),
+                        "progress": prog,
                         "scan_id": sid_val,
                         "scan_link": scan_link,
                         "notes": str(rd.get("notes") or "").strip(),
                         "last_error": str(rd.get("last_error") or "").strip()[:80],
                     })
-                all_run_steps[int(rid)] = step_rows
+                all_run_steps[int(rid)] = {
+                    "rows": steps_to_show,
+                    "metrics": {
+                        "completed": completed,
+                        "errors": errors,
+                        "disabled": disabled,
+                        "in_prog": in_prog,
+                        "pending": total_steps - completed - errors - disabled - in_prog
+                    }
+                }
             except Exception:
-                all_run_steps[int(rid)] = []
+                all_run_steps[int(rid)] = {"rows": [], "metrics": {"completed":0,"errors":0,"disabled":0,"in_prog":0,"pending":0}}
 
         # --- Status badge ---
         def _badge(status_val):
@@ -11763,6 +11891,7 @@ def page_workflow_automation():
 
             def _btn(emoji, action, tooltip, enabled):
                 if enabled:
+                    # Removed target="_parent" as we are now in the main page (sandbox-free)
                     return f'<a href="{page_base}&run_id={rid}&wf_action={action}" title="{tooltip}" style="{btn_style}" onclick="event.stopPropagation();">{emoji}</a>'
                 return f'<span title="{tooltip}" style="{disabled_style}">{emoji}</span>'
 
@@ -11780,44 +11909,57 @@ def page_workflow_automation():
                 _btn("🗑️", "delete", "Delete",         can_delete)
             )
 
-            rows_html += f'''<tr class="main-row" data-rid="{rid}" style="cursor:pointer;{bg}">
-      <td style="padding:8px 12px;font-weight:700;color:{PRIMARY_COLOR};white-space:nowrap;" onclick="toggle({rid})"><span id="a{rid}">{arrow}</span> Run {rid}</td>
-      <td style="padding:8px 12px;" onclick="toggle({rid})">{html.escape(str(rr["name"] or ""))}</td>
-      <td style="padding:8px 12px;" onclick="toggle({rid})">{_badge(rr["status"])}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;" onclick="toggle({rid})">{html.escape(str(rr.get("started_at") or "—"))}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;" onclick="toggle({rid})">{html.escape(str(rr.get("finished_at") or "—"))}</td>
-      <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;" onclick="toggle({rid})">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
-      <td style="padding:8px 12px;white-space:nowrap;">{actions_html}</td>
-    </tr>\n'''
+            # Format timestamps to avoid "NaT"
+            def _fmt_ts(val):
+                if pd.isna(val) or val is None or str(val).strip().lower() == "nan":
+                    return "—"
+                return html.escape(str(val))
+
+            check_attr = "checked" if is_exp else ""
+            open_run_href = f"{page_base}&run_id={rid}"
+            # Use top-level navigation so link works when table is inside st.html() iframe
+            rows_html += f"""<input type="checkbox" id="toggle-{rid}" class="wf-toggle" {check_attr} style="display:none;">
+<tr class="main-row" data-rid="{rid}" style="{bg}">
+  <td style="padding:8px 12px;font-weight:700;white-space:nowrap;">
+    <a href="{html.escape(open_run_href)}" style="color:{PRIMARY_COLOR};text-decoration:none;cursor:pointer;display:block;" onclick="window.top.location.href=this.getAttribute('href');return false;"><span class="arrow-icon"></span> Run {rid}</a>
+  </td>
+  <td style="padding:8px 12px;">{html.escape(str(rr["name"] or ""))}</td>
+  <td style="padding:8px 12px;">{_badge(rr["status"])}</td>
+  <td style="padding:8px 12px;font-size:0.82rem;">{_fmt_ts(rr.get("started_at"))}</td>
+  <td style="padding:8px 12px;font-size:0.82rem;">{_fmt_ts(rr.get("finished_at"))}</td>
+  <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
+  <td style="padding:8px 12px;white-space:nowrap;">{actions_html}</td>
+</tr>\n"""
 
             # Sub-table (detail row)
-            steps = all_run_steps.get(rid, [])
-            if steps:
+            steps_obj = all_run_steps.get(rid, {})
+            if isinstance(steps_obj, dict) and steps_obj.get("rows"):
                 s_rows = ""
-                for i, sr in enumerate(steps):
+                for i, sr in enumerate(steps_obj["rows"]):
                     row_bg = "#f9f8ff" if i % 2 == 0 else "#ffffff"
                     err_cell = f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(sr["last_error"])}">{html.escape(sr["last_error"][:40])}</span>' if sr["last_error"] else ""
-                    s_rows += f'''<tr style="background:{row_bg};">
-      <td style="padding:4px 8px;text-align:center;font-weight:600;">{sr["seq"]}</td>
-      <td style="padding:4px 8px;">{html.escape(sr["env"])}</td>
-      <td style="padding:4px 8px;">{html.escape(sr["ds_type"])}</td>
-      <td style="padding:4px 8px;">{html.escape(sr["ds_name"])}</td>
-      <td style="padding:4px 8px;">{html.escape(sr["scan_type"])}</td>
-      <td style="padding:4px 8px;">{html.escape(sr["file_set"])}</td>
-      <td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["flags"])}</td>
-      <td style="padding:4px 8px;">{sr["progress"]}</td>
-      <td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["scan_id"])}</td>
-      <td style="padding:4px 8px;">{sr["scan_link"]}</td>
-      <td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["notes"])}</td>
-      <td style="padding:4px 8px;">{err_cell}</td>
-    </tr>\n'''
+                    s_rows += f"""<tr style="background:{row_bg};">
+<td style="padding:4px 8px;text-align:center;font-weight:600;">{sr["seq"]}</td>
+<td style="padding:4px 8px;">{html.escape(sr["env"])}</td>
+<td style="padding:4px 8px;">{html.escape(sr["ds_type"])}</td>
+<td style="padding:4px 8px;">{html.escape(sr["ds_name"])}</td>
+<td style="padding:4px 8px;">{html.escape(sr["scan_type"])}</td>
+<td style="padding:4px 8px;">{html.escape(sr["file_set"])}</td>
+<td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["flags"])}</td>
+<td style="padding:4px 8px;">{sr["progress"]}</td>
+<td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["scan_id"])}</td>
+<td style="padding:4px 8px;">{sr["scan_link"]}</td>
+<td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["notes"])}</td>
+<td style="padding:4px 8px;">{err_cell}</td>
+</tr>\n"""
 
-                # Summary counts
-                completed = sum(1 for s in steps if "✅Scan" in s["progress"] or "✅ Scan" in s["progress"])
-                errors = sum(1 for s in steps if "❌" in s["progress"] or "⚠️" in s["progress"])
-                disabled = sum(1 for s in steps if "🚫" in s["progress"])
-                in_prog = sum(1 for s in steps if "⏳" in s["progress"])
-                pending = len(steps) - completed - errors - disabled - in_prog
+                # Summary counts from pre-calculated metrics
+                metrics = steps_obj.get("metrics", {})
+                pending = metrics.get("pending", 0)
+                in_prog = metrics.get("in_prog", 0)
+                completed = metrics.get("completed", 0)
+                disabled = metrics.get("disabled", 0)
+                errors = metrics.get("errors", 0)
 
                 metrics_html = f'''<div style="display:flex;gap:24px;margin-bottom:10px;flex-wrap:wrap;">
       <div><span style="font-size:0.78rem;color:#6b7280;">Pending</span><br><strong style="font-size:1.1rem;">{pending}</strong></div>
@@ -11827,82 +11969,61 @@ def page_workflow_automation():
       <div><span style="font-size:0.78rem;color:#6b7280;">Errors</span><br><strong style="font-size:1.1rem;color:#dc2626;">{errors}</strong></div>
     </div>'''
 
-                detail_inner = f'''{metrics_html}
-    <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
-      <thead><tr style="background:#e8e3f5;">
-        <th style="padding:5px 8px;text-align:center;">Step</th>
-        <th style="padding:5px 8px;">Env</th>
-        <th style="padding:5px 8px;">DS Type</th>
-        <th style="padding:5px 8px;">DS Name</th>
-        <th style="padding:5px 8px;">Scan</th>
-        <th style="padding:5px 8px;">File Set</th>
-        <th style="padding:5px 8px;">Flags</th>
-        <th style="padding:5px 8px;">Progress</th>
-        <th style="padding:5px 8px;">Scan Id</th>
-        <th style="padding:5px 8px;">Link</th>
-        <th style="padding:5px 8px;">Notes</th>
-        <th style="padding:5px 8px;">Error</th>
-      </tr></thead>
-      <tbody>{s_rows}</tbody>
-    </table>'''
+                detail_inner = f"""{metrics_html}
+<table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+  <thead><tr style="background:#e8e3f5;">
+    <th style="padding:5px 8px;text-align:center;">Step</th>
+    <th style="padding:5px 8px;">Env</th>
+    <th style="padding:5px 8px;">DS Type</th>
+    <th style="padding:5px 8px;">DS Name</th>
+    <th style="padding:5px 8px;">Scan</th>
+    <th style="padding:5px 8px;">File Set</th>
+    <th style="padding:5px 8px;">Flags</th>
+    <th style="padding:5px 8px;">Progress</th>
+    <th style="padding:5px 8px;">Scan Id</th>
+    <th style="padding:5px 8px;">Link</th>
+    <th style="padding:5px 8px;">Notes</th>
+    <th style="padding:5px 8px;">Error</th>
+  </tr></thead>
+  <tbody>{s_rows}</tbody>
+</table>"""
             else:
                 detail_inner = '<span style="color:#6b7280;font-style:italic;">No steps found for this run.</span>'
 
-            rows_html += f'''<tr id="d{rid}" class="detail-row" style="display:{d_disp};">
-      <td colspan="6" style="padding:0;border:none;">
-        <div style="border-left:4px solid {PRIMARY_COLOR};margin:0 0 0 16px;padding:12px 16px;background:#faf8ff;">
-          <div style="font-weight:700;font-size:0.95rem;color:{PRIMARY_COLOR};margin-bottom:8px;">Step Progress — Run {rid}</div>
-          {detail_inner}
-        </div>
-      </td>
-    </tr>\n'''
+            rows_html += f"""<tr class="detail-row">
+  <td colspan="7" style="padding:0;border:none;">
+    <div style="border-left:4px solid {PRIMARY_COLOR};margin:0 0 0 16px;padding:12px 16px;background:#faf8ff;">
+      <div style="font-weight:700;font-size:0.95rem;color:{PRIMARY_COLOR};margin-bottom:8px;">Step Progress — Run {rid}</div>
+      {detail_inner}
+    </div>
+  </td>
+</tr>\n"""
 
-        full_html = f'''
-    <style>
-      .wf-tbl {{ width:100%; border-collapse:collapse; font-family:'Inter','Segoe UI',sans-serif; }}
-      .wf-tbl thead th {{ background:{PRIMARY_COLOR}; color:#fff; padding:10px 12px; font-size:0.82rem; font-weight:600; text-align:left; position:sticky; top:0; z-index:2; }}
-      .main-row:hover {{ background:#f0ecff !important; }}
-      .main-row td {{ border-bottom:1px solid #e2e8f0; }}
-      .detail-row td {{ border-bottom:2px solid {PRIMARY_COLOR}; }}
-    </style>
-    <table class="wf-tbl">
-      <thead><tr>
-        <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
-      </tr></thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-    <script>
-    function toggle(rid) {{
-      var d = document.getElementById('d'+rid);
-      var a = document.getElementById('a'+rid);
-      if (d.style.display === 'none') {{
-        document.querySelectorAll('.detail-row').forEach(function(el){{ el.style.display='none'; }});
-        document.querySelectorAll('.main-row').forEach(function(el){{ el.style.background=''; }});
-        document.querySelectorAll('[id^="a"]').forEach(function(el){{ if(/^a\\d+$/.test(el.id)) el.textContent='▸'; }});
-        d.style.display='table-row';
-        a.textContent='▾';
-        document.querySelector('.main-row[data-rid="'+rid+'"]').style.background='#f0ecff';
-        // Communicate selected run to Streamlit via query params
-        var url = new URL(window.parent.location.href);
-        url.searchParams.set('run_id', rid);
-        window.parent.history.replaceState(null, '', url.toString());
-      }} else {{
-        d.style.display='none';
-        a.textContent='▸';
-        document.querySelector('.main-row[data-rid="'+rid+'"]').style.background='';
-      }}
-    }}
-    </script>'''
-
-        # Compute height: when no row expanded use compact height to avoid empty space below table
-        n_runs = len(runs_df)
-        n_steps = len(all_run_steps.get(default_expanded, [])) if default_expanded is not None else 0
-        if n_steps == 0:
-            table_height = 60 + n_runs * 45 + 16
-        else:
-            table_height = 60 + n_runs * 45 + max(280, n_steps * 32 + 120)
-        import streamlit.components.v1 as components
-        components.html(full_html, height=min(table_height, 1200), scrolling=True)
+    full_html = f"""
+<style>
+  .wf-tbl {{ width:100%; border-collapse:collapse; font-family:'Inter','Segoe UI',sans-serif; margin-bottom:20px; }}
+  .wf-tbl thead th {{ background:{PRIMARY_COLOR}; color:#fff; padding:10px 12px; font-size:0.82rem; font-weight:600; text-align:left; }}
+  .main-row:hover {{ background:#f0ecff !important; }}
+  .main-row td {{ border-bottom:1px solid #e2e8f0; }}
+  .arrow-icon::before {{ content: '▸'; margin-right: 5px; }}
+  .detail-row {{ display: none; }}
+  .wf-toggle:checked + .main-row .arrow-icon::before {{ content: '▾'; }}
+  .wf-toggle:checked + .main-row {{ background: #f0ecff !important; }}
+  .wf-toggle:checked + .main-row + .detail-row {{ display: table-row; }}
+</style>
+<div class="wf-container">
+  <table class="wf-tbl">
+    <thead><tr>
+      <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
+    </tr></thead>
+    <tbody>{rows_html}</tbody>
+  </table>
+</div>
+"""
+    try:
+        st.html(full_html)
+    except Exception:
+        st.markdown(full_html, unsafe_allow_html=True)
 
         # --- Controls section (for the selected/expanded run) ---
         # Build label list for selectbox (newest first = same order as table)
@@ -12677,6 +12798,10 @@ def main():
         }
         .sidebar-header {
             margin-top: -12px !important;
+        }
+        /* Fix for potential "page inside page" / iframe nesting issues */
+        iframe[title="streamlit.components.v1.html"] {
+            border: none !important;
         }
         </style>
     """, unsafe_allow_html=True)
