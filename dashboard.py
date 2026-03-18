@@ -10920,6 +10920,40 @@ def page_scan_progress():
     except Exception:
         pass
 
+    # total_classifications discrepancy vs previous scan for same scenario
+    cls_vs_prev: dict = {}  # keys: cur, prev, delta, pct, prev_build, prev_sid
+    try:
+        if engine and cur_max_cls > 0:
+            ctx = _wf_ctx_for_scan(str(scan_id))
+            prev_sid_cls, prev_build_cls = _find_prev_scan(ctx or {}, str(scan_id))
+            if prev_sid_cls:
+                try:
+                    with engine.connect() as _conn:
+                        prev_cls_row = _conn.execute(
+                            text(
+                                "SELECT MAX(CAST(COALESCE(total_classifications, 0) AS SIGNED)) "
+                                "FROM scan_progress WHERE scan_id = :sid"
+                            ),
+                            {"sid": prev_sid_cls},
+                        ).fetchone()
+                    prev_cls_val = int(prev_cls_row[0] or 0) if prev_cls_row and prev_cls_row[0] is not None else 0
+                except Exception:
+                    prev_cls_val = 0
+                if prev_cls_val > 0:
+                    delta_cls = cur_max_cls - prev_cls_val
+                    pct_cls = (abs(delta_cls) / prev_cls_val * 100.0) if prev_cls_val else 0.0
+                    # Flag when difference > 5% OR > 1000 absolute
+                    if pct_cls > 5.0 or abs(delta_cls) > 1000:
+                        cls_vs_prev = {
+                            "cur": cur_max_cls,
+                            "prev": prev_cls_val,
+                            "delta": delta_cls,
+                            "pct": pct_cls,
+                            "prev_build": prev_build_cls or "unknown",
+                            "prev_sid": prev_sid_cls,
+                        }
+    except Exception:
+        cls_vs_prev = {}
 
     # Observations (rule-based): highlight inconsistencies like "Completed but objects < expected".
     observations = []
@@ -11275,6 +11309,27 @@ def page_scan_progress():
                 st.error("Possible regression detected in classification metrics:")
                 for w in regression_warnings:
                     st.caption(f"- {w}")
+        except Exception:
+            pass
+
+        # Total classifications discrepancy vs previous same-scenario scan
+        try:
+            if cls_vs_prev:
+                cur_v = cls_vs_prev["cur"]
+                prev_v = cls_vs_prev["prev"]
+                delta_v = cls_vs_prev["delta"]
+                pct_v = cls_vs_prev["pct"]
+                prev_bld = cls_vs_prev["prev_build"]
+                prev_s = cls_vs_prev["prev_sid"]
+                direction = "higher" if delta_v > 0 else "lower"
+                sign = "+" if delta_v > 0 else ""
+                st.error(
+                    f"⚠️ **Total classifications discrepancy vs previous scan** "
+                    f"(same scenario type, build `{prev_bld}`, scan `{prev_s}`): "
+                    f"current = **{cur_v:,}** vs previous = **{prev_v:,}** "
+                    f"— {direction} by **{sign}{delta_v:,}** ({sign}{pct_v:.1f}%). "
+                    f"Possible causes: changed classifier set, data drift, or classification regression."
+                )
         except Exception:
             pass
 
