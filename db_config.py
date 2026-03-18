@@ -39,7 +39,10 @@ DDL_STATEMENTS = {
             auth_module_path VARCHAR(500),
             auth_function_name VARCHAR(100) DEFAULT 'Get_auth_token',
             classifiers_api_path VARCHAR(1200),
-            is_active BOOLEAN DEFAULT TRUE
+            is_active BOOLEAN DEFAULT TRUE,
+            is_busy BOOLEAN DEFAULT FALSE,
+            busy_by_run_id INT NULL,
+            busy_since DATETIME NULL
         );
     """,
     'test_environment_version_history': """

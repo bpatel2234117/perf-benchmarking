@@ -103,8 +103,10 @@ def ensure_rbac_tables(engine):
                 conn.execute(text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, :p, :r)"),
                              {"u": "bpatel@bigid.com", "p": admin_pwd_hash, "r": admin_role_id})
     except Exception as e:
-        import streamlit as st
-        st.error(f"Error ensuring RBAC tables: {e}")
+        # Graceful error handling: log the error instead of breaking the landing page UI.
+        # This prevents transient connection issues from preventing the user from reaching the login page.
+        import logging
+        logging.error(f"Error ensuring RBAC tables: {e}")
 
 ADMIN_ONLY_PAGES = [
     "Add New Benchmark",

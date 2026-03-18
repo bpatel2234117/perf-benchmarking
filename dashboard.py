@@ -19,7 +19,18 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from db_config import DB_CONFIG, DB_CONNECTION_STRING
+
+# db_config may only define DB_CONNECTION_STRING (e.g. on Windows); DB_CONFIG is optional.
+try:
+    from db_config import DB_CONFIG, DB_CONNECTION_STRING
+except ImportError:
+    try:
+        from db_config import DB_CONNECTION_STRING
+        DB_CONFIG = None
+    except ImportError:
+        DB_CONNECTION_STRING = os.getenv("DB_CONNECTION_STRING") or ""
+        DB_CONFIG = None
+
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
 from dashboard_auth import ensure_rbac_tables, login_user, logout_user, check_access, get_user_permissions, hash_password, verify_password
 try:
@@ -3425,7 +3436,7 @@ def create_workflow_run(
             seq_rows.append({
                 "rid": int(run_id),
                 "seq": int(i),
-                "eid": stp.get("environment_id"),
+                "eid": None,  # Set by runner when step actually starts; no pre-allocation so UI shows env only for running steps
                 "dk": str(stp.get("ds_kind") or "").strip() or None,
                 "dn": str(stp.get("ds_name") or "").strip() or None,
                 "sk": str(stp.get("scan_kind") or "").strip() or None,
@@ -3514,6 +3525,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
                         ws.seq,
                         ws.environment_id,
                         te.env_name,
+                        te.is_busy AS env_is_busy,
                         ws.ds_kind,
                         ws.ds_name,
                         ws.scan_kind,
@@ -3544,7 +3556,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
                 {"rids": tuple(run_ids)},
             ).fetchall()
         cols = [
-            "id","run_id","seq","environment_id","environment",
+            "id","run_id","seq","environment_id","environment","env_is_busy",
             "ds_kind","ds_name","scan_kind","file_set_type",
             "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
@@ -3618,13 +3630,43 @@ def set_workflow_run_status(run_id: int, status: str, *, last_error: Optional[st
         return
     try:
         with engine.connect() as conn:
+            # When starting/resuming, clear next_eligible_at so the runner can pick steps immediately (no stale cooldown).
+            if stv == "running":
+                conn.execute(
+                    text("""
+                        UPDATE workflow_runs
+                        SET status = :s, last_error = COALESCE(:e, last_error), next_eligible_at = NULL
+                        WHERE id = :rid
+                    """),
+                    {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        UPDATE workflow_runs
+                        SET status = :s, last_error = COALESCE(:e, last_error)
+                        WHERE id = :rid
+                    """),
+                    {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
+                )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def release_workflow_run_envs(eng, run_id: int) -> None:
+    """Release all environments reserved by this workflow run (is_busy=1, busy_by_run_id=run_id)."""
+    if not eng or run_id is None:
+        return
+    try:
+        with eng.connect() as conn:
             conn.execute(
                 text("""
-                    UPDATE workflow_runs
-                    SET status = :s, last_error = COALESCE(:e, last_error)
-                    WHERE id = :rid
+                    UPDATE test_environments
+                    SET is_busy = 0, busy_by_run_id = NULL, busy_since = NULL
+                    WHERE busy_by_run_id = :rid
                 """),
-                {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
+                {"rid": int(run_id)},
             )
             conn.commit()
     except Exception:
@@ -11354,11 +11396,18 @@ def page_scan_progress():
             ticklabeloverflow="allow",
         )
 
+    # Use actual capture time for x-axis and sort so graph order matches real sequence (first snapshot = first point).
+    def _plot_time_sorted(df):
+        out = df.copy()
+        time_col = "captured_at_actual" if "captured_at_actual" in out.columns else "captured_at_slot_utc"
+        out["captured_at_utc"] = pd.to_datetime(out[time_col], errors="coerce", utc=True)
+        if out["captured_at_utc"].dt.tz is not None:
+            out["captured_at_utc"] = out["captured_at_utc"].dt.tz_localize(None)
+        return out.sort_values("captured_at_utc")
+
     with c1:
         st.subheader("Parts (Totals)")
-        plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
-        plot_df = plot_df.sort_values("captured_at_utc")
+        plot_df = _plot_time_sorted(df)
 
         # Plotly: parts only
         fig = go.Figure()
@@ -11403,9 +11452,7 @@ def page_scan_progress():
 
     with c2:
         st.subheader("Objects (Totals)")
-        plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
-        plot_df = plot_df.sort_values("captured_at_utc")
+        plot_df = _plot_time_sorted(df)
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_scanned", 0),
@@ -11428,9 +11475,7 @@ def page_scan_progress():
 
     with c3:
         st.subheader("ObjectsWithPi + Classifications")
-        plot_df = df.copy()
-        plot_df["captured_at_utc"] = plot_df["captured_at_slot_utc"].dt.tz_convert("UTC").dt.tz_localize(None)
-        plot_df = plot_df.sort_values("captured_at_utc")
+        plot_df = _plot_time_sorted(df)
         fig3 = go.Figure()
         fig3.add_trace(go.Scatter(
             x=plot_df["captured_at_utc"], y=plot_df.get("objects_with_pi", 0),
@@ -11609,14 +11654,17 @@ def page_workflow_automation():
                 set_workflow_run_status(_wf_act_rid, "running")
             elif _wf_action == "pause":
                 set_workflow_run_status(_wf_act_rid, "paused")
+                release_workflow_run_envs(engine, _wf_act_rid)
             elif _wf_action == "resume":
                 set_workflow_run_status(_wf_act_rid, "running")
             elif _wf_action == "stop":
                 set_workflow_run_status(_wf_act_rid, "stopped")
+                release_workflow_run_envs(engine, _wf_act_rid)
                 with engine.connect() as conn:
                     conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
                     conn.commit()
             elif _wf_action == "delete":
+                release_workflow_run_envs(engine, _wf_act_rid)
                 with engine.connect() as conn:
                     conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": _wf_act_rid})
                     conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": _wf_act_rid})
@@ -11795,6 +11843,21 @@ def page_workflow_automation():
             
             return " ➔ ".join(parts) if parts else "➖ DS"
 
+        # --- Pre-load env busy status for page-level indicator ---
+        env_status_parts = []
+        try:
+            with _engine.connect() as conn:
+                env_busy_rows = conn.execute(text(
+                    "SELECT id, env_name, is_busy FROM test_environments WHERE is_active = 1 ORDER BY env_name"
+                )).fetchall()
+            for er in env_busy_rows or []:
+                name = str(er[1] or "").strip() or f"id={er[0]}"
+                busy = bool(er[2]) if er[2] is not None else False
+                env_status_parts.append(f"{'🔴' if busy else '🟢'} {html.escape(name)} ({'busy' if busy else 'free'})")
+        except Exception:
+            pass
+        env_status_line = " &nbsp; ".join(env_status_parts) if env_status_parts else ""
+
         # --- Pre-load all step data ---
         all_run_steps = {}
         run_ids_list = runs_df["id"].tolist()
@@ -11835,9 +11898,16 @@ def page_workflow_automation():
                     sid_val = str(rd.get("scan_id") or "").strip()
                     if sid_val:
                         scan_link = f'<a href="?page=Scan+Progress&scan_id={html.escape(sid_val)}" target="_blank" rel="noopener noreferrer" style="color:{PRIMARY_COLOR};text-decoration:none;font-size:0.8rem;">View Progress</a>'
+                    # Env with busy/free indicator: 🟢 free, 🔴 busy
+                    env_name = str(rd.get("environment") or "").strip()
+                    env_is_busy = rd.get("env_is_busy")
+                    if env_name:
+                        env_display = ("🔴 " if env_is_busy else "🟢 ") + env_name
+                    else:
+                        env_display = "—"
                     steps_to_show.append({
                         "seq": rd.get("seq", ""),
-                        "env": str(rd.get("environment") or "").strip(),
+                        "env": env_display,
                         "ds_type": str(rd.get("ds_kind") or "").strip(),
                         "ds_name": str(rd.get("ds_name") or "").strip(),
                         "scan_type": str(rd.get("scan_kind") or "").strip(),
@@ -11915,13 +11985,11 @@ def page_workflow_automation():
                     return "—"
                 return html.escape(str(val))
 
-            check_attr = "checked" if is_exp else ""
             open_run_href = f"{page_base}&run_id={rid}"
-            # Use top-level navigation so link works when table is inside st.html() iframe
-            rows_html += f"""<input type="checkbox" id="toggle-{rid}" class="wf-toggle" {check_attr} style="display:none;">
-<tr class="main-row" data-rid="{rid}" style="{bg}">
+            arrow = "▾" if is_exp else "▸"
+            rows_html += f"""<tr class="main-row" data-rid="{rid}" style="{bg}">
   <td style="padding:8px 12px;font-weight:700;white-space:nowrap;">
-    <a href="{html.escape(open_run_href)}" style="color:{PRIMARY_COLOR};text-decoration:none;cursor:pointer;display:block;" onclick="window.top.location.href=this.getAttribute('href');return false;"><span class="arrow-icon"></span> Run {rid}</a>
+    <a href="{html.escape(open_run_href)}" style="color:{PRIMARY_COLOR};text-decoration:none;cursor:pointer;display:block;" onclick="window.top.location.href=this.getAttribute('href');return false;"><span style="margin-right:5px;">{arrow}</span> Run {rid}</a>
   </td>
   <td style="padding:8px 12px;">{html.escape(str(rr["name"] or ""))}</td>
   <td style="padding:8px 12px;">{_badge(rr["status"])}</td>
@@ -11937,7 +12005,11 @@ def page_workflow_automation():
                 s_rows = ""
                 for i, sr in enumerate(steps_obj["rows"]):
                     row_bg = "#f9f8ff" if i % 2 == 0 else "#ffffff"
-                    err_cell = f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(sr["last_error"])}">{html.escape(sr["last_error"][:40])}</span>' if sr["last_error"] else ""
+                    # Hide transient "no free env this tick" message (cleared by runner when env is assigned)
+                    err_val = (sr["last_error"] or "").strip()
+                    if err_val and "No free env this tick" in err_val:
+                        err_val = ""
+                    err_cell = f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(sr["last_error"])}">{html.escape(err_val[:40])}</span>' if err_val else ""
                     s_rows += f"""<tr style="background:{row_bg};">
 <td style="padding:4px 8px;text-align:center;font-weight:600;">{sr["seq"]}</td>
 <td style="padding:4px 8px;">{html.escape(sr["env"])}</td>
@@ -11990,7 +12062,8 @@ def page_workflow_automation():
             else:
                 detail_inner = '<span style="color:#6b7280;font-style:italic;">No steps found for this run.</span>'
 
-            rows_html += f"""<tr class="detail-row">
+            detail_display = "table-row" if is_exp else "none"
+            rows_html += f"""<tr class="detail-row" style="display:{detail_display};">
   <td colspan="7" style="padding:0;border:none;">
     <div style="border-left:4px solid {PRIMARY_COLOR};margin:0 0 0 16px;padding:12px 16px;background:#faf8ff;">
       <div style="font-weight:700;font-size:0.95rem;color:{PRIMARY_COLOR};margin-bottom:8px;">Step Progress — Run {rid}</div>
@@ -11999,19 +12072,16 @@ def page_workflow_automation():
   </td>
 </tr>\n"""
 
+    env_status_block = f'<div style="font-size:0.85rem;color:#6b7280;margin-bottom:10px;">Env status: {env_status_line}</div>' if env_status_line else ""
     full_html = f"""
 <style>
   .wf-tbl {{ width:100%; border-collapse:collapse; font-family:'Inter','Segoe UI',sans-serif; margin-bottom:20px; }}
   .wf-tbl thead th {{ background:{PRIMARY_COLOR}; color:#fff; padding:10px 12px; font-size:0.82rem; font-weight:600; text-align:left; }}
   .main-row:hover {{ background:#f0ecff !important; }}
   .main-row td {{ border-bottom:1px solid #e2e8f0; }}
-  .arrow-icon::before {{ content: '▸'; margin-right: 5px; }}
-  .detail-row {{ display: none; }}
-  .wf-toggle:checked + .main-row .arrow-icon::before {{ content: '▾'; }}
-  .wf-toggle:checked + .main-row {{ background: #f0ecff !important; }}
-  .wf-toggle:checked + .main-row + .detail-row {{ display: table-row; }}
 </style>
 <div class="wf-container">
+  {env_status_block}
   <table class="wf-tbl">
     <thead><tr>
       <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
@@ -12110,7 +12180,9 @@ def page_workflow_automation():
             except Exception as ex:
                 st.error(f"Start failed: {ex}")
         if b2.button("Pause", disabled=pause_disabled):
-            set_workflow_run_status(int(run_id), "paused"); st.rerun()
+            set_workflow_run_status(int(run_id), "paused")
+            release_workflow_run_envs(engine, int(run_id))
+            st.rerun()
         if b3.button("Resume Workflow", disabled=resume_disabled):
             set_workflow_run_status(int(run_id), "running")
             try:
@@ -12119,8 +12191,9 @@ def page_workflow_automation():
             st.rerun()
         if b6.button("Stop Workflow", disabled=stop_disabled):
             set_workflow_run_status(int(run_id), "stopped")
+            release_workflow_run_envs(engine, int(run_id))
             try:
-                with _engine.connect() as conn:
+                with engine.connect() as conn:
                     conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": int(run_id)})
                     conn.commit()
             except Exception: pass
@@ -12146,7 +12219,8 @@ def page_workflow_automation():
                 st.error(f"**Danger!** This will permanently delete Run {run_id} and ALL its steps from the database. DS/Scans in BigID are NOT deleted.")
                 if st.button("⚠️ Confirm Delete Run", key=f"wf_delete_confirm_{run_id}", type="primary"):
                     try:
-                        with _engine.connect() as conn:
+                        release_workflow_run_envs(engine, int(run_id))
+                        with engine.connect() as conn:
                             conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": int(run_id)})
                             conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)})
                             conn.commit()
