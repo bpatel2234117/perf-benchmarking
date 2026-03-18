@@ -11060,22 +11060,52 @@ def page_scan_progress():
             df_lag["t"] = pd.to_datetime(df_lag["captured_at_actual"], errors="coerce", utc=True)
             df_lag["state_c"] = df_lag["scan_state"].apply(_compact_state_local) if "scan_state" in df_lag.columns else ""
 
+            # Pre-compute numeric columns used across multiple checks
+            if "objects_scanned" in df_lag.columns:
+                df_lag["objects_scanned_num"] = pd.to_numeric(df_lag["objects_scanned"], errors="coerce")
+            if "completed_parts" in df_lag.columns:
+                df_lag["completed_parts_num"] = pd.to_numeric(df_lag["completed_parts"], errors="coerce")
+            if "total_parts_scanned" in df_lag.columns:
+                df_lag["total_parts_num"] = pd.to_numeric(df_lag["total_parts_scanned"], errors="coerce")
+
             # First time we reached expected totals (objects)
             t_reach_files = None
-            if expected_total_files and expected_total_files > 0 and "objects_scanned" in df_lag.columns:
-                df_lag["objects_scanned_num"] = pd.to_numeric(df_lag["objects_scanned"], errors="coerce")
+            if expected_total_files and expected_total_files > 0 and "objects_scanned_num" in df_lag.columns:
                 reach_rows = df_lag[(df_lag["objects_scanned_num"] >= float(expected_total_files)) & df_lag["t"].notna()]
                 if not reach_rows.empty:
                     t_reach_files = reach_rows.iloc[0]["t"]
 
-            # First time parts appear complete (parts)
+            # First time parts appear complete (completed_parts >= total_parts)
             t_reach_parts = None
-            if "completed_parts" in df_lag.columns and "total_parts_scanned" in df_lag.columns:
-                df_lag["completed_parts_num"] = pd.to_numeric(df_lag["completed_parts"], errors="coerce")
-                df_lag["total_parts_num"] = pd.to_numeric(df_lag["total_parts_scanned"], errors="coerce")
+            if "completed_parts_num" in df_lag.columns and "total_parts_num" in df_lag.columns:
                 reach_p = df_lag[(df_lag["total_parts_num"] > 0) & (df_lag["completed_parts_num"] >= df_lag["total_parts_num"]) & df_lag["t"].notna()]
                 if not reach_p.empty:
                     t_reach_parts = reach_p.iloc[0]["t"]
+
+            # Plateau fallback: for scans that end with failures (CompletedWithFailures),
+            # objects/parts may never reach 100%.  Detect the FIRST snapshot where both
+            # objects_scanned AND completed_parts stop changing vs the previous snapshot.
+            # That sustained plateau is the point at which all scanning work was effectively done.
+            t_reach_plateau = None
+            try:
+                if len(df_lag) >= 2:
+                    prev_obj = None
+                    prev_parts = None
+                    for i, row in df_lag.iterrows():
+                        obj_v = row.get("objects_scanned_num") if "objects_scanned_num" in df_lag.columns else None
+                        parts_v = row.get("completed_parts_num") if "completed_parts_num" in df_lag.columns else None
+                        t_v = row.get("t")
+                        if prev_obj is not None and pd.notnull(t_v):
+                            obj_same = (obj_v == prev_obj) if (obj_v is not None and pd.notnull(obj_v)) else True
+                            parts_same = (parts_v == prev_parts) if (parts_v is not None and pd.notnull(parts_v)) else True
+                            if obj_same and parts_same and prev_obj > 0:
+                                # Use the time of the PREVIOUS snapshot (first time it flatlined)
+                                t_reach_plateau = df_lag.loc[df_lag["t"] < t_v, "t"].max() if (df_lag["t"] < t_v).any() else t_v
+                                break
+                        prev_obj = obj_v if (obj_v is not None and pd.notnull(obj_v)) else prev_obj
+                        prev_parts = parts_v if (parts_v is not None and pd.notnull(parts_v)) else prev_parts
+            except Exception:
+                t_reach_plateau = None
 
             # First terminal state time
             t_terminal = None
@@ -11083,8 +11113,11 @@ def page_scan_progress():
             if not term_rows.empty:
                 t_terminal = term_rows.iloc[0]["t"]
 
-            # Define "reached 100%" time as max of the available reach times (when both are satisfied).
+            # Combine reach candidates: prefer exact 100% over plateau
+            # Use plateau only when neither 100%-objects nor 100%-parts were achieved.
             reach_candidates = [x for x in [t_reach_files, t_reach_parts] if x is not None and pd.notnull(x)]
+            if not reach_candidates and t_reach_plateau is not None and pd.notnull(t_reach_plateau):
+                reach_candidates = [t_reach_plateau]
             t_reach = max(reach_candidates) if reach_candidates else None
 
             if t_reach is not None and t_terminal is not None and pd.notnull(t_terminal) and t_terminal > t_reach:

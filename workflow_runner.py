@@ -2596,6 +2596,37 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
     return did_any_work
 
+
+def _maybe_mark_run_completed(engine, run_id: int) -> None:
+    """
+    If all steps in the run are in a terminal or non-actionable state
+    (completed, error, disabled) — i.e. nothing pending/active remains —
+    mark the workflow run as 'completed'. Called after auth failure so
+    runs don't stay stuck in 'running' forever when all work is done.
+    """
+    try:
+        with engine.connect() as conn:
+            any_active = conn.execute(
+                text(
+                    "SELECT 1 FROM workflow_steps "
+                    "WHERE run_id=:rid "
+                    "AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') "
+                    "AND COALESCE(is_enabled,1)=1 "
+                    "LIMIT 1"
+                ),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not any_active:
+            with engine.connect() as conn:
+                conn.execute(
+                    text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid AND status NOT IN ('completed','stopped')"),
+                    {"rid": int(run_id)},
+                )
+                conn.commit()
+    except Exception:
+        pass
+
+
 def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) -> bool:
     """Helper to process a single step. Extracted from original run_once."""
     step_id = int(step[0])
@@ -2626,6 +2657,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         set_step_error(engine, step_id, f"Auth failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: auth failed")
         _set_env_busy(engine, env_id, run_id, False) # RELEASE
+        # If no other steps are pending/active, auto-complete the run.
+        _maybe_mark_run_completed(engine, run_id)
         return True
 
     cur_status = str(step[19] or "").strip().lower()
