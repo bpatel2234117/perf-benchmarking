@@ -670,6 +670,45 @@ def load_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
         return []
 
 
+def load_workflow_running_scan_env_rows(engine) -> List[Dict[str, Any]]:
+    """
+    Safety net: scans started by workflow_runner may not be present in scan_parents yet.
+    Track any scan_id referenced by workflow_steps with status='scan_running'.
+    Returns rows with: scan_id, scan_name, environment_id, env_name, base_url
+    """
+    if not engine:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    ws.scan_id,
+                    COALESCE(ws.scan_profile_name, ws.ds_name, '') AS scan_name,
+                    ws.environment_id,
+                    te.env_name,
+                    te.base_url
+                FROM workflow_steps ws
+                JOIN test_environments te ON te.id = ws.environment_id
+                WHERE te.is_active = 1
+                  AND COALESCE(ws.is_enabled,1)=1
+                  AND COALESCE(ws.status,'') = 'scan_running'
+                  AND ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> ''
+            """)).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                'scan_id': str(r[0] or '').strip(),
+                'scan_name': str(r[1] or '').strip(),
+                'environment_id': r[2],
+                'env_name': str(r[3] or '').strip(),
+                'base_url': str(r[4] or '').strip(),
+                'scan_status': 'In Progress',
+            })
+        return [x for x in out if x.get('scan_id') and x.get('base_url')]
+    except Exception:
+        return []
+
+
 def _request_get(
     url: str,
     token: str,
@@ -1094,6 +1133,20 @@ def ensure_classifier_mapping_tables(engine) -> None:
                     FOREIGN KEY (classifier_id) REFERENCES classifiers(id)
                 )
             """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS classifier_details_snapshots (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NULL,
+                    build_id INT NOT NULL,
+                    bigid_classifier_id VARCHAR(64) NOT NULL,
+                    classifier_name VARCHAR(500) NOT NULL,
+                    snapshot_json LONGTEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE KEY uniq_env_build_classifier (environment_id, build_id, bigid_classifier_id),
+                    FOREIGN KEY (build_id) REFERENCES builds(id),
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                )
+            """))
             try:
                 conn.execute(text("ALTER TABLE build_classifier_mappings ADD UNIQUE KEY uniq_build_classifier_env (build_id, classifier_id, environment_id)"))
                 conn.commit()
@@ -1104,11 +1157,13 @@ def ensure_classifier_mapping_tables(engine) -> None:
         pass
 
 
-def fetch_enabled_classifiers(base_url: str, token: str, api_path: str) -> List[str]:
+def fetch_classifiers_list_items(base_url: str, token: str, api_path: str) -> List[Dict[str, Any]]:
     """
-    Fetch enabled classifiers list (used as template classifier set approximation).
+    Fetch classifiers list items (objects).
     """
     url = build_api_url(base_url, api_path)
+    # Using the existing _request_get which might be defined in tracker.py (let's check)
+    # Re-checking tracker.py imports and helpers...
     resp = _request_get(url, token, params=None)
     if resp.status_code in (401, 403):
         raise RuntimeError(f"Unauthorized classifiers API: {resp.status_code}")
@@ -1123,7 +1178,140 @@ def fetch_enabled_classifiers(base_url: str, token: str, api_path: str) -> List[
             if isinstance(root.get(key), list):
                 items = [x for x in root.get(key) if isinstance(x, dict)]
                 break
+    return items
 
+
+def fetch_classifier_detail(base_url: str, classifier_id: str, token: str) -> Dict[str, Any]:
+    """GET /api/v1/classifications/{id} -> detail data."""
+    # BigID usually uses /api/v1/classifications/{id} for detail
+    url = build_api_url(base_url, f"/api/v1/classifications/{classifier_id}")
+    resp = _request_get(url, token, params=None)
+    if resp.status_code != 200:
+        # Try fallback /api/v1/all-classifications/{id}
+        url = build_api_url(base_url, f"/api/v1/all-classifications/{classifier_id}")
+        resp = _request_get(url, token, params=None)
+
+    if resp.status_code != 200:
+        return {}
+
+    data = resp.json()
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        return data.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+CLASSIFIER_DETAIL_KEYS = [
+    "classification_name", "category", "classifierType", "dataType", "original_name",
+    "detection_sensitivity", "enabled", "min_length", "max_length",
+    "proximity_after", "proximity_before", "nst_proximity_after", "nst_proximity_before",
+    "description",
+]
+
+
+def sync_classifier_details_for_env_build(engine, env_row: Dict[str, Any], token: str, build_version: str) -> bool:
+    """
+    Fetch and store full detail snapshots for all enabled classifiers.
+    Staggered/Throttled to avoid overloading API.
+    """
+    base_url = str(env_row.get("base_url") or "").strip()
+    env_id = env_row.get("id")
+    if not base_url or not env_id or not build_version:
+        return False
+
+    # Check if we already synced details for this build recently.
+    # We use a 24-hour TTL for full detail sync as it's expensive.
+    env_key = str(env_id)
+    try:
+        # Check if we have ANY snapshots for this build in this environment
+        with engine.connect() as conn:
+            # First get the build_id
+            bid_res = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
+            if bid_res:
+                bid = int(bid_res[0])
+                # Check if we have snapshots
+                snap_count = conn.execute(text("""
+                    SELECT COUNT(*) FROM classifier_details_snapshots 
+                    WHERE build_id = :bid AND environment_id = :eid
+                """), {"bid": bid, "eid": int(env_id)}).scalar()
+                
+                # If we have data, respect the 24-hour TTL. If 0 rows, we FORCE sync.
+                if snap_count > 0:
+                    last_sync = _kv_get(engine, f"classifier_details_sync_last::{env_key}")
+                    last_build = _kv_get(engine, f"classifier_details_sync_build::{env_key}")
+                    if last_sync and last_build == build_version:
+                        dt = _parse_iso_dt(last_sync)
+                        if dt and (datetime.utcnow() - dt).total_seconds() < 86400: # 24h
+                            return True
+    except Exception:
+        pass
+
+    api_path = str(env_row.get("classifiers_api_path") or "").strip() or "/api/v1/classifications"
+    try:
+        items = fetch_classifiers_list_items(base_url, token, api_path)
+    except Exception:
+        return False
+
+    if not items:
+        return False
+
+    with engine.connect() as conn:
+        conn.execute(text("INSERT IGNORE INTO builds (version) VALUES (:v)"), {"v": build_version})
+        bid_row = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
+        if not bid_row:
+            return False
+        build_id = int(bid_row[0])
+
+    print(f"[{datetime.utcnow().isoformat()}Z] env={env_row.get('env_name')} Syncing {len(items)} classifier details for build {build_version}...")
+
+    import json
+    for it in items:
+        cid = it.get("_id") or it.get("id")
+        name = it.get("name") or it.get("classificationName") or it.get("displayName")
+        if not cid or not name:
+            continue
+
+        try:
+            detail = fetch_classifier_detail(base_url, str(cid), token)
+            if not detail:
+                # Use current list item as detail if GET /{id} fails
+                detail = it
+
+            snapshot = {k: detail.get(k) for k in CLASSIFIER_DETAIL_KEYS if k in detail}
+            snapshot_json = json.dumps(snapshot, default=str)
+
+            with engine.connect() as conn:
+                conn.execute(text("""
+                    INSERT INTO classifier_details_snapshots (environment_id, build_id, bigid_classifier_id, classifier_name, snapshot_json)
+                    VALUES (:eid, :bid, :cid, :cname, :json)
+                    ON DUPLICATE KEY UPDATE
+                        classifier_name = VALUES(classifier_name),
+                        snapshot_json = VALUES(snapshot_json),
+                        created_at = CURRENT_TIMESTAMP
+                """), {
+                    "eid": int(env_id),
+                    "bid": build_id,
+                    "cid": str(cid)[:64],
+                    "cname": str(name)[:500],
+                    "json": snapshot_json
+                })
+                conn.commit()
+        except Exception as ex:
+            print(f"  [!] Failed detail for {name}: {ex}")
+
+    try:
+        _kv_set(engine, f"classifier_details_sync_last::{env_key}", datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S'))
+        _kv_set(engine, f"classifier_details_sync_build::{env_key}", str(build_version))
+    except Exception:
+        pass
+
+    return True
+
+
+def fetch_enabled_classifiers(base_url: str, token: str, api_path: str) -> List[str]:
+    """
+    Fetch enabled classifiers list (used as template classifier set approximation).
+    """
+    items = fetch_classifiers_list_items(base_url, token, api_path)
     names: List[str] = []
     for it in items:
         n = str(it.get("name") or it.get("classificationName") or it.get("displayName") or "").strip()
@@ -1338,6 +1526,49 @@ def upsert_scan_progress_record(
         env_id_int = None
 
     with engine.connect() as conn:
+        # start-marker row (scan start time): write the real BigID startedAt as the first DB row for this scan
+        try:
+            sp0 = si.get('scanProfile') if isinstance(si.get('scanProfile'), dict) else {}
+            started_raw = sp0.get('startedAt') or sp0.get('startTime') or sp0.get('createdAt')
+            started_dt = _parse_iso_dt(str(started_raw or '')) if started_raw else None
+            if started_dt is not None:
+                row = conn.execute(text('SELECT 1 FROM scan_progress WHERE scan_id=:sid LIMIT 1'), {'sid': str(scan_id)}).fetchone()
+                if not row:
+                    cau = started_dt.replace(microsecond=0)
+                    slot_m = int(_slot_minutes())
+                    # Avoid colliding with slot-aligned snapshots (seconds=0 at slot boundaries)
+                    if (cau.second == 0) and (cau.minute % slot_m == 0):
+                        cau = cau + timedelta(seconds=1)
+                    ts0 = started_dt.replace(microsecond=0)
+                    conn.execute(text("""
+                        INSERT IGNORE INTO scan_progress (
+                            captured_at_utc, `timestamp`,
+                            scan_id, scan_name, environment_id,
+                            scan_state,
+                            completed_sub_scans, failed_sub_scans, total_sub_scans,
+                            completed_parts, failed_parts, total_parts_scanned,
+                            total_classifications, newly_added_classifications, false_removed_classifications,
+                            objects_scanned, objects_failed, objects_with_pi
+                        ) VALUES (
+                            :cau, :ts,
+                            :sid, :sname, :eid,
+                            :sst,
+                            0,0,0,
+                            0,0,0,
+                            0,0,0,
+                            0,0,0
+                        )
+                    """), {
+                        'cau': cau,
+                        'ts': ts0,
+                        'sid': str(scan_id),
+                        'sname': str(scan_name or ''),
+                        'eid': env_id_int,
+                        'sst': 'Started',
+                    })
+        except Exception:
+            pass
+
         conn.execute(
             text("""
                 INSERT INTO scan_progress (
@@ -2039,6 +2270,7 @@ def track_once(engine) -> Dict[str, Any]:
 
     # DB-driven safety net: keep tracking scans that DB believes are still running
     db_running = load_running_scan_env_rows(engine)
+    wf_running = load_workflow_running_scan_env_rows(engine)
     metrics["db_running_seen"] = len(db_running)
     for r in db_running:
         sid = str(r.get("scan_id") or "").strip()
@@ -2057,6 +2289,28 @@ def track_once(engine) -> Dict[str, Any]:
                 sid,
                 str(r.get("scan_name") or ""),
                 str(r.get("scan_status") or ""),
+            )
+        )
+        seen_scan_ids.add(sid)
+
+    # Workflow-driven safety net: track scans referenced by workflow_steps scan_running
+    for r in (wf_running or []):
+        sid = str(r.get("scan_id") or "").strip()
+        if not sid or sid in seen_scan_ids:
+            continue
+        base = str(r.get("base_url") or "").strip().rstrip("/")
+        env_row = env_by_id.get(r.get("environment_id")) or env_by_base.get(base) or {
+            "id": r.get("environment_id"),
+            "env_name": r.get("env_name"),
+            "base_url": r.get("base_url"),
+        }
+        jobs.append(
+            (
+                str(env_row.get("base_url") or "").strip(),
+                env_row,
+                sid,
+                str(r.get("scan_name") or ""),
+                str(r.get("scan_status") or "In Progress"),
             )
         )
         seen_scan_ids.add(sid)
@@ -2138,6 +2392,13 @@ def track_once(engine) -> Dict[str, Any]:
                         names = fetch_enabled_classifiers(base_url, token, api_path)
                         if names:
                             upsert_build_classifier_set(engine, bver, str(tmpl or "Data Source Scan"), names, int(eid) if eid is not None else None)
+                            
+                            # NEW: Also sync full details for the classifier_details_snapshots table
+                            try:
+                                sync_classifier_details_for_env_build(engine, env_row, token, str(bver))
+                            except Exception:
+                                pass
+                                
                             metrics["global_classifier_sync_ok"] += 1
                             try:
                                 metrics["global_builds_seen"].append(str(bver))
