@@ -1782,9 +1782,9 @@ def wait_for_ds_connection_test_result(
             if cst is None and (_now_utc() >= grace_decide_at):
                 # BigID often does not return connectionStatusTest in GET for MSSQL/S3/SMB. Test was already triggered (POST).
                 # Default: proceed so workflow continues; set WORKFLOW_DS_TEST_STRICT=1 to require connectionStatusTest.
-                if os.getenv("WORKFLOW_DS_TEST_STRICT", "1").strip().lower() in ("1", "true", "yes"):
+                if os.getenv("WORKFLOW_DS_TEST_STRICT", "").strip().lower() in ("1", "true", "yes"):
                     return False, "connectionStatusTest missing; cannot confirm success (DS may stay Draft in BigID)"
-                return False, "no connectionStatusTest in response; test was triggered but result unknown, failing for safety"
+                return True, "no connectionStatusTest in response; test was triggered, proceeding so workflow can continue"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
@@ -2520,8 +2520,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                             {"rid": run_id, "seq": cand_seq},
                         ).fetchone()
                     count_before = int(in_progress[0]) if in_progress else 0
-                    if count_before >= 1:
-                        continue  # Sequential execution: wait for earlier steps to finish or fail terminal.
+                    if count_before >= num_envs:
+                        continue  # no capacity: all envs are "used" by earlier steps or those with higher priority (lower seq)
 
                 c_status = str(cand[19] or '').strip().lower()
                 c_env = cand[2]
