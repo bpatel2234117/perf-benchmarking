@@ -10951,7 +10951,61 @@ def page_scan_progress():
                             "pct": pct_cls,
                             "prev_build": prev_build_cls or "unknown",
                             "prev_sid": prev_sid_cls,
+                            "missing": [],
+                            "new": [],
+                            "changed": []
                         }
+                        
+                        # Fetch and compare individual classifiers if available
+                        try:
+                            import json
+                            def _get_cls_dict(sid: str) -> dict:
+                                with engine.connect() as _c:
+                                    r = _c.execute(
+                                        text("SELECT attributes_payload FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                                        {"sid": sid}
+                                    ).fetchone()
+                                if not r or not r[0]: return {}
+                                data = json.loads(r[0])
+                                attrs = data.get("data", {}).get("attributes", []) if isinstance(data, dict) else []
+                                if not attrs and isinstance(data, list): attrs = data
+                                # Each attribute usually has "_id" (name) and "new" (count)
+                                res = {}
+                                for a in attrs:
+                                    if isinstance(a, dict) and "_id" in a:
+                                        c_name = str(a.get("_id")).replace("classifier.", "")
+                                        c_cnt = int(a.get("new", 0))
+                                        if c_cnt > 0:
+                                            res[c_name] = c_cnt
+                                return res
+
+                            cur_dict = _get_cls_dict(str(scan_id))
+                            prev_dict = _get_cls_dict(prev_sid_cls)
+
+                            if cur_dict or prev_dict:
+                                missing = []
+                                new_cls = []
+                                changed = []
+                                all_keys = set(cur_dict.keys()).union(set(prev_dict.keys()))
+                                for k in sorted(all_keys):
+                                    c_val = cur_dict.get(k, 0)
+                                    p_val = prev_dict.get(k, 0)
+                                    if p_val > 0 and c_val == 0:
+                                        missing.append(k)
+                                    elif c_val > 0 and p_val == 0:
+                                        new_cls.append(k)
+                                    elif p_val > 0 and c_val > 0:
+                                        diff = abs(c_val - p_val)
+                                        pct = (diff / p_val) * 100.0
+                                        if pct > 10.0 or diff > 100:
+                                            changed.append(f"{k} ({p_val:,} -> {c_val:,})")
+                                
+                                cls_vs_prev["missing"] = missing
+                                cls_vs_prev["new"] = new_cls
+                                cls_vs_prev["changed"] = changed
+                        except Exception:
+                            pass
+
     except Exception:
         cls_vs_prev = {}
 
@@ -11330,6 +11384,26 @@ def page_scan_progress():
                     f"— {direction} by **{sign}{delta_v:,}** ({sign}{pct_v:.1f}%). "
                     f"Possible causes: changed classifier set, data drift, or classification regression."
                 )
+                
+                # Show classifier difference breakdown if available
+                missing = cls_vs_prev.get("missing", [])
+                new_cls = cls_vs_prev.get("new", [])
+                changed = cls_vs_prev.get("changed", [])
+                
+                if missing or new_cls or changed:
+                    with st.expander("🔍 View Classifier Differences", expanded=True):
+                        if missing:
+                            st.markdown("**Missing Classifiers (in previous, but 0 in current):**")
+                            for m in missing:
+                                st.caption(f"- 🔴 {m}")
+                        if new_cls:
+                            st.markdown("**New Classifiers (in current, but 0 in previous):**")
+                            for n in new_cls:
+                                st.caption(f"- 🟢 {n}")
+                        if changed:
+                            st.markdown("**Significantly Changed ( >10% or >100 diff ):**")
+                            for c in changed:
+                                st.caption(f"- 🟡 {c}")
         except Exception:
             pass
 
