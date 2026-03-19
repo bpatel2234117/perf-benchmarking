@@ -6687,9 +6687,9 @@ def page_manage_test_environments():
         st.session_state["_prev_base_url_for_version_sync"] = normalize_base_url(selected_row.get("base_url") or "")
         st.session_state.pop("_auto_version_status", None)
 
-    c1, c2 = st.columns(2)
-    env_name = c1.text_input("Environment Name", key="env_name_input")
-    base_url = c2.text_input("Base URL", key="env_base_url_input", placeholder="https://test-env.example.com")
+    col1, col2, col3 = st.columns(3)
+    env_name = col1.text_input("Environment Name", key="env_name_input")
+    base_url = col2.text_input("Base URL", key="env_base_url_input", placeholder="https://test-env.example.com")
 
     # Auto-fetch version when base URL changes (especially for first-time/new env entry)
     normalized_base_url = normalize_base_url(base_url)
@@ -6733,12 +6733,14 @@ def page_manage_test_environments():
         else:
             st.warning(msg)
 
-    c3, c4 = st.columns(2)
-    version = c3.text_input("Version", key="env_version_input")
-    auth_username = c4.text_input("Username (optional)", key="env_auth_username_input", help="If blank, defaults to bigid")
-    c5, _ = st.columns(2)
-    auth_password = c5.text_input("Password (optional)", key="env_auth_password_input", type="password", help="If blank, defaults to bigid111")
-    is_active = st.checkbox("Active", value=bool(selected_row.get("is_active", True)))
+    version = col3.text_input("Version", key="env_version_input")
+
+    col4, col5, col6 = st.columns(3)
+    auth_username = col4.text_input("Username (optional)", key="env_auth_username_input", help="If blank, defaults to bigid")
+    auth_password = col5.text_input("Password (optional)", key="env_auth_password_input", type="password", help="If blank, defaults to bigid111")
+    with col6:
+        st.markdown("<div style='margin-top: 32px;'></div>", unsafe_allow_html=True)
+        is_active = st.checkbox("Active", value=bool(selected_row.get("is_active", True)))
 
     if st.button("Save Environment", type="primary"):
         if not env_name.strip():
