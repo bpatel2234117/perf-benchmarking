@@ -1105,6 +1105,8 @@ def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: st
     for k in keys:
         v = str(get_template(engine, k) or "").strip()
         if v:
+            try: logger.info("resolved template key=%s value=%s", k, v)
+            except Exception: pass
             return v
     # Env var fallback
     env_v = str(os.getenv("WORKFLOW_DEFAULT_SCAN_TEMPLATE_ID", "") or "").strip()
@@ -1115,13 +1117,15 @@ def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: st
         items = fetch_scan_templates(base_url, token, limit=200, skip=0)
         for it in items or []:
             nm = str(it.get("name") or "").strip().lower()
-            if nm == "data source scan":
+            if nm in {"data source scan", "datasource scan"}:
                 tid = str(it.get("_id") or it.get("id") or "").strip()
                 if tid:
                     if env_id is not None:
                         upsert_template_value(engine, f"config::scan_template_id::env={int(env_id)}", "config", tid)
                     else:
                         upsert_template_value(engine, "config::scan_template_id", "config", tid)
+                    try: logger.info("resolved default scan template '%s' -> %s", nm, tid)
+                    except Exception: pass
                     return tid
     except Exception:
         pass
@@ -1778,9 +1782,9 @@ def wait_for_ds_connection_test_result(
             if cst is None and (_now_utc() >= grace_decide_at):
                 # BigID often does not return connectionStatusTest in GET for MSSQL/S3/SMB. Test was already triggered (POST).
                 # Default: proceed so workflow continues; set WORKFLOW_DS_TEST_STRICT=1 to require connectionStatusTest.
-                if os.getenv("WORKFLOW_DS_TEST_STRICT", "").strip().lower() in ("1", "true", "yes"):
+                if os.getenv("WORKFLOW_DS_TEST_STRICT", "1").strip().lower() in ("1", "true", "yes"):
                     return False, "connectionStatusTest missing; cannot confirm success (DS may stay Draft in BigID)"
-                return True, "no connectionStatusTest in response; test was triggered, proceeding so workflow can continue"
+                return False, "no connectionStatusTest in response; test was triggered but result unknown, failing for safety"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
@@ -2168,8 +2172,8 @@ def _extract_id(payload: Dict[str, Any], keys: List[str]) -> str:
     if isinstance(v, str) and v.strip():
         return v.strip()
     if isinstance(v, dict):
-        for kk in ["_id", "id", "scanId", "scan_id", "parentScanId", "parent_scan_id"]:
-            if isinstance(v.get(kk), str) and v.get(kk).strip():
+        for kk in ["_id", "id", "ID", "Guid", "GUID", "scanId", "scan_id", "parentScanId", "parent_scan_id", "dsId", "ds_id"]:
+            if isinstance(v.get(kk), (str, int)) and str(v.get(kk)).strip():
                 return str(v.get(kk)).strip()
     return ""
 
@@ -2516,8 +2520,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                             {"rid": run_id, "seq": cand_seq},
                         ).fetchone()
                     count_before = int(in_progress[0]) if in_progress else 0
-                    if count_before >= num_envs:
-                        continue  # no capacity: all envs are "used" by earlier steps
+                    if count_before >= 1:
+                        continue  # Sequential execution: wait for earlier steps to finish or fail terminal.
 
                 c_status = str(cand[19] or '').strip().lower()
                 c_env = cand[2]
@@ -2947,8 +2951,12 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
 
         # Match BigID UI: PUT body must include isSavedAsDraft=false so DS is not left in Draft.
         if isinstance(ds_payload, dict):
+            # Same nesting-aware logic as _apply_runtime_flags
             ds_payload = dict(ds_payload)
-            ds_payload["isSavedAsDraft"] = False
+            if isinstance(ds_payload.get("ds_connection"), dict):
+                ds_payload["ds_connection"]["isSavedAsDraft"] = False
+            else:
+                ds_payload["isSavedAsDraft"] = False
 
         # Idempotency: if DS already exists for this step (ds_id stored) and name matches,
         # avoid re-PUT to prevent accidental duplicate DS artifacts.
@@ -2975,6 +2983,9 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
                 ds_id = ds_id or _extract_ds_id_from_payload(fetched)
         except Exception:
             pass
+        if not ds_id:
+            try: logger.warning("failed to extract ds_id from PUT or GET for ds_name=%s payload_keys=%s", desired_ds_name, list(out.keys()) if isinstance(out,dict) else 'non-dict')
+            except Exception: pass
         if ds_id:
             logger.info("WORKFLOW_STEP_DS_CREATED run_id=%s step_seq=%s ds_id=%s ds_name=%s", run_id, seq, ds_id, desired_ds_name)
             set_step_status(engine, step_id, "ds_created", ds_id=str(ds_id))

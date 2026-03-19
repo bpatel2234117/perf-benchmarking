@@ -11979,11 +11979,24 @@ def page_workflow_automation():
             if s in {"running", "pre_action_done"}: return "⏳ DS"
             
             if s == "error":
-                if sid: return "✅DS ➔ ✅Test ➔ ✅Profile ➔ ⏳Scan ⚠️"
-                if not has_ds: return "❌ DS"
-                if has_ds and not has_test: return "✅DS ➔ ❌Test"
-                if has_test and not has_profile: return "✅DS ➔ ✅Test ➔ ❌Profile"
-                if has_profile and not has_scan: return "✅DS ➔ ✅Test ➔ ✅Profile ➔ ❌Scan"
+                # Detailed error flow for better visibility
+                if sid: return f"✅DS ➔ ✅Test ➔ ✅Profile ➔ ⏳Scan ⚠️"
+                err_text = str(row_dict.get("last_error") or "").lower()
+                
+                # Check based on last_error message content combined with known IDs
+                if "scan start failed" in err_text or has_profile:
+                    return "✅DS ➔ ✅Test ➔ ✅Profile ❌Scan"
+                if "scan profile" in err_text or "template" in err_text:
+                    return "✅DS ➔ ✅Test ❌Profile"
+                if "connection test failed" in err_text:
+                    return "✅DS ❌Test"
+                if "ds create failed" in err_text or not has_ds:
+                    return "❌ DS"
+                
+                # Fallback matching original logic but more cautious
+                if has_ds:
+                    # If we have a DS but errored, and didn't hit any subsequent phase strings
+                    return "✅DS ❌Test"
                 return "❌ Error"
                 
             parts = []
