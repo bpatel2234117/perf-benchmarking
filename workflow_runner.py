@@ -2529,9 +2529,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if c_env is None: continue
                     return (cand, int(c_env))
 
-                # Search through ALL active environments. DB first (reserved by another run?), then API (scan running?).
+                # Search through ALL active environments (or just the assigned one). DB first (reserved by another run?), then API (scan running?).
                 best_env = None
-                for eid in active_env_ids:
+                env_candidates = [int(c_env)] if c_env is not None else active_env_ids
+                for eid in env_candidates:
+                    if int(eid) not in active_env_ids:
+                        continue
                     if int(eid) in targeted_envs:
                         continue
                     db_busy, db_busy_by = env_db_busy.get(eid, (False, None))

@@ -11690,17 +11690,11 @@ def page_scan_progress():
         st.rerun()
 
 
-def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]) -> List[Dict[str, Any]]:
+def _build_default_workflow_steps() -> List[Dict[str, Any]]:
     """
     UI plan (no side-effects). Backend runner will execute these sequentially.
-    Alternates env1/env2 per step.
+    Environment IDs are selected at execution time, not creation time.
     """
-    envs = [env1_id, env2_id]
-    def _env_for_idx(i: int) -> Optional[int]:
-        if not envs or (envs[0] is None and envs[1] is None):
-            return None
-        return envs[i % 2] if envs[i % 2] is not None else envs[(i + 1) % 2]
-
     base: List[Dict[str, Any]] = [
         {"ds_kind": "postgres", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "Postgres Full Scan"},
         {"ds_kind": "mssql", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "MSSQL Full Scan"},
@@ -11767,7 +11761,7 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
     steps: List[Dict[str, Any]] = []
     for idx, stp in enumerate(base):
         stp2 = dict(stp)
-        stp2["environment_id"] = _env_for_idx(idx)
+        stp2["environment_id"] = None
         stp2["ds_name"] = _standard_ds_name(
             str(stp2.get("ds_kind") or ""),
             stp2.get("file_set_type"),
@@ -11882,19 +11876,15 @@ def page_workflow_automation():
                 "You can still select them, but steps will be queued until that workflow finishes."
             )
 
-        c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
-        env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_new_expander")
-        env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2_new_expander")
-        cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_new_expander"))
-        env1_id = env_ids[env_labels.index(env1_label)]
-        env2_id = env_ids[env_labels.index(env2_label)]
-        wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_new_expander")
+        st.info("💡 **Tip:** Test Environments are now mapped when you click **start** (▶️) on a run below, giving you flexibility to reuse Workflow Plans across different active environments.")
 
+        c1, c2 = st.columns([2.0, 1.0])
+        wf_name = c1.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_new_expander")
+        cooldown = int(c2.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_new_expander"))
+        
         create_disabled = False
-        if int(env1_id) == int(env2_id):
-            st.info("Env 1 and Env 2 are the same. Workflow will run sequentially on this single machine.")
 
-        preview_steps = _build_default_workflow_steps(env1_id, env2_id)
+        preview_steps = _build_default_workflow_steps()
         for stp in preview_steps or []:
             if isinstance(stp, dict) and "is_enabled" not in stp:
                 stp["is_enabled"] = True
@@ -11920,8 +11910,8 @@ def page_workflow_automation():
         if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
             rid = create_workflow_run(
                 wf_name,
-                env1_id=int(env1_id),
-                env2_id=int(env2_id),
+                env1_id=None,
+                env2_id=None,
                 steps=preview_steps,
                 cooldown_minutes=int(cooldown),
             )
@@ -12336,8 +12326,47 @@ def page_workflow_automation():
         resume_disabled = (selected_status != "paused")
         stop_disabled = (selected_status not in {"running", "paused"})
 
+        chosen_e1_id = None
+        chosen_e2_id = None
+        if selected_status in {"created", "stopped", "paused"}:
+            st.markdown("##### 🚀 Start / Resume Environment Mapping")
+            st.caption("Select the environments where this workflow will run. Steps will alternate between Env 1 and Env 2.")
+            c_env1, c_env2 = st.columns(2)
+            
+            # Fetch active envs again
+            env_labels_ctrl = [_env_label(r) for r in active_df.itertuples()]
+            env_ids_ctrl = [int(r.id) for r in active_df.itertuples()]
+            
+            # Default to previously selected if exists
+            prev_e1 = int(rrow.get("env1_id")) if rrow.get("env1_id") else (env_ids_ctrl[0] if env_ids_ctrl else None)
+            prev_e2 = int(rrow.get("env2_id")) if rrow.get("env2_id") else (env_ids_ctrl[1] if len(env_ids_ctrl)>1 else prev_e1)
+            
+            idx1 = env_ids_ctrl.index(prev_e1) if prev_e1 in env_ids_ctrl else 0
+            idx2 = env_ids_ctrl.index(prev_e2) if prev_e2 in env_ids_ctrl else (1 if len(env_ids_ctrl)>1 else 0)
+
+            chosen_env1_lbl = c_env1.selectbox("Env 1 (Primary)", env_labels_ctrl, index=idx1, key=f"start_e1_{run_id}")
+            chosen_env2_lbl = c_env2.selectbox("Env 2 (Secondary)", env_labels_ctrl, index=idx2, key=f"start_e2_{run_id}")
+            chosen_e1_id = env_ids_ctrl[env_labels_ctrl.index(chosen_env1_lbl)]
+            chosen_e2_id = env_ids_ctrl[env_labels_ctrl.index(chosen_env2_lbl)]
+            st.markdown("<br>", unsafe_allow_html=True)
+
+        b1, b2, b3, b4, b5, b6 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3, 1.0])
+
+        def _apply_run_envs(r_id, e1_id, e2_id):
+            if e1_id is None or e2_id is None: return
+            with engine.connect() as conn:
+                conn.execute(text("UPDATE workflow_runs SET env1_id=:e1, env2_id=:e2 WHERE id=:rid"), {"e1": e1_id, "e2": e2_id, "rid": r_id})
+                # Lock environments only for steps that are not already running/completed etc
+                conn.execute(text("""
+                    UPDATE workflow_steps 
+                    SET environment_id = CASE WHEN (seq % 2) = 1 THEN :e1 ELSE :e2 END
+                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('scan_running', 'completed', 'disabled')
+                """), {"e1": e1_id, "e2": e2_id, "rid": r_id})
+                conn.commit()
+
         if b1.button("Start Workflow", type="primary", disabled=start_disabled):
             try:
+                _apply_run_envs(int(run_id), chosen_e1_id, chosen_e2_id)
                 set_workflow_run_status(int(run_id), "running")
                 try:
                     if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
@@ -12350,11 +12379,15 @@ def page_workflow_automation():
             release_workflow_run_envs(engine, int(run_id))
             st.rerun()
         if b3.button("Resume Workflow", disabled=resume_disabled):
-            set_workflow_run_status(int(run_id), "running")
             try:
-                if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
-            except Exception: pass
-            st.rerun()
+                _apply_run_envs(int(run_id), chosen_e1_id, chosen_e2_id)
+                set_workflow_run_status(int(run_id), "running")
+                try:
+                    if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
+                except Exception: pass
+                st.rerun()
+            except Exception as ex:
+                st.error(f"Resume failed: {ex}")
         if b6.button("Stop Workflow", disabled=stop_disabled):
             set_workflow_run_status(int(run_id), "stopped")
             release_workflow_run_envs(engine, int(run_id))
