@@ -6833,7 +6833,9 @@ def page_manage_test_environments():
                             st.warning("Environment saved, but classifier API returned no names.")
                     except Exception as ex:
                         st.warning(f"Environment saved, but classifier sync failed: {ex}")
-
+                
+                # Clear the cache so the updated active state renders immediately 
+                load_test_environments.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"Error saving environment: {e}")
