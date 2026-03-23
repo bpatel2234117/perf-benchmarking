@@ -9,6 +9,21 @@ from pathlib import Path
 SESSION_DIR = Path.home() / ".streamlit_sessions"
 SESSION_DIR.mkdir(exist_ok=True)
 
+__all__ = [
+    'ensure_rbac_tables', 
+    'login_user', 
+    'logout_user', 
+    'check_access', 
+    'get_user_permissions', 
+    'hash_password', 
+    'verify_password',
+    'update_user_role'
+]
+
+# Diagnostic for ImportError debugging
+import logging
+logging.debug("Dashboard Auth module initialized. Exports: " + ", ".join(__all__))
+
 def get_client_id():
     """Identify the client based on headers."""
     headers = st.context.headers
