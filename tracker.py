@@ -578,6 +578,42 @@ def ensure_scan_progress_table(engine) -> None:
                 INDEX idx_state (scan_state)
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scanner_group_performance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                environment_id INT NOT NULL,
+                captured_at_utc DATETIME NOT NULL,
+                group_name VARCHAR(255) NULL,
+                running_scanners INT DEFAULT 0,
+                running_threads INT DEFAULT 0,
+                max_threads INT DEFAULT 0,
+                scanner_threads INT DEFAULT 0,
+                physical_memory_mb BIGINT DEFAULT 0,
+                free_memory_mb BIGINT DEFAULT 0,
+                avg_scan_speed FLOAT DEFAULT 0,
+                update_date_bigid DATETIME NULL,
+                INDEX idx_env_time_group (environment_id, captured_at_utc)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scanner_individual_performance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                environment_id INT NOT NULL,
+                captured_at_utc DATETIME NOT NULL,
+                scanner_id VARCHAR(255) NULL,
+                name VARCHAR(255) NULL,
+                status VARCHAR(64) NULL,
+                group_name VARCHAR(255) NULL,
+                running_threads INT DEFAULT 0,
+                total_num_of_threads INT DEFAULT 0,
+                system_load_average FLOAT DEFAULT 0,
+                physical_memory_mb BIGINT DEFAULT 0,
+                free_memory_mb BIGINT DEFAULT 0,
+                scanner_threads INT DEFAULT 0,
+                update_date_bigid DATETIME NULL,
+                INDEX idx_env_time_scanner (environment_id, captured_at_utc, scanner_id)
+            )
+        """))
         # schema upgrades for existing DBs
         for stmt in [
             "ALTER TABLE scan_progress MODIFY COLUMN `timestamp` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
@@ -1435,6 +1471,11 @@ def upsert_scan_parent_record(engine, env_id: Any, scan: Dict[str, Any], status:
     started_at = str(scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt") or "").strip() or None
     completed_at = str(scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt") or "").strip() or None
     status_val = str(status or "").strip() or None
+
+    # Hardening: Only accept completed_at if the scan is in a terminal state.
+    # Some BigID versions return a non-null endTime/completedAt for in-progress scans.
+    if status_val and not _is_terminal_state(status_val):
+        completed_at = None
     try:
         env_id_int = int(env_id) if env_id is not None and str(env_id).strip() != "" else None
     except Exception:
@@ -1626,6 +1667,51 @@ def upsert_scan_progress_record(
                 "owp": objects_with_pi,
             },
         )
+        
+        # FINAL/TERMINAL row: If scan is terminal, insert a row with the ACTUAL completedAt as captured_at_utc
+        if scan_state and _is_terminal_state(scan_state):
+            try:
+                sp0 = si.get('scanProfile') if isinstance(si.get('scanProfile'), dict) else {}
+                completed_raw = sp0.get('completedAt') or sp0.get('endTime') or sp0.get('endedAt') or si.get('completedAt')
+                completed_dt = _parse_iso_dt(str(completed_raw or '')) if completed_raw else None
+                if completed_dt:
+                    cau_end = completed_dt.replace(microsecond=0)
+                    # Offset by 1s if it lands exactly on a slot to avoid collision with PULSE snapshots
+                    if (cau_end.second == 0) and (cau_end.minute % slot_m == 0):
+                        cau_end = cau_end + timedelta(seconds=1)
+                        
+                    conn.execute(text("""
+                        INSERT IGNORE INTO scan_progress (
+                            captured_at_utc, `timestamp`,
+                            scan_id, scan_name, environment_id,
+                            scan_state,
+                            completed_sub_scans, failed_sub_scans, total_sub_scans,
+                            completed_parts, failed_parts, total_parts_scanned,
+                            total_classifications, newly_added_classifications, false_removed_classifications,
+                            objects_scanned, objects_failed, objects_with_pi
+                        ) VALUES (
+                            :cau, :ts,
+                            :sid, :sname, :eid,
+                            :sst,
+                            :cs, :fs, :tsc,
+                            :cp, :fp, :tp,
+                            :tc, :nc, :fr,
+                            :os, :of, :owp
+                        )
+                    """), {
+                        'cau': cau_end,
+                        'ts': cau_end,
+                        'sid': str(scan_id),
+                        'sname': str(scan_name or ''),
+                        'eid': env_id_int,
+                        'sst': scan_state,
+                        'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
+                        'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
+                        'tc': total_class, 'nc': new_class, 'fr': false_removed,
+                        'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
+                    })
+            except Exception:
+                pass
         conn.commit()
 
 
@@ -1647,6 +1733,94 @@ def upsert_scan_insights_record(engine, scan_id: str, insight_payload: Dict[str,
             return int(v)
         except Exception:
             return None
+
+def _strip_mb_to_int(v: Any) -> int:
+    try:
+        if not v: return 0
+        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
+        return int(float(s))
+    except Exception:
+        return 0
+
+def get_scanner_group_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
+    """Fetch scanner group metrics from /api/v1/scanner-groups"""
+    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
+    try:
+        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Expecting data: { "status": "success", "data": [ { "scannerGroups": [...] } ] }
+            groups_outer = data.get("data", [])
+            if groups_outer and isinstance(groups_outer, list):
+                return groups_outer[0].get("scannerGroups", [])
+    except Exception:
+        pass
+    return []
+
+def get_individual_scanner_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
+    """Fetch individual scanner metrics from /api/v1/health-checks/services-status"""
+    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
+    try:
+        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                return [x for x in data if x.get("type") == "scanner"]
+    except Exception:
+        pass
+    return []
+
+def upsert_scanner_performance(engine, env_id: int, group_data: List[Dict[str, Any]], individual_data: List[Dict[str, Any]], captured_at=None) -> None:
+    now_utc = captured_at if captured_at else _now_utc_naive()
+    # If no captured_at was passed, we might still want to align to 20-min marks for the periodic loop.
+    # However, I'll move the alignment logic TO THE CALLER (the main loop) so manual calls aren't forced into buckets.
+    captured_at_utc = now_utc.replace(second=0, microsecond=0)
+    
+    with engine.connect() as conn:
+        # Save group stats
+        for g in group_data:
+            update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
+            conn.execute(text("""
+                INSERT IGNORE INTO scanner_group_performance (
+                    environment_id, captured_at_utc, group_name,
+                    running_scanners, running_threads, max_threads, scanner_threads,
+                    physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
+                ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
+            """), {
+                "eid": env_id, "cau": captured_at_utc, "gn": str(g.get("name") or ""),
+                "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
+                "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
+                "pm": int(g.get("physicalMemory") or 0), "fm": int(g.get("freeMemory") or 0),
+                "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
+            })
+            
+        # Save individual stats
+        for s in individual_data:
+            update_date = _parse_iso_dt(str(s.get("updateDate") or ""))
+            sid = str(s.get("id") or "")
+            s_name = str(s.get("name") or "")
+            # If multiple scanners have the same name, we suffix with ID to separate lines in charts
+            display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
+            
+            conn.execute(text("""
+                INSERT IGNORE INTO scanner_individual_performance (
+                    environment_id, captured_at_utc, scanner_id, name, status, group_name,
+                    running_threads, total_num_of_threads, system_load_average,
+                    physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
+                ) VALUES (
+                    :eid, :cau, :sid, :name, :status, :gn,
+                    :rt, :tt, :la, :pm, :fm, :st, :ud
+                )
+            """), {
+                "eid": env_id, "cau": captured_at_utc, "sid": sid,
+                "name": display_name, "status": str(s.get("status") or ""),
+                "gn": str(s.get("group") or ""),
+                "rt": int(s.get("runningThreads") or 0), "tt": int(s.get("totalNumOfThreads") or 0),
+                "la": float(s.get("systemLoadAverage") or 0),
+                "pm": _strip_mb_to_int(s.get("physicalMemory")), "fm": _strip_mb_to_int(s.get("freeMemory")),
+                "st": int(s.get("scannerThreads") or 0), "ud": update_date
+            })
+        conn.commit()
 
     ds_names = data_sources.get("dataSourceNames")
     if isinstance(ds_names, list):
@@ -2243,6 +2417,24 @@ def track_once(engine) -> Dict[str, Any]:
 
         try:
             scans = _fetch_running_parent_scans(base_url, token)
+            
+            # Performance tracking (every 20 minutes)
+            # ONLY if there are active scans (requested by user)
+            if scans:
+                try:
+                    now_p = _now_utc_naive()
+                    # We use 20-minute buckets (0-19, 20-39, 40-59)
+                    p_bucket = now_p.minute // 20
+                    p_key = f"scanner_perf_cap::{env_id}::{now_p.strftime('%Y%m%d%H')}_{p_bucket}"
+                    if not _kv_get(engine, p_key):
+                        p_groups = get_scanner_group_performance(base_url, token)
+                        p_inds = get_individual_scanner_performance(base_url, token)
+                        if p_groups or p_inds:
+                            aligned_p = now_p.replace(minute=p_bucket * 20, second=0, microsecond=0)
+                            upsert_scanner_performance(engine, env_id, p_groups, p_inds, captured_at=aligned_p)
+                            _kv_set(engine, p_key, "done", expire_seconds=1200)
+                except Exception:
+                    pass
         except Exception as ex:
             metrics["env_failures"] += 1
             metrics["fail_parent_scans"] += 1

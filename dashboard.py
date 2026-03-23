@@ -2205,14 +2205,26 @@ def parse_iso_datetime(dt_value):
         return None
 
 
-def format_scan_duration(started_at, completed_at):
+def format_scan_duration(started_at, completed_at, is_running=False):
     start_dt = parse_iso_datetime(started_at)
-    end_dt = parse_iso_datetime(completed_at)
-    if not start_dt or not end_dt:
+    if not start_dt:
         return ""
+    end_dt = parse_iso_datetime(completed_at)
+    if not end_dt:
+        if is_running:
+            end_dt = datetime.now(timezone.utc)
+        else:
+            return ""
+    
+    # Ensure both are offset-aware for comparison
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
     seconds = int((end_dt - start_dt).total_seconds())
     if seconds < 0:
-        return ""
+        return "00:00:00"
     hh = seconds // 3600
     mm = (seconds % 3600) // 60
     ss = seconds % 60
@@ -3158,6 +3170,42 @@ def ensure_scan_progress_table():
                     INDEX idx_timestamp (timestamp),
                     INDEX idx_captured_at_utc (captured_at_utc),
                     INDEX idx_state (scan_state)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scanner_group_performance (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    captured_at_utc DATETIME NOT NULL,
+                    group_name VARCHAR(255) NULL,
+                    running_scanners INT DEFAULT 0,
+                    running_threads INT DEFAULT 0,
+                    max_threads INT DEFAULT 0,
+                    scanner_threads INT DEFAULT 0,
+                    physical_memory_mb BIGINT DEFAULT 0,
+                    free_memory_mb BIGINT DEFAULT 0,
+                    avg_scan_speed FLOAT DEFAULT 0,
+                    update_date_bigid DATETIME NULL,
+                    INDEX idx_env_time_group (environment_id, captured_at_utc)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scanner_individual_performance (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    captured_at_utc DATETIME NOT NULL,
+                    scanner_id VARCHAR(255) NULL,
+                    name VARCHAR(255) NULL,
+                    status VARCHAR(64) NULL,
+                    group_name VARCHAR(255) NULL,
+                    running_threads INT DEFAULT 0,
+                    total_num_of_threads INT DEFAULT 0,
+                    system_load_average FLOAT DEFAULT 0,
+                    physical_memory_mb BIGINT DEFAULT 0,
+                    free_memory_mb BIGINT DEFAULT 0,
+                    scanner_threads INT DEFAULT 0,
+                    update_date_bigid DATETIME NULL,
+                    INDEX idx_env_time_scanner (environment_id, captured_at_utc, scanner_id)
                 )
             """))
             # Non-breaking schema upgrades for existing DBs
@@ -4362,9 +4410,222 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
                 "os": objects_scanned, "of": objects_failed, "owp": objects_with_pi
             })
             conn.commit()
+        # Final terminal snapshot logic
+        try:
+            terminal_states = {
+                "completed", "completedwithfailures", "completed with failures",
+                "failed", "stopped", "stop", "aborted", "cancelled", "canceled",
+            }
+            is_terminal = str(scan_state).strip().lower().replace(" ", "") in {x.replace(" ", "") for x in terminal_states}
+            if is_terminal:
+                try:
+                    # Get actual completedAt from BigID if available
+                    si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
+                    if not si:
+                        si = insight_payload if isinstance(insight_payload, dict) else {}
+                    sp = si.get("scanProfile") if isinstance(si.get("scanProfile"), dict) else {}
+                    cat = sp.get("completedAt")
+                    if cat:
+                        cat_dt = None
+                        try:
+                            clean_time = str(cat).replace("Z", "+00:00")
+                            cat_dt = datetime.fromisoformat(clean_time)
+                            if cat_dt.tzinfo:
+                                cat_dt = cat_dt.astimezone(timedelta(0)).replace(tzinfo=None)
+                        except Exception:
+                            pass
+                        
+                        if cat_dt:
+                            with engine.connect() as conn:
+                                existing = conn.execute(text("""
+                                    SELECT id FROM scan_progress 
+                                    WHERE scan_id = :sid AND scan_state = :st AND captured_at_utc = :cat
+                                """), {"sid": scan_id, "st": scan_state, "cat": cat_dt}).fetchone()
+                                
+                                if not existing:
+                                    conn.execute(text("""
+                                        INSERT INTO scan_progress (
+                                            scan_id, scan_name, environment_id, scan_state,
+                                            captured_at_utc, timestamp,
+                                            completed_parts, failed_parts, total_parts_scanned,
+                                            objects_scanned, objects_failed, objects_with_pi,
+                                            total_classifications, newly_added_classifications, false_removed_classifications
+                                        ) VALUES (
+                                            :sid, :sn, :eid, :st, :cat, :cat,
+                                            :cp, :fp, :tp, :os, :of, :opi, :tc, :nac, :frc
+                                        )
+                                    """), {
+                                        "sid": scan_id, "sn": scan_name, "eid": env_id, "st": scan_state, "cat": cat_dt,
+                                        "cp": completed_parts, "fp": failed_parts, "tp": total_parts,
+                                        "os": objects_scanned, "of": objects_failed, "opi": objects_with_pi,
+                                        "tc": total_class, "nac": new_class, "frc": false_removed
+                                    })
+                                    conn.commit()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return {"ok": True, "captured_at_utc": captured_at_utc, "scan_state": scan_state}
     except Exception as ex:
         return {"ok": False, "error": str(ex)}
+
+
+def _strip_mb_to_int(val_str):
+    if val_str is None: return 0
+    s = str(val_str).strip().upper()
+    if not s: return 0
+    s = s.replace("MB", "").replace("M", "").replace(",", "").strip()
+    try:
+        return int(float(s))
+    except (ValueError, TypeError):
+        return 0
+
+def get_scanner_group_performance(base_url, token):
+    if not base_url or not token: return []
+    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
+    try:
+        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            groups = []
+            for item in data.get("data", []):
+                for sg in item.get("scannerGroups", []):
+                    groups.append({
+                        "name": sg.get("name"),
+                        "runningScanners": sg.get("runningScanners", 0),
+                        "runningThreads": sg.get("runningThreads", 0),
+                        "maxThreads": sg.get("maxThreads", 0),
+                        "scannerThreads": sg.get("scannerThreads", 0),
+                        "avgScanSpeed": sg.get("avgScanSpeed", 0),
+                        "physicalMemory": sg.get("physicalMemory"),
+                        "freeMemory": sg.get("freeMemory"),
+                        "updateDate": sg.get("updateDate")
+                    })
+            return groups
+    except Exception:
+        pass
+    return []
+
+def get_individual_scanner_performance(base_url, token):
+    if not base_url or not token: return []
+    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
+    try:
+        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            scanners = []
+            for item in data:
+                if item.get("type") == "scanner":
+                    scanners.append({
+                        "id": item.get("id"),
+                        "name": item.get("name"),
+                        "status": item.get("status"),
+                        "group": item.get("groupName"),
+                        "runningThreads": item.get("runningThreads", 0),
+                        "totalNumOfThreads": item.get("totalNumOfThreads", 0),
+                        "systemLoadAverage": item.get("systemLoadAverage", 0),
+                        "physicalMemory": item.get("physicalMemory"),
+                        "freeMemory": item.get("freeMemory"),
+                        "scannerThreads": item.get("scannerThreads", 0),
+                        "updateDate": item.get("updateDate")
+                    })
+            return scanners
+    except Exception:
+        pass
+    return []
+
+def _now_utc_naive():
+    return datetime.utcnow()
+
+def _strip_mb_to_int(v):
+    try:
+        if not v: return 0
+        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
+        return int(float(s))
+    except Exception:
+        return 0
+
+def upsert_scanner_performance(engine, env_id, group_metrics, individual_metrics, captured_at=None):
+    if not engine or env_id is None: return
+    now = captured_at if captured_at else _now_utc_naive()
+    now = now.replace(microsecond=0)
+    try:
+        with engine.connect() as conn:
+            for g in group_metrics:
+                update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
+                conn.execute(text("""
+                    INSERT IGNORE INTO scanner_group_performance (
+                        environment_id, captured_at_utc, group_name,
+                        running_scanners, running_threads, max_threads, scanner_threads,
+                        physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
+                    ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
+                """), {
+                    "eid": env_id, "cau": now, "gn": str(g.get("name") or ""),
+                    "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
+                    "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
+                    "pm": _strip_mb_to_int(g.get("physicalMemory")), "fm": _strip_mb_to_int(g.get("freeMemory")),
+                    "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
+                })
+            for i in individual_metrics:
+                update_date = _parse_iso_dt(str(i.get("updateDate") or ""))
+                sid = str(i.get("id") or "")
+                s_name = str(i.get("name") or "")
+                # If multiple scanners have the same name, we suffix with ID to separate lines in charts
+                display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
+
+                conn.execute(text("""
+                    INSERT IGNORE INTO scanner_individual_performance (
+                        environment_id, captured_at_utc, scanner_id, name, status, group_name,
+                        running_threads, total_num_of_threads, system_load_average,
+                        physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
+                    ) VALUES (
+                        :eid, :cau, :sid, :name, :status, :gn,
+                        :rt, :tt, :la, :pm, :fm, :st, :ud
+                    )
+                """), {
+                    "eid": env_id, "cau": now, "sid": sid,
+                    "name": display_name, "status": str(i.get("status") or ""),
+                    "gn": str(i.get("group") or ""),
+                    "rt": int(i.get("runningThreads") or 0),
+                    "tt": int(i.get("totalNumOfThreads") or 0),
+                    "la": float(i.get("systemLoadAverage") or 0),
+                    "pm": _strip_mb_to_int(i.get("physicalMemory")), 
+                    "fm": _strip_mb_to_int(i.get("freeMemory")),
+                    "st": int(i.get("scannerThreads") or 0), "ud": update_date
+                })
+            conn.commit()
+    except Exception:
+        pass
+
+def _parse_iso_dt(val):
+    if not val: return None
+    try:
+        clean = str(val).replace("Z", "+00:00")
+        return datetime.fromisoformat(clean).replace(tzinfo=None)
+    except Exception:
+        return None
+
+def capture_scanner_performance_for_env(env_row, captured_at=None):
+    if not env_row or not engine: return {"ok": False}
+    eid = env_row.get("id")
+    base_url = env_row.get("base_url")
+    token = None
+    try:
+        from bigid_auth import Get_auth_token
+        token = Get_auth_token(env_row)
+    except Exception:
+        pass
+    if not token: return {"ok": False}
+    try:
+        g = get_scanner_group_performance(base_url, token)
+        i = get_individual_scanner_performance(base_url, token)
+        if g or i:
+            upsert_scanner_performance(engine, eid, g, i, captured_at=captured_at)
+            return {"ok": True, "groups": len(g), "individuals": len(i)}
+    except Exception:
+        pass
+    return {"ok": False}
 
 
 def _resolve_env_row_for_scan_progress(scan_id):
@@ -7920,7 +8181,7 @@ def page_build_analysis(df):
                         st.dataframe(
                             disp.style.applymap(_color_delta, subset=["vs Base"]),
                             hide_index=True,
-                            use_container_width=True,
+                            width='stretch',
                         )
                     else:
                         st.caption("No scenario data for this group.")
@@ -9527,7 +9788,7 @@ def page_classifier_build_diffs():
             build_b = st.selectbox("To Build (Newer)", [v for v in build_versions if v != build_a] + [build_a], index=0, key="cl_detail_build_b")
         with c3:
             st.write("") # spacing
-            fetch_btn = st.button("Manual Refresh Snapshots", use_container_width=True, type="secondary", help="Triggers manual capture of current classifier metadata from environment API.")
+            fetch_btn = st.button("Manual Refresh Snapshots", width='stretch', type="secondary", help="Triggers manual capture of current classifier metadata from environment API.")
 
         # Local environment override for refresh if "All" is selected globally
         refresh_env_id = sel_env_id
@@ -10333,17 +10594,86 @@ def load_scan_progress_history(scan_id):
                timestamp AS captured_at_actual,
                captured_at_utc AS captured_at_slot_utc,
                scan_state,
+               environment_id,
                completed_parts, failed_parts, total_parts_scanned,
                objects_scanned, objects_failed,
                objects_with_pi,
                total_classifications, newly_added_classifications, false_removed_classifications
         FROM scan_progress
         WHERE scan_id = :sid
-        ORDER BY COALESCE(captured_at_utc, timestamp) ASC
+        ORDER BY timestamp ASC
     """)
     try:
         with engine.connect() as conn:
             df = pd.read_sql(query, conn, params={"sid": scan_id})
+            return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def load_scanner_group_performance(env_id, start_dt, end_dt):
+    if not engine or env_id is None:
+        return pd.DataFrame()
+    query = text("""
+        SELECT captured_at_utc, group_name, running_scanners, running_threads, avg_scan_speed, physical_memory_mb, free_memory_mb
+        FROM scanner_group_performance
+        WHERE environment_id = :eid
+          AND captured_at_utc BETWEEN :start AND :end
+        ORDER BY captured_at_utc ASC
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"eid": env_id, "start": start_dt, "end": end_dt})
+            if not df.empty:
+                # Robust cleaning for historical strings like "14336 MB"
+                def clean_num(v):
+                    if isinstance(v, str):
+                        return v.upper().replace("MB", "").replace(" ", "").strip()
+                    return v
+                df["physical_memory_mb"] = pd.to_numeric(df["physical_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["free_memory_mb"] = pd.to_numeric(df["free_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["used_memory_mb"] = df["physical_memory_mb"] - df["free_memory_mb"]
+            return df
+    except Exception:
+        return pd.DataFrame()
+
+def load_scanner_individual_performance(env_id, start_dt, end_dt):
+    if not engine or env_id is None:
+        return pd.DataFrame()
+    query = text("""
+        SELECT captured_at_utc, scanner_id, name, status, group_name, running_threads, total_num_of_threads, system_load_average, physical_memory_mb, free_memory_mb
+        FROM scanner_individual_performance
+        WHERE environment_id = :eid
+          AND captured_at_utc BETWEEN :start AND :end
+        ORDER BY captured_at_utc ASC
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"eid": env_id, "start": start_dt, "end": end_dt})
+            if not df.empty:
+                # Differentiate scanners by combining name and first 4 chars of ID
+                # This works for both historical data (missing suffix) and new data
+                def get_disp(r):
+                    base = str(r['name'])
+                    sid = str(r['scanner_id']) if r['scanner_id'] else ""
+                    if sid and f"[{sid[:4]}]" not in base:
+                        return f"{base} [{sid[:4]}]"
+                    return base
+                df["display_name"] = df.apply(get_disp, axis=1)
+                
+                # Calculate Memory Usage Metrics
+                # BigID UI shows usage %, so we derive it: (Physical - Free) / Physical * 100
+                def clean_num(v):
+                    if isinstance(v, str):
+                        return v.upper().replace("MB", "").replace(" ", "").strip()
+                    return v
+                df["physical_memory_mb"] = pd.to_numeric(df["physical_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["free_memory_mb"] = pd.to_numeric(df["free_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["used_memory_mb"] = df["physical_memory_mb"] - df["free_memory_mb"]
+                df["memory_usage_pct"] = df.apply(
+                    lambda r: (r["used_memory_mb"] / r["physical_memory_mb"] * 100) if r["physical_memory_mb"] > 0 else 0,
+                    axis=1
+                )
             return df
     except Exception:
         return pd.DataFrame()
@@ -10599,6 +10929,14 @@ def page_scan_progress():
 
                     # Full normalized scan_insights + attributes delta map (for Add New Benchmark prefill)
                     sync_single_scan_insight(str(scan_id), sync_env_row)
+
+                    # NEW: Also manually capture scanner performance on demand
+                    try:
+                        p_res = capture_scanner_performance_for_env(sync_env_row, captured_at=_now_utc_naive())
+                        if p_res.get("ok"):
+                            st.caption(f"Captured scanner performance: `{p_res.get('groups')} groups, {p_res.get('individuals')} scanners`")
+                    except Exception:
+                        pass
 
                     st.success("Synced. Reloading…")
                     st.rerun()
@@ -11024,13 +11362,17 @@ def page_scan_progress():
 
         # Duration / timestamps from scan_parents when available
         try:
-            dur = format_scan_duration(db_started_at, db_completed_at)
+            is_run = cur_state and _is_running_state(cur_state)
+            # If in-progress, ignore the database completed_at which might be premature
+            eff_completed_at = None if is_run else db_completed_at
+            dur = format_scan_duration(db_started_at, eff_completed_at, is_running=bool(is_run))
             if db_started_at:
                 observations.append(f"Start: `{str(db_started_at)}`")
-            if db_completed_at:
-                observations.append(f"End: `{str(db_completed_at)}`")
+            if eff_completed_at:
+                observations.append(f"End: `{str(eff_completed_at)}`")
             if dur:
-                observations.append(f"Duration: **{dur}** (time between Start and End). Scan time (so far) is total elapsed from start until now.")
+                obs_label = "Elapsed (so far)" if is_run else "Duration"
+                observations.append(f"{obs_label}: **{dur}** (Scan time {'so far' if is_run else 'total'})")
         except Exception:
             pass
 
@@ -11284,34 +11626,26 @@ def page_scan_progress():
             m4.metric("falseRemoved (Δ)", "N/A")
         # Total scan time (so far)
         try:
-            started_dt = None
-            if db_started_at:
-                started_dt = pd.to_datetime(db_started_at, errors='coerce', utc=True)
-            if started_dt is None or pd.isna(started_dt):
-                # Fallback: earliest saved snapshot time
-                try:
-                    started_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).min() if isinstance(df_ai, pd.DataFrame) and ('captured_at_actual' in df_ai.columns) else None
-                except Exception:
-                    started_dt = None
-            end_dt = None
-            if db_completed_at:
-                end_dt = pd.to_datetime(db_completed_at, errors='coerce', utc=True)
-            if end_dt is None or pd.isna(end_dt):
-                if cur_state and _is_terminal_state(cur_state):
-                    try:
-                        end_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).max()
-                    except Exception:
-                        end_dt = pd.Timestamp.utcnow()
-                else:
-                    end_dt = pd.Timestamp.utcnow()
+            is_run = cur_state and _is_running_state(cur_state)
+            eff_completed_at = None if is_run else db_completed_at
+            runtime_str = "N/A"
+            
+            s_dt = pd.to_datetime(db_started_at, errors='coerce', utc=True) if db_started_at else None
+            # Fallback for s_dt
+            if s_dt is None or pd.isna(s_dt):
+                if isinstance(df_ai, pd.DataFrame) and 'captured_at_actual' in df_ai.columns:
+                    s_dt = pd.to_datetime(df_ai['captured_at_actual'], errors='coerce', utc=True).min()
 
-            if started_dt is not None and pd.notnull(started_dt) and end_dt is not None and pd.notnull(end_dt):
-                mins = max(0.0, (end_dt - started_dt).total_seconds() / 60.0)
-                h = int(mins // 60)
-                m = int(mins % 60)
+            e_dt = pd.to_datetime(eff_completed_at, errors='coerce', utc=True) if eff_completed_at else None
+            if e_dt is None or pd.isna(e_dt):
+                e_dt = pd.Timestamp.utcnow()
+
+            if s_dt is not None and pd.notnull(s_dt) and e_dt is not None and pd.notnull(e_dt):
+                diff_sec = (e_dt - s_dt).total_seconds()
+                mins_tot = max(0.0, diff_sec / 60.0)
+                h = int(mins_tot // 60)
+                m = int(mins_tot % 60)
                 runtime_str = (f"{h}h {m}m" if h > 0 else f"{m}m")
-            else:
-                runtime_str = 'N/A'
         except Exception:
             runtime_str = 'N/A'
         m5.metric("Scan time (so far)", runtime_str)
@@ -11415,9 +11749,11 @@ def page_scan_progress():
         try:
             if observations:
                 st.markdown("**Observations**")
-                for o in observations:
+                o_cols = st.columns(3)
+                for idx, o in enumerate(observations):
                     if str(o or '').strip():
-                        st.caption(f"- {o}")
+                        # Distribute across columns
+                        o_cols[idx % 3].caption(f"• {o}")
         except Exception:
             pass
 
@@ -11565,10 +11901,20 @@ def page_scan_progress():
     # Use actual capture time for x-axis and sort so graph order matches real sequence (first snapshot = first point).
     def _plot_time_sorted(df):
         out = df.copy()
-        time_col = "captured_at_actual" if "captured_at_actual" in out.columns else "captured_at_slot_utc"
-        out["captured_at_utc"] = pd.to_datetime(out[time_col], errors="coerce", utc=True)
+        # Prefer actual timestamp (timestamp col) for plotting to avoid "V-spikes" caused by slot-rounding.
+        # Fallback to slot time only if actual is missing.
+        if "captured_at_actual" in out.columns:
+            out["captured_at_utc"] = pd.to_datetime(out["captured_at_actual"], errors="coerce", utc=True)
+            # If some actual times are missing, fill them with slot times
+            if out["captured_at_utc"].isna().any():
+                slot_times = pd.to_datetime(out["captured_at_slot_utc"], errors="coerce", utc=True)
+                out["captured_at_utc"] = out["captured_at_utc"].fillna(slot_times)
+        else:
+            out["captured_at_utc"] = pd.to_datetime(out["captured_at_slot_utc"], errors="coerce", utc=True)
+
         if out["captured_at_utc"].dt.tz is not None:
             out["captured_at_utc"] = out["captured_at_utc"].dt.tz_localize(None)
+        
         return out.sort_values("captured_at_utc")
 
     with c1:
@@ -11671,19 +12017,159 @@ def page_scan_progress():
             hovermode="x unified",
         )
         st.plotly_chart(fig3, width="stretch")
+    
+    # NEW: Scanner Performance Section
+    try:
+        # Determine environment and time range for performance stats
+        p_env_id = None
+        if "environment_id" in df.columns:
+            # Dropna just to be safe in case some rows are null
+            valid_ids = df["environment_id"].dropna().unique()
+            if len(valid_ids) > 0:
+                p_env_id = valid_ids[0]
+        
+        # Fallback: Check scan_parents if environment_id is missing from progress table
+        if p_env_id is None and scan_id:
+            try:
+                with engine.connect() as conn:
+                    p_env_id = conn.execute(
+                        text("SELECT environment_id FROM scan_parents WHERE scan_id = :sid"),
+                        {"sid": str(scan_id)}
+                    ).scalar()
+            except Exception:
+                pass
+
+        if p_env_id is not None:
+            # We use the actual timestamp for the time range
+            p_start = df["captured_at_actual"].min()
+            p_end = df["captured_at_actual"].max()
+            
+            # If the scan is very new, we might not have many points yet
+            # Pad the range slightly to catch nearby performance pulses
+            p_start_padded = p_start - timedelta(minutes=30)
+            p_end_padded = p_end + timedelta(minutes=60) if p_end else p_start + timedelta(minutes=60)
+            
+            df_perf_g = load_scanner_group_performance(p_env_id, p_start_padded, p_end_padded)
+            df_perf_i = load_scanner_individual_performance(p_env_id, p_start_padded, p_end_padded)
+            
+            if not df_perf_g.empty or not df_perf_i.empty:
+                with st.expander("📊 Scanner Performance Metrics", expanded=False):
+                    pg1, pg2 = st.columns(2)
+                    
+                    if not df_perf_g.empty:
+                        with pg1:
+                            st.caption("Scanner Group Metrics")
+                            fig_pg1 = go.Figure()
+                            # 1. Total Scanners
+                            fig_pg1.add_trace(go.Scatter(
+                                x=df_perf_g["captured_at_utc"], y=df_perf_g["running_scanners"],
+                                mode="lines+markers", name="Running Scanners (Total)",
+                                line=dict(color="#3B82F6", width=2)
+                            ))
+                            # 2. Avg Speed (Secondary Axis)
+                            fig_pg1.add_trace(go.Scatter(
+                                x=df_perf_g["captured_at_utc"], y=df_perf_g["avg_scan_speed"],
+                                mode="lines+markers", name="Avg Speed (obj/s)",
+                                line=dict(color="#10B981", width=2), yaxis="y2"
+                            ))
+                            # 3. Individual Threads (Merged here as requested)
+                            if not df_perf_i.empty:
+                                colors = px.colors.qualitative.Plotly
+                                for idx, name in enumerate(df_perf_i["display_name"].unique()):
+                                    scanner_df = df_perf_i[df_perf_i["display_name"] == name]
+                                    fig_pg1.add_trace(go.Scatter(
+                                        x=scanner_df["captured_at_utc"], y=scanner_df["running_threads"],
+                                        mode="lines+markers", name=f"Threads: {name}",
+                                        line=dict(width=1, dash='dot', color=colors[idx % len(colors)])
+                                    ))
+                                    
+                            fig_pg1.update_layout(
+                                yaxis=dict(title="Count / Threads", rangemode="tozero"),
+                                yaxis2=dict(title="Speed (obj/s)", overlaying="y", side="right", rangemode="tozero"),
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
+                                hovermode="x unified"
+                            )
+                            st.plotly_chart(fig_pg1, width='stretch')
+                            
+                        with pg2:
+                            st.caption("Memory Usage (Group Sum)")
+                            fig_pg2 = go.Figure()
+                            # FIXED: Show Used vs Total for the group
+                            fig_pg2.add_trace(go.Scatter(
+                                x=df_perf_g["captured_at_utc"], y=df_perf_g["used_memory_mb"],
+                                mode="lines+markers", name="Group Used (MB)",
+                                fill='tozeroy', line=dict(color="#EF4444", width=2)
+                            ))
+                            fig_pg2.add_trace(go.Scatter(
+                                x=df_perf_g["captured_at_utc"], y=df_perf_g["physical_memory_mb"],
+                                mode="lines+markers", name="Group Total (MB)",
+                                line=dict(color="#8B5CF6", width=1, dash='dot')
+                            ))
+                            fig_pg2.update_layout(
+                                yaxis=dict(title="Memory (MB)", rangemode="tozero"),
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
+                                hovermode="x unified"
+                            )
+                            st.plotly_chart(fig_pg2, width='stretch')
+                            
+                    if not df_perf_i.empty:
+                        pi1, pi2 = st.columns(2)
+                        with pi1:
+                            st.caption("System Load (CPU Average) Per Scanner")
+                            fig_pi1 = px.line(df_perf_i, x="captured_at_utc", y="system_load_average", color="display_name", 
+                                             title=None, markers=True)
+                            fig_pi1.update_traces(mode="lines+markers")
+                            fig_pi1.update_layout(
+                                yaxis=dict(title="Load Avg", rangemode="tozero"),
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
+                                hovermode="x unified"
+                            )
+                            st.plotly_chart(fig_pi1, width='stretch')
+                            
+                        with pi2:
+                            # FIXED: Show Usage % instead of total capacity
+                            st.caption("Memory Usage (%) Per Scanner")
+                            fig_pi2 = px.line(df_perf_i, x="captured_at_utc", y="memory_usage_pct", color="display_name",
+                                             title=None, markers=True)
+                            fig_pi2.update_traces(mode="lines+markers")
+                            fig_pi2.update_layout(
+                                yaxis=dict(title="Usage %", rangemode="tozero"),
+                                margin=dict(l=10, r=10, t=10, b=10),
+                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
+                                hovermode="x unified"
+                            )
+                            st.plotly_chart(fig_pi2, width='stretch')
+
+                            st.plotly_chart(fig_pi1, width='stretch')
+                        
+                        # (Memory chart block follows in column 2...)
+    except Exception:
+        pass
 
     st.subheader("Raw Progress Data")
     # Show oldest first so the first row shows scan start time.
     show_df = df.copy()
     try:
-        show_df = show_df.rename(columns={
-            "captured_at_actual": "captured_at_actual_utc",
-            "captured_at_slot_utc": "captured_at_slot_utc",
-        })
+        # Format timestamps for readability
+        for c in ["captured_at_actual", "captured_at_slot_utc"]:
+            if c in show_df.columns:
+                show_df[c] = pd.to_datetime(show_df[c]).dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Sort by actual timestamp to show chronological flow
+        show_df = show_df.sort_values("captured_at_actual", ascending=True)
+        
+        # Reorder columns for better flow
+        cols = ["captured_at_actual", "scan_state", "completed_parts", "total_parts_scanned", "objects_scanned", "total_classifications"]
+        existing_cols = [c for c in cols if c in show_df.columns]
+        other_cols = [c for c in show_df.columns if c not in existing_cols]
+        show_df = show_df[existing_cols + other_cols]
     except Exception:
         pass
 
-    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=True), width="stretch")
+    st.dataframe(show_df, width='stretch')
     
     if st.button("Back to Scan Status"):
         st.query_params["page"] = "Scan Status"
@@ -13323,7 +13809,7 @@ def main():
     st.sidebar.markdown(sidebar_html, unsafe_allow_html=True)
     
     st.sidebar.markdown("<br>", unsafe_allow_html=True)
-    if st.sidebar.button("Refresh", use_container_width=True): 
+    if st.sidebar.button("Refresh", width='stretch'): 
         st.cache_data.clear()
         st.rerun()
 
@@ -13437,7 +13923,7 @@ def render_login_page():
             password = st.text_input("Password", type="password", key="login_password_input")
 
         st.markdown("<div style='height: 10px;'></div>", unsafe_allow_html=True)
-        if st.button("Sign In", use_container_width=True, type="primary"):
+        if st.button("Sign In", width='stretch', type="primary"):
             if not email:
                 st.error("Please enter your email address.")
             else:
@@ -13472,7 +13958,7 @@ def page_manage_rbac():
             """), conn)
             roles_df = pd.read_sql(text("SELECT id, role_name FROM app_roles"), conn)
         
-        st.dataframe(users_df, use_container_width=True, hide_index=True)
+        st.dataframe(users_df, width='stretch', hide_index=True)
         
         with st.expander("👤 Edit User Role / Add User"):
             # List users for editing
@@ -13512,7 +13998,7 @@ def page_manage_rbac():
 
     with tab2:
         st.subheader("Manage Roles")
-        st.dataframe(roles_df, use_container_width=True, hide_index=True)
+        st.dataframe(roles_df, width='stretch', hide_index=True)
         
         with st.expander("➕ Add New Role"):
             new_role = st.text_input("Role Name")
