@@ -5,8 +5,6 @@ Runs forever (default every 10 minutes):
 - pulls "running" parent scans from each active environment
 - fetches scan insights for each running scan
 - writes a snapshot row into MySQL table `scan_progress`
-- captures scanner-group + services-status metrics at the **same** `captured_at_utc` as that snapshot
-  (once per environment per slot when multiple scans run in parallel)
 
 Usage:
   python3 tracker.py
@@ -34,7 +32,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_config import DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token
-from scanner_performance import capture_scanner_performance_for_env, ensure_scanner_performance_tables
 
 
 ENV_FILE_PATH = Path(__file__).parent / ".env"
@@ -617,10 +614,6 @@ def ensure_scan_progress_table(engine) -> None:
         except Exception:
             pass
         conn.commit()
-    try:
-        ensure_scanner_performance_tables(engine)
-    except Exception:
-        pass
 
 
 def load_active_environments(engine) -> List[Dict[str, Any]]:
@@ -1484,13 +1477,9 @@ def upsert_scan_progress_record(
     scan_name: str,
     insight_payload: Dict[str, Any],
     forced_state: Optional[str] = None,
-) -> Optional[datetime]:
-    """
-    Writes slot-aligned scan_progress row. Returns captured_at_utc used for the main upsert
-    so scanner performance can use the same timestamp as the insights snapshot.
-    """
+) -> None:
     if not scan_id:
-        return None
+        return
 
     # Unwrap BigID response shape: {data:{scanInsights:{...}}}
     si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
@@ -1638,7 +1627,6 @@ def upsert_scan_progress_record(
             },
         )
         conn.commit()
-    return captured_at_utc
 
 
 def upsert_scan_insights_record(engine, scan_id: str, insight_payload: Dict[str, Any]) -> None:
@@ -2327,22 +2315,6 @@ def track_once(engine) -> Dict[str, Any]:
         )
         seen_scan_ids.add(sid)
 
-    # One scanner snapshot per (environment, progress slot) per cycle — aligned to the same
-    # captured_at_utc as scan_progress (not a separate timestamp at end of the cycle).
-    scanner_cap_state: Dict[str, Any] = {"lock": threading.Lock(), "done": set()}
-
-    def _scanner_snap_key(env_row: Dict[str, Any], cau: Optional[datetime]) -> Optional[Tuple[Any, str]]:
-        if cau is None:
-            return None
-        eid = env_row.get("id")
-        if eid is None:
-            return None
-        try:
-            ts = cau.replace(microsecond=0).isoformat(sep=" ")
-        except Exception:
-            ts = str(cau)
-        return (eid, ts)
-
     def process_scan(job: Tuple[str, Dict[str, Any], str, str, str]) -> Tuple[bool, str, int]:
         base_url, env_row, scan_id, scan_name, parent_state = job
         if not base_url or not scan_id:
@@ -2376,7 +2348,7 @@ def track_once(engine) -> Dict[str, Any]:
                 pass
 
             # Snapshot row (slot-aligned) + normalized insights summary
-            cau = upsert_scan_progress_record(
+            upsert_scan_progress_record(
                 engine,
                 env_row.get("id"),
                 scan_id,
@@ -2385,22 +2357,6 @@ def track_once(engine) -> Dict[str, Any]:
                 forced_state=best_state,
             )
             upsert_scan_insights_record(engine, scan_id, insight)
-
-            # Scanner-group + services-status at same captured_at_utc as this progress row (deduped per env+slot).
-            sk = _scanner_snap_key(env_row, cau)
-            if sk is not None:
-                do_cap = False
-                with scanner_cap_state["lock"]:
-                    if sk not in scanner_cap_state["done"]:
-                        scanner_cap_state["done"].add(sk)
-                        do_cap = True
-                if do_cap and cau is not None:
-                    try:
-                        capture_scanner_performance_for_env(
-                            engine, env_row, captured_at=cau.replace(microsecond=0)
-                        )
-                    except Exception:
-                        pass
 
             # Template classifier set sync (what user means by "template has ~72 classifiers").
             # Only when we are already processing a scan (no extra background /about polling).
@@ -2662,15 +2618,8 @@ def run_for_scan_id(engine, scan_id: str, verbose: bool = True) -> bool:
             continue
         try:
             state = _extract_live_state(insight)
-            cau = upsert_scan_progress_record(engine, env_id, scan_id, "", insight)
+            upsert_scan_progress_record(engine, env_id, scan_id, "", insight)
             upsert_scan_insights_record(engine, scan_id, insight)
-            if cau is not None:
-                try:
-                    capture_scanner_performance_for_env(
-                        engine, env, captured_at=cau.replace(microsecond=0)
-                    )
-                except Exception:
-                    pass
             try:
                 attrs = fetch_scan_classifier_attributes(base_url, scan_id, token)
                 upsert_scan_attribute_deltas(engine, scan_id, attrs)

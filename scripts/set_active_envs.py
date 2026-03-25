@@ -45,10 +45,6 @@ def main():
             ("is_busy", "ALTER TABLE test_environments ADD COLUMN is_busy BOOLEAN DEFAULT FALSE"),
             ("busy_by_run_id", "ALTER TABLE test_environments ADD COLUMN busy_by_run_id INT NULL"),
             ("busy_since", "ALTER TABLE test_environments ADD COLUMN busy_since DATETIME NULL"),
-            (
-                "include_in_workflow_runs",
-                "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE",
-            ),
         ]:
             try:
                 conn.execute(text(ddl))
