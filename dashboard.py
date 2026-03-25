@@ -18,7 +18,7 @@ import html
 import re
 import textwrap
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # db_config may only define DB_CONNECTION_STRING (e.g. on Windows); DB_CONFIG is optional.
 try:
@@ -32,6 +32,7 @@ except ImportError:
         DB_CONFIG = None
 
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
+from scanner_performance import ensure_scanner_performance_tables, capture_scanner_performance_for_env
 from dashboard_auth import ensure_rbac_tables, login_user, logout_user, check_access, get_user_permissions, hash_password, verify_password
 try:
     # Optional: auto-start tracker when available (same folder as dashboard.py).
@@ -864,6 +865,14 @@ def ensure_test_environments_table(_eng):
                 conn.execute(text("ALTER TABLE test_environments ADD COLUMN busy_since DATETIME NULL"))
             except Exception:
                 pass
+            try:
+                conn.execute(
+                    text(
+                        "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE"
+                    )
+                )
+            except Exception:
+                pass
 
             # Supporting tables for version history + build-wise classifier mappings.
             # These are used by Version Comparison and environment history views.
@@ -1068,11 +1077,22 @@ def load_test_environments():
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
+                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active,
+                       COALESCE(include_in_workflow_runs, 1) AS include_in_workflow_runs
                 FROM test_environments
                 ORDER BY is_active DESC, env_name ASC
             """)).fetchall()
-            cols = ["id", "env_name", "base_url", "version", "auth_module_path", "auth_function_name", "classifiers_api_path", "is_active"]
+            cols = [
+                "id",
+                "env_name",
+                "base_url",
+                "version",
+                "auth_module_path",
+                "auth_function_name",
+                "classifiers_api_path",
+                "is_active",
+                "include_in_workflow_runs",
+            ]
             return pd.DataFrame(rows, columns=cols)
     except Exception:
         return pd.DataFrame()
@@ -3205,6 +3225,270 @@ def ensure_scan_progress_table():
             conn.commit()
     except Exception:
         pass
+    ensure_scanner_performance_tables(engine)
+
+
+def ensure_scanner_pod_metrics_table():
+    """Time-series metrics per scanner pod (CPU, memory, load). Ingest via INSERT or your collector."""
+    if not engine:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scanner_pod_metrics (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NULL,
+                    captured_at_utc DATETIME NOT NULL,
+                    scanner_id VARCHAR(128) NOT NULL,
+                    scanner_name VARCHAR(255) NULL,
+                    scanner_version VARCHAR(100) NULL,
+                    bigid_version VARCHAR(100) NULL,
+                    status VARCHAR(64) NULL,
+                    load_avg DOUBLE NULL,
+                    memory_pct DOUBLE NULL,
+                    cpu_pct DOUBLE NULL,
+                    network_mbps DOUBLE NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_spm_env_time (environment_id, captured_at_utc),
+                    INDEX idx_spm_scanner (scanner_id, captured_at_utc),
+                    INDEX idx_spm_bigid_ver (bigid_version)
+                )
+            """))
+            conn.commit()
+    except Exception:
+        pass
+
+
+def load_scanner_pod_metrics_df(environment_id: Optional[int] = None) -> pd.DataFrame:
+    if not engine:
+        return pd.DataFrame()
+    ensure_scanner_pod_metrics_table()
+    try:
+        q = """
+            SELECT environment_id, captured_at_utc, scanner_id, scanner_name, scanner_version,
+                   bigid_version, status, load_avg, memory_pct, cpu_pct, network_mbps
+            FROM scanner_pod_metrics
+            WHERE 1=1
+        """
+        params: Dict[str, Any] = {}
+        if environment_id is not None:
+            q += " AND environment_id = :eid"
+            params["eid"] = int(environment_id)
+        q += " ORDER BY captured_at_utc ASC, scanner_id ASC"
+        with engine.connect() as conn:
+            df = pd.read_sql(text(q), conn, params=params)
+        if df.empty:
+            return df
+        df["captured_at_utc"] = pd.to_datetime(df["captured_at_utc"], errors="coerce", utc=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _scanner_status_inactive(status_val: Any) -> bool:
+    """BigID scanner row status — hide these from default charts when user only wants healthy pods."""
+    s = str(status_val or "").strip().lower()
+    if not s:
+        return False
+    if s in {"failed", "inactive", "error", "stopped", "dead", "offline", "unknown", "aborted", "cancelled", "canceled"}:
+        return True
+    if "fail" in s:
+        return True
+    return False
+
+
+def _spm_normalize_version(v: Any) -> str:
+    return str(v or "").strip()
+
+
+def _spm_faded_line_color(base_c: str, alpha: float = 0.35) -> str:
+    """Plotly palette may be #hex or rgb(...); fade inactive traces."""
+    s = str(base_c or "").strip()
+    try:
+        if s.startswith("#") and len(s) >= 7:
+            h = s.lstrip("#")[:6]
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return f"rgba({r},{g},{b},{alpha})"
+        if s.startswith("rgb") and "(" in s:
+            inner = s.split("(", 1)[1].split(")", 1)[0]
+            parts = [p.strip() for p in inner.split(",")]
+            if len(parts) >= 3:
+                r, g, b = int(float(parts[0])), int(float(parts[1])), int(float(parts[2]))
+                return f"rgba({r},{g},{b},{alpha})"
+    except Exception:
+        pass
+    return f"rgba(180,180,180,{alpha})"
+
+
+def page_scanner_infrastructure():
+    """
+    Primary charts use scanner_* tables filled by tracker / Scan Progress Sync (BigID APIs).
+    Legacy `scanner_pod_metrics` section at bottom — tracker does NOT write there by default.
+    """
+    st.title("🖥️ Scanner infrastructure")
+    st.caption(
+        "**BigID snapshots:** `scanner_individual_performance` + `scanner_group_performance` (same as **Scan Progress → Sync** / **tracker**). "
+        "Left chart = **CPU %** (BigID UI scale, often **>100%**). Right = **memory %**. "
+        "This is **not** the old `scanner_pod_metrics` load-only view unless you scroll to **Legacy**."
+    )
+    if not engine:
+        st.error("Database not configured.")
+        return
+    ensure_scanner_performance_tables(engine)
+    try:
+        env_df = load_test_environments()
+    except Exception:
+        env_df = pd.DataFrame()
+    if env_df.empty:
+        st.warning("No test environments. Add one under Manage Test Environments.")
+        return
+    if "is_active" in env_df.columns:
+        active = env_df[pd.to_numeric(env_df["is_active"], errors="coerce").fillna(0).astype(int) != 0]
+    else:
+        active = env_df
+    labels = [f"{r.get('env_name', r.get('id'))} (id={r.get('id')})" for _, r in active.iterrows()]
+    ids = [int(r["id"]) for _, r in active.iterrows()]
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
+        idx = st.selectbox("Environment", range(len(labels)), format_func=lambda i: labels[i] if labels else "")
+    env_id = ids[idx] if ids else None
+    with c2:
+        days_back = st.slider("History (days)", 1, 30, 7, key="si_hist_days")
+    with c3:
+        show_failed_si = st.checkbox("Show failed/inactive pods", value=False, key="si_show_failed")
+        show_all_si = st.checkbox("Show all pods (ignore running set)", value=False, key="si_show_all")
+
+    end_dt = datetime.utcnow()
+    start_dt = end_dt - timedelta(days=int(days_back))
+
+    df_perf_g = load_scanner_group_performance(env_id, start_dt, end_dt) if env_id is not None else pd.DataFrame()
+    df_perf_i = load_scanner_individual_performance(env_id, start_dt, end_dt) if env_id is not None else pd.DataFrame()
+    if not df_perf_g.empty:
+        df_perf_g = df_perf_g.copy()
+        df_perf_g["captured_at_utc"] = pd.to_datetime(df_perf_g["captured_at_utc"], errors="coerce")
+    if not df_perf_i.empty:
+        df_perf_i = df_perf_i.copy()
+        df_perf_i["captured_at_utc"] = pd.to_datetime(df_perf_i["captured_at_utc"], errors="coerce")
+
+    df_chart = df_perf_i
+    eff_ids: set = set()
+    eff_src = ""
+    if not df_perf_i.empty:
+        try:
+            _ord = df_perf_i.sort_values("captured_at_utc")
+            _last_st = _ord.groupby("display_name", dropna=False)["status"].last()
+            _active_names = {
+                str(nm) for nm, st in _last_st.items() if not _scanner_status_inactive(st)
+            }
+            if not _active_names:
+                _active_names = set(df_perf_i["display_name"].astype(str).unique())
+        except Exception:
+            _active_names = set(df_perf_i["display_name"].astype(str).unique())
+        if not show_failed_si:
+            df_chart = df_perf_i[df_perf_i["display_name"].astype(str).isin(_active_names)].copy()
+            if df_chart.empty:
+                df_chart = df_perf_i.copy()
+        else:
+            df_chart = df_perf_i.copy()
+
+        eff_ids, eff_src = spm_effective_running_scanner_id_set(df_perf_g, df_perf_i)
+        if not show_all_si and eff_ids:
+            _tg = df_chart[df_chart["scanner_id"].astype(str).isin(eff_ids)].copy()
+            if not _tg.empty:
+                df_chart = _tg
+
+    si_layout = dict(
+        template="plotly_white",
+        hovermode="x unified",
+        height=400,
+        margin=dict(l=48, r=36, t=44, b=96),
+        legend=dict(orientation="h", yanchor="top", y=-0.32, xanchor="left", x=0),
+    )
+
+    if df_perf_i.empty and df_perf_g.empty:
+        st.warning(
+            f"No rows in **`scanner_individual_performance` / `scanner_group_performance`** for env **#{env_id}** in the last **{days_back}** day(s). "
+            "Open **Scan Progress** for a running scan and click **Sync now**, or run **tracker.py**."
+        )
+    else:
+        if eff_ids:
+            st.success(f"**{len(eff_ids)} pod(s)** in chart filter — **{eff_src}**. (Uncheck filters above to widen.)")
+        elif not df_perf_i.empty:
+            st.info("No **running-set** IDs found (sync **scanner-groups** to store `scannersIDs`, or enable **Show all pods**).")
+
+        col_cpu, col_mem = st.columns(2)
+        with col_cpu:
+            st.subheader("CPU % per scanner")
+            _cs = pd.to_numeric(df_chart.get("cpu_pct"), errors="coerce") if not df_chart.empty else pd.Series(dtype=float)
+            if not df_chart.empty and _cs.notna().any():
+                _mx = float(_cs.max() or 0)
+                if _mx <= 0:
+                    _top = 100.0
+                elif _mx < 100:
+                    _top = max(100.0, _mx * 1.25 + 10.0)
+                else:
+                    _top = max(700.0, _mx * 1.15 + 50.0)
+                fig_c = px.line(
+                    df_chart.dropna(subset=["cpu_pct"]),
+                    x="captured_at_utc",
+                    y="cpu_pct",
+                    color="display_name",
+                    markers=True,
+                )
+                fig_c.update_traces(mode="lines+markers")
+                fig_c.update_layout(**si_layout, yaxis=dict(title="CPU % (BigID)", range=[0, _top]))
+                spm_apply_plotly_ticks(fig_c, df_chart["captured_at_utc"])
+                st.plotly_chart(fig_c, width="stretch")
+                st.caption(
+                    f"Y-axis to **~{_top:.0f}%** (series max **{_mx:.1f}%**). "
+                    "**Not** Linux load average — that is a different number (see **Legacy** or **Scan Progress → expander**)."
+                )
+            else:
+                st.info("No **cpu_pct** in DB for this window — capture from **services-status** (tracker / **Sync now**).")
+        with col_mem:
+            st.subheader("Memory usage % per scanner")
+            if not df_chart.empty:
+                fig_m = px.line(
+                    df_chart,
+                    x="captured_at_utc",
+                    y="memory_usage_pct",
+                    color="display_name",
+                    markers=True,
+                )
+                fig_m.update_traces(mode="lines+markers")
+                fig_m.update_layout(**si_layout, yaxis=dict(title="Memory %", range=[0, 100]))
+                spm_apply_plotly_ticks(fig_m, df_chart["captured_at_utc"])
+                st.plotly_chart(fig_m, width="stretch")
+                st.caption("Host **memory %** from physical/free MB in **services-status** (stays 0–100%).")
+            else:
+                st.caption("—")
+
+        with st.expander("Optional: **system load average** (raw API — not CPU %)"):
+            if not df_chart.empty:
+                fig_l = px.line(
+                    df_chart,
+                    x="captured_at_utc",
+                    y="system_load_average",
+                    color="display_name",
+                    markers=True,
+                )
+                fig_l.update_traces(mode="lines+markers")
+                fig_l.update_layout(**si_layout, yaxis=dict(title="Load average", rangemode="tozero"))
+                spm_apply_plotly_ticks(fig_l, df_chart["captured_at_utc"])
+                st.plotly_chart(fig_l, width="stretch")
+
+    st.divider()
+    st.subheader("Legacy: `scanner_pod_metrics`")
+    st.caption(
+        "Separate table — **not** populated by default tracker. Only appears if you INSERT rows yourself "
+        "(load_avg / memory_pct / cpu_pct columns)."
+    )
+    ensure_scanner_pod_metrics_table()
+    raw = load_scanner_pod_metrics_df(environment_id=env_id)
+    if raw.empty:
+        st.caption("No rows in `scanner_pod_metrics`.")
+    else:
+        st.dataframe(raw.sort_values(["captured_at_utc", "scanner_id"]).tail(500), width="stretch")
 
 
 def ensure_workflow_tables():
@@ -6422,6 +6706,9 @@ def page_manage_test_environments():
 
     # Bulk: sync current versions for all active envs + global enabled classifiers (no manual follow-up steps).
     st.subheader("0. Bulk Actions")
+    st.caption(
+        "Bulk sync runs for **every active** environment. **Use for workflow runs** only affects the workflow runner, not sync or tracker."
+    )
     if st.button("Sync current versions (API) for all active envs", type="primary"):
         if env_df.empty:
             st.warning("No environments found.")
@@ -6686,6 +6973,15 @@ def page_manage_test_environments():
         st.session_state["env_auth_password_input"] = _saved_pass
         st.session_state["_prev_base_url_for_version_sync"] = normalize_base_url(selected_row.get("base_url") or "")
         st.session_state.pop("_auto_version_status", None)
+        _iwf = selected_row.get("include_in_workflow_runs")
+        try:
+            if _iwf is None or (isinstance(_iwf, float) and pd.isna(_iwf)):
+                _iwf = True
+            else:
+                _iwf = bool(int(_iwf))
+        except Exception:
+            _iwf = bool(_iwf) if _iwf is not None else True
+        st.session_state["env_include_workflow_input"] = _iwf
 
     c1, c2 = st.columns(2)
     env_name = c1.text_input("Environment Name", key="env_name_input")
@@ -6739,6 +7035,12 @@ def page_manage_test_environments():
     c5, _ = st.columns(2)
     auth_password = c5.text_input("Password (optional)", key="env_auth_password_input", type="password", help="If blank, defaults to bigid111")
     is_active = st.checkbox("Active", value=bool(selected_row.get("is_active", True)))
+    st.checkbox(
+        "Use for workflow runs",
+        key="env_include_workflow_input",
+        help="When enabled, the workflow runner may assign DS/scan steps to this environment. "
+        "Turn off to keep the env active for version/classifier sync and tracking only.",
+    )
 
     if st.button("Save Environment", type="primary"):
         if not env_name.strip():
@@ -6754,15 +7056,19 @@ def page_manage_test_environments():
 
                 with engine.connect() as conn:
                     conn.execute(text("""
-                        INSERT INTO test_environments (env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active)
-                        VALUES (:n, :u, :v, :ap, :af, :cp, :ia)
+                        INSERT INTO test_environments (
+                            env_name, base_url, version, auth_module_path, auth_function_name,
+                            classifiers_api_path, is_active, include_in_workflow_runs
+                        )
+                        VALUES (:n, :u, :v, :ap, :af, :cp, :ia, :iwf)
                         ON DUPLICATE KEY UPDATE
                             base_url = VALUES(base_url),
                             version = VALUES(version),
                             auth_module_path = VALUES(auth_module_path),
                             auth_function_name = VALUES(auth_function_name),
                             classifiers_api_path = VALUES(classifiers_api_path),
-                            is_active = VALUES(is_active)
+                            is_active = VALUES(is_active),
+                            include_in_workflow_runs = VALUES(include_in_workflow_runs)
                     """), {
                         "n": env_name.strip(),
                         "u": normalize_base_url(base_url),
@@ -6770,7 +7076,8 @@ def page_manage_test_environments():
                         "ap": resolved_auth_module_path or None,
                         "af": resolved_auth_function or "Get_auth_token",
                         "cp": resolved_api_path or DEFAULT_CLASSIFIERS_API_PATH,
-                        "ia": 1 if is_active else 0
+                        "ia": 1 if is_active else 0,
+                        "iwf": 1 if st.session_state.get("env_include_workflow_input", True) else 0,
                     })
                     conn.commit()
 
@@ -6841,6 +7148,12 @@ def page_manage_test_environments():
     if not env_df.empty:
         show_df = env_df.copy()
         show_df["is_active"] = show_df["is_active"].apply(lambda x: bool(x))
+        if "include_in_workflow_runs" not in show_df.columns:
+            show_df["include_in_workflow_runs"] = True
+        else:
+            show_df["include_in_workflow_runs"] = pd.to_numeric(
+                show_df["include_in_workflow_runs"], errors="coerce"
+            ).fillna(1).astype(int).ne(0)
         build_paths = load_environment_build_change_paths()
         def run_env_actions(fetch_row, do_sync=False, do_fetch=False):
             env_name_val = str(fetch_row.get("env_name") or "").strip()
@@ -6926,14 +7239,15 @@ def page_manage_test_environments():
                 st.session_state["env_action_msg"] = f"[{env_name_val}] Action failed: {ex}"
 
         # Render a compact inline table-like layout with native buttons (no full page refresh)
-        h1, h2, h3, h4, h5, h6, h7 = st.columns([1.2, 3.2, 0.8, 0.7, 2.2, 1.1, 1.2])
+        h1, h2, h3, h4, h5, h6, h7, h8 = st.columns([1.2, 2.9, 0.75, 0.55, 0.55, 2.0, 1.05, 1.05])
         h1.markdown("**env_name**")
         h2.markdown("**base_url**")
         h3.markdown("**version**")
-        h4.markdown("**is_active**")
-        h5.markdown("**Build Change Path**")
-        h6.markdown("**Sync Core Ver**")
-        h7.markdown("**Get Classifiers**")
+        h4.markdown("**active**")
+        h5.markdown("**WF**")
+        h6.markdown("**Build path**")
+        h7.markdown("**Sync ver**")
+        h8.markdown("**Classifiers**")
         st.divider()
 
         for _, r in show_df.iterrows():
@@ -6950,7 +7264,7 @@ def page_manage_test_environments():
             # We'll apply styling to markdown where we can, or just keep it simple with text color if needed.
             # For now, we'll prefix names to indicate status and use opacity in the columns.
             
-            c1, c2, c3, c4, c5, c6, c7 = st.columns([1.2, 3.2, 0.8, 0.7, 2.2, 1.1, 1.2])
+            c1, c2, c3, c4, c5, c6, c7, c8 = st.columns([1.2, 2.9, 0.75, 0.55, 0.55, 2.0, 1.05, 1.05])
             
             name_display = str(row_dict.get("env_name") or "")
             if not is_env_active:
@@ -6959,24 +7273,16 @@ def page_manage_test_environments():
             c1.markdown(f'<div style="{row_style}">{name_display}</div>', unsafe_allow_html=True)
             c2.markdown(f'<div style="{row_style} font-size: 0.85rem;">{str(row_dict.get("base_url") or "")}</div>', unsafe_allow_html=True)
             c3.markdown(f'<div style="{row_style}">{str(row_dict.get("version") or "")}</div>', unsafe_allow_html=True)
-            c4.markdown(f'<div style="{row_style}">{"✅ Yes" if is_env_active else "❌ No"}</div>', unsafe_allow_html=True)
+            c4.markdown(f'<div style="{row_style}">{"✅" if is_env_active else "❌"}</div>', unsafe_allow_html=True)
+            _iwf_show = bool(row_dict.get("include_in_workflow_runs", True))
+            c5.markdown(
+                f'<div style="{row_style}" title="Use for workflow runs">{"✅" if _iwf_show else "—"}</div>',
+                unsafe_allow_html=True,
+            )
             
             env_id = row_dict.get("id")
             path_text = build_paths.get(int(env_id), f"None -> {str(row_dict.get('version') or '').strip()}") if env_id is not None else f"None -> {str(row_dict.get('version') or '').strip()}"
-            c5.markdown(f'<div style="{row_style} font-size: 0.8rem; color: #64748b;">{path_text}</div>', unsafe_allow_html=True)
-            c6.markdown(
-                """
-                <style>
-                div[data-testid="stButton"] > button[kind="secondary"] {
-                    min-width: 120px !important;
-                    padding: 0.35rem 0.75rem !important;
-                }
-                </style>
-                """,
-                unsafe_allow_html=True
-            )
-            if c6.button("Sync Core Ver", key=f"sync_btn_{int(row_dict.get('id'))}"):
-                run_env_actions(row_dict, do_sync=True, do_fetch=False)
+            c6.markdown(f'<div style="{row_style} font-size: 0.8rem; color: #64748b;">{path_text}</div>', unsafe_allow_html=True)
             c7.markdown(
                 """
                 <style>
@@ -6988,7 +7294,20 @@ def page_manage_test_environments():
                 """,
                 unsafe_allow_html=True
             )
-            if c7.button("Get Classifiers", key=f"fetch_btn_{int(row_dict.get('id'))}"):
+            if c7.button("Sync Core Ver", key=f"sync_btn_{int(row_dict.get('id'))}"):
+                run_env_actions(row_dict, do_sync=True, do_fetch=False)
+            c8.markdown(
+                """
+                <style>
+                div[data-testid="stButton"] > button[kind="secondary"] {
+                    min-width: 120px !important;
+                    padding: 0.35rem 0.75rem !important;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+            if c8.button("Get Classifiers", key=f"fetch_btn_{int(row_dict.get('id'))}"):
                 run_env_actions(row_dict, do_sync=False, do_fetch=True)
             st.divider()
     else:
@@ -10329,6 +10648,7 @@ def load_scan_progress_history(scan_id):
                timestamp AS captured_at_actual,
                captured_at_utc AS captured_at_slot_utc,
                scan_state,
+               environment_id,
                completed_parts, failed_parts, total_parts_scanned,
                objects_scanned, objects_failed,
                objects_with_pi,
@@ -10340,6 +10660,358 @@ def load_scan_progress_history(scan_id):
     try:
         with engine.connect() as conn:
             df = pd.read_sql(query, conn, params={"sid": scan_id})
+            return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _progress_column_header_two_lines(col_name: str) -> str:
+    """Underscores → spaces; split long names across two lines to save horizontal space."""
+    raw = str(col_name).replace("_", " ").strip()
+    parts = raw.split()
+    if len(parts) <= 1:
+        return raw
+    mid = (len(parts) + 1) // 2
+    return " ".join(parts[:mid]) + "\n" + " ".join(parts[mid:])
+
+
+_RAW_PROGRESS_HEADER_OVERRIDES = {
+    "avg_scanner_cpu_pct": "avg scanner\nCPU %",
+    "avg_scanner_mem_pct": "avg scanner\nmemory %",
+    "scanner_pods_n": "scanner\npods (n)",
+}
+
+
+def merge_scanner_averages_into_progress_df(
+    df_prog: pd.DataFrame,
+    df_scanner_i: pd.DataFrame,
+    *,
+    tolerance_minutes: int = 20,
+) -> pd.DataFrame:
+    """
+    Add mean CPU % and memory % across scanner pods per snapshot, matched by nearest
+    scanner_individual_performance.captured_at_utc to scan_progress.captured_at_slot_utc.
+    """
+    if df_prog is None or df_prog.empty or df_scanner_i is None or df_scanner_i.empty:
+        return df_prog
+    if "captured_at_slot_utc" not in df_prog.columns:
+        return df_prog
+    out = df_prog.copy()
+    dfi = df_scanner_i.copy()
+    dfi["captured_at_utc"] = pd.to_datetime(dfi["captured_at_utc"], errors="coerce", utc=True)
+    dfi = dfi.dropna(subset=["captured_at_utc"])
+    if dfi.empty:
+        return out
+    if "memory_usage_pct" not in dfi.columns:
+        pm = pd.to_numeric(dfi.get("physical_memory_mb"), errors="coerce")
+        fm = pd.to_numeric(dfi.get("free_memory_mb"), errors="coerce")
+        dfi["memory_usage_pct"] = np.where(pm > 0, (pm - fm) / pm * 100.0, np.nan)
+    dfi["_cpu"] = pd.to_numeric(dfi.get("cpu_pct"), errors="coerce")
+    agg = dfi.groupby("captured_at_utc", as_index=False).agg(
+        avg_scanner_cpu_pct=("_cpu", "mean"),
+        avg_scanner_mem_pct=("memory_usage_pct", "mean"),
+        scanner_pods_n=("scanner_id", "count"),
+    )
+    if agg.empty:
+        return out
+    agg = agg.sort_values("captured_at_utc")
+    left = out.copy()
+    left["_slot"] = pd.to_datetime(left["captured_at_slot_utc"], errors="coerce", utc=True)
+    left = left.sort_values("_slot")
+    tol = pd.Timedelta(minutes=int(tolerance_minutes))
+    try:
+        merged = pd.merge_asof(
+            left,
+            agg,
+            left_on="_slot",
+            right_on="captured_at_utc",
+            direction="nearest",
+            tolerance=tol,
+        )
+    except Exception:
+        return out
+    drop_cols = [c for c in ("_slot", "captured_at_utc") if c in merged.columns]
+    merged = merged.drop(columns=drop_cols, errors="ignore")
+    for col in ("avg_scanner_cpu_pct", "avg_scanner_mem_pct"):
+        if col in merged.columns:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").round(2)
+    if "scanner_pods_n" in merged.columns:
+        merged["scanner_pods_n"] = (
+            pd.to_numeric(merged["scanner_pods_n"], errors="coerce").fillna(0).astype("Int64")
+        )
+    return merged
+
+
+def load_scanner_group_performance(env_id, start_dt, end_dt):
+    if not engine or env_id is None:
+        return pd.DataFrame()
+    query = text("""
+        SELECT captured_at_utc, group_name, running_scanners, running_threads,
+               max_threads, scanner_threads, avg_scan_speed,
+               physical_memory_mb, free_memory_mb, group_scanner_ids_json
+        FROM scanner_group_performance
+        WHERE environment_id = :eid
+          AND captured_at_utc BETWEEN :start AND :end
+        ORDER BY captured_at_utc ASC
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"eid": env_id, "start": start_dt, "end": end_dt})
+            if not df.empty:
+
+                def clean_num(v):
+                    if isinstance(v, str):
+                        return v.upper().replace("MB", "").replace(" ", "").strip()
+                    return v
+
+                df["physical_memory_mb"] = pd.to_numeric(df["physical_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["free_memory_mb"] = pd.to_numeric(df["free_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["used_memory_mb"] = df["physical_memory_mb"] - df["free_memory_mb"]
+                for _col in ("max_threads", "scanner_threads"):
+                    if _col in df.columns:
+                        df[_col] = pd.to_numeric(df[_col], errors="coerce").fillna(0).astype(int)
+                if "avg_scan_speed" in df.columns:
+                    df["avg_scan_speed"] = pd.to_numeric(df["avg_scan_speed"], errors="coerce").fillna(0.0)
+                    # BigID scanner-groups returns bytes/sec (e.g. 24006 ≈ 23.4 KiB/s in product UI)
+                    df["avg_scan_speed_kib_s"] = df["avg_scan_speed"] / 1024.0
+            return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
+    """
+    Fallback when `group_scanner_ids_json` was not stored yet: pods whose **latest** row is
+    not failed/inactive and has **running_threads > 0** (typical BigID "busy" running set).
+    """
+    if df_i is None or df_i.empty or "scanner_id" not in df_i.columns:
+        return set()
+    try:
+        d = df_i.sort_values("captured_at_utc", na_position="last")
+        last = d.groupby("scanner_id", as_index=False).last()
+        out: set = set()
+        for _, r in last.iterrows():
+            sid = str(r.get("scanner_id") or "").strip()
+            if not sid:
+                continue
+            if _scanner_status_inactive(r.get("status")):
+                continue
+            rt = int(pd.to_numeric(r.get("running_threads"), errors="coerce") or 0)
+            if rt > 0:
+                out.add(sid)
+        return out
+    except Exception:
+        return set()
+
+
+def spm_effective_running_scanner_id_set(df_g: pd.DataFrame, df_i: pd.DataFrame) -> Tuple[set, str]:
+    """
+    Prefer scanner-groups `scannersIDs` (matches BigID runningScanners count).
+    Else infer from services-status latest rows (threads > 0, non-failed).
+    """
+    ids = spm_latest_group_scanner_id_set(df_g)
+    if ids:
+        return ids, "scanner-groups `scannersIDs`"
+    ids2 = spm_infer_running_scanner_ids_from_individual(df_i)
+    if ids2:
+        return ids2, "inferred (latest non-failed + running_threads > 0)"
+    return set(), ""
+
+
+def spm_latest_group_scanner_id_set(df_g: pd.DataFrame) -> set:
+    """
+    Union of BigID `scannersIDs` from the latest `captured_at_utc` in group rows
+    (same list that backs `runningScanners` in the UI).
+    """
+    if df_g is None or df_g.empty or "group_scanner_ids_json" not in df_g.columns:
+        return set()
+    try:
+        tmax = df_g["captured_at_utc"].max()
+        if pd.isna(tmax):
+            return set()
+        sub = df_g[df_g["captured_at_utc"] == tmax]
+        out = set()
+        for _, r in sub.iterrows():
+            raw = r.get("group_scanner_ids_json")
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)) or str(raw).strip() == "":
+                continue
+            arr = json.loads(str(raw))
+            if isinstance(arr, list):
+                out.update(str(x).strip() for x in arr if x is not None and str(x).strip())
+        return out
+    except Exception:
+        return set()
+
+
+def spm_latest_per_scanner_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Latest row per scanner_id (for bar charts / at-a-glance metrics)."""
+    if df is None or df.empty or "scanner_id" not in df.columns:
+        return pd.DataFrame()
+    d = df.sort_values("captured_at_utc", na_position="last").copy()
+    d = d[d["scanner_id"].astype(str).str.strip().ne("")]
+    if d.empty:
+        return pd.DataFrame()
+    return d.groupby("scanner_id", as_index=False).last()
+
+
+def spm_dedupe_scanner_group_rows(df_g: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per (captured_at_utc, group_name) before aggregating by time only.
+    Stops **running_scanners** / **running_threads** from being summed across duplicate
+    snapshots (same group + same slot stored more than once → e.g. 5+5+5 = 15).
+    """
+    if df_g is None or df_g.empty:
+        return df_g
+    d = df_g.sort_values("captured_at_utc", na_position="last").copy()
+    key_cols = ["captured_at_utc"]
+    if "group_name" in d.columns:
+        key_cols.append("group_name")
+    return d.drop_duplicates(subset=key_cols, keep="last")
+
+
+def spm_apply_plotly_ticks(fig_obj, x_vals):
+    """
+    Avoid dense dtick labels across multi-hour/day gaps (Scan Progress + Scanner infrastructure).
+    """
+    try:
+        xs = [x for x in list(x_vals) if x is not None and str(x) != "NaT"]
+    except Exception:
+        xs = []
+    if not xs:
+        return
+    try:
+        xs = [pd.to_datetime(x) for x in xs]
+    except Exception:
+        pass
+    try:
+        xs = sorted(xs)
+    except Exception:
+        pass
+    max_ticks = 6
+    if len(xs) > max_ticks:
+        try:
+            idx = np.linspace(0, len(xs) - 1, num=max_ticks)
+            idx = sorted({int(round(i)) for i in idx})
+            xs = [xs[i] for i in idx]
+        except Exception:
+            xs = [xs[0], xs[-1]]
+    try:
+        x_min = min(xs)
+        x_max = max(xs)
+        show_date = getattr(x_min, "date", None) and getattr(x_max, "date", None) and (x_min.date() != x_max.date())
+    except Exception:
+        show_date = False
+    try:
+        if show_date:
+            tick_text = [pd.to_datetime(x).strftime("%m-%d<br>%H:%M") for x in xs]
+        else:
+            tick_text = [pd.to_datetime(x).strftime("%H:%M") for x in xs]
+        tick_vals = [pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S") for x in xs]
+    except Exception:
+        tick_text = [str(x) for x in xs]
+        tick_vals = [str(x) for x in xs]
+    fig_obj.update_xaxes(
+        title_text="UTC time",
+        tickmode="array",
+        tickvals=tick_vals,
+        ticktext=tick_text,
+        tickangle=0,
+        tickfont=dict(size=10),
+        automargin=True,
+        ticklabeloverflow="allow",
+    )
+
+
+def _spm_layout_merge(base: Dict[str, Any], **overrides: Any) -> Dict[str, Any]:
+    """Merge Plotly layout dict with overrides (avoids duplicate keyword errors from **base + height=...)."""
+    out = dict(base or {})
+    out.update({k: v for k, v in overrides.items() if v is not None})
+    return out
+
+
+def _spm_scanner_two_line_label(name: Any) -> str:
+    """Underscores → spaces; split into two lines for compact x-axis labels (Plotly accepts <br>)."""
+    s = str(name or "").replace("_", " ").strip()
+    if not s:
+        return "—"
+    parts = s.split()
+    if len(parts) <= 1:
+        return s
+    mid = (len(parts) + 1) // 2
+    return "<br>".join([" ".join(parts[:mid]), " ".join(parts[mid:])])
+
+
+def load_scanner_individual_performance(env_id, start_dt, end_dt):
+    if not engine or env_id is None:
+        return pd.DataFrame()
+    query = text("""
+        SELECT captured_at_utc, scanner_id, name, status, group_name, running_threads, total_num_of_threads,
+               system_load_average, available_processors, cpu_pct, physical_memory_mb, free_memory_mb
+        FROM scanner_individual_performance
+        WHERE environment_id = :eid
+          AND captured_at_utc BETWEEN :start AND :end
+        ORDER BY captured_at_utc ASC
+    """)
+    try:
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"eid": env_id, "start": start_dt, "end": end_dt})
+            if not df.empty:
+
+                def get_disp(r):
+                    base = str(r["name"])
+                    sid = str(r["scanner_id"]) if r["scanner_id"] else ""
+                    if sid and f"[{sid[:4]}]" not in base:
+                        return f"{base} [{sid[:4]}]"
+                    return base
+
+                df["display_name"] = df.apply(get_disp, axis=1)
+
+                def clean_num(v):
+                    if isinstance(v, str):
+                        return v.upper().replace("MB", "").replace(" ", "").strip()
+                    return v
+
+                df["physical_memory_mb"] = pd.to_numeric(df["physical_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["free_memory_mb"] = pd.to_numeric(df["free_memory_mb"].apply(clean_num), errors="coerce").fillna(0)
+                df["used_memory_mb"] = df["physical_memory_mb"] - df["free_memory_mb"]
+                df["memory_usage_pct"] = df.apply(
+                    lambda r: (r["used_memory_mb"] / r["physical_memory_mb"] * 100) if r["physical_memory_mb"] > 0 else 0,
+                    axis=1,
+                )
+                if "cpu_pct" in df.columns:
+                    df["cpu_pct"] = pd.to_numeric(df["cpu_pct"], errors="coerce")
+                else:
+                    df["cpu_pct"] = np.nan
+                if "available_processors" in df.columns:
+                    df["available_processors"] = pd.to_numeric(df["available_processors"], errors="coerce")
+                else:
+                    df["available_processors"] = np.nan
+                # Older rows: derive CPU % for charts if load + processors exist (same as BigID UI)
+                try:
+                    _m = (
+                        df["cpu_pct"].isna()
+                        & df["system_load_average"].notna()
+                        & (pd.to_numeric(df["available_processors"], errors="coerce") > 0)
+                    )
+                    if _m.any():
+                        _ap = pd.to_numeric(df.loc[_m, "available_processors"], errors="coerce").clip(lower=1.0)
+                        df.loc[_m, "cpu_pct"] = (
+                            pd.to_numeric(df.loc[_m, "system_load_average"], errors="coerce") * 100.0 / _ap
+                        )
+                    # Rows captured before `available_processors` existed: use default logical CPU count (BigID often 7)
+                    try:
+                        _def_p = float(str(os.getenv("BIGID_SCANNER_DEFAULT_PROCESSORS", "7") or "7").strip())
+                    except Exception:
+                        _def_p = 7.0
+                    if _def_p <= 0:
+                        _def_p = 7.0
+                    _m2 = df["cpu_pct"].isna() & pd.to_numeric(df["system_load_average"], errors="coerce").notna()
+                    if _m2.any():
+                        df.loc[_m2, "cpu_pct"] = (
+                            pd.to_numeric(df.loc[_m2, "system_load_average"], errors="coerce") * 100.0 / _def_p
+                        )
+                except Exception:
+                    pass
             return df
     except Exception:
         return pd.DataFrame()
@@ -10596,6 +11268,24 @@ def page_scan_progress():
                     # Full normalized scan_insights + attributes delta map (for Add New Benchmark prefill)
                     sync_single_scan_insight(str(scan_id), sync_env_row)
 
+                    try:
+                        _cau_scan = write_res.get("captured_at_utc") if isinstance(write_res, dict) else None
+                        if _cau_scan is not None and hasattr(_cau_scan, "replace"):
+                            _cap_at = _cau_scan.replace(microsecond=0)
+                        else:
+                            _cap_at = datetime.utcnow().replace(microsecond=0)
+                        p_res = capture_scanner_performance_for_env(
+                            engine,
+                            sync_env_row,
+                            captured_at=_cap_at,
+                        )
+                        if p_res.get("ok"):
+                            st.caption(
+                                f"Captured scanner performance: `{p_res.get('groups')} groups, {p_res.get('individuals')} scanners`"
+                            )
+                    except Exception:
+                        pass
+
                     st.success("Synced. Reloading…")
                     st.rerun()
                 except Exception as ex:
@@ -10607,6 +11297,7 @@ def page_scan_progress():
 
     # Load (possibly updated) history after any auto-save.
     df = load_scan_progress_history(scan_id)
+    _scanner_i_for_progress_merge = pd.DataFrame()
 
     def _tracker_slot_minutes() -> int:
         # Prefer process env, fallback to .env in repo root.
@@ -11333,69 +12024,6 @@ def page_scan_progress():
             st.markdown(narrative)
 
     c1, c2, c3 = st.columns(3)
-    def _apply_snapshot_ticks(fig_obj, x_vals):
-        """
-        Avoid dense dtick labels across multi-hour/day gaps.
-        Show a small set of snapshot times (evenly spaced).
-        """
-        try:
-            xs = [x for x in list(x_vals) if x is not None and str(x) != "NaT"]
-        except Exception:
-            xs = []
-        if not xs:
-            return
-
-        # Normalize to pandas timestamps for stable formatting/ordering
-        try:
-            xs = [pd.to_datetime(x) for x in xs]
-        except Exception:
-            pass
-        try:
-            xs = sorted(xs)
-        except Exception:
-            pass
-
-        # Pick up to N evenly spaced tick labels (always include first+last).
-        max_ticks = 6
-        if len(xs) > max_ticks:
-            try:
-                import numpy as _np
-                idx = _np.linspace(0, len(xs) - 1, num=max_ticks)
-                idx = sorted({int(round(i)) for i in idx})
-                xs = [xs[i] for i in idx]
-            except Exception:
-                xs = [xs[0], xs[-1]]
-
-        try:
-            x_min = min(xs)
-            x_max = max(xs)
-            show_date = getattr(x_min, "date", None) and getattr(x_max, "date", None) and (x_min.date() != x_max.date())
-        except Exception:
-            show_date = False
-
-        # Use string tickvals so Plotly doesn't drop labels in tight layouts
-        # (datetime tickvals can still be auto-thinned in small subplots).
-        try:
-            if show_date:
-                tick_text = [pd.to_datetime(x).strftime("%m-%d<br>%H:%M") for x in xs]
-            else:
-                tick_text = [pd.to_datetime(x).strftime("%H:%M") for x in xs]
-            tick_vals = [pd.to_datetime(x).strftime("%Y-%m-%d %H:%M:%S") for x in xs]
-        except Exception:
-            tick_text = [str(x) for x in xs]
-            tick_vals = [str(x) for x in xs]
-
-        fig_obj.update_xaxes(
-            title_text="UTC time",
-            tickmode="array",
-            tickvals=tick_vals,
-            ticktext=tick_text,
-            tickangle=0,
-            tickfont=dict(size=10),
-            automargin=True,
-            ticklabeloverflow="allow",
-        )
-
     # Use actual capture time for x-axis and sort so graph order matches real sequence (first snapshot = first point).
     def _plot_time_sorted(df):
         out = df.copy()
@@ -11441,7 +12069,7 @@ def page_scan_progress():
                 marker=dict(color="#EF4444", size=7),
             )
         )
-        _apply_snapshot_ticks(fig, plot_df["captured_at_utc"])
+        spm_apply_plotly_ticks(fig, plot_df["captured_at_utc"])
         fig.update_yaxes(title_text="Count", rangemode="tozero")
         fig.update_layout(
             margin=dict(l=10, r=10, t=30, b=70),
@@ -11464,7 +12092,7 @@ def page_scan_progress():
             mode="lines+markers", name="Objects Failed (count)",
             line=dict(color="#F97316", width=2), marker=dict(color="#F97316", size=7),
         ))
-        _apply_snapshot_ticks(fig2, plot_df["captured_at_utc"])
+        spm_apply_plotly_ticks(fig2, plot_df["captured_at_utc"])
         fig2.update_yaxes(title_text="Count", rangemode="tozero")
         fig2.update_layout(
             margin=dict(l=10, r=10, t=30, b=70),
@@ -11497,7 +12125,7 @@ def page_scan_progress():
             mode="lines+markers", name="classifications.falseRemoved",
             line=dict(color="#EF4444", width=2), marker=dict(color="#EF4444", size=7),
         ))
-        _apply_snapshot_ticks(fig3, plot_df["captured_at_utc"])
+        spm_apply_plotly_ticks(fig3, plot_df["captured_at_utc"])
         fig3.update_yaxes(title_text="Count", rangemode="tozero")
         fig3.update_layout(
             margin=dict(l=10, r=10, t=30, b=70),
@@ -11506,9 +12134,776 @@ def page_scan_progress():
         )
         st.plotly_chart(fig3, width="stretch")
 
+    # Scanner performance (DB): group + per-scanner metrics captured by tracker or "Sync now"
+    try:
+        p_env_id = None
+        if "environment_id" in df.columns:
+            valid_ids = df["environment_id"].dropna().unique()
+            if len(valid_ids) > 0:
+                p_env_id = valid_ids[0]
+        if p_env_id is None and scan_id and engine:
+            try:
+                with engine.connect() as conn:
+                    p_env_id = conn.execute(
+                        text(
+                            "SELECT environment_id FROM scan_parents WHERE scan_id = :sid ORDER BY last_seen_at DESC, id DESC LIMIT 1"
+                        ),
+                        {"sid": str(scan_id)},
+                    ).scalar()
+            except Exception:
+                pass
+
+        _spm_expand = False
+        try:
+            _last_st = str(
+                df.sort_values("captured_at_actual", ascending=True).iloc[-1].get("scan_state") if not df.empty else ""
+            ).strip()
+            _spm_expand = bool(_is_running_state(_last_st))
+        except Exception:
+            _spm_expand = False
+
+        if p_env_id is not None:
+            ts_series = pd.to_datetime(df["captured_at_actual"], errors="coerce")
+            p_start = ts_series.min()
+            p_end = ts_series.max()
+            if pd.notna(p_start) and pd.notna(p_end):
+                p_start_padded = p_start.to_pydatetime() - timedelta(minutes=30)
+                p_end_padded = p_end.to_pydatetime() + timedelta(minutes=60)
+                df_perf_g = load_scanner_group_performance(p_env_id, p_start_padded, p_end_padded)
+                df_perf_i = load_scanner_individual_performance(p_env_id, p_start_padded, p_end_padded)
+
+                if not df_perf_g.empty:
+                    df_perf_g = df_perf_g.copy()
+                    df_perf_g["captured_at_utc"] = pd.to_datetime(df_perf_g["captured_at_utc"], errors="coerce")
+                if not df_perf_i.empty:
+                    df_perf_i = df_perf_i.copy()
+                    df_perf_i["captured_at_utc"] = pd.to_datetime(df_perf_i["captured_at_utc"], errors="coerce")
+
+                _scanner_i_for_progress_merge = df_perf_i.copy() if not df_perf_i.empty else pd.DataFrame()
+
+                _spm_has = not df_perf_g.empty or not df_perf_i.empty
+                # Open by default whenever we have samples so users don’t miss running-set vs all-pods behavior.
+                with st.expander("Scanner Performance Metrics", expanded=bool(_spm_has) or bool(_spm_expand)):
+                    if not _spm_has:
+                        st.caption(
+                            "No **scanner_group_performance** / **scanner_individual_performance** in this window — "
+                            "**Sync now** or run **tracker.py** with scan snapshots."
+                        )
+                        st.info(
+                            "No rows in `scanner_group_performance` / `scanner_individual_performance` for this window. "
+                            "Click **Sync now (manual)** above, or wait for **tracker.py** (runs with scan snapshots)."
+                        )
+                    else:
+                        st.markdown(
+                            """
+<style>
+.spm-hero {
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 40%, #e2e8f0 100%);
+  color: #0f172a;
+  border-radius: 14px;
+  padding: 1rem 1.2rem 1.15rem;
+  margin: 0 0 0.85rem 0;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 4px 18px rgba(15, 23, 42, 0.06);
+}
+.spm-hero h3 { margin: 0 0 0.4rem 0; font-size: 1.12rem; font-weight: 700; letter-spacing: -0.02em; color: #0f172a; }
+.spm-hero .spm-sub { margin: 0; font-size: 0.8rem; line-height: 1.5; color: #475569; }
+.spm-note-ok {
+  background: linear-gradient(90deg, rgba(59, 130, 246, 0.08), rgba(99, 102, 241, 0.05));
+  border-left: 4px solid #6366f1;
+  padding: 0.65rem 0.9rem;
+  border-radius: 0 12px 12px 0;
+  margin: 0.45rem 0 0.75rem 0;
+  font-size: 0.88rem;
+  color: #334155;
+}
+.spm-note-warn {
+  background: rgba(254, 252, 232, 0.85);
+  border-left: 4px solid #ca8a04;
+  padding: 0.65rem 0.9rem;
+  border-radius: 0 12px 12px 0;
+  margin: 0.45rem 0 0.75rem 0;
+  font-size: 0.88rem;
+  color: #713f12;
+}
+</style>
+""",
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(
+                            f"""<div class="spm-hero">
+<h3>Environment #{p_env_id}</h3>
+<p class="spm-sub">
+  Window <b>{p_start_padded:%Y-%m-%d %H:%M}</b> → <b>{p_end_padded:%Y-%m-%d %H:%M}</b> UTC<br/>
+  <span style="opacity:0.92">Sources: <code style="background:#e2e8f0;color:#0f172a;padding:0.12em 0.4em;border-radius:4px;font-size:0.9em">/scanner-groups</code>
+  + <code style="background:#e2e8f0;color:#0f172a;padding:0.12em 0.4em;border-radius:4px;font-size:0.9em">/health-checks/services-status</code>
+  · Speed stored as B/s in DB, charts use KiB/s</span>
+</p></div>""",
+                            unsafe_allow_html=True,
+                        )
+                        _spm_m = dict(
+                            template="plotly_white",
+                            paper_bgcolor="#f8fafc",
+                            plot_bgcolor="#ffffff",
+                            font=dict(color="#334155", family="ui-sans-serif, system-ui, sans-serif", size=12),
+                            hovermode="x unified",
+                            height=400,
+                            margin=dict(l=52, r=48, t=42, b=96),
+                            legend=dict(
+                                orientation="h",
+                                yanchor="top",
+                                y=-0.30,
+                                xanchor="left",
+                                x=0,
+                                bgcolor="rgba(248,250,252,0.92)",
+                                bordercolor="#e2e8f0",
+                                borderwidth=1,
+                            ),
+                        )
+                        n_g = len(df_perf_g)
+                        n_i = len(df_perf_i)
+                        try:
+                            _mins = []
+                            _maxs = []
+                            if n_g:
+                                _mins.append(df_perf_g["captured_at_utc"].min())
+                                _maxs.append(df_perf_g["captured_at_utc"].max())
+                            if n_i:
+                                _mins.append(df_perf_i["captured_at_utc"].min())
+                                _maxs.append(df_perf_i["captured_at_utc"].max())
+                            t_min = min(_mins) if _mins else None
+                            t_max = max(_maxs) if _maxs else None
+                        except Exception:
+                            t_min, t_max = None, None
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Group samples", f"{n_g:,}")
+                        m2.metric("Pod samples", f"{n_i:,}")
+                        try:
+                            _span_long = (
+                                (t_max - t_min).total_seconds() > 86400
+                                if t_min is not None
+                                and t_max is not None
+                                and pd.notna(t_min)
+                                and pd.notna(t_max)
+                                else False
+                            )
+                            _tfmt = "%m-%d %H:%M" if _span_long else "%H:%M"
+                        except Exception:
+                            _tfmt = "%H:%M"
+                        m3.metric(
+                            "First capture",
+                            pd.Timestamp(t_min).strftime(_tfmt) if t_min is not None and pd.notna(t_min) else "—",
+                        )
+                        m4.metric(
+                            "Last capture",
+                            pd.Timestamp(t_max).strftime(_tfmt) if t_max is not None and pd.notna(t_max) else "—",
+                        )
+
+                        # Default charts: BigID **status** (Active vs Failed/inactive), not load/thread heuristics.
+                        _spm_active_names = set()
+                        _spm_show_inactive_status = False
+                        _spm_show_all_pods = False
+                        df_i_chart = df_perf_i
+                        if not df_perf_i.empty:
+                            try:
+                                _ord = df_perf_i.sort_values("captured_at_utc")
+                                _last_st = _ord.groupby("display_name", dropna=False)["status"].last()
+                                _spm_active_names = {
+                                    str(nm)
+                                    for nm, st in _last_st.items()
+                                    if not _scanner_status_inactive(st)
+                                }
+                                if not _spm_active_names:
+                                    _spm_active_names = set(df_perf_i["display_name"].astype(str).unique())
+                            except Exception:
+                                _spm_active_names = set(df_perf_i["display_name"].astype(str).unique())
+                            _n_scan_tot = int(df_perf_i["display_name"].nunique())
+                            _n_scan_active = len(_spm_active_names)
+                            _n_failed_hidden = max(0, _n_scan_tot - _n_scan_active)
+                            st.markdown(
+                                f"**Pods (latest BigID status):** {_n_scan_active} active · {_n_scan_tot} distinct in window"
+                                + (
+                                    f" · {_n_failed_hidden} failed/inactive hidden"
+                                    if _n_failed_hidden
+                                    else ""
+                                )
+                            )
+                            _cb_a, _cb_b = st.columns(2)
+                            with _cb_a:
+                                _spm_show_inactive_status = st.checkbox(
+                                    "Include failed / inactive pods",
+                                    value=False,
+                                    key=f"spm_show_inactive_{str(scan_id)}",
+                                    help="Uses BigID **status** on the latest row per scanner (e.g. Active vs Failed).",
+                                )
+                            with _cb_b:
+                                _spm_show_all_pods = st.checkbox(
+                                    "All UUIDs in window (noisy legends)",
+                                    value=False,
+                                    key=f"spm_all_pods_{str(scan_id)}",
+                                    help="Unchecked = BigID **running** pod set only. Check to debug every services-status UUID.",
+                                )
+                            if not _spm_show_inactive_status:
+                                df_i_chart = df_perf_i[
+                                    df_perf_i["display_name"].astype(str).isin(_spm_active_names)
+                                ].copy()
+                                if df_i_chart.empty:
+                                    df_i_chart = df_perf_i.copy()
+                                    st.warning("Active-status filter matched no rows; showing all scanners.")
+                            else:
+                                df_i_chart = df_perf_i.copy()
+
+                        # Default: BigID **running** pod set, not every historical UUID from services-status.
+                        _spm_eff_ids, _spm_eff_src = spm_effective_running_scanner_id_set(df_perf_g, df_perf_i)
+                        if _spm_eff_ids:
+                            st.markdown(
+                                f'<div class="spm-note-ok"><strong>Default chart set:</strong> {len(_spm_eff_ids)} pod(s) · '
+                                f'<em>{html.escape(str(_spm_eff_src))}</em> — same idea as BigID <strong>runningScanners</strong>.</div>',
+                                unsafe_allow_html=True,
+                            )
+                        elif not df_perf_i.empty:
+                            st.markdown(
+                                '<div class="spm-note-warn"><strong>No running-set IDs</strong> (missing <code>scannersIDs</code> '
+                                "or no <code>running_threads &gt; 0</code> on latest row). Showing <strong>all non-failed</strong> pods — "
+                                "<strong>Sync now</strong> after scanner-groups capture.</div>",
+                                unsafe_allow_html=True,
+                            )
+
+                        if (not df_perf_i.empty) and (not _spm_show_all_pods) and _spm_eff_ids:
+                            _d_prev = df_i_chart.copy()
+                            _tgid = df_i_chart[df_i_chart["scanner_id"].astype(str).isin(_spm_eff_ids)].copy()
+                            if not _tgid.empty:
+                                df_i_chart = _tgid
+                            else:
+                                st.warning(
+                                    "Running-set filter matched no rows (stale IDs vs current services-status). "
+                                    "Showing scanners after status filter only."
+                                )
+                                df_i_chart = _d_prev
+
+                        st.caption("Tabs: **Overview** · **Groups** · **Pods** · **Raw DB**")
+
+                        tab_sum, tab_grp, tab_scan, tab_raw = st.tabs(
+                            ["Overview", "Groups", "Pods", "Raw DB"]
+                        )
+
+                        with tab_sum:
+                            if not df_perf_i.empty:
+                                try:
+                                    snap = spm_latest_per_scanner_df(df_i_chart)
+                                    if snap.empty:
+                                        st.caption("No per-scanner rows after filters (try **Show all pods** or include failed).")
+                                    else:
+                                        snap_threads = snap.copy()
+                                        snap_threads["running_threads"] = pd.to_numeric(
+                                            snap_threads["running_threads"], errors="coerce"
+                                        ).fillna(0)
+                                        snap_threads = snap_threads.sort_values(
+                                            "running_threads", ascending=True
+                                        )
+                                        _order = snap_threads["display_name"].astype(str).tolist()
+                                        _x_lbl = [_spm_scanner_two_line_label(n) for n in _order]
+                                        _y_rt = snap_threads["running_threads"].tolist()
+                                        _idx_snap = snap.set_index("display_name", drop=False)
+                                        _cpu_aligned = pd.to_numeric(
+                                            _idx_snap.reindex(_order)["cpu_pct"], errors="coerce"
+                                        )
+                                        _mem_raw = _idx_snap.reindex(_order)
+                                        if "memory_usage_pct" in _mem_raw.columns:
+                                            _mem_aligned = pd.to_numeric(
+                                                _mem_raw["memory_usage_pct"], errors="coerce"
+                                            )
+                                        else:
+                                            _mem_aligned = pd.Series(np.nan, index=_order)
+                                        if bool(_mem_aligned.isna().all()) and "physical_memory_mb" in _mem_raw.columns:
+                                            _pm = pd.to_numeric(_mem_raw["physical_memory_mb"], errors="coerce")
+                                            _fm = pd.to_numeric(
+                                                _mem_raw["free_memory_mb"]
+                                                if "free_memory_mb" in _mem_raw.columns
+                                                else pd.Series(np.nan, index=_mem_raw.index),
+                                                errors="coerce",
+                                            )
+                                            _mem_aligned = pd.Series(
+                                                np.where(
+                                                    _pm > 0, (_pm - _fm) / _pm * 100.0, np.nan
+                                                ),
+                                                index=_order,
+                                            )
+                                        _sum_h = max(340, min(560, 120 + len(_order) * 52))
+                                        _sum_marg = dict(l=8, r=8, t=44, b=96)
+                                        st.caption("Latest snapshot — **vertical bars** · `services-status`")
+                                        _col_rt, _col_cpu, _col_mem = st.columns(3)
+                                        with _col_rt:
+                                            fig_rt = go.Figure(
+                                                go.Bar(
+                                                    x=_x_lbl,
+                                                    y=_y_rt,
+                                                    marker_color="#6366F1",
+                                                    hovertemplate="%{x}<br><b>Threads</b> %{y}<extra></extra>",
+                                                )
+                                            )
+                                            fig_rt.update_layout(
+                                                **_spm_layout_merge(
+                                                    _spm_m,
+                                                    title=dict(text="Running threads", font=dict(size=13)),
+                                                    yaxis=dict(title="Threads", rangemode="tozero"),
+                                                    xaxis=dict(tickfont=dict(size=10)),
+                                                    showlegend=False,
+                                                    height=_sum_h,
+                                                    margin=_sum_marg,
+                                                ),
+                                            )
+                                            st.plotly_chart(fig_rt, width="stretch")
+                                        with _col_cpu:
+                                            if _cpu_aligned.notna().any():
+                                                _mx_c = float(_cpu_aligned.max())
+                                                _rng = max(110.0, _mx_c * 1.08 + 20.0) if _mx_c > 0 else 100.0
+                                                fig_sb_c = go.Figure(
+                                                    go.Bar(
+                                                        x=_x_lbl,
+                                                        y=_cpu_aligned.fillna(0.0),
+                                                        marker_color="#e11d48",
+                                                        hovertemplate="%{x}<br><b>CPU</b> %{y:.2f}%<extra></extra>",
+                                                    )
+                                                )
+                                                fig_sb_c.update_layout(
+                                                    **_spm_layout_merge(
+                                                        _spm_m,
+                                                        title=dict(text="CPU %", font=dict(size=13)),
+                                                        yaxis=dict(title="CPU %", rangemode="tozero", range=[0, _rng]),
+                                                        xaxis=dict(tickfont=dict(size=10)),
+                                                        showlegend=False,
+                                                        height=_sum_h,
+                                                        margin=_sum_marg,
+                                                    ),
+                                                )
+                                                st.plotly_chart(fig_sb_c, width="stretch")
+                                            else:
+                                                st.caption("No CPU % in latest rows.")
+                                        with _col_mem:
+                                            _mem_s = pd.to_numeric(_mem_aligned, errors="coerce")
+                                            if _mem_s.notna().any():
+                                                fig_sb_m = go.Figure(
+                                                    go.Bar(
+                                                        x=_x_lbl,
+                                                        y=_mem_s.fillna(0.0),
+                                                        marker_color="#0891b2",
+                                                        hovertemplate="%{x}<br><b>Memory</b> %{y:.2f}%<extra></extra>",
+                                                    )
+                                                )
+                                                fig_sb_m.update_layout(
+                                                    **_spm_layout_merge(
+                                                        _spm_m,
+                                                        title=dict(text="Memory %", font=dict(size=13)),
+                                                        yaxis=dict(title="Memory %", rangemode="tozero", range=[0, 100]),
+                                                        xaxis=dict(tickfont=dict(size=10)),
+                                                        showlegend=False,
+                                                        height=_sum_h,
+                                                        margin=_sum_marg,
+                                                    ),
+                                                )
+                                                st.plotly_chart(fig_sb_m, width="stretch")
+                                            else:
+                                                st.caption("No memory % in latest rows.")
+                                        c_a, c_b, c_c, c_d = st.columns(4)
+                                        _mcpu = pd.to_numeric(snap.get("cpu_pct"), errors="coerce")
+                                        _mload = pd.to_numeric(snap.get("system_load_average"), errors="coerce")
+                                        _mmem = pd.to_numeric(snap.get("memory_usage_pct"), errors="coerce")
+                                        _rt_sum = pd.to_numeric(snap["running_threads"], errors="coerce").fillna(0)
+                                        with c_a:
+                                            st.metric("Scanners (latest)", len(snap))
+                                        with c_b:
+                                            st.metric("Σ running threads", int(_rt_sum.sum()))
+                                        with c_c:
+                                            if _mcpu.notna().any():
+                                                st.metric("Mean / peak CPU %", f"{float(_mcpu.mean()):.1f} / {float(_mcpu.max()):.1f}")
+                                            elif _mload.notna().any():
+                                                st.metric("Mean load avg", f"{float(_mload.mean()):.2f}")
+                                            else:
+                                                st.metric("Mean load avg", "—")
+                                        with c_d:
+                                            if _mmem.notna().any():
+                                                st.metric("Mean / peak mem %", f"{float(_mmem.mean()):.1f} / {float(_mmem.max()):.1f}")
+                                            elif _mcpu.notna().any():
+                                                st.metric("Peak CPU %", f"{float(_mcpu.max()):.1f}")
+                                            elif _mload.notna().any():
+                                                st.metric("Peak load avg", f"{float(_mload.max()):.2f}")
+                                            else:
+                                                st.metric("Peak load avg", "—")
+                                except Exception as _sum_err:
+                                    st.warning(f"Could not build summary chart: `{_sum_err!s}`")
+                            elif not df_perf_g.empty:
+                                st.info("No per-scanner rows in window; open **Groups** tab.")
+                            else:
+                                st.caption("No data.")
+
+                        with tab_grp:
+                            try:
+                                if df_perf_g.empty:
+                                    st.caption("No group-level rows.")
+                                else:
+                                    _dg_tab = spm_dedupe_scanner_group_rows(df_perf_g)
+                                    _agg_kw = dict(
+                                        running_scanners=("running_scanners", "sum"),
+                                        running_threads=("running_threads", "sum"),
+                                        avg_scan_speed=("avg_scan_speed", "mean"),
+                                        used_memory_mb=("used_memory_mb", "sum"),
+                                        physical_memory_mb=("physical_memory_mb", "max"),
+                                    )
+                                    if "max_threads" in _dg_tab.columns:
+                                        _agg_kw["max_threads_pool"] = ("max_threads", "max")
+                                    if "scanner_threads" in _dg_tab.columns:
+                                        _agg_kw["scanner_threads_cap"] = ("scanner_threads", "max")
+                                    g_sum = _dg_tab.groupby("captured_at_utc", as_index=False).agg(**_agg_kw).sort_values(
+                                        "captured_at_utc"
+                                    )
+                                    g_sum["avg_scan_speed_kib_s"] = pd.to_numeric(
+                                        g_sum["avg_scan_speed"], errors="coerce"
+                                    ).fillna(0.0) / 1024.0
+                                    cga, cgb = st.columns(2)
+                                    with cga:
+                                        st.markdown("**Capacity vs throughput**")
+                                        fig_a = go.Figure()
+                                        fig_a.add_trace(
+                                            go.Scatter(
+                                                x=g_sum["captured_at_utc"],
+                                                y=g_sum["running_scanners"],
+                                                mode="lines+markers",
+                                                name="Running scanners (Σ groups, deduped)",
+                                                line=dict(color="#2563EB", width=2),
+                                            )
+                                        )
+                                        fig_a.add_trace(
+                                            go.Scatter(
+                                                x=g_sum["captured_at_utc"],
+                                                y=g_sum["avg_scan_speed_kib_s"],
+                                                mode="lines+markers",
+                                                name="Avg scan speed (mean, KiB/s)",
+                                                line=dict(color="#059669", width=2),
+                                                yaxis="y2",
+                                            )
+                                        )
+                                        fig_a.update_layout(
+                                            **_spm_layout_merge(
+                                                _spm_m,
+                                                yaxis=dict(title="Scanners", rangemode="tozero"),
+                                                yaxis2=dict(
+                                                    title="Scan speed (KiB/s)",
+                                                    overlaying="y",
+                                                    side="right",
+                                                    rangemode="tozero",
+                                                ),
+                                            ),
+                                        )
+                                        spm_apply_plotly_ticks(fig_a, g_sum["captured_at_utc"])
+                                        st.plotly_chart(fig_a, width="stretch")
+                                        st.caption(
+                                            "**Running scanners:** summed per timestamp after **dedupe (time × group_name)** so duplicate rows don’t inflate. "
+                                            "Right axis: `avgScanSpeed` as **KiB/s** (÷1024); raw **B/s** in **Raw tables**."
+                                        )
+                                    with cgb:
+                                        st.markdown("**Group memory (aggregated)**")
+                                        fig_b = go.Figure()
+                                        fig_b.add_trace(
+                                            go.Scatter(
+                                                x=g_sum["captured_at_utc"],
+                                                y=g_sum["used_memory_mb"],
+                                                mode="lines+markers",
+                                                name="Σ used (MB)",
+                                                fill="tozeroy",
+                                                line=dict(color="#DC2626", width=2),
+                                            )
+                                        )
+                                        fig_b.add_trace(
+                                            go.Scatter(
+                                                x=g_sum["captured_at_utc"],
+                                                y=g_sum["physical_memory_mb"],
+                                                mode="lines+markers",
+                                                name="Max physical (MB)",
+                                                line=dict(color="#7C3AED", width=1, dash="dot"),
+                                            )
+                                        )
+                                        fig_b.update_layout(
+                                            **_spm_layout_merge(
+                                                _spm_m,
+                                                yaxis=dict(title="MB", rangemode="tozero"),
+                                            ),
+                                        )
+                                        spm_apply_plotly_ticks(fig_b, g_sum["captured_at_utc"])
+                                        st.plotly_chart(fig_b, width="stretch")
+                                    st.markdown("**Thread usage vs caps** *(Σ running_threads vs BigID pool / UI cap)*")
+                                    fig_c = go.Figure()
+                                    fig_c.add_trace(
+                                        go.Scatter(
+                                            x=g_sum["captured_at_utc"],
+                                            y=g_sum["running_threads"],
+                                            mode="lines+markers",
+                                            name="Σ running_threads (in use)",
+                                            line=dict(color="#0D9488", width=2),
+                                            fill="tozeroy",
+                                        )
+                                    )
+                                    if "max_threads_pool" in g_sum.columns and g_sum["max_threads_pool"].notna().any():
+                                        _mtp = pd.to_numeric(g_sum["max_threads_pool"], errors="coerce")
+                                        if _mtp.max() > 0:
+                                            fig_c.add_trace(
+                                                go.Scatter(
+                                                    x=g_sum["captured_at_utc"],
+                                                    y=_mtp,
+                                                    mode="lines",
+                                                    name="maxThreads (pool cap, API)",
+                                                    line=dict(color="#94A3B8", width=2, dash="dot"),
+                                                )
+                                            )
+                                    if "scanner_threads_cap" in g_sum.columns and g_sum["scanner_threads_cap"].notna().any():
+                                        _stc = pd.to_numeric(g_sum["scanner_threads_cap"], errors="coerce")
+                                        if _stc.max() > 0:
+                                            fig_c.add_trace(
+                                                go.Scatter(
+                                                    x=g_sum["captured_at_utc"],
+                                                    y=_stc,
+                                                    mode="lines",
+                                                    name="scannerThreads (group UI cap, API)",
+                                                    line=dict(color="#F59E0B", width=2, dash="dash"),
+                                                )
+                                            )
+                                    fig_c.update_layout(
+                                        **_spm_layout_merge(
+                                            _spm_m,
+                                            yaxis=dict(title="Threads", rangemode="tozero"),
+                                        ),
+                                    )
+                                    spm_apply_plotly_ticks(fig_c, g_sum["captured_at_utc"])
+                                    st.plotly_chart(fig_c, width="stretch")
+                                    st.caption(
+                                        "**maxThreads** = large thread pool in API; **scannerThreads** ≈ the smaller cap shown in Scanner groups (e.g. 50)."
+                                    )
+
+                            except Exception as _grp_err:
+                                st.error(f"Scanner groups tab: `{_grp_err!s}`")
+                        with tab_scan:
+                            try:
+                                if df_perf_i.empty:
+                                    st.caption("No per-scanner rows.")
+                                elif df_i_chart.empty:
+                                    st.caption("No rows after filters.")
+                                else:
+                                    st.markdown("### Pods · `services-status`")
+                                    st.caption(
+                                        "**CPU %** = BigID table formula when no native field: load × 100 ÷ processors. "
+                                        "**Memory %** = (physical − free) / physical. "
+                                        "Group-level charts → **Groups** tab."
+                                    )
+                                    _snap_ps = spm_latest_per_scanner_df(df_i_chart)
+                                    st.markdown("##### Latest snapshot")
+                                    _bcpu, _bmem = st.columns(2)
+                                    with _bcpu:
+                                        _row_cpu = _snap_ps.dropna(subset=["cpu_pct"]).copy()
+                                        if _row_cpu.empty:
+                                            st.info(
+                                                "No **cpu_pct** (and nothing to derive). **Sync now** or wait for **tracker**; "
+                                                "set **`BIGID_SCANNER_CPU_DERIVE_FROM_LOAD=1`** (default)."
+                                            )
+                                        else:
+                                            _row_cpu = _row_cpu.sort_values("cpu_pct", ascending=True)
+                                            _la = pd.to_numeric(_row_cpu["system_load_average"], errors="coerce")
+                                            _ap = pd.to_numeric(_row_cpu.get("available_processors"), errors="coerce")
+                                            _la_h = _la.map(lambda x: f"{float(x):.4f}" if pd.notna(x) else "—")
+                                            _ap_h = _ap.map(lambda x: str(int(x)) if pd.notna(x) and float(x) > 0 else "—")
+                                            fig_bar_cpu = go.Figure(
+                                                go.Bar(
+                                                    x=_row_cpu["cpu_pct"],
+                                                    y=_row_cpu["display_name"],
+                                                    orientation="h",
+                                                    marker_color="#e11d48",
+                                                    hovertemplate=(
+                                                        "%{y}<br><b>CPU</b> %{x:.2f}%<br>status: %{customdata[0]}<br>"
+                                                        "load: %{customdata[1]} · processors: %{customdata[2]}<extra></extra>"
+                                                    ),
+                                                    customdata=np.column_stack(
+                                                        [_row_cpu["status"].astype(str).values, _la_h.values, _ap_h.values]
+                                                    ),
+                                                )
+                                            )
+                                            _cmx = float(_row_cpu["cpu_pct"].max())
+                                            _ctop = max(110.0, _cmx * 1.08 + 25.0) if _cmx > 0 else 100.0
+                                            fig_bar_cpu.update_layout(
+                                                **_spm_layout_merge(
+                                                    _spm_m,
+                                                    title="CPU % (BigID Scanners table)",
+                                                    xaxis=dict(title="CPU %", range=[0, _ctop]),
+                                                    yaxis=dict(autorange="reversed"),
+                                                    showlegend=False,
+                                                    height=max(340, 32 * len(_row_cpu) + 100),
+                                                ),
+                                            )
+                                            st.plotly_chart(fig_bar_cpu, width="stretch")
+                                    with _bmem:
+                                        _row_mem = _snap_ps.sort_values("memory_usage_pct", ascending=True).copy()
+                                        _um = pd.to_numeric(_row_mem["used_memory_mb"], errors="coerce")
+                                        _pm = pd.to_numeric(_row_mem["physical_memory_mb"], errors="coerce")
+                                        fig_bar_mem = go.Figure(
+                                            go.Bar(
+                                                x=_row_mem["memory_usage_pct"],
+                                                y=_row_mem["display_name"],
+                                                orientation="h",
+                                                marker_color="#0891b2",
+                                                hovertemplate=(
+                                                    "%{y}<br><b>Memory</b> %{x:.2f}%<br>used %{customdata[0]:.0f} MB / "
+                                                    "phys %{customdata[1]:.0f} MB<br>status: %{customdata[2]}<extra></extra>"
+                                                ),
+                                                customdata=np.column_stack(
+                                                    [
+                                                        _um.fillna(0),
+                                                        _pm.fillna(0),
+                                                        _row_mem["status"].astype(str),
+                                                    ]
+                                                ),
+                                            )
+                                        )
+                                        fig_bar_mem.update_layout(
+                                            **_spm_layout_merge(
+                                                _spm_m,
+                                                title="Memory usage % (host reported by scanner)",
+                                                xaxis=dict(title="Memory %", range=[0, 100]),
+                                                yaxis=dict(autorange="reversed"),
+                                                showlegend=False,
+                                                height=max(340, 32 * len(_row_mem) + 100),
+                                            ),
+                                        )
+                                        st.plotly_chart(fig_bar_mem, width="stretch")
+
+                                    st.markdown("#### Over time — **CPU %** *(per scanner)*")
+                                    _cpu_series = pd.to_numeric(df_i_chart.get("cpu_pct"), errors="coerce")
+                                    _has_cpu = bool(_cpu_series.notna().any())
+                                    if _has_cpu:
+                                        fig_cpu = px.line(
+                                            df_i_chart.dropna(subset=["cpu_pct"]),
+                                            x="captured_at_utc",
+                                            y="cpu_pct",
+                                            color="display_name",
+                                            markers=True,
+                                        )
+                                        fig_cpu.update_traces(mode="lines+markers")
+                                        _cpu_mx = float(_cpu_series.max() or 0)
+                                        if _cpu_mx <= 0:
+                                            _cpu_top = 100.0
+                                        elif _cpu_mx < 100:
+                                            _cpu_top = max(100.0, _cpu_mx * 1.25 + 10.0)
+                                        else:
+                                            _cpu_top = max(700.0, _cpu_mx * 1.15 + 50.0)
+                                        fig_cpu.update_layout(
+                                            **_spm_layout_merge(
+                                                _spm_m,
+                                                yaxis=dict(title="CPU %", rangemode="tozero", range=[0, _cpu_top]),
+                                            ),
+                                        )
+                                        spm_apply_plotly_ticks(fig_cpu, df_i_chart["captured_at_utc"])
+                                        st.caption(f"Y-axis capped ~**{_cpu_top:.0f}%** (series max **{_cpu_mx:.1f}%**).")
+                                        st.plotly_chart(fig_cpu, width="stretch")
+                                    else:
+                                        st.warning(
+                                            "No **cpu_pct** in this window. **Sync now** / **tracker** after upgrading capture; "
+                                            "**`BIGID_SCANNER_CPU_DERIVE_FROM_LOAD`** (default on) or store **`available_processors`** for display backfill."
+                                        )
+
+                                    st.markdown("#### Over time — **memory usage %** *(per scanner)*")
+                                    fig_mem_pct = px.line(
+                                        df_i_chart,
+                                        x="captured_at_utc",
+                                        y="memory_usage_pct",
+                                        color="display_name",
+                                        markers=True,
+                                    )
+                                    fig_mem_pct.update_traces(mode="lines+markers")
+                                    fig_mem_pct.update_layout(
+                                        **_spm_layout_merge(
+                                            _spm_m,
+                                            yaxis=dict(title="Memory %", rangemode="tozero", range=[0, 100]),
+                                        ),
+                                    )
+                                    spm_apply_plotly_ticks(fig_mem_pct, df_i_chart["captured_at_utc"])
+                                    st.plotly_chart(fig_mem_pct, width="stretch")
+
+                                    st.markdown("#### Over time — **used memory (MB)** *(absolute)*")
+                                    fig_mem_mb = px.line(
+                                        df_i_chart,
+                                        x="captured_at_utc",
+                                        y="used_memory_mb",
+                                        color="display_name",
+                                        markers=True,
+                                    )
+                                    fig_mem_mb.update_traces(mode="lines+markers")
+                                    fig_mem_mb.update_layout(
+                                        **_spm_layout_merge(
+                                            _spm_m,
+                                            yaxis=dict(title="Used MB", rangemode="tozero"),
+                                        ),
+                                    )
+                                    spm_apply_plotly_ticks(fig_mem_mb, df_i_chart["captured_at_utc"])
+                                    st.plotly_chart(fig_mem_mb, width="stretch")
+
+                                    st.markdown("#### Over time — **running threads**")
+                                    fig_t = px.line(
+                                        df_i_chart,
+                                        x="captured_at_utc",
+                                        y="running_threads",
+                                        color="display_name",
+                                        markers=True,
+                                    )
+                                    fig_t.update_traces(mode="lines+markers")
+                                    fig_t.update_layout(**_spm_m)
+                                    spm_apply_plotly_ticks(fig_t, df_i_chart["captured_at_utc"])
+                                    st.plotly_chart(fig_t, width="stretch")
+
+                                    with st.expander("Raw **system load average** from API *(not the same as CPU %)*"):
+                                        fig_l = px.line(
+                                            df_i_chart,
+                                            x="captured_at_utc",
+                                            y="system_load_average",
+                                            color="display_name",
+                                            markers=True,
+                                        )
+                                        fig_l.update_traces(mode="lines+markers")
+                                        fig_l.update_layout(**_spm_m)
+                                        spm_apply_plotly_ticks(fig_l, df_i_chart["captured_at_utc"])
+                                        st.plotly_chart(fig_l, width="stretch")
+
+                            except Exception as _scan_err:
+                                st.error(f"Per-scanner tab: `{_scan_err!s}`")
+                        with tab_raw:
+                            try:
+                                st.caption("Tables below are **unfiltered** (all scanners in the time window).")
+                                if not df_perf_g.empty:
+                                    st.markdown("**scanner_group_performance**")
+                                    _raw_g = df_perf_g.sort_values("captured_at_utc", ascending=False).head(500).copy()
+                                    if "avg_scan_speed" in _raw_g.columns:
+                                        _raw_g["avg_scan_speed_kib_s"] = (
+                                            pd.to_numeric(_raw_g["avg_scan_speed"], errors="coerce").fillna(0.0) / 1024.0
+                                        )
+                                    st.dataframe(_raw_g, width="stretch", height=280)
+                                if not df_perf_i.empty:
+                                    st.markdown("**scanner_individual_performance**")
+                                    _raw_i = df_perf_i.sort_values("captured_at_utc", ascending=False).head(500).copy()
+                                    if "memory_usage_pct" not in _raw_i.columns and "physical_memory_mb" in _raw_i.columns:
+                                        _pm = pd.to_numeric(_raw_i["physical_memory_mb"], errors="coerce")
+                                        _fm = pd.to_numeric(_raw_i["free_memory_mb"], errors="coerce")
+                                        _raw_i["memory_usage_pct"] = np.where(
+                                            _pm > 0, (_pm - _fm) / _pm * 100.0, np.nan
+                                        )
+                                    st.dataframe(_raw_i, width="stretch", height=320)
+                            except Exception as _raw_err:
+                                st.error(f"Raw tables tab: `{_raw_err!s}`")
+    except Exception:
+        pass
+
     st.subheader("Raw Progress Data")
     # Show oldest first so the first row shows scan start time.
     show_df = df.copy()
+    try:
+        show_df = merge_scanner_averages_into_progress_df(show_df, _scanner_i_for_progress_merge)
+    except Exception:
+        pass
     try:
         show_df = show_df.rename(columns={
             "captured_at_actual": "captured_at_actual_utc",
@@ -11516,8 +12911,26 @@ def page_scan_progress():
         })
     except Exception:
         pass
+    try:
+        sort_col = "captured_at_actual_utc" if "captured_at_actual_utc" in show_df.columns else "captured_at_actual"
+        show_sorted = show_df.sort_values(sort_col, ascending=True)
+    except Exception:
+        show_sorted = show_df
+    try:
+        _hdr_map = {
+            c: _RAW_PROGRESS_HEADER_OVERRIDES.get(c, _progress_column_header_two_lines(c))
+            for c in show_sorted.columns
+        }
+        show_disp = show_sorted.rename(columns=_hdr_map)
+    except Exception:
+        show_disp = show_sorted
 
-    st.dataframe(show_df.sort_values("captured_at_actual_utc", ascending=True), width="stretch")
+    st.caption(
+        "Headers use **spaces** and **two lines** where it helps column width. "
+        "**avg scanner** columns = mean CPU % / memory % across pods in `scanner_individual_performance`, "
+        "matched to each snapshot’s slot time (±20 min nearest neighbor)."
+    )
+    st.dataframe(show_disp, width="stretch")
     
     if st.button("Back to Scan Status"):
         st.query_params["page"] = "Scan Status"
@@ -11618,7 +13031,10 @@ def _build_default_workflow_steps(env1_id: Optional[int], env2_id: Optional[int]
 def page_workflow_automation():
     global engine
     st.title("🧪 Workflow Automation")
-    st.caption("UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially.")
+    st.caption(
+        "UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially. "
+        "Only environments with **Use for workflow runs** (Manage Test Environments) are eligible for new steps."
+    )
 
     ensure_test_environments_table(engine)
     ensure_scan_tracking_tables()
@@ -11632,11 +13048,18 @@ def page_workflow_automation():
 
     work_df = env_df.copy()
     work_df["is_active"] = work_df["is_active"].apply(lambda x: bool(x))
+    if "include_in_workflow_runs" not in work_df.columns:
+        work_df["include_in_workflow_runs"] = True
+    else:
+        work_df["include_in_workflow_runs"] = (
+            pd.to_numeric(work_df["include_in_workflow_runs"], errors="coerce").fillna(1).astype(int).ne(0)
+        )
     active_df = work_df[work_df["is_active"] == True].copy()
     active_df = active_df.sort_values(by=["env_name"], ascending=[True]).reset_index(drop=True)
     if active_df.empty:
-        st.warning("No active environments. Mark at least two environments active to run this workflow.")
+        st.warning("No active environments. Add or activate one under **Manage Test Environments**.")
         return
+    wf_pool_df = active_df[active_df["include_in_workflow_runs"] == True].copy().reset_index(drop=True)
 
 
 
@@ -11707,73 +13130,79 @@ def page_workflow_automation():
                 lbl = f"⚠️ {lbl} [IN USE]"
             return lbl
 
-        env_labels = [_env_label(r) for r in active_df.itertuples()]
-        env_ids = [int(r.id) for r in active_df.itertuples()]
-
-        if in_use_env_ids:
+        if wf_pool_df.empty:
             st.warning(
-                f"**Environments marked ⚠️ [IN USE]** are currently running another workflow. "
-                "You can still select them, but steps will be queued until that workflow finishes."
+                "No environments are in the **workflow pool**. Enable **Use for workflow runs** "
+                "for at least one active environment in **Manage Test Environments**."
             )
+        else:
+            env_labels = [_env_label(r) for r in wf_pool_df.itertuples()]
+            env_ids = [int(r.id) for r in wf_pool_df.itertuples()]
 
-        c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
-        env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_new_expander")
-        env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2_new_expander")
-        cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_new_expander"))
-        env1_id = env_ids[env_labels.index(env1_label)]
-        env2_id = env_ids[env_labels.index(env2_label)]
-        wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_new_expander")
+            if in_use_env_ids:
+                st.warning(
+                    "**Environments marked ⚠️ [IN USE]** are currently running another workflow. "
+                    "You can still select them, but steps will be queued until that workflow finishes."
+                )
 
-        create_disabled = False
-        if int(env1_id) == int(env2_id):
-            st.info("Env 1 and Env 2 are the same. Workflow will run sequentially on this single machine.")
+            c1, c2, c3 = st.columns([1.4, 1.4, 1.0])
+            env1_label = c1.selectbox("Env 1 (first step)", env_labels, index=0, key="wf_env1_new_expander")
+            env2_label = c2.selectbox("Env 2 (second step)", env_labels, index=(1 if len(env_labels) > 1 else 0), key="wf_env2_new_expander")
+            cooldown = int(c3.number_input("Cooldown (minutes)", min_value=1, max_value=180, value=15, step=1, key="wf_cd_new_expander"))
+            env1_id = env_ids[env_labels.index(env1_label)]
+            env2_id = env_ids[env_labels.index(env2_label)]
+            wf_name = st.text_input("Workflow name", value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}", key="wf_name_new_expander")
 
-        preview_steps = _build_default_workflow_steps(env1_id, env2_id)
-        for stp in preview_steps or []:
-            if isinstance(stp, dict) and "is_enabled" not in stp:
-                stp["is_enabled"] = True
-        with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
-            prev_df = pd.DataFrame(preview_steps)
-            show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
-            show_cols = [c for c in show_cols if c in prev_df.columns]
-            editable_df = st.data_editor(
-                prev_df[show_cols],
-                width="stretch",
-                hide_index=True,
-                key="wf_preview_steps_editor_new_expander",
-                column_config={
-                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
-                },
-                disabled=[c for c in show_cols if c != "is_enabled"],
-            )
-            try:
-                preview_steps = editable_df.to_dict("records")
-            except Exception:
-                pass
+            create_disabled = False
+            if int(env1_id) == int(env2_id):
+                st.info("Env 1 and Env 2 are the same. Workflow will run sequentially on this single machine.")
 
-        if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
-            rid = create_workflow_run(
-                wf_name,
-                env1_id=int(env1_id),
-                env2_id=int(env2_id),
-                steps=preview_steps,
-                cooldown_minutes=int(cooldown),
-            )
-            if rid:
-                st.success(f"Created workflow run id={rid}. Reloading…")
-                st.query_params["page"] = "Workflow Automation"
-                st.query_params["run_id"] = str(int(rid))
+            preview_steps = _build_default_workflow_steps(env1_id, env2_id)
+            for stp in preview_steps or []:
+                if isinstance(stp, dict) and "is_enabled" not in stp:
+                    stp["is_enabled"] = True
+            with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
+                prev_df = pd.DataFrame(preview_steps)
+                show_cols = ["is_enabled", "environment_id", "ds_kind", "ds_name", "scan_kind", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "feature_flags", "notes", "status"]
+                show_cols = [c for c in show_cols if c in prev_df.columns]
+                editable_df = st.data_editor(
+                    prev_df[show_cols],
+                    width="stretch",
+                    hide_index=True,
+                    key="wf_preview_steps_editor_new_expander",
+                    column_config={
+                        "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                    },
+                    disabled=[c for c in show_cols if c != "is_enabled"],
+                )
                 try:
-                    st.session_state["wf_run_sel_id"] = int(rid)
+                    preview_steps = editable_df.to_dict("records")
                 except Exception:
                     pass
-                try:
-                    st.cache_data.clear()
-                except Exception:
-                    pass
-                st.rerun()
-            else:
-                st.error("Failed to create workflow plan.")
+
+            if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
+                rid = create_workflow_run(
+                    wf_name,
+                    env1_id=int(env1_id),
+                    env2_id=int(env2_id),
+                    steps=preview_steps,
+                    cooldown_minutes=int(cooldown),
+                )
+                if rid:
+                    st.success(f"Created workflow run id={rid}. Reloading…")
+                    st.query_params["page"] = "Workflow Automation"
+                    st.query_params["run_id"] = str(int(rid))
+                    try:
+                        st.session_state["wf_run_sel_id"] = int(rid)
+                    except Exception:
+                        pass
+                    try:
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+                else:
+                    st.error("Failed to create workflow plan.")
 
     # --- Load runs ---
     st.markdown("### Workflow Runs")
@@ -12840,6 +14269,7 @@ def main():
         "Create Data Source": "Create Data Source",
         "Scan Status": "Scan Status",
         "Scan Progress": "Scan Progress",
+        "Scanner Infrastructure": "Scanner Infrastructure",
         "Manage RBAC": "Manage RBAC"
     }
 
@@ -13096,6 +14526,7 @@ def main():
                 {f'<a href="?page=Create+Data+Source" target="_self" class="flyout-item"><span>🧩</span> <span>Create Data Source</span></a>' if check_access("Create Data Source") else ""}
                 {f'<a href="?page=Scan+Status" target="_self" class="flyout-item"><span>🛰️</span> <span>Scan Status</span></a>' if check_access("Scan Status") else ""}
                 {f'<a href="?page=Scan+Progress" target="_self" class="flyout-item"><span>📈</span> <span>Scan Progress</span></a>' if check_access("Scan Progress") else ""}
+                {f'<a href="?page=Scanner+Infrastructure" target="_self" class="flyout-item"><span>🖥️</span> <span>Scanner Infrastructure</span></a>' if check_access("Scan Status") else ""}
                 {f'<a href="?page=Manage+RBAC" target="_self" class="flyout-item"><span>🛡️</span> <span>Manage RBAC</span></a>' if check_access("Manage RBAC") else ""}
             </div>
         </div>
@@ -13188,6 +14619,11 @@ def main():
         page_scan_status()
     elif page == "Scan Progress":
         page_scan_progress()
+    elif page == "Scanner Infrastructure":
+        if check_access("Scan Status"):
+            page_scanner_infrastructure()
+        else:
+            st.error("Access denied.")
     elif page == "Manage RBAC":
         if check_access("Manage RBAC"):
             page_manage_rbac()

@@ -1355,7 +1355,9 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
     with engine.connect() as conn:
         row = conn.execute(
             text("""
-                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
+                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name,
+                       classifiers_api_path, is_active,
+                       COALESCE(include_in_workflow_runs, 1) AS include_in_workflow_runs
                 FROM test_environments
                 WHERE id = :id
                 LIMIT 1
@@ -1373,6 +1375,7 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
         "auth_function_name": row[5],
         "classifiers_api_path": row[6],
         "is_active": row[7],
+        "include_in_workflow_runs": bool(int(row[8])) if row[8] is not None else True,
     }
 
 
@@ -2174,6 +2177,27 @@ def _extract_id(payload: Dict[str, Any], keys: List[str]) -> str:
     return ""
 
 
+_workflow_include_col_ready = False
+
+
+def _ensure_test_environments_workflow_column(engine) -> None:
+    """Adds include_in_workflow_runs if missing (runner may start before Streamlit runs ensure)."""
+    global _workflow_include_col_ready
+    if _workflow_include_col_ready:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE"
+                )
+            )
+            conn.commit()
+    except Exception:
+        pass
+    _workflow_include_col_ready = True
+
+
 def _scenario_lock_key(ds_kind: Any, file_set_type: Any) -> str:
     """
     Lock key that prevents running the *same DS kind + file set* in parallel across envs.
@@ -2194,6 +2218,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     logger = _get_logger(quiet=quiet)
     logger.info('run_once: tick quiet=%s', bool(quiet))
     ensure_workflow_tables(engine)
+    _ensure_test_environments_workflow_column(engine)
     set_runner_heartbeat(engine, status="running", message="tick", started=False)
     ok_lock, lock_msg = acquire_runner_lock(engine, ttl_seconds=120)
     if not ok_lock:
@@ -2279,11 +2304,16 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception:
         pass
 
-    # Load active env ids (any non-zero is_active: 1, TRUE, etc.), then sync each env from API every tick
+    # Load workflow-pool env ids (active + include_in_workflow_runs), then sync each from API every tick
     try:
         with engine.connect() as conn:
             env_rows = conn.execute(text(
-                "SELECT id FROM test_environments WHERE COALESCE(is_active, 0) != 0 ORDER BY id"
+                """
+                SELECT id FROM test_environments
+                WHERE COALESCE(is_active, 0) != 0
+                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                ORDER BY id
+                """
             )).fetchall()
             active_env_ids = [int(r[0]) for r in env_rows if r[0] is not None]
         for eid in active_env_ids:
@@ -2293,7 +2323,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 pass
         with engine.connect() as conn:
             env_rows = conn.execute(text(
-                "SELECT id, is_busy, busy_by_run_id FROM test_environments WHERE COALESCE(is_active, 0) != 0 ORDER BY id"
+                """
+                SELECT id, is_busy, busy_by_run_id FROM test_environments
+                WHERE COALESCE(is_active, 0) != 0
+                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                ORDER BY id
+                """
             )).fetchall()
             env_db_busy = {int(r[0]): (bool(r[1]), r[2]) for r in env_rows if r[0] is not None}
             env_count = len(active_env_ids)
