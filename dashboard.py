@@ -5747,6 +5747,47 @@ def fetch_live_scan_classifier_hits_df(scan_id: str, env_row: Optional[Dict[str,
     return df, note, total_hint
 
 
+def load_scan_classifier_hits_map(scan_id: str) -> Dict[str, int]:
+    """
+    Return classifier->new_findings map for a scan.
+    Uses DB snapshot first; falls back to a one-shot live attributes API call.
+    """
+    out: Dict[str, int] = {}
+    sid = str(scan_id or "").strip()
+    if not sid:
+        return out
+    try:
+        df_hits, _note = load_scan_insight_classifier_hits_df(sid)
+    except Exception:
+        df_hits = pd.DataFrame()
+
+    if (df_hits is None or df_hits.empty):
+        try:
+            env_row = get_environment_row_for_scan_id(sid)
+            if env_row:
+                live_df, _live_note, _live_total = fetch_live_scan_classifier_hits_df(sid, env_row)
+                if live_df is not None and not live_df.empty:
+                    df_hits = live_df
+        except Exception:
+            pass
+
+    try:
+        if df_hits is None or df_hits.empty:
+            return out
+        for _r in df_hits.to_dict(orient="records"):
+            nm = str(_r.get("Classifier / attribute") or "").strip()
+            if not nm:
+                continue
+            try:
+                cnt = int(_r.get("New findings") or 0)
+            except Exception:
+                cnt = 0
+            out[nm] = cnt
+    except Exception:
+        return {}
+    return out
+
+
 def load_scan_insight_map_for_scan_ids(scan_ids):
     """
     Batch-load scan insight metrics for many scan ids in one query.
@@ -11501,6 +11542,14 @@ def _progress_column_header_two_lines(col_name: str) -> str:
 
 
 _RAW_PROGRESS_HEADER_OVERRIDES = {
+    "captured_at_utc": "captured at\nutc",
+    "scan_state": "scan\nstate",
+    "completed_parts": "completed\nparts",
+    "total_parts_scanned": "total parts\nscanned",
+    "objects_scanned": "objects\nscanned",
+    "total_classifications": "total\nclassifications",
+    "newly_added_classifications": "newly added\nclassifications",
+    "false_removed_classifications": "false removed\nclassifications",
     "avg_scanner_cpu_pct": "avg scanner\nCPU %",
     "avg_scanner_mem_pct": "avg scanner\nmemory %",
     "scanner_pods_n": "scanner\npods (n)",
@@ -12201,7 +12250,7 @@ def page_scan_progress():
 
     if last_line or global_line:
         joined = " | ".join([x for x in [last_line, global_line] if x])
-        st.caption(f"Latest snapshots: {joined}")
+        st.caption(f"Latest snapshots — {joined}")
 
     # Single consolidated warning (avoid duplicate warnings)
     # Only warn for running scans. For terminal scans, no new snapshots are expected.
@@ -12252,13 +12301,11 @@ def page_scan_progress():
             except Exception:
                 pass
             st.caption(
-                "Tracker heartbeat: "
-                + (f"status=`{stt}` " if stt else "")
-                + (f"started=`{s.strftime('%Y-%m-%d %H:%M UTC')}` " if s is not None and pd.notnull(s) else "")
-                + (f"finished=`{f.strftime('%Y-%m-%d %H:%M UTC')}` " if f is not None and pd.notnull(f) else "")
+                "Tracker heartbeat — "
+                + (f"status={stt} " if stt else "")
+                + (f"started={s.strftime('%Y-%m-%d %H:%M UTC')} " if s is not None and pd.notnull(s) else "")
+                + (f"finished={f.strftime('%Y-%m-%d %H:%M UTC')}" if f is not None and pd.notnull(f) else "")
             )
-            if msg:
-                st.caption(f"Tracker message: `{str(msg)[:200]}`")
     except Exception:
         pass
 
@@ -12479,18 +12526,31 @@ def page_scan_progress():
                                         text("SELECT attributes_payload FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
                                         {"sid": sid}
                                     ).fetchone()
-                                if not r or not r[0]: return {}
-                                data = json.loads(r[0])
-                                attrs = data.get("data", {}).get("attributes", []) if isinstance(data, dict) else []
-                                if not attrs and isinstance(data, list): attrs = data
-                                # Each attribute usually has "_id" (name) and "new" (count)
+                                if not r or not r[0]:
+                                    return {}
+                                raw = r[0]
+                                if isinstance(raw, dict):
+                                    data = raw
+                                else:
+                                    data = json.loads(str(raw))
+                                # Parse all known payload shapes (attributes, dataSourcesInsights, etc.)
+                                attrs, _total_hint = extract_scan_attributes_payload(data if isinstance(data, dict) else {})
                                 res = {}
                                 for a in attrs:
-                                    if isinstance(a, dict) and "_id" in a:
-                                        c_name = str(a.get("_id")).replace("classifier.", "")
-                                        c_cnt = int(a.get("new", 0))
-                                        if c_cnt > 0:
-                                            res[c_name] = c_cnt
+                                    if not isinstance(a, dict):
+                                        continue
+                                    raw_name = a.get("_id") or a.get("id") or a.get("name")
+                                    if raw_name is None:
+                                        continue
+                                    c_name = str(raw_name).replace("classifier.", "").strip()
+                                    if not c_name:
+                                        continue
+                                    try:
+                                        c_cnt = int(a.get("new", 0) or 0)
+                                    except Exception:
+                                        c_cnt = 0
+                                    if c_cnt > 0:
+                                        res[c_name] = c_cnt
                                 return res
 
                             cur_dict = _get_cls_dict(str(scan_id))
@@ -12938,6 +12998,22 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
+    # Always-visible object progress summary (outside expander).
+    try:
+        if expected_total_files is not None and str(expected_total_files).strip() != "":
+            exp_files_now = int(expected_total_files)
+            short_now = max(0, int(exp_files_now) - int(cur_objects or 0))
+            lk_now = str(lookup_key or "").strip()
+            st.markdown("### Objects")
+            st.markdown(
+                f"- Objects scanned: **{int(cur_objects):,} / {int(exp_files_now):,}**"
+                + (f" (expected from `{lk_now}`)" if lk_now else "")
+            )
+            if short_now > 0:
+                st.markdown(f"- Object shortfall: **{int(short_now):,}**")
+    except Exception:
+        pass
+
     with st.expander("🧠 Analysis (stats + narrative)", expanded=True):
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Objects scanned", f"{cur_objects:,}")
@@ -12987,6 +13063,9 @@ def page_scan_progress():
                     if not s:
                         continue
                     sl = s.lower()
+                    # Object summary is shown once in the dedicated "Objects" section above.
+                    if s.startswith("Objects scanned:") or s.startswith("Object shortfall:"):
+                        continue
                     if s.startswith("Start:") or s.startswith("End:") or "elapsed" in sl or "duration" in sl:
                         time_lines.append(s)
                     elif "object" in sl or "shortfall" in sl:
@@ -13060,21 +13139,6 @@ def page_scan_progress():
                     pass
                 if hits_note:
                     st.caption(hits_note)
-                try:
-                    _hn = pd.to_numeric(hits_df["New findings"], errors="coerce").fillna(0)
-                    _matched_only = hits_df[_hn > 0]["Classifier / attribute"].astype(str).str.strip()
-                    _matched_list = sorted({x for x in _matched_only if x})
-                    if _matched_list:
-                        st.markdown("**Classifiers / attributes with new findings (compact)**")
-                        mc1, mc2, mc3 = st.columns(3)
-                        nmc = len(_matched_list)
-                        for ci, col in enumerate((mc1, mc2, mc3)):
-                            lo = (nmc * ci) // 3
-                            hi = (nmc * (ci + 1)) // 3
-                            chunk = _matched_list[lo:hi]
-                            col.markdown("\n".join(f"- `{x}`" for x in chunk) if chunk else "—")
-                except Exception:
-                    pass
                 show_hits = hits_df
                 if st.checkbox("Only show rows with New findings > 0 or Removed > 0", value=True, key="scan_prog_hits_filter"):
                     show_hits = hits_df[(hits_df["New findings"] > 0) | (hits_df["Removed"] > 0)]
@@ -13174,6 +13238,24 @@ def page_scan_progress():
                     f"— {direction} by **{sign}{delta_v:,}** ({sign}{pct_v:.1f}%). "
                     f"Possible causes: changed classifier set, data drift, or classification regression.{thr_note}"
                 )
+                # Always print exact missing/new names directly in this warning section.
+                _missing_now = list(cls_vs_prev.get("missing") or [])
+                _new_now = list(cls_vs_prev.get("new") or [])
+                if _missing_now or _new_now:
+                    if _new_now:
+                        st.caption(
+                            "Only in current: " + ", ".join(_new_now[:20]) +
+                            (f" … (+{len(_new_now)-20} more)" if len(_new_now) > 20 else "")
+                        )
+                    if _missing_now:
+                        _missing_text = (
+                            "Missing in current (present in previous): " + ", ".join(_missing_now[:20]) +
+                            (f" … (+{len(_missing_now)-20} more)" if len(_missing_now) > 20 else "")
+                        )
+                        st.markdown(
+                            f"<span style='color:#d32f2f'>{_missing_text}</span>",
+                            unsafe_allow_html=True,
+                        )
                 top_delta_rows = cls_vs_prev.get("top_delta_rows", [])
                 if top_delta_rows:
                     st.markdown("**Top classifier deltas (current vs previous):**")
@@ -13192,6 +13274,32 @@ def page_scan_progress():
                             f"current **{int(cur_tc_hint):,}** vs previous **{int(prev_tc_hint):,}** "
                             f"({sign_tc}{d_tc:,})."
                         )
+
+                    # Always show exact name diff when we are comparing current vs previous scan.
+                    cur_map = load_scan_classifier_hits_map(str(scan_id))
+                    prev_map = load_scan_classifier_hits_map(str(prev_s))
+                    if cur_map or prev_map:
+                        cur_set = {k for k, v in cur_map.items() if int(v or 0) > 0}
+                        prev_set = {k for k, v in prev_map.items() if int(v or 0) > 0}
+                        only_cur = sorted(cur_set - prev_set)
+                        only_prev = sorted(prev_set - cur_set)
+                        st.markdown("**Exact classifier-name mismatch (current vs previous):**")
+                        if only_cur:
+                            st.caption(
+                                "Only in current: " + ", ".join(only_cur[:20]) +
+                                (f" … (+{len(only_cur)-20} more)" if len(only_cur) > 20 else "")
+                            )
+                        if only_prev:
+                            _missing_text = (
+                                "Missing in current (present in previous): " + ", ".join(only_prev[:20]) +
+                                (f" … (+{len(only_prev)-20} more)" if len(only_prev) > 20 else "")
+                            )
+                            st.markdown(
+                                f"<span style='color:#d32f2f'>{_missing_text}</span>",
+                                unsafe_allow_html=True,
+                            )
+                        if not only_cur and not only_prev:
+                            st.caption("No missing classifier names between current and previous scan.")
                 except Exception:
                     pass
 
@@ -13735,6 +13843,7 @@ def page_scan_progress():
                                                 go.Bar(
                                                     x=_x_lbl,
                                                     y=_y_rt,
+                                                    width=0.42,
                                                     marker_color="#6366F1",
                                                     hovertemplate="%{x}<br><b>Threads</b> %{y}<extra></extra>",
                                                 )
@@ -13746,6 +13855,7 @@ def page_scan_progress():
                                                     yaxis=dict(title="Threads", rangemode="tozero"),
                                                     xaxis=dict(tickfont=dict(size=10)),
                                                     showlegend=False,
+                                                    bargap=0.48,
                                                     height=_sum_h,
                                                     margin=_sum_marg,
                                                 ),
@@ -13759,6 +13869,7 @@ def page_scan_progress():
                                                     go.Bar(
                                                         x=_x_lbl,
                                                         y=_cpu_aligned.fillna(0.0),
+                                                        width=0.42,
                                                         marker_color="#e11d48",
                                                         hovertemplate="%{x}<br><b>CPU</b> %{y:.2f}%<extra></extra>",
                                                     )
@@ -13770,6 +13881,7 @@ def page_scan_progress():
                                                         yaxis=dict(title="CPU %", rangemode="tozero", range=[0, _rng]),
                                                         xaxis=dict(tickfont=dict(size=10)),
                                                         showlegend=False,
+                                                        bargap=0.48,
                                                         height=_sum_h,
                                                         margin=_sum_marg,
                                                     ),
@@ -13784,6 +13896,7 @@ def page_scan_progress():
                                                     go.Bar(
                                                         x=_x_lbl,
                                                         y=_mem_s.fillna(0.0),
+                                                        width=0.42,
                                                         marker_color="#0891b2",
                                                         hovertemplate="%{x}<br><b>Memory</b> %{y:.2f}%<extra></extra>",
                                                     )
@@ -13795,6 +13908,7 @@ def page_scan_progress():
                                                         yaxis=dict(title="Memory %", rangemode="tozero", range=[0, 100]),
                                                         xaxis=dict(tickfont=dict(size=10)),
                                                         showlegend=False,
+                                                        bargap=0.48,
                                                         height=_sum_h,
                                                         margin=_sum_marg,
                                                     ),
@@ -14203,18 +14317,16 @@ def page_scan_progress():
         pass
     try:
         show_df = show_df.rename(columns={
-            "captured_at_actual": "captured_at_actual_utc",
-            "captured_at_slot_utc": "captured_at_slot_utc",
+            "captured_at_actual": "captured_at_utc",
         })
-        sort_col0 = "captured_at_actual_utc" if "captured_at_actual_utc" in show_df.columns else "captured_at_actual"
+        sort_col0 = "captured_at_utc" if "captured_at_utc" in show_df.columns else "captured_at_actual"
         if sort_col0 in show_df.columns:
             show_df = show_df.sort_values(sort_col0, ascending=True)
-        for c in ["captured_at_actual_utc", "captured_at_slot_utc"]:
+        for c in ["captured_at_utc"]:
             if c in show_df.columns:
                 show_df[c] = pd.to_datetime(show_df[c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         cols = [
-            "captured_at_actual_utc",
-            "captured_at_slot_utc",
+            "captured_at_utc",
             "scan_state",
             "completed_parts",
             "total_parts_scanned",
@@ -14228,7 +14340,7 @@ def page_scan_progress():
     except Exception:
         pass
     try:
-        sort_col = "captured_at_actual_utc" if "captured_at_actual_utc" in show_df.columns else "captured_at_actual"
+        sort_col = "captured_at_utc" if "captured_at_utc" in show_df.columns else "captured_at_actual"
         show_sorted = show_df.sort_values(sort_col, ascending=True)
     except Exception:
         show_sorted = show_df
@@ -14241,11 +14353,6 @@ def page_scan_progress():
     except Exception:
         show_disp = show_sorted
 
-    st.caption(
-        "Headers use **spaces** and **two lines** where it helps column width. "
-        "**avg scanner** columns = mean CPU % / memory % across pods in `scanner_individual_performance`, "
-        "matched to each snapshot’s slot time (±20 min nearest neighbor)."
-    )
     st.dataframe(show_disp, width="stretch")
     
     if st.button("Back to Scan Status"):
