@@ -14544,17 +14544,61 @@ def page_scan_progress():
                                         used_memory_mb=("used_memory_mb", "sum"),
                                         physical_memory_mb=("physical_memory_mb", "max"),
                                     )
-                                    if "max_threads" in _dg_tab.columns:
-                                        _agg_kw["max_threads_pool"] = ("max_threads", "max")
-                                    if "scanner_threads" in _dg_tab.columns:
-                                        _agg_kw["scanner_threads_cap"] = ("scanner_threads", "max")
                                     g_sum = _dg_tab.groupby("captured_at_utc", as_index=False).agg(**_agg_kw).sort_values(
                                         "captured_at_utc"
                                     )
                                     g_sum["avg_scan_speed_kib_s"] = pd.to_numeric(
                                         g_sum["avg_scan_speed"], errors="coerce"
                                     ).fillna(0.0) / 1024.0
-                                    cga, cgb = st.columns(2)
+                                    # Pod CPU → group-level trend: mean CPU % per scanner group per slot, then mean across groups (matches BigID group × pods).
+                                    _cpu_t = pd.DataFrame()
+                                    try:
+                                        if df_perf_i is not None and not df_perf_i.empty and "cpu_pct" in df_perf_i.columns:
+                                            _di = df_perf_i.copy()
+                                            _di["captured_at_utc"] = pd.to_datetime(
+                                                _di["captured_at_utc"], errors="coerce"
+                                            )
+                                            _di["cpu_pct"] = pd.to_numeric(_di["cpu_pct"], errors="coerce")
+                                            _di = _di.dropna(subset=["captured_at_utc", "cpu_pct"])
+                                            if not _di.empty:
+                                                _has_gn = (
+                                                    "group_name" in _di.columns
+                                                    and _di["group_name"]
+                                                    .astype(str)
+                                                    .str.strip()
+                                                    .replace({"nan": "", "None": ""})
+                                                    .ne("")
+                                                    .any()
+                                                )
+                                                if _has_gn:
+                                                    _di["_g"] = (
+                                                        _di["group_name"].astype(str).str.strip().replace(
+                                                            {"nan": "", "None": "", "NaN": ""}
+                                                        )
+                                                    )
+                                                    _sub = _di[_di["_g"].astype(str).str.len() > 0]
+                                                    if not _sub.empty:
+                                                        _per_g = _sub.groupby(
+                                                            ["captured_at_utc", "_g"], as_index=False
+                                                        )["cpu_pct"].mean()
+                                                        _cpu_t = (
+                                                            _per_g.groupby("captured_at_utc", as_index=False)[
+                                                                "cpu_pct"
+                                                            ]
+                                                            .mean()
+                                                            .sort_values("captured_at_utc")
+                                                        )
+                                                if _cpu_t.empty:
+                                                    _cpu_t = (
+                                                        _di.groupby("captured_at_utc", as_index=False)["cpu_pct"]
+                                                        .mean()
+                                                        .sort_values("captured_at_utc")
+                                                    )
+                                                _cpu_t = _cpu_t.rename(columns={"cpu_pct": "group_cpu_pct"})
+                                    except Exception:
+                                        _cpu_t = pd.DataFrame()
+
+                                    cga, cgb, cgc = st.columns(3)
                                     with cga:
                                         st.markdown("**Capacity vs throughput**")
                                         fig_a = go.Figure()
@@ -14625,53 +14669,42 @@ def page_scan_progress():
                                         )
                                         spm_apply_plotly_ticks(fig_b, g_sum["captured_at_utc"])
                                         st.plotly_chart(fig_b, width="stretch")
-                                    st.markdown("**Thread usage vs caps** *(Σ running_threads vs BigID pool / UI cap)*")
-                                    fig_c = go.Figure()
-                                    fig_c.add_trace(
-                                        go.Scatter(
-                                            x=g_sum["captured_at_utc"],
-                                            y=g_sum["running_threads"],
-                                            mode="lines+markers",
-                                            name="Σ running_threads (in use)",
-                                            line=dict(color="#0D9488", width=2),
-                                            fill="tozeroy",
-                                        )
-                                    )
-                                    if "max_threads_pool" in g_sum.columns and g_sum["max_threads_pool"].notna().any():
-                                        _mtp = pd.to_numeric(g_sum["max_threads_pool"], errors="coerce")
-                                        if _mtp.max() > 0:
-                                            fig_c.add_trace(
+                                    with cgc:
+                                        st.markdown("**Group CPU (aggregated)**")
+                                        if not _cpu_t.empty:
+                                            fig_gcpu = go.Figure()
+                                            fig_gcpu.add_trace(
                                                 go.Scatter(
-                                                    x=g_sum["captured_at_utc"],
-                                                    y=_mtp,
-                                                    mode="lines",
-                                                    name="maxThreads (pool cap, API)",
-                                                    line=dict(color="#94A3B8", width=2, dash="dot"),
+                                                    x=_cpu_t["captured_at_utc"],
+                                                    y=_cpu_t["group_cpu_pct"],
+                                                    mode="lines+markers",
+                                                    name="Mean CPU % (pods)",
+                                                    line=dict(color="#e11d48", width=2),
                                                 )
                                             )
-                                    if "scanner_threads_cap" in g_sum.columns and g_sum["scanner_threads_cap"].notna().any():
-                                        _stc = pd.to_numeric(g_sum["scanner_threads_cap"], errors="coerce")
-                                        if _stc.max() > 0:
-                                            fig_c.add_trace(
-                                                go.Scatter(
-                                                    x=g_sum["captured_at_utc"],
-                                                    y=_stc,
-                                                    mode="lines",
-                                                    name="scannerThreads (group UI cap, API)",
-                                                    line=dict(color="#F59E0B", width=2, dash="dash"),
-                                                )
+                                            try:
+                                                _ymx = float(_cpu_t["group_cpu_pct"].max())
+                                            except Exception:
+                                                _ymx = 0.0
+                                            _yr = max(110.0, _ymx * 1.08 + 10.0) if _ymx > 0 else 100.0
+                                            fig_gcpu.update_layout(
+                                                **_spm_layout_merge(
+                                                    _spm_m,
+                                                    yaxis=dict(title="CPU %", rangemode="tozero", range=[0, _yr]),
+                                                ),
                                             )
-                                    fig_c.update_layout(
-                                        **_spm_layout_merge(
-                                            _spm_m,
-                                            yaxis=dict(title="Threads", rangemode="tozero"),
-                                        ),
-                                    )
-                                    spm_apply_plotly_ticks(fig_c, g_sum["captured_at_utc"])
-                                    st.plotly_chart(fig_c, width="stretch")
-                                    st.caption(
-                                        "**maxThreads** = large thread pool in API; **scannerThreads** ≈ the smaller cap shown in Scanner groups (e.g. 50)."
-                                    )
+                                            spm_apply_plotly_ticks(fig_gcpu, _cpu_t["captured_at_utc"])
+                                            st.plotly_chart(fig_gcpu, width="stretch")
+                                            st.caption(
+                                                "Mean **pod CPU %** per snapshot: averaged within each **group_name**, "
+                                                "then averaged across groups (same slots as scanner-groups). "
+                                                "Falls back to all pods if `group_name` is empty."
+                                            )
+                                        else:
+                                            st.caption(
+                                                "No pod **cpu_pct** in this window — **Sync now** or wait for **tracker** "
+                                                "(`services-status`)."
+                                            )
 
                             except Exception as _grp_err:
                                 st.error(f"Scanner groups tab: `{_grp_err!s}`")
