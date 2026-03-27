@@ -1042,6 +1042,59 @@ def load_classifier_snapshots_for_build(environment_id, build_id):
         return []
 
 
+def load_classifier_detail_snapshot_builds_summary(environment_id: Optional[int]) -> pd.DataFrame:
+    """
+    Build versions that have at least one row in classifier_details_snapshots (metadata for Deep-Dive).
+    When environment_id is None, counts across all environments.
+    """
+    if not engine:
+        return pd.DataFrame(columns=["build_version", "snapshot_rows"])
+    try:
+        with engine.connect() as conn:
+            if environment_id is None:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT b.version, COUNT(*) AS snapshot_rows
+                        FROM classifier_details_snapshots cds
+                        INNER JOIN builds b ON b.id = cds.build_id
+                        WHERE TRIM(COALESCE(b.version, '')) <> ''
+                        GROUP BY cds.build_id, b.version
+                        """
+                    )
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        """
+                        SELECT b.version, COUNT(*) AS snapshot_rows
+                        FROM classifier_details_snapshots cds
+                        INNER JOIN builds b ON b.id = cds.build_id
+                        WHERE cds.environment_id = :eid
+                          AND TRIM(COALESCE(b.version, '')) <> ''
+                        GROUP BY cds.build_id, b.version
+                        """
+                    ),
+                    {"eid": int(environment_id)},
+                ).fetchall()
+        if not rows:
+            return pd.DataFrame(columns=["build_version", "snapshot_rows"])
+        df = pd.DataFrame(rows, columns=["build_version", "snapshot_rows"])
+        df["build_version"] = df["build_version"].astype(str).str.strip()
+
+        def _bk(v: str):
+            try:
+                return float(v)
+            except Exception:
+                return float("inf")
+
+        df["_k"] = df["build_version"].map(lambda x: _bk(str(x)))
+        df = df.sort_values("_k").drop(columns=["_k"]).reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame(columns=["build_version", "snapshot_rows"])
+
+
 def get_test_environment_by_id(env_id):
     """
     Returns the environment record (dict) for a given environment ID.
@@ -3618,6 +3671,7 @@ def ensure_workflow_tables():
                     "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
                     "ALTER TABLE workflow_templates ADD COLUMN template_kind TEXT NULL",
                     "ALTER TABLE workflow_templates ADD COLUMN payload_json TEXT NULL",
+                    "ALTER TABLE workflow_runs ADD COLUMN scan_template_id TEXT NULL",
                 ]:
                     try:
                         conn.execute(text(stmt))
@@ -3703,6 +3757,7 @@ def ensure_workflow_tables():
                 "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
                 "ALTER TABLE workflow_templates ADD COLUMN template_kind VARCHAR(32) NULL",
                 "ALTER TABLE workflow_templates ADD COLUMN payload_json LONGTEXT NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN scan_template_id VARCHAR(128) NULL",
             ]:
                 try:
                     conn.execute(text(stmt))
@@ -3828,7 +3883,8 @@ def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
                         wr.finished_at,
                         wr.updated_at,
                         wr.created_at,
-                        wr.last_error
+                        wr.last_error,
+                        wr.scan_template_id
                     FROM workflow_runs wr
                     ORDER BY wr.id DESC
                     LIMIT :lim
@@ -3838,6 +3894,7 @@ def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
         cols = [
             "id","name","status","env1_id","env2_id","cooldown_minutes",
             "next_eligible_at","started_at","finished_at","updated_at","created_at","last_error",
+            "scan_template_id",
         ]
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     except Exception:
@@ -4003,6 +4060,78 @@ def release_workflow_run_envs(eng, run_id: int) -> None:
             conn.commit()
     except Exception:
         pass
+
+
+def purge_workflow_linked_scan_rows(conn, scan_ids: List[str]) -> None:
+    """
+    Delete local DB rows tied to BigID parent scan ids (insights, progress snapshots,
+    scan_parents, auto benchmarks, manual benchmarks). Safe order for FK-heavy MySQL schemas.
+    Best-effort for optional tables (e.g. benchmarks) if missing on this engine.
+    """
+    ids = list(dict.fromkeys(str(x).strip() for x in (scan_ids or []) if str(x).strip()))
+    if not ids:
+        return
+    tup = tuple(ids)
+
+    def _exec(sql: str, params: dict) -> None:
+        try:
+            conn.execute(text(sql), params)
+        except Exception:
+            pass
+
+    _exec("DELETE FROM scan_insight_attribute_delta_map WHERE scan_id IN :ids", {"ids": tup})
+    _exec("DELETE FROM scan_insight_data_source_map WHERE scan_id IN :ids", {"ids": tup})
+    _exec("DELETE FROM scan_insights WHERE scan_id IN :ids", {"ids": tup})
+    _exec("DELETE FROM scan_progress WHERE scan_id IN :ids", {"ids": tup})
+
+    try:
+        rows = conn.execute(
+            text("SELECT id FROM benchmarks WHERE scan_id IN :ids"),
+            {"ids": tup},
+        ).fetchall()
+        bids = tuple(int(r[0]) for r in rows if r and r[0] is not None)
+        if bids:
+            _exec("DELETE FROM benchmark_findings WHERE benchmark_id IN :bids", {"bids": bids})
+        _exec("DELETE FROM benchmarks WHERE scan_id IN :ids", {"ids": tup})
+    except Exception:
+        pass
+
+    _exec("DELETE FROM auto_scan_benchmarks WHERE scan_id IN :ids", {"ids": tup})
+    _exec("DELETE FROM scan_parents WHERE scan_id IN :ids", {"ids": tup})
+
+
+def delete_workflow_run_and_purge_scans(eng, run_id: int) -> List[str]:
+    """
+    Remove workflow run + steps and purge local DB rows for every scan_id ever recorded on those steps.
+    Releases env reservations for this run. Returns the list of distinct scan ids purged.
+    """
+    if not eng or run_id is None:
+        return []
+    rid = int(run_id)
+    with eng.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE test_environments
+                SET is_busy = 0, busy_by_run_id = NULL, busy_since = NULL
+                WHERE busy_by_run_id = :rid
+            """),
+            {"rid": rid},
+        )
+        rows = conn.execute(
+            text("""
+                SELECT DISTINCT TRIM(scan_id) AS sid
+                FROM workflow_steps
+                WHERE run_id = :rid
+                  AND scan_id IS NOT NULL
+                  AND TRIM(scan_id) <> ''
+            """),
+            {"rid": rid},
+        ).fetchall()
+        scan_ids = [str(r[0]).strip() for r in rows if r and r[0]]
+        purge_workflow_linked_scan_rows(conn, scan_ids)
+        conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": rid})
+        conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": rid})
+    return scan_ids
 
 
 def _workflow_ds_template_key(step: Dict[str, Any]) -> str:
@@ -5396,6 +5525,134 @@ def load_scan_insight_from_db(scan_id):
             }
     except Exception:
         return None
+
+
+def load_scan_insight_classifier_hits_df(scan_id: str) -> Tuple[pd.DataFrame, str]:
+    """
+    Build a table of classifier / attribute hits from `scan_insights.attributes_payload`
+    (and, if empty, from nested shapes inside `insight_payload`). Populated when the
+    tracker or **Sync now** runs `sync_single_scan_insight` (attributes API + upsert).
+    """
+    empty = (pd.DataFrame(), "")
+    if not engine or not str(scan_id or "").strip():
+        return empty
+    sid = str(scan_id).strip()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT attributes_payload, insight_payload
+                    FROM scan_insights
+                    WHERE scan_id = :sid
+                    LIMIT 1
+                    """
+                ),
+                {"sid": sid},
+            ).fetchone()
+        if not row:
+            return (
+                pd.DataFrame(),
+                "No `scan_insights` row yet for this scan. Use **Sync now (manual)** or wait for the tracker.",
+            )
+        ap_raw, ip_raw = row[0], row[1]
+
+        def _loads(x):
+            if x is None:
+                return None
+            if isinstance(x, dict):
+                return x
+            try:
+                return json.loads(str(x))
+            except Exception:
+                return None
+
+        items: List[Any] = []
+        total_hint: Optional[int] = None
+        source = ""
+
+        ap_obj = _loads(ap_raw)
+        if isinstance(ap_obj, dict):
+            items, total_hint = extract_scan_attributes_payload(ap_obj)
+            if items:
+                source = "attributes API snapshot"
+
+        if not items:
+            ip_obj = _loads(ip_raw)
+            if isinstance(ip_obj, dict):
+                items, total_hint = extract_scan_attributes_payload(ip_obj)
+                if items:
+                    source = "parent-scan insight payload"
+            if not items and isinstance(ip_obj, dict):
+                data = ip_obj.get("data")
+                if isinstance(data, dict):
+                    si = data.get("scanInsights")
+                    if isinstance(si, dict):
+                        items, total_hint = extract_scan_attributes_payload(si)
+                        if items:
+                            source = "insight.scanInsights"
+
+        if not items:
+            return (
+                pd.DataFrame(),
+                "`attributes_payload` is empty for this scan. Run **Sync now** to fetch the attributes "
+                "breakdown from BigID (same call as benchmark prefill).",
+            )
+
+        rows_out: List[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            raw_id = (
+                item.get("_id")
+                or item.get("id")
+                or item.get("name")
+                or item.get("attributeName")
+                or item.get("classifierAttribute")
+            )
+            if raw_id is None:
+                continue
+            label = str(raw_id).replace("classifier.", "").strip()
+            if not label:
+                continue
+
+            def _cnt(v: Any) -> int:
+                if v is True:
+                    return 1
+                if v in (False, None, ""):
+                    return 0
+                try:
+                    return int(v)
+                except Exception:
+                    return 0
+
+            n_new = _cnt(item.get("new"))
+            n_rem = _cnt(item.get("removed"))
+            rows_out.append(
+                {
+                    "Classifier / attribute": label,
+                    "New findings": n_new,
+                    "Removed": n_rem,
+                }
+            )
+
+        if not rows_out:
+            return (
+                pd.DataFrame(),
+                "Attributes payload exists but no rows with identifiers were parsed.",
+            )
+
+        df = pd.DataFrame(rows_out)
+        df = df.sort_values(["New findings", "Classifier / attribute"], ascending=[False, True])
+        note = f"Source: **{source}** · **{len(df)}** row(s) in DB"
+        if total_hint is not None and int(total_hint) > len(df):
+            note += f" (API reported totalCount **{int(total_hint)}** — increase attributes fetch limit in sync if you need all rows)."
+        return df, note
+    except Exception:
+        return (
+            pd.DataFrame(),
+            "Could not load classifier hit table (database or JSON parse error).",
+        )
 
 
 def load_scan_insight_map_for_scan_ids(scan_ids):
@@ -6947,6 +7204,10 @@ def page_manage_classifiers():
 def page_manage_test_environments():
     st.title("🌐 Test Environment APIs")
     st.markdown("Manage test environments and load classifiers from API.")
+    st.caption(
+        "Saving an environment, using **Get Classifiers**, or bulk **Sync current versions** updates classifier **names/mappings** "
+        "and refreshes **metadata snapshots** (per-classifier JSON for Deep-Dive). The tracker also polls active envs on a schedule."
+    )
     if st.session_state.get("env_action_msg"):
         lvl = st.session_state.get("env_action_level", "info")
         msg = st.session_state.get("env_action_msg")
@@ -7068,6 +7329,21 @@ def page_manage_test_environments():
                     # Skip heavy classifier fetch if mappings already exist for build+env.
                     if _has_classifier_mappings(effective_version, int(env_id)):
                         res["classifiers"] = "skipped"
+                        try:
+                            from tracker import sync_classifier_details_for_env_build
+
+                            _er = {
+                                "id": int(env_id),
+                                "env_name": env_row.get("env_name"),
+                                "base_url": base,
+                                "classifiers_api_path": env_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH,
+                            }
+                            if token and effective_version:
+                                sync_classifier_details_for_env_build(
+                                    engine, _er, token, str(effective_version), force=False
+                                )
+                        except Exception:
+                            pass
                         res["t_total_s"] = round(time.monotonic() - t0, 3)
                         return res
 
@@ -7119,6 +7395,21 @@ def page_manage_test_environments():
                                 res["classifiers"] = "ok"
                                 res["t_classifiers_api_s"] = 0.0
                                 res["t_db_sync_s"] = round(time.monotonic() - td0, 3)
+                                try:
+                                    from tracker import sync_classifier_details_for_env_build
+
+                                    _er = {
+                                        "id": int(env_id),
+                                        "env_name": env_row.get("env_name"),
+                                        "base_url": base,
+                                        "classifiers_api_path": env_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH,
+                                    }
+                                    if token and effective_version:
+                                        sync_classifier_details_for_env_build(
+                                            engine, _er, token, str(effective_version), force=True
+                                        )
+                                except Exception:
+                                    pass
                                 res["t_total_s"] = round(time.monotonic() - t0, 3)
                                 return res
                         except Exception:
@@ -7145,6 +7436,21 @@ def page_manage_test_environments():
                             )
                             res["t_db_sync_s"] = round(time.monotonic() - td0, 3)
                             res["classifiers"] = "ok"
+                            try:
+                                from tracker import sync_classifier_details_for_env_build
+
+                                _er = {
+                                    "id": int(env_id),
+                                    "env_name": env_row.get("env_name"),
+                                    "base_url": base,
+                                    "classifiers_api_path": env_row.get("classifiers_api_path") or INTERNAL_CLASSIFIERS_API_PATH,
+                                }
+                                if token and effective_version:
+                                    sync_classifier_details_for_env_build(
+                                        engine, _er, token, str(effective_version), force=True
+                                    )
+                            except Exception:
+                                pass
                         else:
                             res["classifiers"] = "fail"
                             res["error"] = "classifiers_empty"
@@ -7399,6 +7705,22 @@ def page_manage_test_environments():
                                 f"set size {set_size}, "
                                 f"{sync_stats['total_links_for_build']} mapped for this environment."
                             )
+                            try:
+                                from tracker import sync_classifier_details_for_env_build
+
+                                meta_row = {
+                                    "id": saved_row.get("id"),
+                                    "env_name": saved_row.get("env_name"),
+                                    "base_url": saved_row.get("base_url"),
+                                    "classifiers_api_path": saved_row.get("classifiers_api_path"),
+                                }
+                                if token and effective_version:
+                                    sync_classifier_details_for_env_build(
+                                        engine, meta_row, token, str(effective_version), force=True
+                                    )
+                                    st.caption("Classifier **metadata snapshots** refreshed for Deep-Dive / build diffs.")
+                            except Exception as mex:
+                                st.caption(f"Metadata snapshot refresh failed (list still synced): {mex}")
                         else:
                             st.warning("Environment saved, but classifier API returned no names.")
                     except Exception as ex:
@@ -7452,11 +7774,27 @@ def page_manage_test_environments():
                             copied = clone_build_mappings_to_environment(fetch_row.get("id"), clean_version)
                             if copied > 0:
                                 st.success(f"[{env_name_val}] Version unchanged ({clean_version}). Reused {copied} existing classifier mappings for this environment.")
+                            else:
+                                st.session_state["env_action_level"] = "info"
+                                st.session_state["env_action_msg"] = f"[{env_name_val}] No version change ({clean_version}). Classifier sync skipped."
+                                st.info(st.session_state["env_action_msg"])
+                            try:
+                                from tracker import sync_classifier_details_for_env_build
+
+                                meta_row = {
+                                    "id": fetch_row.get("id"),
+                                    "env_name": fetch_row.get("env_name"),
+                                    "base_url": fetch_row.get("base_url"),
+                                    "classifiers_api_path": fetch_row.get("classifiers_api_path"),
+                                }
+                                if token and clean_version:
+                                    sync_classifier_details_for_env_build(
+                                        engine, meta_row, token, str(clean_version), force=False
+                                    )
+                            except Exception as mex:
+                                st.caption(f"[{env_name_val}] Metadata snapshot check failed: {mex}")
+                            if copied > 0:
                                 st.cache_data.clear()
-                                return
-                            st.session_state["env_action_level"] = "info"
-                            st.session_state["env_action_msg"] = f"[{env_name_val}] No version change ({clean_version}). Classifier sync skipped."
-                            st.info(st.session_state["env_action_msg"])
                             return
                     else:
                         st.warning(f"[{env_name_val}] Could not read releaseVersion from API response. URL: {about_url}")
@@ -7491,6 +7829,24 @@ def page_manage_test_environments():
                             f"set size {set_size}, "
                             f"{sync_stats['total_links_for_build']} mapped for this environment."
                         )
+                        try:
+                            from tracker import sync_classifier_details_for_env_build
+
+                            meta_row = {
+                                "id": fetch_row.get("id"),
+                                "env_name": fetch_row.get("env_name"),
+                                "base_url": fetch_row.get("base_url"),
+                                "classifiers_api_path": fetch_row.get("classifiers_api_path"),
+                            }
+                            if token and effective_version:
+                                sync_classifier_details_for_env_build(
+                                    engine, meta_row, token, str(effective_version), force=True
+                                )
+                                st.caption(
+                                    f"[{env_name_val}] Classifier **metadata snapshots** refreshed (compare builds under Classifier Changes)."
+                                )
+                        except Exception as mex:
+                            st.caption(f"[{env_name_val}] Metadata snapshots failed: {mex}")
                         st.session_state["env_action_level"] = "success"
                         st.session_state["env_action_msg"] = (
                             f"[{env_name_val}] Sync done for version {effective_version}: "
@@ -10074,6 +10430,57 @@ def page_classifier_build_diffs():
     st.dataframe(summary, width="stretch", hide_index=True)
 
     st.divider()
+    st.markdown("### Compare any two builds (classifier names)")
+    st.caption(
+        "Diffs the **enabled classifier name sets** from `build_classifier_mappings` for the environment you selected above. "
+        "No extra API calls — use this to see what changed between e.g. 249.14 and 231.96."
+    )
+    if len(builds) < 2:
+        st.info("Need at least two builds in the mapping table to compare side by side.")
+    else:
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            pair_a = st.selectbox("Build A", builds, key="cl_pair_build_a")
+        with pc2:
+            cand_b = [x for x in builds if x != pair_a]
+            pair_b = st.selectbox("Build B", cand_b, index=0, key="cl_pair_build_b") if cand_b else pair_a
+        set_a = build_map.get(pair_a, set())
+        set_b = build_map.get(pair_b, set())
+        only_a = sorted(set_a - set_b)
+        only_b = sorted(set_b - set_a)
+        both_n = len(set_a & set_b)
+        m1, m2, m3 = st.columns(3)
+        m1.metric(f"Only in {pair_a}", len(only_a))
+        m2.metric(f"Only in {pair_b}", len(only_b))
+        m3.metric("In both builds", both_n)
+        tc1, tc2, tc3 = st.columns(3)
+        with tc1:
+            st.markdown(f"**Only in {pair_a}** ({len(only_a)})")
+            st.dataframe(
+                pd.DataFrame({"Classifier": only_a}) if only_a else pd.DataFrame({"Classifier": []}),
+                width="stretch",
+                hide_index=True,
+                height=min(400, 120 + 28 * max(1, len(only_a))),
+            )
+        with tc2:
+            st.markdown(f"**Only in {pair_b}** ({len(only_b)})")
+            st.dataframe(
+                pd.DataFrame({"Classifier": only_b}) if only_b else pd.DataFrame({"Classifier": []}),
+                width="stretch",
+                hide_index=True,
+                height=min(400, 120 + 28 * max(1, len(only_b))),
+            )
+        with tc3:
+            st.markdown(f"**In both** ({both_n})")
+            st.caption("Same name present in both builds (metadata may still differ — see Deep-Dive below).")
+            st.dataframe(
+                pd.DataFrame({"Classifier": sorted(set_a & set_b)}),
+                width="stretch",
+                hide_index=True,
+                height=min(400, 120 + 28 * max(1, both_n)),
+            )
+
+    st.divider()
     st.markdown("### Added / Removed details")
     for r in reversed(rows_out):  # newest first
         bver = r["Build"]
@@ -10092,99 +10499,160 @@ def page_classifier_build_diffs():
 
     st.divider()
     st.markdown("### 🔍 Classifier Deep-Dive Comparison")
-    st.caption("Compare full metadata snapshots for the selected builds. Any differences in proximity, sensitivity, or enabled status will be highlighted below.")
-    
+    st.caption(
+        "Compares **stored classifier JSON** (`classifier_details_snapshots`: proximity, sensitivity, enabled, …). "
+        "That is separate from the **name lists** in `build_classifier_mappings` used in the summary table above — "
+        "use **Compare any two builds** for name-only diffs between any versions."
+    )
+
     ensure_classifier_details_snapshots_table()
-    build_versions = sorted(build_map.keys(), key=_build_key)
-    
-    if len(build_versions) < 2:
-        st.info("Need at least two builds with snapshot data to perform a deep-dive comparison.")
+    snap_summary_df = load_classifier_detail_snapshot_builds_summary(sel_env_id)
+    snapshot_build_versions: List[str] = []
+    if not snap_summary_df.empty:
+        snapshot_build_versions = (
+            snap_summary_df["build_version"].astype(str).str.strip().drop_duplicates().tolist()
+        )
+
+    st.markdown("**Builds that have metadata snapshots** (Deep-Dive only lists these)")
+    if snap_summary_df.empty:
+        st.info(
+            f"No rows in `classifier_details_snapshots` for **{sel_label}** yet. "
+            "Use **Manual Refresh Snapshots** after choosing a concrete environment, or let **tracker** sync classifier details. "
+            "Each capture is stored under that environment’s **live** `releaseVersion` from `/about`."
+        )
     else:
-        c1, c2, c3 = st.columns([2, 2, 1])
-        with c1:
-            build_a = st.selectbox("Compare Build (Baseline)", build_versions, index=max(0, len(build_versions)-2), key="cl_detail_build_a")
-        with c2:
-            build_b = st.selectbox("To Build (Newer)", [v for v in build_versions if v != build_a] + [build_a], index=0, key="cl_detail_build_b")
-        with c3:
-            st.write("") # spacing
-            fetch_btn = st.button("Manual Refresh Snapshots", width='stretch', type="secondary", help="Triggers manual capture of current classifier metadata from environment API.")
+        st.dataframe(
+            snap_summary_df,
+            width="stretch",
+            hide_index=True,
+            height=min(260, 80 + 28 * max(1, len(snap_summary_df))),
+        )
 
-        # Local environment override for refresh if "All" is selected globally
-        refresh_env_id = sel_env_id
-        if sel_env_id is None:
-            st.info("💡 To refresh snapshots manually, please select an environment below.")
-            local_env_options = [lbl for lbl, eid in env_options if eid is not None]
-            if local_env_options:
-                sel_local = st.selectbox("Refresh From Environment", local_env_options, key="cl_refresh_local_env")
-                for lbl, eid in env_options:
-                    if lbl == sel_local:
-                        refresh_env_id = eid
-                        break
-            else:
-                st.warning("No environments configured for manual refresh.")
+    refresh_env_id = sel_env_id
+    if sel_env_id is None:
+        st.info("For **Manual Refresh**, choose which environment’s BigID API to read from.")
+        local_env_options = [lbl for lbl, eid in env_options if eid is not None]
+        if local_env_options:
+            sel_local = st.selectbox("Refresh From Environment", local_env_options, key="cl_refresh_local_env")
+            for lbl, eid in env_options:
+                if lbl == sel_local:
+                    refresh_env_id = eid
+                    break
+        else:
+            st.warning("No environments configured for manual refresh.")
 
-        if fetch_btn:
-            if refresh_env_id is None:
-                st.error("Please select a specific Environment to refresh snapshots from.")
-            else:
-                env_row = get_test_environment_by_id(refresh_env_id)
-                if env_row:
-                    with st.spinner(f"Capturing classifier metadata from {env_row['env_name']}..."):
-                        try:
-                            token = fetch_auth_token_for_env(env_row)
-                            base_url = env_row.get("base_url")
-                            api_path = env_row.get("classifiers_api_path") or "/api/v1/classifications"
-                            
-                            # Get the actual current version from /about to ensure we save to the right build_id
-                            about = fetch_about(base_url, token)
-                            if not about:
-                                st.error(f"Failed to connect to {base_url}. Please check if the environment is up and reachable.")
-                            else:
-                                env_version = about.get("releaseVersion") or about.get("version") or env_row.get("version")
-                                
-                                url = build_api_url(base_url, api_path)
-                                headers_raw = {"authorization": token} if token else {}
-                                headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
-                                
-                                resp = requests.get(url, headers=headers_raw, timeout=60)
-                                if resp.status_code in (401, 403) and token:
-                                    resp = requests.get(url, headers=headers_bearer, timeout=60)
-                                
-                                if resp.status_code == 200:
-                                    list_with_ids = extract_classifier_list_with_ids(resp.json())
-                                    if list_with_ids:
-                                        with engine.connect() as conn:
-                                            # Map the environment's current version to a build_id
-                                            target_bid = get_or_create_id(conn, "builds", "version", str(env_version))
-                                            
-                                            success_count = 0
-                                            for item in list_with_ids:
-                                                detail = fetch_classifier_detail_from_api(base_url, item["id"], token)
-                                                if detail:
-                                                    save_classifier_details_snapshot(refresh_env_id, target_bid, item["id"], item["name"], detail)
-                                                    success_count += 1
-                                        if success_count > 0:
-                                            st.success(f"Successfully captured {success_count} classifier snapshots for version {env_version}")
-                                            st.rerun()
-                                        else:
-                                            st.error("Fetched classifier list, but failed to retrieve details for any individual classifier. Check API permissions.")
+    _, btn_col = st.columns([3, 1])
+    with btn_col:
+        fetch_btn = st.button(
+            "Manual Refresh Snapshots",
+            width="stretch",
+            type="secondary",
+            help="Fetches classifier list + per-classifier details from the selected environment; stored under live /about version.",
+        )
+
+    if fetch_btn:
+        if refresh_env_id is None:
+            st.error("Please select a specific Environment to refresh snapshots from.")
+        else:
+            env_row = get_test_environment_by_id(refresh_env_id)
+            if env_row:
+                with st.spinner(f"Capturing classifier metadata from {env_row['env_name']}..."):
+                    try:
+                        token = fetch_auth_token_for_env(env_row)
+                        base_url = env_row.get("base_url")
+                        api_path = env_row.get("classifiers_api_path") or "/api/v1/classifications"
+
+                        # Get the actual current version from /about to ensure we save to the right build_id
+                        about = fetch_about(base_url, token)
+                        if not about:
+                            st.error(f"Failed to connect to {base_url}. Please check if the environment is up and reachable.")
+                        else:
+                            env_version = about.get("releaseVersion") or about.get("version") or env_row.get("version")
+
+                            url = build_api_url(base_url, api_path)
+                            headers_raw = {"authorization": token} if token else {}
+                            headers_bearer = {"Authorization": f"Bearer {token}"} if token else {}
+
+                            resp = requests.get(url, headers=headers_raw, timeout=60)
+                            if resp.status_code in (401, 403) and token:
+                                resp = requests.get(url, headers=headers_bearer, timeout=60)
+
+                            if resp.status_code == 200:
+                                list_with_ids = extract_classifier_list_with_ids(resp.json())
+                                if list_with_ids:
+                                    with engine.connect() as conn:
+                                        target_bid = get_or_create_id(conn, "builds", "version", str(env_version))
+
+                                        success_count = 0
+                                        for item in list_with_ids:
+                                            detail = fetch_classifier_detail_from_api(base_url, item["id"], token)
+                                            if detail:
+                                                save_classifier_details_snapshot(
+                                                    refresh_env_id, target_bid, item["id"], item["name"], detail
+                                                )
+                                                success_count += 1
+                                    if success_count > 0:
+                                        st.success(
+                                            f"Successfully captured {success_count} classifier snapshots for version {env_version}"
+                                        )
+                                        st.rerun()
                                     else:
-                                        st.warning("API returned success but found 0 classifiers in this environment.")
+                                        st.error(
+                                            "Fetched classifier list, but failed to retrieve details for any individual classifier. Check API permissions."
+                                        )
                                 else:
-                                    st.error(f"API Error ({resp.status_code}): Could not fetch classifier list from {url}")
-                        except Exception as e:
-                            st.error(f"Manual sync failed: {e}")
+                                    st.warning("API returned success but found 0 classifiers in this environment.")
+                            else:
+                                st.error(f"API Error ({resp.status_code}): Could not fetch classifier list from {url}")
+                    except Exception as e:
+                        st.error(f"Manual sync failed: {e}")
 
-        # Loading snapshots
+    if len(snapshot_build_versions) < 2:
+        st.warning(
+            f"Deep-Dive needs **at least two** build versions with stored metadata for **{sel_label}**. "
+            f"You currently have **{len(snapshot_build_versions)}**. "
+            "The dropdowns used to show every build from **name mappings**, which made it look like you could compare metadata — "
+            "but metadata only exists after refresh/tracker. "
+            "Refresh once per version you care about (or use **All environments** if snapshots exist from any env)."
+        )
+    else:
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            build_a = st.selectbox(
+                "Compare Build (Baseline)",
+                snapshot_build_versions,
+                index=max(0, len(snapshot_build_versions) - 2),
+                key="cl_detail_build_a",
+            )
+        with dc2:
+            cand_b = [v for v in snapshot_build_versions if v != build_a]
+            build_b = st.selectbox(
+                "To Build (Newer)",
+                cand_b,
+                index=max(0, len(cand_b) - 1) if cand_b else 0,
+                key="cl_detail_build_b",
+            )
+
         with engine.connect() as conn:
-            bid_a = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_a}).scalar() if build_a else None
-            bid_b = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_b}).scalar() if build_b else None
-        
+            bid_a = (
+                conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_a}).scalar()
+                if build_a
+                else None
+            )
+            bid_b = (
+                conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_b}).scalar()
+                if build_b
+                else None
+            )
+
         snap_a = load_classifier_snapshots_for_build(sel_env_id, bid_a) if bid_a else []
         snap_b = load_classifier_snapshots_for_build(sel_env_id, bid_b) if bid_b else []
-        
+
         if not snap_a or not snap_b:
-            st.info("No detailed snapshots found for the selected builds yet. The background tracker will capture these automatically, or you can click 'Manual Refresh Snapshots' above.")
+            st.info(
+                "Could not load snapshots for this pair with the current **Environment** filter. "
+                f"Try **All environments**, or run **Manual Refresh** for **{sel_label}** for both versions."
+            )
         else:
             map_a = {s["classifier_name"]: s["snapshot"] for s in snap_a}
             map_b = {s["classifier_name"]: s["snapshot"] for s in snap_b}
@@ -11962,6 +12430,41 @@ def page_scan_progress():
     except Exception:
         cls_vs_prev = {}
 
+    # Classifier / attribute rows from scan_insights (one load for Observations + Analysis expander)
+    classifier_hits_df = pd.DataFrame()
+    classifier_hits_note = ""
+    try:
+        classifier_hits_df, classifier_hits_note = load_scan_insight_classifier_hits_df(str(scan_id))
+    except Exception:
+        pass
+
+    # Classifier names from stored parent-scan insight JSON (available without attributes API sync)
+    insight_payload_classifier_names: List[str] = []
+    try:
+        if engine:
+            with engine.connect() as conn:
+                r_ip = conn.execute(
+                    text("SELECT insight_payload FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                    {"sid": str(scan_id).strip()},
+                ).fetchone()
+            if r_ip and r_ip[0]:
+                raw_ip = r_ip[0]
+                if isinstance(raw_ip, str):
+                    ip_obj = json.loads(raw_ip)
+                elif isinstance(raw_ip, dict):
+                    ip_obj = raw_ip
+                else:
+                    ip_obj = None
+                if isinstance(ip_obj, dict):
+                    mx = extract_scan_insight_metrics(ip_obj)
+                    tnames = str(mx.get("classifier_attribute_names") or "").strip()
+                    if tnames:
+                        insight_payload_classifier_names = sorted(
+                            {x.strip() for x in tnames.split(",") if x.strip()}
+                        )
+    except Exception:
+        pass
+
     # Observations (rule-based): highlight inconsistencies like "Completed but objects < expected".
     observations = []
     try:
@@ -12005,7 +12508,42 @@ def page_scan_progress():
             try:
                 dca = ins.get('distinct_classification_attributes')
                 if dca not in (None, '', '0'):
-                    observations.append(f"Distinct classifications: **{int(dca):,}**")
+                    observations.append(
+                        f"Distinct classification **attributes** (summary count): **{int(dca):,}** "
+                        "(BigID insight counter — **named list** is in this column when available, "
+                        "or in **Classifier / attribute hits** just **below**.)"
+                    )
+            except Exception:
+                pass
+            try:
+                can = str(ins.get("classifier_attribute_names") or "").strip()
+                if can:
+                    parts = sorted({x.strip() for x in can.split(",") if x.strip()})
+                    if parts:
+                        observations.append(
+                            "**Names from classifier-attribute delta map** (DB): "
+                            + ", ".join(parts[:40])
+                            + (f" … (+{len(parts) - 40} more)" if len(parts) > 40 else "")
+                        )
+                elif insight_payload_classifier_names:
+                    observations.append(
+                        "**Classifier / attribute names** (from stored `scan_insights.insight_payload`): "
+                        + ", ".join(insight_payload_classifier_names[:60])
+                        + (
+                            f" … (+{len(insight_payload_classifier_names) - 60} more)"
+                            if len(insight_payload_classifier_names) > 60
+                            else ""
+                        )
+                    )
+            except Exception:
+                pass
+            try:
+                tcl = ins.get("total_classification")
+                if tcl not in (None, "", "0"):
+                    observations.append(
+                        f"**Total classifications** (insight aggregate counter): **{int(tcl):,}** "
+                        "(BigID sum-style metric — per-row **New findings** counts are in **Classifier / attribute hits** just below; run **Sync now** if that table is empty.)"
+                    )
             except Exception:
                 pass
             try:
@@ -12017,6 +12555,37 @@ def page_scan_progress():
                     observations.append(f"Attributes removed (delta sum): **{int(rac):,}**")
             except Exception:
                 pass
+
+        # Classification counters vs throughput (same scan timeline)
+        try:
+            if len(df_ai) >= 2 and "total_classifications" in df_ai.columns:
+                tc0 = _safe_num(df_ai.iloc[0].get("total_classifications"), None)
+                tc1 = _safe_num(df_ai.iloc[-1].get("total_classifications"), None)
+                if tc0 is not None and tc1 is not None:
+                    d_tc = int(tc1 - tc0)
+                    if d_tc != 0:
+                        fpm_note = ""
+                        if files_per_min is not None and files_per_min > 0:
+                            fpm_note = (
+                                f" Recent object throughput ≈ **{files_per_min:.1f}**/min (last snapshots). "
+                                "If classifications jump while throughput drops (or the reverse), check **Classifier Changes** "
+                                "for this build and **Classifier / attribute hits** below."
+                            )
+                        observations.append(
+                            f"**Total classifications** changed by **{d_tc:+,}** from first to latest snapshot.{fpm_note}"
+                        )
+            if len(df_ai) >= 2 and "newly_added_classifications" in df_ai.columns:
+                na0 = _safe_num(df_ai.iloc[0].get("newly_added_classifications"), None)
+                na1 = _safe_num(df_ai.iloc[-1].get("newly_added_classifications"), None)
+                if na0 is not None and na1 is not None:
+                    d_na = int(na1 - na0)
+                    if abs(d_na) >= 50:
+                        observations.append(
+                            f"**Newly added classifications** moved by **{d_na:+,}** across snapshots — "
+                            "often tracks new findings rate; compare with env classifier list/metadata if the scan profile changed."
+                        )
+        except Exception:
+            pass
 
         # Inconsistency rules
         stc = _cstate(cur_state)
@@ -12050,6 +12619,42 @@ def page_scan_progress():
 
     except Exception:
         observations = observations or []
+
+    # Which classifiers/attributes actually have new findings (from attributes API snapshot)
+    try:
+        if classifier_hits_df is not None and not classifier_hits_df.empty:
+            col_new = "New findings"
+            col_lbl = "Classifier / attribute"
+            if col_new in classifier_hits_df.columns and col_lbl in classifier_hits_df.columns:
+                matched = (
+                    classifier_hits_df[pd.to_numeric(classifier_hits_df[col_new], errors="coerce").fillna(0) > 0][
+                        col_lbl
+                    ]
+                    .astype(str)
+                    .str.strip()
+                )
+                matched = sorted({x for x in matched if x})
+                if matched:
+                    observations.append(
+                        f"**Classifiers / attributes with new findings** ({len(matched)}): "
+                        + ", ".join(matched[:50])
+                        + (f" … (+{len(matched) - 50} more)" if len(matched) > 50 else "")
+                    )
+                elif insight_payload_classifier_names and not any(
+                    "insight_payload" in str(x) or "delta map" in str(x) for x in observations
+                ):
+                    observations.append(
+                        "**Classifier / attribute names** (insight JSON; **New findings** per row not loaded — click **Sync now** for the attributes table): "
+                        + ", ".join(insight_payload_classifier_names[:50])
+                        + (
+                            f" … (+{len(insight_payload_classifier_names) - 50} more)"
+                            if len(insight_payload_classifier_names) > 50
+                            else ""
+                        )
+                    )
+    except Exception:
+        pass
+
     try:
         if len(df_ai) >= 3:
             a = df_ai.iloc[-3]
@@ -12261,6 +12866,113 @@ def page_scan_progress():
             runtime_str = 'N/A'
         m5.metric("Scan time (so far)", runtime_str)
 
+        st.divider()
+        # Observations first so the three-column summary sits directly above Classifier / attribute hits (table + names).
+        try:
+            if observations:
+                st.markdown("**Observations**")
+                time_lines: List[str] = []
+                obj_lines: List[str] = []
+                cls_lines: List[str] = []
+                other_lines: List[str] = []
+                for o in observations:
+                    s = str(o).strip()
+                    if not s:
+                        continue
+                    sl = s.lower()
+                    if s.startswith("Start:") or s.startswith("End:") or "elapsed" in sl or "duration" in sl:
+                        time_lines.append(s)
+                    elif "object" in sl or "shortfall" in sl:
+                        obj_lines.append(s)
+                    elif (
+                        "classification" in sl
+                        or "classifier" in sl
+                        or "attribute" in sl
+                        or "names from classifier" in sl
+                    ):
+                        cls_lines.append(s)
+                    else:
+                        other_lines.append(s)
+
+                oc1, oc2, oc3 = st.columns(3)
+                with oc1:
+                    st.markdown("**Timing**")
+                    if time_lines:
+                        st.markdown("\n\n".join(f"- {line}" for line in time_lines))
+                    else:
+                        st.caption("—")
+                with oc2:
+                    st.markdown("**Objects**")
+                    if obj_lines:
+                        st.markdown("\n\n".join(f"- {line}" for line in obj_lines))
+                    else:
+                        st.caption("—")
+                with oc3:
+                    st.markdown("**Classifications & attributes**")
+                    if cls_lines:
+                        st.markdown("\n\n".join(f"- {line}" for line in cls_lines))
+                    else:
+                        st.caption("—")
+                if other_lines:
+                    st.markdown("**Other**")
+                    st.markdown("\n\n".join(f"- {line}" for line in other_lines))
+        except Exception:
+            pass
+
+        st.divider()
+        # Per-classifier / attribute hits (names + table) directly under Observations
+        try:
+            hits_df, hits_note = classifier_hits_df, classifier_hits_note
+            st.markdown("### Classifier / attribute hits")
+            st.caption(
+                "Rows come from `scan_insights.attributes_payload` (BigID scan **attributes** response). "
+                "**New findings** > 0 means that classifier/attribute had matches in this scan. "
+                "If the table is empty, names may still appear from the parent-scan **insight** JSON (see gray box)."
+            )
+            if hits_note:
+                st.caption(hits_note)
+            if hits_df is not None and not hits_df.empty:
+                try:
+                    _hn = pd.to_numeric(hits_df["New findings"], errors="coerce").fillna(0)
+                    _matched_only = hits_df[_hn > 0]["Classifier / attribute"].astype(str).str.strip()
+                    _matched_list = sorted({x for x in _matched_only if x})
+                    if _matched_list:
+                        st.markdown("**Classifiers / attributes with new findings (compact)**")
+                        mc1, mc2, mc3 = st.columns(3)
+                        nmc = len(_matched_list)
+                        for ci, col in enumerate((mc1, mc2, mc3)):
+                            lo = (nmc * ci) // 3
+                            hi = (nmc * (ci + 1)) // 3
+                            chunk = _matched_list[lo:hi]
+                            col.markdown("\n".join(f"- `{x}`" for x in chunk) if chunk else "—")
+                except Exception:
+                    pass
+                show_hits = hits_df
+                if st.checkbox("Only show rows with New findings > 0 or Removed > 0", value=True, key="scan_prog_hits_filter"):
+                    show_hits = hits_df[(hits_df["New findings"] > 0) | (hits_df["Removed"] > 0)]
+                    if show_hits.empty:
+                        show_hits = hits_df
+                        st.caption("No rows with non-zero deltas; showing full table.")
+                st.dataframe(show_hits, width="stretch", hide_index=True, height=min(420, 120 + 28 * min(25, len(show_hits))))
+            else:
+                if insight_payload_classifier_names:
+                    st.markdown("**Names from parent-scan insight** (stored JSON — not the attributes breakdown table)")
+                    ic1, ic2, ic3 = st.columns(3)
+                    _n = len(insight_payload_classifier_names)
+                    for ci, col in enumerate((ic1, ic2, ic3)):
+                        lo = (_n * ci) // 3
+                        hi = (_n * (ci + 1)) // 3
+                        chunk = insight_payload_classifier_names[lo:hi]
+                        col.markdown("\n".join(f"- `{x}`" for x in chunk) if chunk else "—")
+                st.info(
+                    hits_note
+                    or (
+                        "No **attributes** breakdown rows yet. Click **Sync now (manual)** to fetch per-classifier **New findings** counts. "
+                        "Until then, check **Observations → Classifications** for names from the insight snapshot (if BigID included them)."
+                    )
+                )
+        except Exception:
+            pass
 
         # Optional Local LLM narrative (Windows-ready later)
         llm_enabled = st.toggle("Generate LLM narrative (local)", value=False, help="Uses LOCAL_LLM_* env vars when configured.")
@@ -12326,12 +13038,18 @@ def page_scan_progress():
                 prev_s = cls_vs_prev["prev_sid"]
                 direction = "higher" if delta_v > 0 else "lower"
                 sign = "+" if delta_v > 0 else ""
+                thr_note = ""
+                if files_per_min is not None and files_per_min > 0:
+                    thr_note = (
+                        f" Current run throughput ≈ **{files_per_min:.1f}** objects/min — "
+                        "pair this delta with **Classifier Changes** (metadata) and per-classifier hits below."
+                    )
                 st.error(
                     f"⚠️ **Total classifications discrepancy vs previous scan** "
                     f"(same scenario type, build `{prev_bld}`, scan `{prev_s}`): "
                     f"current = **{cur_v:,}** vs previous = **{prev_v:,}** "
                     f"— {direction} by **{sign}{delta_v:,}** ({sign}{pct_v:.1f}%). "
-                    f"Possible causes: changed classifier set, data drift, or classification regression."
+                    f"Possible causes: changed classifier set, data drift, or classification regression.{thr_note}"
                 )
                 
                 # Show classifier difference breakdown if available
@@ -12353,18 +13071,6 @@ def page_scan_progress():
                             st.markdown("**Significantly Changed ( >10% or >100 diff ):**")
                             for c in changed:
                                 st.caption(f"- 🟡 {c}")
-        except Exception:
-            pass
-
-        # Observations for this scan (DB-only)
-        try:
-            if observations:
-                st.markdown("**Observations**")
-                o_cols = st.columns(3)
-                for idx, o in enumerate(observations):
-                    if str(o or '').strip():
-                        # Distribute across columns
-                        o_cols[idx % 3].caption(f"• {o}")
         except Exception:
             pass
 
@@ -12565,137 +13271,6 @@ def page_scan_progress():
             hovermode="x unified",
         )
         st.plotly_chart(fig3, width="stretch")
-    
-    # NEW: Scanner Performance Section
-    try:
-        # Determine environment and time range for performance stats
-        p_env_id = None
-        if "environment_id" in df.columns:
-            # Dropna just to be safe in case some rows are null
-            valid_ids = df["environment_id"].dropna().unique()
-            if len(valid_ids) > 0:
-                p_env_id = valid_ids[0]
-        
-        # Fallback: Check scan_parents if environment_id is missing from progress table
-        if p_env_id is None and scan_id:
-            try:
-                with engine.connect() as conn:
-                    p_env_id = conn.execute(
-                        text("SELECT environment_id FROM scan_parents WHERE scan_id = :sid"),
-                        {"sid": str(scan_id)}
-                    ).scalar()
-            except Exception:
-                pass
-
-        if p_env_id is not None:
-            # We use the actual timestamp for the time range
-            p_start = df["captured_at_actual"].min()
-            p_end = df["captured_at_actual"].max()
-            
-            # If the scan is very new, we might not have many points yet
-            # Pad the range slightly to catch nearby performance pulses
-            p_start_padded = p_start - timedelta(minutes=30)
-            p_end_padded = p_end + timedelta(minutes=60) if p_end else p_start + timedelta(minutes=60)
-            
-            df_perf_g = load_scanner_group_performance(p_env_id, p_start_padded, p_end_padded)
-            df_perf_i = load_scanner_individual_performance(p_env_id, p_start_padded, p_end_padded)
-            
-            if not df_perf_g.empty or not df_perf_i.empty:
-                with st.expander("📊 Scanner Performance Metrics", expanded=False):
-                    pg1, pg2 = st.columns(2)
-                    
-                    if not df_perf_g.empty:
-                        with pg1:
-                            st.caption("Scanner Group Metrics")
-                            fig_pg1 = go.Figure()
-                            # 1. Total Scanners
-                            fig_pg1.add_trace(go.Scatter(
-                                x=df_perf_g["captured_at_utc"], y=df_perf_g["running_scanners"],
-                                mode="lines+markers", name="Running Scanners (Total)",
-                                line=dict(color="#3B82F6", width=2)
-                            ))
-                            # 2. Avg Speed (Secondary Axis)
-                            fig_pg1.add_trace(go.Scatter(
-                                x=df_perf_g["captured_at_utc"], y=df_perf_g["avg_scan_speed"],
-                                mode="lines+markers", name="Avg Speed (obj/s)",
-                                line=dict(color="#10B981", width=2), yaxis="y2"
-                            ))
-                            # 3. Individual Threads (Merged here as requested)
-                            if not df_perf_i.empty:
-                                colors = px.colors.qualitative.Plotly
-                                for idx, name in enumerate(df_perf_i["display_name"].unique()):
-                                    scanner_df = df_perf_i[df_perf_i["display_name"] == name]
-                                    fig_pg1.add_trace(go.Scatter(
-                                        x=scanner_df["captured_at_utc"], y=scanner_df["running_threads"],
-                                        mode="lines+markers", name=f"Threads: {name}",
-                                        line=dict(width=1, dash='dot', color=colors[idx % len(colors)])
-                                    ))
-                                    
-                            fig_pg1.update_layout(
-                                yaxis=dict(title="Count / Threads", rangemode="tozero"),
-                                yaxis2=dict(title="Speed (obj/s)", overlaying="y", side="right", rangemode="tozero"),
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
-                                hovermode="x unified"
-                            )
-                            st.plotly_chart(fig_pg1, width='stretch')
-                            
-                        with pg2:
-                            st.caption("Memory Usage (Group Sum)")
-                            fig_pg2 = go.Figure()
-                            # FIXED: Show Used vs Total for the group
-                            fig_pg2.add_trace(go.Scatter(
-                                x=df_perf_g["captured_at_utc"], y=df_perf_g["used_memory_mb"],
-                                mode="lines+markers", name="Group Used (MB)",
-                                fill='tozeroy', line=dict(color="#EF4444", width=2)
-                            ))
-                            fig_pg2.add_trace(go.Scatter(
-                                x=df_perf_g["captured_at_utc"], y=df_perf_g["physical_memory_mb"],
-                                mode="lines+markers", name="Group Total (MB)",
-                                line=dict(color="#8B5CF6", width=1, dash='dot')
-                            ))
-                            fig_pg2.update_layout(
-                                yaxis=dict(title="Memory (MB)", rangemode="tozero"),
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
-                                hovermode="x unified"
-                            )
-                            st.plotly_chart(fig_pg2, width='stretch')
-                            
-                    if not df_perf_i.empty:
-                        pi1, pi2 = st.columns(2)
-                        with pi1:
-                            st.caption("System Load (CPU Average) Per Scanner")
-                            fig_pi1 = px.line(df_perf_i, x="captured_at_utc", y="system_load_average", color="display_name", 
-                                             title=None, markers=True)
-                            fig_pi1.update_traces(mode="lines+markers")
-                            fig_pi1.update_layout(
-                                yaxis=dict(title="Load Avg", rangemode="tozero"),
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
-                                hovermode="x unified"
-                            )
-                            st.plotly_chart(fig_pi1, width='stretch')
-                            
-                        with pi2:
-                            # FIXED: Show Usage % instead of total capacity
-                            st.caption("Memory Usage (%) Per Scanner")
-                            fig_pi2 = px.line(df_perf_i, x="captured_at_utc", y="memory_usage_pct", color="display_name",
-                                             title=None, markers=True)
-                            fig_pi2.update_traces(mode="lines+markers")
-                            fig_pi2.update_layout(
-                                yaxis=dict(title="Usage %", rangemode="tozero"),
-                                margin=dict(l=10, r=10, t=10, b=10),
-                                legend=dict(orientation="h", title=None, yanchor="top", y=-0.2, xanchor="left", x=0),
-                                hovermode="x unified"
-                            )
-                            st.plotly_chart(fig_pi2, width='stretch')
-
-                            st.plotly_chart(fig_pi1, width='stretch')
-                        
-                        # (Memory chart block follows in column 2...)
-    except Exception:
-        pass
 
     # Scanner performance (DB): group + per-scanner metrics captured by tracker or "Sync now"
     try:
@@ -12746,7 +13321,7 @@ def page_scan_progress():
 
                 _spm_has = not df_perf_g.empty or not df_perf_i.empty
                 # Open by default whenever we have samples so users don’t miss running-set vs all-pods behavior.
-                with st.expander("Scanner Performance Metrics", expanded=bool(_spm_has) or bool(_spm_expand)):
+                with st.expander("📊 Scanner Performance Metrics", expanded=bool(_spm_has) or bool(_spm_expand)):
                     if not _spm_has:
                         st.caption(
                             "No **scanner_group_performance** / **scanner_individual_performance** in this window — "
@@ -12768,6 +13343,8 @@ def page_scan_progress():
   margin: 0 0 0.85rem 0;
   border: 1px solid #cbd5e1;
   box-shadow: 0 4px 18px rgba(15, 23, 42, 0.06);
+  max-width: min(28rem, 100%);
+  width: fit-content;
 }
 .spm-hero h3 { margin: 0 0 0.4rem 0; font-size: 1.12rem; font-weight: 700; letter-spacing: -0.02em; color: #0f172a; }
 .spm-hero .spm-sub { margin: 0; font-size: 0.8rem; line-height: 1.5; color: #475569; }
@@ -12793,9 +13370,23 @@ def page_scan_progress():
 """,
                             unsafe_allow_html=True,
                         )
+                        _spm_env_name = ""
+                        try:
+                            _spm_er = get_test_environment_by_id(int(p_env_id))
+                            if _spm_er:
+                                _spm_env_name = str(_spm_er.get("env_name") or "").strip()
+                        except Exception:
+                            pass
+                        if _spm_env_name:
+                            _spm_hero_title = (
+                                f"{html.escape(_spm_env_name)} "
+                                f'<span style="font-weight:600;color:#64748b;font-size:0.92em">· Environment #{int(p_env_id)}</span>'
+                            )
+                        else:
+                            _spm_hero_title = f"Environment #{int(p_env_id)}"
                         st.markdown(
                             f"""<div class="spm-hero">
-<h3>Environment #{p_env_id}</h3>
+<h3>{_spm_hero_title}</h3>
 <p class="spm-sub">
   Window <b>{p_start_padded:%Y-%m-%d %H:%M}</b> → <b>{p_end_padded:%Y-%m-%d %H:%M}</b> UTC<br/>
   <span style="opacity:0.92">Sources: <code style="background:#e2e8f0;color:#0f172a;padding:0.12em 0.4em;border-radius:4px;font-size:0.9em">/scanner-groups</code>
@@ -13608,14 +14199,73 @@ def page_workflow_automation():
     global engine
     st.title("🧪 Workflow Automation")
     st.caption(
-        "UI-first: plan + pause/resume. A background runner will execute DS+scan creation sequentially. "
-        "Only environments with **Use for workflow runs** (Manage Test Environments) are eligible for new steps."
+        "UI-first: plan + pause/resume. The runner uses every **workflow-pool** env (Manage Test Environments → **Use for workflow runs**) "
+        "and runs **up to one active step per env in parallel** (odd steps → Env 1, even → Env 2). "
+        "Each step: DS → connection test → scan profile → start scan → wait for terminal state → cooldown. "
+        "Concurrency cap: `WORKFLOW_MAX_CONCURRENT_SCANS` (default = pool size)."
     )
 
     ensure_test_environments_table(engine)
     ensure_scan_tracking_tables()
     ensure_scan_progress_table()
     ensure_workflow_tables()
+
+    _wf_flash = st.session_state.pop("wf_delete_flash", None)
+    if _wf_flash:
+        st.success(str(_wf_flash))
+    _wf_reconcile_flash = st.session_state.pop("wf_reconcile_flash", None)
+    if _wf_reconcile_flash:
+        st.success(str(_wf_reconcile_flash))
+
+    # Query-param actions (runs before env empty-check so delete/start still work if env list is empty).
+    try:
+        _wf_action = str(st.query_params.get("wf_action", "") or "").strip().lower()
+        _wf_act_rid_str = str(st.query_params.get("run_id", "") or "").strip()
+    except Exception:
+        _wf_action = ""
+        _wf_act_rid_str = ""
+    if _wf_action and _wf_act_rid_str.isdigit() and engine:
+        _wf_act_rid = int(_wf_act_rid_str)
+        try:
+            if _wf_action == "start":
+                set_workflow_run_status(_wf_act_rid, "running")
+            elif _wf_action == "pause":
+                set_workflow_run_status(_wf_act_rid, "paused")
+                release_workflow_run_envs(engine, _wf_act_rid)
+            elif _wf_action == "resume":
+                set_workflow_run_status(_wf_act_rid, "running")
+            elif _wf_action == "stop":
+                set_workflow_run_status(_wf_act_rid, "stopped")
+                release_workflow_run_envs(engine, _wf_act_rid)
+                with engine.connect() as conn:
+                    conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
+                    conn.commit()
+            elif _wf_action == "reconcile":
+                res = reconcile_workflow_run(_wf_act_rid)
+                st.session_state["wf_reconcile_flash"] = (
+                    f"Run {_wf_act_rid} reconciled: updated_steps={res.get('updated_steps')} "
+                    f"completed_run={res.get('completed_run')}"
+                )
+            elif _wf_action == "delete":
+                _purged = delete_workflow_run_and_purge_scans(engine, _wf_act_rid)
+                st.session_state["wf_delete_flash"] = (
+                    f"Removed workflow run {_wf_act_rid} and purged {len(_purged)} distinct scan id(s) "
+                    "from local DB (scan_insights, scan_progress, scan_parents, auto_scan_benchmarks, manual benchmarks when present)."
+                )
+        except Exception as _e:
+            st.error(f"Action '{_wf_action}' failed for run {_wf_act_rid}: {_e}")
+        finally:
+            try:
+                del st.query_params["wf_action"]
+                if _wf_action == "delete":
+                    del st.query_params["run_id"]
+            except Exception:
+                pass
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.rerun()
 
     env_df = load_test_environments()
     if env_df.empty:
@@ -13636,51 +14286,6 @@ def page_workflow_automation():
         st.warning("No active environments. Add or activate one under **Manage Test Environments**.")
         return
     wf_pool_df = active_df[active_df["include_in_workflow_runs"] == True].copy().reset_index(drop=True)
-
-
-
-    # -------- Inline action dispatcher (from row icon buttons) --------
-    try:
-        _wf_action = str(st.query_params.get("wf_action", "") or "").strip().lower()
-        _wf_act_rid_str = str(st.query_params.get("run_id", "") or "").strip()
-    except Exception:
-        _wf_action = ""
-        _wf_act_rid_str = ""
-    if _wf_action and _wf_act_rid_str.isdigit():
-        _wf_act_rid = int(_wf_act_rid_str)
-        try:
-            if _wf_action == "start":
-                set_workflow_run_status(_wf_act_rid, "running")
-            elif _wf_action == "pause":
-                set_workflow_run_status(_wf_act_rid, "paused")
-                release_workflow_run_envs(engine, _wf_act_rid)
-            elif _wf_action == "resume":
-                set_workflow_run_status(_wf_act_rid, "running")
-            elif _wf_action == "stop":
-                set_workflow_run_status(_wf_act_rid, "stopped")
-                release_workflow_run_envs(engine, _wf_act_rid)
-                with engine.connect() as conn:
-                    conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
-                    conn.commit()
-            elif _wf_action == "delete":
-                release_workflow_run_envs(engine, _wf_act_rid)
-                with engine.connect() as conn:
-                    conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": _wf_act_rid})
-                    conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": _wf_act_rid})
-                    conn.commit()
-        except Exception as _e:
-            st.error(f"Action '{_wf_action}' failed for run {_wf_act_rid}: {_e}")
-        finally:
-            # Clear the action param and re-render cleanly
-            try:
-                del st.query_params["wf_action"]
-                if _wf_action == "delete":
-                    del st.query_params["run_id"]
-            except Exception: pass
-            try: st.cache_data.clear()
-            except Exception: pass
-            st.rerun()
-    # ------------------------------------------------------------------
 
     st.divider()
     with st.expander("➕ Create New Workflow Run", expanded=False):
@@ -13804,7 +14409,11 @@ def page_workflow_automation():
 
     # --- Load runs ---
     st.markdown("### Workflow Runs")
-    st.caption("Click any row to expand step progress details.")
+    st.caption(
+        "Click a run id to expand details. Row **🔁** = quick reconcile from DB. **Reset** options live under "
+        "**Controls — Run …** below the table (scroll down). **Delete** (🗑️) purges local DB rows for that run’s "
+        "`scan_id`s — not BigID."
+    )
     runs_df = load_workflow_runs(limit=50)
     if runs_df.empty:
         st.info("No workflow runs yet. Use the **➕ New Run** tab below to create one.")
@@ -13917,13 +14526,26 @@ def page_workflow_automation():
                 for _, sr in sdf.iterrows():
                     rd = sr.to_dict()
                     c_status = str(rd.get("status") or "").strip().lower()
-                    
-                    # Logic for counts (includes all steps)
+                    is_en = bool(rd.get("is_enabled", True)) if rd.get("is_enabled") is not None else True
+                    try:
+                        if rd.get("is_enabled") is not None and not bool(int(rd.get("is_enabled"))):
+                            is_en = False
+                    except Exception:
+                        pass
+
+                    # Counts from DB status (emoji progress strings miss phases like ds_created → false "Pending")
+                    if not is_en or c_status == "disabled":
+                        disabled += 1
+                    elif c_status == "error":
+                        errors += 1
+                    elif c_status == "completed":
+                        completed += 1
+                    elif c_status in {"", "pending"}:
+                        pass  # included in metrics.pending below (residual)
+                    else:
+                        in_prog += 1
+
                     prog = _pf(rd)
-                    if "✅Scan" in prog or "✅ Scan" in prog: completed += 1
-                    elif "❌" in prog or "⚠️" in prog: errors += 1
-                    elif "🚫" in prog or c_status == "disabled": disabled += 1
-                    elif "⏳" in prog: in_prog += 1
 
                     # Visibility filter: "no need to show disable steps"
                     if c_status == "disabled": continue
@@ -13957,7 +14579,7 @@ def page_workflow_automation():
                         "scan_id": sid_val,
                         "scan_link": scan_link,
                         "notes": str(rd.get("notes") or "").strip(),
-                        "last_error": str(rd.get("last_error") or "").strip()[:80],
+                        "last_error": str(rd.get("last_error") or "").strip(),
                     })
                 all_run_steps[int(rid)] = {
                     "rows": steps_to_show,
@@ -14005,7 +14627,7 @@ def page_workflow_automation():
                     return f'<a href="{page_base}&run_id={rid}&wf_action={action}" title="{tooltip}" style="{btn_style}" onclick="event.stopPropagation();">{emoji}</a>'
                 return f'<span title="{tooltip}" style="{disabled_style}">{emoji}</span>'
 
-            can_start  = rstatus in {"created", "stopped", "paused"} and rstatus != "completed"
+            can_start = rstatus in {"created", "stopped", "paused", "failed"}
             can_pause  = rstatus == "running"
             can_resume = rstatus == "paused"
             can_stop   = rstatus in {"running", "paused"}
@@ -14016,7 +14638,8 @@ def page_workflow_automation():
                 _btn("⏸", "pause",  "Pause",          can_pause)  +
                 _btn("↩️", "resume", "Resume",         can_resume) +
                 _btn("⏹", "stop",   "Stop",           can_stop)   +
-                _btn("🗑️", "delete", "Delete",         can_delete)
+                _btn("🔁", "reconcile", "Reconcile from DB (scan_parents / scan_progress → step status)", True) +
+                _btn("🗑️", "delete", "Delete workflow + purge local scan DB rows for its scan ids", can_delete)
             )
 
             # Format timestamps to avoid "NaT"
@@ -14035,7 +14658,7 @@ def page_workflow_automation():
   <td style="padding:8px 12px;">{_badge(rr["status"])}</td>
   <td style="padding:8px 12px;font-size:0.82rem;">{_fmt_ts(rr.get("started_at"))}</td>
   <td style="padding:8px 12px;font-size:0.82rem;">{_fmt_ts(rr.get("finished_at"))}</td>
-  <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;">{html.escape(str(rr.get("last_error") or "")[:60])}</td>
+  <td style="padding:8px 12px;font-size:0.82rem;color:#dc2626;max-width:280px;word-break:break-word;" title="{html.escape(str(rr.get('last_error') or ''))}">{html.escape(str(rr.get("last_error") or "")[:200])}</td>
   <td style="padding:8px 12px;white-space:nowrap;">{actions_html}</td>
 </tr>\n"""
 
@@ -14049,7 +14672,12 @@ def page_workflow_automation():
                     err_val = (sr["last_error"] or "").strip()
                     if err_val and "No free env this tick" in err_val:
                         err_val = ""
-                    err_cell = f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(sr["last_error"])}">{html.escape(err_val[:40])}</span>' if err_val else ""
+                    _err_full = str(sr.get("last_error") or "")
+                    err_cell = (
+                        f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(_err_full)}">{html.escape(err_val[:40])}</span>'
+                        if err_val
+                        else ""
+                    )
                     s_rows += f"""<tr style="background:{row_bg};">
 <td style="padding:4px 8px;text-align:center;font-weight:600;">{sr["seq"]}</td>
 <td style="padding:4px 8px;">{html.escape(sr["env"])}</td>
@@ -14112,28 +14740,28 @@ def page_workflow_automation():
   </td>
 </tr>\n"""
 
-    env_status_block = f'<div style="font-size:0.85rem;color:#6b7280;margin-bottom:10px;">Env status: {env_status_line}</div>' if env_status_line else ""
-    full_html = f"""
-<style>
-  .wf-tbl {{ width:100%; border-collapse:collapse; font-family:'Inter','Segoe UI',sans-serif; margin-bottom:20px; }}
-  .wf-tbl thead th {{ background:{PRIMARY_COLOR}; color:#fff; padding:10px 12px; font-size:0.82rem; font-weight:600; text-align:left; }}
-  .main-row:hover {{ background:#f0ecff !important; }}
-  .main-row td {{ border-bottom:1px solid #e2e8f0; }}
-</style>
-<div class="wf-container">
-  {env_status_block}
-  <table class="wf-tbl">
-    <thead><tr>
-      <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
-    </tr></thead>
-    <tbody>{rows_html}</tbody>
-  </table>
-</div>
-"""
-    try:
-        st.html(full_html)
-    except Exception:
-        st.markdown(full_html, unsafe_allow_html=True)
+        env_status_block = f'<div style="font-size:0.85rem;color:#6b7280;margin-bottom:10px;">Env status: {env_status_line}</div>' if env_status_line else ""
+        full_html = f"""
+    <style>
+      .wf-tbl {{ width:100%; border-collapse:collapse; font-family:'Inter','Segoe UI',sans-serif; margin-bottom:20px; }}
+      .wf-tbl thead th {{ background:{PRIMARY_COLOR}; color:#fff; padding:10px 12px; font-size:0.82rem; font-weight:600; text-align:left; }}
+      .main-row:hover {{ background:#f0ecff !important; }}
+      .main-row td {{ border-bottom:1px solid #e2e8f0; }}
+    </style>
+    <div class="wf-container">
+      {env_status_block}
+      <table class="wf-tbl">
+        <thead><tr>
+          <th style="min-width:90px;">Run</th><th>Name</th><th>Status</th><th>Started</th><th>Finished</th><th>Last Error</th><th>Actions</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>
+    """
+        try:
+            st.html(full_html)
+        except Exception:
+            st.markdown(full_html, unsafe_allow_html=True)
 
         # --- Controls section (for the selected/expanded run) ---
         # Build label list for selectbox (newest first = same order as table)
@@ -14197,7 +14825,7 @@ def page_workflow_automation():
 
         last_err = str(rrow.get("last_error") or "").strip()
         if last_err:
-            if selected_status in {"paused", "stopped"}:
+            if selected_status in {"paused", "stopped", "failed"}:
                 st.error(last_err)
             else:
                 st.caption(f"Last failure (history): {last_err}")
@@ -14212,7 +14840,7 @@ def page_workflow_automation():
 
         chosen_e1_id = None
         chosen_e2_id = None
-        if selected_status in {"created", "stopped", "paused"}:
+        if selected_status in {"created", "stopped", "paused", "failed"}:
             st.markdown("##### 🚀 Start / Resume Environment Mapping")
             st.caption(
                 "Select environments in the **workflow pool** (Use for workflow runs). "
@@ -14317,20 +14945,27 @@ def page_workflow_automation():
             if delete_disabled:
                 st.warning("Stop the workflow before deleting it.")
             else:
-                st.error(f"**Danger!** This will permanently delete Run {run_id} and ALL its steps from the database. DS/Scans in BigID are NOT deleted.")
+                st.error(
+                    f"**Danger!** Deletes Run **{run_id}** and all its steps, and **purges local DB data** for every "
+                    "`scan_id` recorded on those steps: `scan_insights`, `scan_progress`, `scan_parents`, "
+                    "`auto_scan_benchmarks`, attribute/delta maps, and **manual** `benchmarks` rows linked by `scan_id`. "
+                    "If the same scan id also appears on another workflow run, those rows are removed once — the other run "
+                    "would still exist but lose matching local history. Data sources and scans in **BigID are NOT deleted**."
+                )
                 if st.button("⚠️ Confirm Delete Run", key=f"wf_delete_confirm_{run_id}", type="primary"):
                     try:
-                        release_workflow_run_envs(engine, int(run_id))
-                        with engine.connect() as conn:
-                            conn.execute(text("DELETE FROM workflow_steps WHERE run_id=:rid"), {"rid": int(run_id)})
-                            conn.execute(text("DELETE FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)})
-                            conn.commit()
+                        purged = delete_workflow_run_and_purge_scans(engine, int(run_id))
                         try:
                             st.session_state.pop("wf_run_sel_id", None)
-                        except Exception: pass
-                        try: st.cache_data.clear()
-                        except Exception: pass
-                        st.success(f"Run {run_id} deleted.")
+                        except Exception:
+                            pass
+                        try:
+                            st.cache_data.clear()
+                        except Exception:
+                            pass
+                        st.success(
+                            f"Run {run_id} deleted; purged {len(purged)} distinct scan id(s) from local tables."
+                        )
                         st.rerun()
                     except Exception as ex:
                         st.error(f"Delete failed: {ex}")

@@ -1065,6 +1065,10 @@ def sync_global_classifiers_for_env_build(engine, env_row: Dict[str, Any], token
     except Exception:
         min_expected = 40
     if (not force_on_version_change) and existing and existing > 0 and not stale and existing >= min_expected:
+        try:
+            sync_classifier_details_for_env_build(engine, env_row, token, str(build_version), force=False)
+        except Exception:
+            pass
         return True
 
     api_path = str(env_row.get("classifiers_api_path") or "").strip() or CLASSIFIERS_API_PATH
@@ -1089,6 +1093,11 @@ def sync_global_classifiers_for_env_build(engine, env_row: Dict[str, Any], token
     try:
         env_key2 = str(env_id if env_id is not None else base_url.rstrip("/"))
         _kv_set(engine, f"global_cls_last_build::{env_key2}", str(build_version))
+    except Exception:
+        pass
+    try:
+        # List/mappings were just refreshed — pull full per-classifier metadata so Deep-Dive/diffs stay aligned.
+        sync_classifier_details_for_env_build(engine, env_row, token, str(build_version), force=True)
     except Exception:
         pass
     return True
@@ -1251,42 +1260,48 @@ CLASSIFIER_DETAIL_KEYS = [
 ]
 
 
-def sync_classifier_details_for_env_build(engine, env_row: Dict[str, Any], token: str, build_version: str) -> bool:
+def sync_classifier_details_for_env_build(
+    engine, env_row: Dict[str, Any], token: str, build_version: str, *, force: bool = False
+) -> bool:
     """
     Fetch and store full detail snapshots for all enabled classifiers.
-    Staggered/Throttled to avoid overloading API.
+    Throttled by CLASSIFIER_DETAILS_SYNC_TTL_HOURS (default 6h) unless force=True or no rows yet.
     """
     base_url = str(env_row.get("base_url") or "").strip()
     env_id = env_row.get("id")
     if not base_url or not env_id or not build_version:
         return False
 
-    # Check if we already synced details for this build recently.
-    # We use a 24-hour TTL for full detail sync as it's expensive.
-    env_key = str(env_id)
     try:
-        # Check if we have ANY snapshots for this build in this environment
-        with engine.connect() as conn:
-            # First get the build_id
-            bid_res = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
-            if bid_res:
-                bid = int(bid_res[0])
-                # Check if we have snapshots
-                snap_count = conn.execute(text("""
-                    SELECT COUNT(*) FROM classifier_details_snapshots 
-                    WHERE build_id = :bid AND environment_id = :eid
-                """), {"bid": bid, "eid": int(env_id)}).scalar()
-                
-                # If we have data, respect the 24-hour TTL. If 0 rows, we FORCE sync.
-                if snap_count > 0:
-                    last_sync = _kv_get(engine, f"classifier_details_sync_last::{env_key}")
-                    last_build = _kv_get(engine, f"classifier_details_sync_build::{env_key}")
-                    if last_sync and last_build == build_version:
-                        dt = _parse_iso_dt(last_sync)
-                        if dt and (datetime.utcnow() - dt).total_seconds() < 86400: # 24h
-                            return True
+        ttl_h = float(os.getenv("CLASSIFIER_DETAILS_SYNC_TTL_HOURS", "6") or "6")
     except Exception:
-        pass
+        ttl_h = 6.0
+    ttl_sec = max(300, int(ttl_h * 3600))
+
+    env_key = str(env_id)
+    if not force:
+        try:
+            with engine.connect() as conn:
+                bid_res = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
+                if bid_res:
+                    bid = int(bid_res[0])
+                    snap_count = conn.execute(
+                        text("""
+                            SELECT COUNT(*) FROM classifier_details_snapshots
+                            WHERE build_id = :bid AND environment_id = :eid
+                        """),
+                        {"bid": bid, "eid": int(env_id)},
+                    ).scalar()
+
+                    if snap_count and int(snap_count or 0) > 0:
+                        last_sync = _kv_get(engine, f"classifier_details_sync_last::{env_key}")
+                        last_build = _kv_get(engine, f"classifier_details_sync_build::{env_key}")
+                        if last_sync and last_build == build_version:
+                            dt = _parse_iso_dt(last_sync)
+                            if dt and (datetime.utcnow() - dt).total_seconds() < float(ttl_sec):
+                                return True
+        except Exception:
+            pass
 
     api_path = str(env_row.get("classifiers_api_path") or "").strip() or "/api/v1/classifications"
     try:
@@ -2426,6 +2441,14 @@ def track_once(engine) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Global classifier list + metadata snapshots (throttled inside helpers; runs even with no active scans).
+        try:
+            if sync_global_classifiers_for_env_build(engine, env, token):
+                metrics["global_classifier_sync_ok"] += 1
+            else:
+                metrics["global_classifier_sync_fail"] += 1
+        except Exception:
+            metrics["global_classifier_sync_fail"] += 1
 
         try:
             scans = _fetch_running_parent_scans(base_url, token)
@@ -2631,7 +2654,7 @@ def track_once(engine) -> Dict[str, Any]:
                             
                             # NEW: Also sync full details for the classifier_details_snapshots table
                             try:
-                                sync_classifier_details_for_env_build(engine, env_row, token, str(bver))
+                                sync_classifier_details_for_env_build(engine, env_row, token, str(bver), force=True)
                             except Exception:
                                 pass
                                 
