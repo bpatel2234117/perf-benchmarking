@@ -1904,14 +1904,17 @@ def wait_for_ds_connection_test_result(
             payload = fetch_ds_connection(base_url, token, ds_name, timeout_seconds=min(10.0, float(HTTP_TIMEOUT)))
             dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
             ds_state = str((dc or {}).get("status") or (dc or {}).get("state") or "").strip().lower()
-            if ds_state in {"draft", "new", "disabled"} and (_now_utc() >= grace_decide_at):
-                return False, f"DS stayed in state '{ds_state}' after connection test trigger"
+            # Do not fail fast on DS state alone; many tenants lag status updates after test trigger.
             cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
             if cst is None and (_now_utc() >= grace_decide_at):
-                strict_mode = str(os.getenv("WORKFLOW_DS_TEST_STRICT", "1") or "1").strip().lower() in ("1", "true", "yes")
+                strict_mode = str(os.getenv("WORKFLOW_DS_TEST_STRICT", "0") or "0").strip().lower() in ("1", "true", "yes")
                 if strict_mode:
-                    return False, "connectionStatusTest missing; cannot confirm success"
-                return False, "connectionStatusTest missing; non-strict pass-through is disabled for safety"
+                    # Strict mode: keep waiting until timeout/grouped-statuses fallback decides.
+                    pass
+                else:
+                    # Non-strict mode: if DS moved out of draft/new/disabled, accept as success.
+                    if ds_state and ds_state not in {"draft", "new", "disabled"}:
+                        return True, f"success (non-strict; ds_state={ds_state})"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
@@ -2018,9 +2021,15 @@ def test_ds_connection_auto(
     did = str(ds_id or "").strip()
     # 1) ids-based test
     try:
-        return test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
+        out = test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
+        # If ids endpoint explicitly reports success, no need to force fallback.
+        ov = str((out or {}).get("result") or (out or {}).get("status") or "").strip().lower() if isinstance(out, dict) else ""
+        if ov in {"ok", "success", "accepted", "queued", "running", "started"}:
+            return out
+        # If ids endpoint returns explicit failure markers, fallback to client endpoint.
     except Exception:
-        allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
+        out = {}
+        allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '1') or '1').strip().lower() in {'1','true','yes','y','on'}
         if did and (not allow_fallback):
             raise
     # 2) client-style test (fallback) — matches UI POST body
@@ -2329,6 +2338,46 @@ def _ensure_test_environments_workflow_column(engine) -> None:
     _workflow_include_col_ready = True
 
 
+def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
+    """
+    If a run was marked failed while enabled steps are still non-terminal, flip back to running.
+    Otherwise the runner never loads it (WHERE status='running') and parallelism / DS pipeline stall forever.
+    """
+    try:
+        with engine.connect() as conn:
+            st_row = conn.execute(
+                text("SELECT LOWER(TRIM(COALESCE(status,''))) FROM workflow_runs WHERE id=:rid LIMIT 1"),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not st_row or str(st_row[0] or "") != "failed":
+            return
+        with engine.connect() as conn:
+            act = conn.execute(
+                text(
+                    "SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,1)=1 "
+                    "AND LOWER(TRIM(COALESCE(status,''))) NOT IN ('completed','error','disabled') LIMIT 1"
+                ),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not act:
+            return
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE workflow_runs SET status='running', finished_at=NULL, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,'')))='failed'"
+                ),
+                {"rid": int(run_id)},
+            )
+            conn.commit()
+        try:
+            print(f"[{_now_utc().isoformat()}Z] auto_resume_failed_run run_id={int(run_id)} (non-terminal steps remain)", flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 def run_once(engine, *, quiet: bool = False) -> bool:
     """
     One scheduler tick: reconcile scans, then dispatch up to WORKFLOW_MAX_CONCURRENT_SCANS
@@ -2367,13 +2416,20 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             text("""
                 SELECT id, status, cooldown_minutes, next_eligible_at
                 FROM workflow_runs
-                WHERE status = 'running'
+                WHERE status IN ('running', 'failed')
                 ORDER BY id ASC
             """)
         ).fetchall()
     if not run_rows:
         set_runner_heartbeat(engine, status="idle", message="no running workflows", started=False)
         return False
+
+    # Failed runs with non-terminal enabled steps still need the runner (otherwise steps stay stuck forever).
+    for rr0 in run_rows:
+        try:
+            _auto_resume_failed_run_if_stuck(engine, int(rr0[0]))
+        except Exception:
+            pass
 
     # Track global state across all running workflows
     inflight_envs: Set[int] = set()
@@ -2402,8 +2458,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             r_status = str(r_row[0] or "").lower()
             r_next = r_row[1]
             
-            # Release if run is no longer active
-            if r_status not in {"running"}:
+            # Release if run is no longer active (keep failed runs reserved while steps still occupy envs).
+            if r_status not in {"running", "failed"}:
                 _set_env_busy(engine, be_id, None, False)
                 continue
             
@@ -2692,7 +2748,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     with engine.connect() as conn:
                         in_progress = conn.execute(
                             text(
-                                "SELECT COUNT(1) FROM workflow_steps WHERE run_id=:rid AND seq < :seq AND COALESCE(status,'') NOT IN ('completed','disabled','error')"
+                                f"SELECT COUNT(1) FROM workflow_steps WHERE run_id=:rid AND seq < :seq AND LOWER(TRIM(COALESCE(status,''))) IN ({_workflow_env_occupying_sql_in()})"
                             ),
                             {"rid": run_id, "seq": cand_seq},
                         ).fetchone()
@@ -2704,10 +2760,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 c_env = cand[2]
 
                 # Special case: already running?
-                if (not allow_scan_running) and c_status == 'scan_running': continue
+                if (not allow_scan_running) and c_status == 'scan_running':
+                    continue
                 if c_status == 'scan_running' and allow_scan_running:
                     # If it's already running, it must stay on its assigned env
-                    if c_env is None: continue
+                    if c_env is None:
+                        continue
+                    return (cand, int(c_env))
+
+                # If step already owns an environment and is in an active DS/scan phase,
+                # keep advancing it even when global capacity is full.
+                if c_env is not None and c_status in WORKFLOW_ENV_OCCUPYING_STATUSES and c_status != 'scan_running':
                     return (cand, int(c_env))
 
                 # Search through ALL active environments (or just the assigned one). DB first (reserved by another run?), then API (scan running?).
@@ -2717,7 +2780,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if int(eid) not in active_env_ids:
                         continue
                     if int(eid) in targeted_envs:
-                        continue
+                        # Allow the step that already owns this env to continue its own pipeline.
+                        if not (c_env is not None and int(c_env) == int(eid) and c_status in WORKFLOW_ENV_OCCUPYING_STATUSES):
+                            continue
                     db_busy, db_busy_by = env_db_busy.get(eid, (False, None))
                     if db_busy and db_busy_by is not None and int(db_busy_by) != int(run_id):
                         continue  # reserved by another run

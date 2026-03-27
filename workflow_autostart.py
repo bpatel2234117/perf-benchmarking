@@ -53,16 +53,29 @@ def _has_running_workflow(engine) -> bool:
     try:
         with engine.connect() as conn:
             row = conn.execute(
-                text("SELECT id FROM workflow_runs WHERE status = 'running' ORDER BY id ASC LIMIT 1")
+                text(
+                    """
+                    SELECT 1 FROM workflow_runs wr
+                    WHERE LOWER(TRIM(COALESCE(wr.status, ''))) IN ('running', 'failed')
+                      AND EXISTS (
+                        SELECT 1 FROM workflow_steps ws
+                        WHERE ws.run_id = wr.id
+                          AND COALESCE(ws.is_enabled, 1) = 1
+                          AND LOWER(TRIM(COALESCE(ws.status, ''))) NOT IN ('completed', 'error', 'disabled')
+                      )
+                    LIMIT 1
+                    """
+                )
             ).fetchone()
-        return bool(row and row[0] is not None)
+        return bool(row)
     except Exception:
         return False
 
 
 def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
     """
-    Ensures workflow runner process is running if any workflow_runs.status='running'.
+    Ensures workflow runner process is running when any workflow has work left
+    (status running, or failed with non-terminal enabled steps — runner will auto-resume).
     Returns: (started_or_running, message)
     """
     if str(os.getenv("DISABLE_WORKFLOW_AUTOSTART", "")).strip().lower() in {"1", "true", "yes", "y"}:

@@ -14622,10 +14622,14 @@ def page_workflow_automation():
             page_base = "?page=Workflow+Automation"
 
             def _btn(emoji, action, tooltip, enabled):
+                tt = html.escape(str(tooltip or ""), quote=True)
                 if enabled:
-                    # Removed target="_parent" as we are now in the main page (sandbox-free)
-                    return f'<a href="{page_base}&run_id={rid}&wf_action={action}" title="{tooltip}" style="{btn_style}" onclick="event.stopPropagation();">{emoji}</a>'
-                return f'<span title="{tooltip}" style="{disabled_style}">{emoji}</span>'
+                    # st.html runs in an iframe: navigate the top frame or links appear dead / greyed-out.
+                    return (
+                        f'<a href="{page_base}&run_id={rid}&wf_action={action}" title="{tt}" style="{btn_style}" '
+                        f'onclick="event.stopPropagation();try{{window.top.location.assign(this.href);}}catch(e){{window.location.href=this.href;}}return false;">{emoji}</a>'
+                    )
+                return f'<span title="{tt}" style="{disabled_style}">{emoji}</span>'
 
             can_start = rstatus in {"created", "stopped", "paused", "failed"}
             can_pause  = rstatus == "running"
