@@ -5655,6 +5655,98 @@ def load_scan_insight_classifier_hits_df(scan_id: str) -> Tuple[pd.DataFrame, st
         )
 
 
+def load_scan_insight_classifier_total_count_hint(scan_id: str) -> Optional[int]:
+    """
+    Best-effort totalCount hint from stored `scan_insights.attributes_payload`.
+    Falls back to parsed item count when totalCount is absent.
+    """
+    if not engine or not str(scan_id or "").strip():
+        return None
+    sid = str(scan_id).strip()
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT attributes_payload FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                {"sid": sid},
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        raw = row[0]
+        obj = raw if isinstance(raw, dict) else json.loads(str(raw))
+        if not isinstance(obj, dict):
+            return None
+        items, total_hint = extract_scan_attributes_payload(obj)
+        if total_hint is not None:
+            try:
+                return int(total_hint)
+            except Exception:
+                pass
+        return len(items) if isinstance(items, list) and items else None
+    except Exception:
+        return None
+
+
+def fetch_live_scan_classifier_hits_df(scan_id: str, env_row: Optional[Dict[str, Any]]) -> Tuple[pd.DataFrame, str, Optional[int]]:
+    """
+    Live one-shot fetch from BigID attributes API (same endpoint as Manual Sync).
+    Returns (df, note, total_count_hint).
+    """
+    empty = (pd.DataFrame(), "No live classifier hit rows.", None)
+    if not str(scan_id or "").strip() or not isinstance(env_row, dict):
+        return empty
+    base_url = str(env_row.get("base_url") or "").strip()
+    if not base_url:
+        return empty
+
+    try:
+        token = fetch_auth_token_for_env(env_row)
+        payload, api_url = fetch_parent_scan_attributes_from_api(base_url, str(scan_id).strip(), token, skip=0, limit=200)
+    except Exception as ex:
+        return pd.DataFrame(), f"Live attributes API fetch failed: {ex}", None
+
+    try:
+        items, total_hint = extract_scan_attributes_payload(payload if isinstance(payload, dict) else {})
+    except Exception:
+        items, total_hint = [], None
+    if not isinstance(items, list) or not items:
+        return pd.DataFrame(), "Live attributes API returned no rows.", total_hint
+
+    rows_out: List[Dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_id = item.get("_id") or item.get("id") or item.get("name")
+        if raw_id is None:
+            continue
+        label = str(raw_id).replace("classifier.", "").strip()
+        if not label:
+            continue
+        try:
+            n_new = int(item.get("new") or 0)
+        except Exception:
+            n_new = 0
+        try:
+            n_rem = int(item.get("removed") or 0)
+        except Exception:
+            n_rem = 0
+        rows_out.append(
+            {
+                "Classifier / attribute": label,
+                "New findings": n_new,
+                "Removed": n_rem,
+            }
+        )
+    if not rows_out:
+        return pd.DataFrame(), "Live attributes payload parsed but no classifier rows found.", total_hint
+
+    df = pd.DataFrame(rows_out).sort_values(["New findings", "Classifier / attribute"], ascending=[False, True])
+    note = f"Source: **live attributes API** · **{len(df)}** row(s)"
+    if total_hint is not None:
+        note += f" · totalCount={int(total_hint)}"
+    note += f" · `{api_url}`"
+    return df, note, total_hint
+
+
 def load_scan_insight_map_for_scan_ids(scan_ids):
     """
     Batch-load scan insight metrics for many scan ids in one query.
@@ -12374,7 +12466,8 @@ def page_scan_progress():
                             "prev_sid": prev_sid_cls,
                             "missing": [],
                             "new": [],
-                            "changed": []
+                            "changed": [],
+                            "top_delta_rows": []
                         }
                         
                         # Fetch and compare individual classifiers if available
@@ -12407,23 +12500,37 @@ def page_scan_progress():
                                 missing = []
                                 new_cls = []
                                 changed = []
+                                delta_rows = []
                                 all_keys = set(cur_dict.keys()).union(set(prev_dict.keys()))
                                 for k in sorted(all_keys):
-                                    c_val = cur_dict.get(k, 0)
-                                    p_val = prev_dict.get(k, 0)
+                                    c_val = int(cur_dict.get(k, 0) or 0)
+                                    p_val = int(prev_dict.get(k, 0) or 0)
                                     if p_val > 0 and c_val == 0:
                                         missing.append(k)
                                     elif c_val > 0 and p_val == 0:
                                         new_cls.append(k)
-                                    elif p_val > 0 and c_val > 0:
+                                    if p_val > 0 or c_val > 0:
+                                        diff_signed = c_val - p_val
+                                        diff_abs = abs(diff_signed)
+                                        if diff_abs > 0:
+                                            delta_rows.append((k, p_val, c_val, diff_signed, diff_abs))
+                                    if p_val > 0 and c_val > 0:
                                         diff = abs(c_val - p_val)
                                         pct = (diff / p_val) * 100.0
                                         if pct > 10.0 or diff > 100:
                                             changed.append(f"{k} ({p_val:,} -> {c_val:,})")
-                                
+
+                                delta_rows = sorted(delta_rows, key=lambda x: x[4], reverse=True)
+                                top_delta_rows = [
+                                    f"{nm} ({pv:,} -> {cv:,}, {sgn}{dv:,})"
+                                    for (nm, pv, cv, dv, _abs) in delta_rows[:5]
+                                    for sgn in (["+"] if dv > 0 else [""])
+                                ]
+
                                 cls_vs_prev["missing"] = missing
                                 cls_vs_prev["new"] = new_cls
                                 cls_vs_prev["changed"] = changed
+                                cls_vs_prev["top_delta_rows"] = top_delta_rows
                         except Exception:
                             pass
 
@@ -12908,11 +13015,17 @@ def page_scan_progress():
                     else:
                         st.caption("—")
                 with oc3:
-                    st.markdown("**Classifications & attributes**")
-                    if cls_lines:
-                        st.markdown("\n\n".join(f"- {line}" for line in cls_lines))
+                    st.markdown("**Classifications (summary)**")
+                    cls_compact = [
+                        x
+                        for x in cls_lines
+                        if "names from classifier" not in str(x).lower()
+                        and "parent-scan insight" not in str(x).lower()
+                    ]
+                    if cls_compact:
+                        st.markdown("\n\n".join(f"- {line}" for line in cls_compact))
                     else:
-                        st.caption("—")
+                        st.caption("See detailed classifier hits table below.")
                 if other_lines:
                     st.markdown("**Other**")
                     st.markdown("\n\n".join(f"- {line}" for line in other_lines))
@@ -12923,15 +13036,30 @@ def page_scan_progress():
         # Per-classifier / attribute hits (names + table) directly under Observations
         try:
             hits_df, hits_note = classifier_hits_df, classifier_hits_note
+            hits_total_hint = load_scan_insight_classifier_total_count_hint(str(scan_id))
+            if (hits_df is None or hits_df.empty):
+                # Fallback: call live attributes API once so users see real classifier counts even before tracker sync lands.
+                live_env = get_environment_row_for_scan_id(str(scan_id))
+                if live_env:
+                    _live_df, _live_note, _live_total = fetch_live_scan_classifier_hits_df(str(scan_id), live_env)
+                    if _live_df is not None and not _live_df.empty:
+                        hits_df = _live_df
+                        hits_note = _live_note
+                        hits_total_hint = _live_total
             st.markdown("### Classifier / attribute hits")
             st.caption(
-                "Rows come from `scan_insights.attributes_payload` (BigID scan **attributes** response). "
-                "**New findings** > 0 means that classifier/attribute had matches in this scan. "
-                "If the table is empty, names may still appear from the parent-scan **insight** JSON (see gray box)."
+                "Rows come from BigID attributes response (`type=classifier`). **New findings** is the classifier hit count in this scan."
             )
-            if hits_note:
-                st.caption(hits_note)
             if hits_df is not None and not hits_df.empty:
+                try:
+                    if hits_total_hint is not None:
+                        st.markdown(f"**Classifier totalCount:** **{int(hits_total_hint):,}**")
+                    else:
+                        st.markdown(f"**Classifiers returned:** **{int(len(hits_df)):,}**")
+                except Exception:
+                    pass
+                if hits_note:
+                    st.caption(hits_note)
                 try:
                     _hn = pd.to_numeric(hits_df["New findings"], errors="coerce").fillna(0)
                     _matched_only = hits_df[_hn > 0]["Classifier / attribute"].astype(str).str.strip()
@@ -12964,13 +13092,8 @@ def page_scan_progress():
                         hi = (_n * (ci + 1)) // 3
                         chunk = insight_payload_classifier_names[lo:hi]
                         col.markdown("\n".join(f"- `{x}`" for x in chunk) if chunk else "—")
-                st.info(
-                    hits_note
-                    or (
-                        "No **attributes** breakdown rows yet. Click **Sync now (manual)** to fetch per-classifier **New findings** counts. "
-                        "Until then, check **Observations → Classifications** for names from the insight snapshot (if BigID included them)."
-                    )
-                )
+                else:
+                    st.caption("No classifier rows available yet. Use **Sync now (manual)** or wait for tracker.")
         except Exception:
             pass
 
@@ -13051,7 +13174,27 @@ def page_scan_progress():
                     f"— {direction} by **{sign}{delta_v:,}** ({sign}{pct_v:.1f}%). "
                     f"Possible causes: changed classifier set, data drift, or classification regression.{thr_note}"
                 )
-                
+                top_delta_rows = cls_vs_prev.get("top_delta_rows", [])
+                if top_delta_rows:
+                    st.markdown("**Top classifier deltas (current vs previous):**")
+                    for _td in top_delta_rows:
+                        st.caption(f"- {_td}")
+                try:
+                    cur_tc_hint = load_scan_insight_classifier_total_count_hint(str(scan_id))
+                    prev_tc_hint = load_scan_insight_classifier_total_count_hint(str(prev_s))
+                    if cur_tc_hint is None:
+                        cur_tc_hint = len(classifier_hits_df) if classifier_hits_df is not None else None
+                    if prev_tc_hint is not None and cur_tc_hint is not None and int(prev_tc_hint) != int(cur_tc_hint):
+                        d_tc = int(cur_tc_hint) - int(prev_tc_hint)
+                        sign_tc = "+" if d_tc > 0 else ""
+                        st.warning(
+                            f"Classifier totalCount mismatch vs previous scan: "
+                            f"current **{int(cur_tc_hint):,}** vs previous **{int(prev_tc_hint):,}** "
+                            f"({sign_tc}{d_tc:,})."
+                        )
+                except Exception:
+                    pass
+
                 # Show classifier difference breakdown if available
                 missing = cls_vs_prev.get("missing", [])
                 new_cls = cls_vs_prev.get("new", [])
@@ -13320,8 +13463,8 @@ def page_scan_progress():
                 _scanner_i_for_progress_merge = df_perf_i.copy() if not df_perf_i.empty else pd.DataFrame()
 
                 _spm_has = not df_perf_g.empty or not df_perf_i.empty
-                # Open by default whenever we have samples so users don’t miss running-set vs all-pods behavior.
-                with st.expander("📊 Scanner Performance Metrics", expanded=bool(_spm_has) or bool(_spm_expand)):
+                # Keep this collapsed by default; users can expand when needed.
+                with st.expander("📊 Scanner Performance Metrics", expanded=False):
                     if not _spm_has:
                         st.caption(
                             "No **scanner_group_performance** / **scanner_individual_performance** in this window — "
