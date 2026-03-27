@@ -15211,6 +15211,20 @@ def page_workflow_automation():
     ensure_scan_progress_table()
     ensure_workflow_tables()
 
+    def _wf_env_int(val: Any, fallback: int) -> int:
+        """workflow_runs env ids from DataFrames may be float NaN; never pass those to int()."""
+        if val is None:
+            return fallback
+        try:
+            if pd.isna(val):
+                return fallback
+        except Exception:
+            pass
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return fallback
+
     _wf_flash = st.session_state.pop("wf_delete_flash", None)
     if _wf_flash:
         st.success(str(_wf_flash))
@@ -15292,7 +15306,7 @@ def page_workflow_automation():
     with st.expander("➕ Create New Workflow Run", expanded=False):
         # Detect which envs are used by currently-running workflows
         try:
-            with _engine.connect() as conn:
+            with engine.connect() as conn:
                 used_rows = conn.execute(text("""
                     SELECT DISTINCT ws.environment_id
                     FROM workflow_steps ws
@@ -15496,7 +15510,7 @@ def page_workflow_automation():
         # --- Pre-load env busy status for page-level indicator ---
         env_status_parts = []
         try:
-            with _engine.connect() as conn:
+            with engine.connect() as conn:
                 env_busy_rows = conn.execute(text(
                     "SELECT id, env_name, is_busy FROM test_environments WHERE is_active = 1 ORDER BY env_name"
                 )).fetchall()
@@ -15865,11 +15879,10 @@ def page_workflow_automation():
                 env_ids_ctrl = [int(r.id) for r in wf_pool_df.itertuples()]
 
             if env_ids_ctrl:
-                prev_e1 = int(rrow.get("env1_id")) if rrow.get("env1_id") else env_ids_ctrl[0]
-                prev_e2 = (
-                    int(rrow.get("env2_id"))
-                    if rrow.get("env2_id")
-                    else (env_ids_ctrl[1] if len(env_ids_ctrl) > 1 else prev_e1)
+                prev_e1 = _wf_env_int(rrow.get("env1_id"), env_ids_ctrl[0])
+                prev_e2 = _wf_env_int(
+                    rrow.get("env2_id"),
+                    env_ids_ctrl[1] if len(env_ids_ctrl) > 1 else prev_e1,
                 )
 
                 idx1 = env_ids_ctrl.index(prev_e1) if prev_e1 in env_ids_ctrl else 0
@@ -15904,7 +15917,7 @@ def page_workflow_automation():
                 _apply_run_envs(int(run_id), chosen_e1_id, chosen_e2_id)
                 set_workflow_run_status(int(run_id), "running")
                 try:
-                    if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
+                    if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(engine)
                 except Exception: pass
                 st.rerun()
             except Exception as ex:
@@ -15918,7 +15931,7 @@ def page_workflow_automation():
                 _apply_run_envs(int(run_id), chosen_e1_id, chosen_e2_id)
                 set_workflow_run_status(int(run_id), "running")
                 try:
-                    if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(_engine)
+                    if callable(ensure_workflow_runner_running): ensure_workflow_runner_running(engine)
                 except Exception: pass
                 st.rerun()
             except Exception as ex:
@@ -15991,7 +16004,7 @@ def page_workflow_automation():
             kind = st.session_state["wf_confirm_reset"]
             running_scan_steps = []
             try:
-                with _engine.connect() as conn:
+                with engine.connect() as conn:
                     rows = conn.execute(text("SELECT id, seq, status, scan_id, ds_name FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'') IN ('scan_running','scan_waiting') AND TRIM(COALESCE(scan_id,''))<>''"), {"rid": int(run_id)}).fetchall()
                     running_scan_steps = [{"seq": r[1], "scan_id": r[3], "ds_name": r[4]} for r in (rows or [])]
             except Exception: pass
@@ -16006,7 +16019,7 @@ def page_workflow_automation():
                 with rc1:
                     if st.button("Confirm reset", key="wf_reset_confirm"):
                         try:
-                            with _engine.connect() as conn:
+                            with engine.connect() as conn:
                                 if kind == "full":
                                     conn.execute(text("UPDATE workflow_steps SET status='pending', last_error=NULL, started_at=NULL, finished_at=NULL, scan_id=NULL, ds_id=NULL, scan_profile_id=NULL, scan_profile_name=NULL, updated_at=CURRENT_TIMESTAMP WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('completed','disabled')"), {"rid": int(run_id)})
                                 else:
@@ -16036,11 +16049,11 @@ def page_workflow_automation():
         if selected_is_running:
             try:
                 if callable(ensure_workflow_runner_running):
-                    ok, msg = ensure_workflow_runner_running(_engine)
+                    ok, msg = ensure_workflow_runner_running(engine)
                     st.caption(f"Runner: {msg}")
             except Exception: pass
             try:
-                with _engine.connect() as conn:
+                with engine.connect() as conn:
                     row = conn.execute(text("SELECT last_started_at_utc, last_finished_at_utc, last_status, last_message FROM tracker_heartbeat WHERE name='workflow_runner' LIMIT 1")).fetchone()
                 if row: st.caption(f"Runner heartbeat: status={row[2]} started={row[0]} finished={row[1]} msg={row[3]}")
             except Exception: pass
@@ -16093,7 +16106,7 @@ def page_workflow_automation():
                                     env_updates.append({"id": int(r["id"]), "env_id": int(env_map[str(r["Env"]).strip()])})
 
                             from sqlalchemy import bindparam
-                            with _engine.connect() as conn:
+                            with engine.connect() as conn:
                                 if disable_ids:
                                     conn.execute(text("UPDATE workflow_steps SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": disable_ids})
                                 if enable_ids:
