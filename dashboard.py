@@ -5788,6 +5788,457 @@ def load_scan_classifier_hits_map(scan_id: str) -> Dict[str, int]:
     return out
 
 
+def load_workflow_context_for_scan_id(sid: str) -> Dict[str, Any]:
+    """Latest workflow_steps row for a scan (scenario + build context)."""
+    if not engine or not str(sid or "").strip():
+        return {}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT ds_kind, file_set_type, is_acl, is_ols, is_structured_ff, build_version, environment_id\n"
+                    "FROM workflow_steps\n"
+                    "WHERE scan_id = :sid\n"
+                    "ORDER BY updated_at DESC, id DESC\n"
+                    "LIMIT 1"
+                ),
+                {"sid": str(sid).strip()},
+            ).fetchone()
+        if not row:
+            return {}
+        return {
+            "ds_kind": str(row[0] or "").strip(),
+            "file_set_type": (str(row[1]).strip() if row[1] is not None else None),
+            "is_acl": int(row[2] or 0),
+            "is_ols": int(row[3] or 0),
+            "is_structured_ff": int(row[4] or 0),
+            "build_version": str(row[5] or "").strip(),
+            "environment_id": (int(row[6]) if row[6] is not None else None),
+        }
+    except Exception:
+        return {}
+
+
+def _scan_progress_peak_row_for_report(scan_id: str) -> Dict[str, Any]:
+    """Peak / latest-style metrics from scan_progress for reporting."""
+    out: Dict[str, Any] = {}
+    if not engine or not str(scan_id or "").strip():
+        return out
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT "
+                    "MAX(CAST(COALESCE(objects_scanned, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(total_classifications, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(newly_added_classifications, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(false_removed_classifications, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(objects_with_pi, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(completed_parts, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(total_parts_scanned, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(failed_parts, 0) AS SIGNED)), "
+                    "MAX(CAST(COALESCE(objects_failed, 0) AS SIGNED)) "
+                    "FROM scan_progress WHERE scan_id = :sid"
+                ),
+                {"sid": str(scan_id).strip()},
+            ).fetchone()
+            if not row:
+                return out
+            out["objects_scanned_max"] = int(row[0] or 0)
+            out["total_classifications_max"] = int(row[1] or 0)
+            out["newly_added_max"] = int(row[2] or 0)
+            out["false_removed_max"] = int(row[3] or 0)
+            out["objects_with_pi_max"] = int(row[4] or 0)
+            out["completed_parts_max"] = int(row[5] or 0)
+            out["total_parts_max"] = int(row[6] or 0)
+            out["failed_parts_max"] = int(row[7] or 0)
+            out["objects_failed_max"] = int(row[8] or 0)
+            r2 = conn.execute(
+                text(
+                    "SELECT scan_state, captured_at_utc FROM scan_progress "
+                    "WHERE scan_id = :sid ORDER BY captured_at_utc DESC, id DESC LIMIT 1"
+                ),
+                {"sid": str(scan_id).strip()},
+            ).fetchone()
+            if r2:
+                out["latest_scan_state"] = str(r2[0] or "").strip()
+                out["latest_captured_at_utc"] = str(r2[1] or "").strip()
+    except Exception:
+        return {}
+    return out
+
+
+def find_peer_scans_same_build(cur_scan_id: str, build_version: str, *, limit: int = 12) -> List[Dict[str, Any]]:
+    """
+    Other scans on the same BigID build (workflow_steps), e.g. S3 vs SMB small-files runs.
+    """
+    if not engine:
+        return []
+    bv = str(build_version or "").strip()
+    cur = str(cur_scan_id or "").strip()
+    if not bv or not cur:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT scan_id, ds_kind, file_set_type, build_version, MAX(updated_at) AS mx "
+                    "FROM workflow_steps "
+                    "WHERE scan_id IS NOT NULL AND TRIM(scan_id) <> '' "
+                    "  AND scan_id <> :cur "
+                    "  AND build_version = :bv "
+                    "GROUP BY scan_id, ds_kind, file_set_type, build_version "
+                    "ORDER BY mx DESC "
+                    "LIMIT :lim"
+                ),
+                {"cur": cur, "bv": bv, "lim": int(limit)},
+            ).fetchall()
+        peers: List[Dict[str, Any]] = []
+        for r in rows or []:
+            peers.append(
+                {
+                    "scan_id": str(r[0] or "").strip(),
+                    "ds_kind": str(r[1] or "").strip(),
+                    "file_set_type": (str(r[2]).strip() if r[2] is not None else ""),
+                    "build_version": str(r[3] or "").strip(),
+                }
+            )
+        return peers
+    except Exception:
+        return []
+
+
+def build_scan_progress_manager_reports(
+    *,
+    scan_id: str,
+    display_name: str,
+    db_started_at: str,
+    db_completed_at: str,
+    cur_state: str,
+    cur_objects: int,
+    cur_parts_done: int,
+    cur_parts_total: int,
+    cur_failed_parts: int,
+    cur_objects_failed: int,
+    pct_parts: Optional[float],
+    files_per_min: Optional[float],
+    expected_total_files: Optional[Any],
+    lookup_key: str,
+    wf_ctx: Dict[str, Any],
+    cls_vs_prev: Dict[str, Any],
+    cls_new_removed_vs_prev: Dict[str, Any],
+    classifier_hits_df: Any,
+    classifier_hits_note: str,
+    narrative: str,
+    flags: List[str],
+    completion_lag_summary: str,
+    regression_warnings: List[str],
+    observations: List[str],
+) -> Tuple[str, str]:
+    """Return (markdown_report, csv_report) for manager sharing."""
+    import csv
+    from io import StringIO
+
+    sid = str(scan_id or "").strip()
+    now_s = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    title_name = (display_name or "").strip() or sid
+
+    def _fmt_num(v: Any) -> str:
+        try:
+            if v is None or (isinstance(v, float) and pd.isna(v)):
+                return ""
+            return f"{int(v):,}"
+        except Exception:
+            return str(v or "")
+
+    lines: List[str] = []
+    lines.append(f"# Scan status report — {title_name}")
+    lines.append("")
+    lines.append(f"- **Generated:** {now_s}")
+    lines.append(f"- **Scan ID:** `{sid}`")
+    lines.append(f"- **DB started:** `{db_started_at or '—'}`")
+    lines.append(f"- **DB completed:** `{db_completed_at or '—'}`")
+    lines.append(f"- **Latest state (snapshots):** `{cur_state or '—'}`")
+    lines.append("")
+
+    lines.append("## Scenario context (workflow)")
+    lines.append("")
+    if wf_ctx:
+        lines.append(f"- **ds_kind:** `{wf_ctx.get('ds_kind') or '—'}`")
+        lines.append(f"- **file_set_type:** `{wf_ctx.get('file_set_type') or '—'}`")
+        lines.append(f"- **build_version:** `{wf_ctx.get('build_version') or '—'}`")
+        lines.append(
+            f"- **flags:** acl={wf_ctx.get('is_acl', 0)}, ols={wf_ctx.get('is_ols', 0)}, structured_ff={wf_ctx.get('is_structured_ff', 0)}"
+        )
+        if wf_ctx.get("environment_id") is not None:
+            lines.append(f"- **environment_id:** `{wf_ctx.get('environment_id')}`")
+    else:
+        lines.append("_No workflow_steps row for this scan (scenario context unknown)._")
+    lines.append("")
+
+    lines.append("## Progress & throughput")
+    lines.append("")
+    lines.append(f"- **Objects scanned (latest):** {_fmt_num(cur_objects)}")
+    if expected_total_files is not None and str(expected_total_files).strip() != "":
+        try:
+            exp = int(expected_total_files)
+            short = max(0, exp - int(cur_objects or 0))
+            lk = str(lookup_key or "").strip()
+            lines.append(f"- **Expected objects:** {_fmt_num(exp)}" + (f" (`{lk}`)" if lk else ""))
+            lines.append(f"- **Object shortfall:** {_fmt_num(short)}")
+        except Exception:
+            pass
+    if pct_parts is not None:
+        lines.append(
+            f"- **Parts:** {_fmt_num(cur_parts_done)} / {_fmt_num(cur_parts_total)} ({pct_parts:.1f}%)"
+        )
+    else:
+        lines.append(f"- **Parts:** {_fmt_num(cur_parts_done)} / {_fmt_num(cur_parts_total)}")
+    lines.append(f"- **Failed parts:** {_fmt_num(cur_failed_parts)}")
+    lines.append(f"- **Objects failed:** {_fmt_num(cur_objects_failed)}")
+    if files_per_min is not None and files_per_min >= 0:
+        lines.append(f"- **Recent throughput (approx):** {files_per_min:,.1f} objects/min")
+    lines.append("")
+
+    lines.append("## Classification vs previous same scenario")
+    lines.append("")
+    if cls_vs_prev:
+        pv = cls_vs_prev.get("prev_sid", "")
+        lines.append(
+            f"- **Total classifications:** current **{_fmt_num(cls_vs_prev.get('cur'))}** vs previous **{_fmt_num(cls_vs_prev.get('prev'))}** "
+            f"(Δ {int(cls_vs_prev.get('delta') or 0):+,}, {float(cls_vs_prev.get('pct') or 0):.1f}% vs previous)"
+        )
+        lines.append(f"- **Previous scan:** `{pv}` (build `{cls_vs_prev.get('prev_build') or 'unknown'}`)")
+        miss = list(cls_vs_prev.get("missing") or [])
+        new_c = list(cls_vs_prev.get("new") or [])
+        if miss:
+            lines.append(f"- **Missing in current (were in previous):** {', '.join(miss)}")
+        if new_c:
+            lines.append(f"- **Only in current:** {', '.join(new_c)}")
+        top = cls_vs_prev.get("top_delta_rows") or []
+        if top:
+            lines.append("- **Top classifier deltas (prev → current):**")
+            for t in top:
+                lines.append(f"  - {t}")
+    else:
+        lines.append("_No flagged total-classifications delta vs previous (threshold not met or no previous scan)._")
+    lines.append("")
+
+    lines.append("## Newly added / removed classifications vs previous")
+    lines.append("")
+    if cls_new_removed_vs_prev:
+        cn = int(cls_new_removed_vs_prev.get("cur_new", 0) or 0)
+        pn = int(cls_new_removed_vs_prev.get("prev_new", 0) or 0)
+        dn = int(cls_new_removed_vs_prev.get("d_new", 0) or 0)
+        cr = int(cls_new_removed_vs_prev.get("cur_removed", 0) or 0)
+        pr = int(cls_new_removed_vs_prev.get("prev_removed", 0) or 0)
+        dr = int(cls_new_removed_vs_prev.get("d_removed", 0) or 0)
+        lines.append(
+            f"- **Newly added:** {cn:,} vs {pn:,} (Δ {dn:+,}) — previous scan `{cls_new_removed_vs_prev.get('prev_sid', '')}`"
+        )
+        lines.append(f"- **Removed (false removed):** {cr:,} vs {pr:,} (Δ {dr:+,})")
+    else:
+        lines.append("_Not available (no previous same-scenario scan or metrics missing)._")
+    lines.append("")
+
+    lines.append("## Classifier / attribute hits (snapshot)")
+    lines.append("")
+    if classifier_hits_note:
+        lines.append(classifier_hits_note.replace("**", ""))
+        lines.append("")
+    try:
+        dfh = classifier_hits_df
+        if dfh is not None and not getattr(dfh, "empty", True):
+            show = dfh.copy()
+            if "New findings" in show.columns and "Removed" in show.columns:
+                show = show[(pd.to_numeric(show["New findings"], errors="coerce").fillna(0) > 0) | (pd.to_numeric(show["Removed"], errors="coerce").fillna(0) > 0)]
+            show = show.head(25)
+            lines.append("| Classifier | New | Removed |")
+            lines.append("| --- | ---: | ---: |")
+            for rec in show.to_dict(orient="records"):
+                nm = str(rec.get("Classifier / attribute") or "").replace("|", "\\|")
+                nw = _fmt_num(rec.get("New findings"))
+                rm = _fmt_num(rec.get("Removed"))
+                lines.append(f"| {nm} | {nw} | {rm} |")
+        else:
+            lines.append("_No classifier hit rows in DB; use Sync now on Scan Progress to refresh attributes._")
+    except Exception:
+        lines.append("_Could not render classifier hit table._")
+    lines.append("")
+
+    lines.append("## Same-build peer scans (e.g. S3 vs SMB)")
+    lines.append("")
+    bv = str((wf_ctx or {}).get("build_version") or "").strip()
+    peers = find_peer_scans_same_build(sid, bv, limit=12) if bv else []
+    peer_rows_csv: List[List[Any]] = []
+    if bv:
+        self_agg = _scan_progress_peak_row_for_report(sid)
+        lines.append("### This scan (reference)")
+        lines.append("")
+        lines.append("| Scan ID | ds_kind | file_set_type | objects (max) | classifications (max) | latest state |")
+        lines.append("| --- | --- | --- | ---: | ---: | --- |")
+        lines.append(
+            f"| `{sid}` | {(wf_ctx or {}).get('ds_kind') or '—'} | {(wf_ctx or {}).get('file_set_type') or '—'} | "
+            f"{_fmt_num(self_agg.get('objects_scanned_max'))} | {_fmt_num(self_agg.get('total_classifications_max'))} | "
+            f"`{self_agg.get('latest_scan_state') or cur_state or '—'}` |"
+        )
+        lines.append("")
+    if peers:
+        lines.append("### Other scans (same `build_version`)")
+        lines.append("")
+        lines.append("| Scan ID | ds_kind | file_set_type | objects (max) | classifications (max) | latest state |")
+        lines.append("| --- | --- | --- | ---: | ---: | --- |")
+        for p in peers:
+            pk = str(p.get("scan_id") or "").strip()
+            if not pk:
+                continue
+            agg = _scan_progress_peak_row_for_report(pk)
+            lines.append(
+                f"| `{pk}` | {p.get('ds_kind') or '—'} | {p.get('file_set_type') or '—'} | "
+                f"{_fmt_num(agg.get('objects_scanned_max'))} | {_fmt_num(agg.get('total_classifications_max'))} | "
+                f"`{agg.get('latest_scan_state') or '—'}` |"
+            )
+            peer_rows_csv.append(
+                [
+                    pk,
+                    p.get("ds_kind"),
+                    p.get("file_set_type"),
+                    agg.get("objects_scanned_max"),
+                    agg.get("total_classifications_max"),
+                    agg.get("newly_added_max"),
+                    agg.get("false_removed_max"),
+                    agg.get("latest_scan_state"),
+                ]
+            )
+    elif bv:
+        lines.append("_No other scans found for this `build_version` in workflow_steps (only this scan listed above)._")
+    else:
+        lines.append("_Build version unknown — cannot list peer runs for cross-scenario comparison._")
+    lines.append("")
+
+    lines.append("## Risks & notes")
+    lines.append("")
+    lines.append(narrative or "_—_")
+    lines.append("")
+    if completion_lag_summary:
+        lines.append(f"- **Completion lag:** {completion_lag_summary}")
+    if flags:
+        lines.append("- **Flags:**")
+        for fl in flags:
+            lines.append(f"  - {fl}")
+    if regression_warnings:
+        lines.append("- **Regression warnings:**")
+        for rw in regression_warnings:
+            lines.append(f"  - {rw}")
+    if observations:
+        lines.append("- **Other observations:**")
+        for ob in observations[:40]:
+            lines.append(f"  - {ob}")
+    lines.append("")
+    lines.append("---")
+    lines.append("_End of report_")
+
+    md = "\n".join(lines)
+
+    buf = StringIO()
+    cw = csv.writer(buf)
+    cur_agg = _scan_progress_peak_row_for_report(sid)
+    cw.writerow(["PRIMARY_SCAN"])
+    cw.writerow(
+        [
+            "scan_id",
+            "display_name",
+            "ds_kind",
+            "file_set_type",
+            "build_version",
+            "latest_state",
+            "objects_scanned_latest",
+            "expected_objects",
+            "object_shortfall",
+            "parts_done",
+            "parts_total",
+            "failed_parts",
+            "objects_failed",
+            "throughput_objects_per_min",
+            "total_classifications_max",
+            "newly_added_max",
+            "false_removed_max",
+            "objects_with_pi_max",
+            "prev_scan_id",
+            "prev_total_classifications",
+            "delta_total_classifications",
+            "missing_classifiers",
+            "only_in_current_classifiers",
+            "vs_prev_newly_added_cur",
+            "vs_prev_newly_added_prev",
+            "vs_prev_newly_added_delta",
+            "vs_prev_removed_cur",
+            "vs_prev_removed_prev",
+            "vs_prev_removed_delta",
+            "vs_prev_new_removed_prev_scan_id",
+        ]
+    )
+    try:
+        exp_o = int(expected_total_files) if expected_total_files is not None and str(expected_total_files).strip() != "" else ""
+        shf = max(0, int(exp_o) - int(cur_objects or 0)) if exp_o != "" else ""
+    except Exception:
+        exp_o, shf = "", ""
+    _nr = cls_new_removed_vs_prev or {}
+    cw.writerow(
+        [
+            sid,
+            title_name,
+            (wf_ctx or {}).get("ds_kind"),
+            (wf_ctx or {}).get("file_set_type"),
+            (wf_ctx or {}).get("build_version"),
+            cur_state,
+            cur_objects,
+            exp_o,
+            shf,
+            cur_parts_done,
+            cur_parts_total,
+            cur_failed_parts,
+            cur_objects_failed,
+            f"{files_per_min:.4f}" if files_per_min is not None else "",
+            cur_agg.get("total_classifications_max"),
+            cur_agg.get("newly_added_max"),
+            cur_agg.get("false_removed_max"),
+            cur_agg.get("objects_with_pi_max"),
+            (cls_vs_prev or {}).get("prev_sid"),
+            (cls_vs_prev or {}).get("prev"),
+            (cls_vs_prev or {}).get("delta"),
+            ";".join(cls_vs_prev.get("missing") or []) if cls_vs_prev else "",
+            ";".join(cls_vs_prev.get("new") or []) if cls_vs_prev else "",
+            _nr.get("cur_new"),
+            _nr.get("prev_new"),
+            _nr.get("d_new"),
+            _nr.get("cur_removed"),
+            _nr.get("prev_removed"),
+            _nr.get("d_removed"),
+            _nr.get("prev_sid"),
+        ]
+    )
+    cw.writerow([])
+    cw.writerow(["SAME_BUILD_PEER_SCANS"])
+    cw.writerow(
+        [
+            "scan_id",
+            "ds_kind",
+            "file_set_type",
+            "objects_scanned_max",
+            "total_classifications_max",
+            "newly_added_max",
+            "false_removed_max",
+            "latest_scan_state",
+        ]
+    )
+    for pr in peer_rows_csv:
+        cw.writerow(pr)
+    csv_text = buf.getvalue()
+
+    return md, csv_text
+
+
 def load_scan_insight_map_for_scan_ids(scan_ids):
     """
     Batch-load scan insight metrics for many scan ids in one query.
@@ -12482,11 +12933,49 @@ def page_scan_progress():
 
     # total_classifications discrepancy vs previous scan for same scenario
     cls_vs_prev: dict = {}  # keys: cur, prev, delta, pct, prev_build, prev_sid
+    cls_new_removed_vs_prev: dict = {}  # keys: cur_new, prev_new, d_new, cur_removed, prev_removed, d_removed
     try:
         if engine and cur_max_cls > 0:
             ctx = _wf_ctx_for_scan(str(scan_id))
             prev_sid_cls, prev_build_cls = _find_prev_scan(ctx or {}, str(scan_id))
             if prev_sid_cls:
+                try:
+                    with engine.connect() as _conn_nr:
+                        cur_nr_row = _conn_nr.execute(
+                            text(
+                                "SELECT "
+                                "MAX(CAST(COALESCE(newly_added_classifications, 0) AS SIGNED)) AS cur_new, "
+                                "MAX(CAST(COALESCE(false_removed_classifications, 0) AS SIGNED)) AS cur_removed "
+                                "FROM scan_progress WHERE scan_id = :sid"
+                            ),
+                            {"sid": str(scan_id)},
+                        ).fetchone()
+                        prev_nr_row = _conn_nr.execute(
+                            text(
+                                "SELECT "
+                                "MAX(CAST(COALESCE(newly_added_classifications, 0) AS SIGNED)) AS prev_new, "
+                                "MAX(CAST(COALESCE(false_removed_classifications, 0) AS SIGNED)) AS prev_removed "
+                                "FROM scan_progress WHERE scan_id = :sid"
+                            ),
+                            {"sid": str(prev_sid_cls)},
+                        ).fetchone()
+                    cur_new = int(cur_nr_row[0] or 0) if cur_nr_row else 0
+                    cur_removed = int(cur_nr_row[1] or 0) if cur_nr_row else 0
+                    prev_new = int(prev_nr_row[0] or 0) if prev_nr_row else 0
+                    prev_removed = int(prev_nr_row[1] or 0) if prev_nr_row else 0
+                    cls_new_removed_vs_prev = {
+                        "cur_new": cur_new,
+                        "prev_new": prev_new,
+                        "d_new": cur_new - prev_new,
+                        "cur_removed": cur_removed,
+                        "prev_removed": prev_removed,
+                        "d_removed": cur_removed - prev_removed,
+                        "prev_build": prev_build_cls or "unknown",
+                        "prev_sid": prev_sid_cls,
+                    }
+                except Exception:
+                    cls_new_removed_vs_prev = {}
+
                 try:
                     with engine.connect() as _conn:
                         prev_cls_row = _conn.execute(
@@ -12998,6 +13487,72 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
+    # Manager report: Markdown + CSV (same-build peer rows help compare S3 vs SMB scenarios).
+    try:
+        wf_ctx_report = load_workflow_context_for_scan_id(str(scan_id))
+        _rep_obs: List[str] = []
+        for _o in observations or []:
+            _s = str(_o).strip()
+            if not _s:
+                continue
+            if _s.startswith("Objects scanned:") or _s.startswith("Object shortfall:"):
+                continue
+            _rep_obs.append(_s)
+        _rep_obs = _rep_obs[:45]
+        _md_rep, _csv_rep = build_scan_progress_manager_reports(
+            scan_id=str(scan_id),
+            display_name=str(display_name or db_name or ""),
+            db_started_at=str(db_started_at or ""),
+            db_completed_at=str(db_completed_at or ""),
+            cur_state=str(cur_state or ""),
+            cur_objects=int(cur_objects or 0),
+            cur_parts_done=int(cur_parts_done or 0),
+            cur_parts_total=int(cur_parts_total or 0),
+            cur_failed_parts=int(cur_failed_parts or 0),
+            cur_objects_failed=int(cur_objects_failed or 0),
+            pct_parts=pct_parts,
+            files_per_min=files_per_min,
+            expected_total_files=expected_total_files,
+            lookup_key=str(lookup_key or ""),
+            wf_ctx=wf_ctx_report,
+            cls_vs_prev=cls_vs_prev or {},
+            cls_new_removed_vs_prev=cls_new_removed_vs_prev or {},
+            classifier_hits_df=classifier_hits_df,
+            classifier_hits_note=str(classifier_hits_note or ""),
+            narrative=str(narrative or ""),
+            flags=list(flags or []),
+            completion_lag_summary=str(completion_lag_summary or ""),
+            regression_warnings=list(regression_warnings or []),
+            observations=_rep_obs,
+        )
+        _fn_ts = datetime.utcnow().strftime("%Y%m%d_%H%MUTC")
+        _fn_safe = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(scan_id).strip())[:48]
+        _fn_base = f"scan_manager_report_{_fn_safe}_{_fn_ts}"
+        st.markdown("### Manager report")
+        st.caption(
+            "Download a Markdown summary for email or docs, or CSV for spreadsheet compare. "
+            "The Markdown **Same-build** section lists other scans on this BigID build (e.g. S3 vs SMB small files) when workflow history exists."
+        )
+        _dc1, _dc2 = st.columns(2)
+        with _dc1:
+            st.download_button(
+                "Download report (.md)",
+                data=_md_rep.encode("utf-8"),
+                file_name=_fn_base + ".md",
+                mime="text/markdown",
+                key=f"mgr_md_{_fn_safe}",
+            )
+        with _dc2:
+            st.download_button(
+                "Download compare (.csv)",
+                data=_csv_rep.encode("utf-8"),
+                file_name=_fn_base + ".csv",
+                mime="text/csv",
+                key=f"mgr_csv_{_fn_safe}",
+            )
+    except Exception as _mgr_ex:
+        st.caption(f"Manager report export unavailable: {_mgr_ex}")
+
     # Always-visible object progress summary (outside expander).
     try:
         if expected_total_files is not None and str(expected_total_files).strip() != "":
@@ -13322,6 +13877,42 @@ def page_scan_progress():
                             st.markdown("**Significantly Changed ( >10% or >100 diff ):**")
                             for c in changed:
                                 st.caption(f"- 🟡 {c}")
+        except Exception:
+            pass
+
+        # Compare newly-added/removed classifications vs previous scan for same scenario.
+        try:
+            if cls_new_removed_vs_prev:
+                _nr_prev_bld = cls_new_removed_vs_prev.get("prev_build", "unknown")
+                _nr_prev_sid = cls_new_removed_vs_prev.get("prev_sid", "")
+                _cur_new = int(cls_new_removed_vs_prev.get("cur_new", 0) or 0)
+                _prev_new = int(cls_new_removed_vs_prev.get("prev_new", 0) or 0)
+                _d_new = int(cls_new_removed_vs_prev.get("d_new", 0) or 0)
+                _cur_rem = int(cls_new_removed_vs_prev.get("cur_removed", 0) or 0)
+                _prev_rem = int(cls_new_removed_vs_prev.get("prev_removed", 0) or 0)
+                _d_rem = int(cls_new_removed_vs_prev.get("d_removed", 0) or 0)
+                _s_new = "+" if _d_new > 0 else ""
+                _s_rem = "+" if _d_rem > 0 else ""
+                def _delta_color(v: int) -> str:
+                    if v > 0:
+                        return "#1b5e20"  # green
+                    if v < 0:
+                        return "#c62828"  # red
+                    return "#616161"      # neutral gray
+
+                _new_color = _delta_color(_d_new)
+                _rem_color = _delta_color(_d_rem)
+                st.markdown(
+                    (
+                        f"**Newly added / removed classifications vs previous scan** "
+                        f"(same scenario type, build `{_nr_prev_bld}`, scan `{_nr_prev_sid}`): "
+                        f"newly added **{_cur_new:,}** vs **{_prev_new:,}** "
+                        f"(<span style='color:{_new_color};font-weight:700'>{_s_new}{_d_new:,}</span>), "
+                        f"removed **{_cur_rem:,}** vs **{_prev_rem:,}** "
+                        f"(<span style='color:{_rem_color};font-weight:700'>{_s_rem}{_d_rem:,}</span>)."
+                    ),
+                    unsafe_allow_html=True,
+                )
         except Exception:
             pass
 
