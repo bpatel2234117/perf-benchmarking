@@ -13487,7 +13487,10 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
-    # Manager report: Markdown + CSV (same-build peer rows help compare S3 vs SMB scenarios).
+    # Markdown report payload for download inside Analysis expander (no separate section / no CSV).
+    _md_rep: Optional[str] = None
+    _fn_base = ""
+    _fn_safe_key = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(scan_id).strip())[:48]
     try:
         wf_ctx_report = load_workflow_context_for_scan_id(str(scan_id))
         _rep_obs: List[str] = []
@@ -13499,7 +13502,7 @@ def page_scan_progress():
                 continue
             _rep_obs.append(_s)
         _rep_obs = _rep_obs[:45]
-        _md_rep, _csv_rep = build_scan_progress_manager_reports(
+        _md_rep, _ = build_scan_progress_manager_reports(
             scan_id=str(scan_id),
             display_name=str(display_name or db_name or ""),
             db_started_at=str(db_started_at or ""),
@@ -13526,32 +13529,10 @@ def page_scan_progress():
             observations=_rep_obs,
         )
         _fn_ts = datetime.utcnow().strftime("%Y%m%d_%H%MUTC")
-        _fn_safe = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(scan_id).strip())[:48]
-        _fn_base = f"scan_manager_report_{_fn_safe}_{_fn_ts}"
-        st.markdown("### Manager report")
-        st.caption(
-            "Download a Markdown summary for email or docs, or CSV for spreadsheet compare. "
-            "The Markdown **Same-build** section lists other scans on this BigID build (e.g. S3 vs SMB small files) when workflow history exists."
-        )
-        _dc1, _dc2 = st.columns(2)
-        with _dc1:
-            st.download_button(
-                "Download report (.md)",
-                data=_md_rep.encode("utf-8"),
-                file_name=_fn_base + ".md",
-                mime="text/markdown",
-                key=f"mgr_md_{_fn_safe}",
-            )
-        with _dc2:
-            st.download_button(
-                "Download compare (.csv)",
-                data=_csv_rep.encode("utf-8"),
-                file_name=_fn_base + ".csv",
-                mime="text/csv",
-                key=f"mgr_csv_{_fn_safe}",
-            )
-    except Exception as _mgr_ex:
-        st.caption(f"Manager report export unavailable: {_mgr_ex}")
+        _fn_base = f"scan_manager_report_{_fn_safe_key}_{_fn_ts}"
+    except Exception:
+        _md_rep = None
+        _fn_base = ""
 
     # Always-visible object progress summary (outside expander).
     try:
@@ -13570,7 +13551,7 @@ def page_scan_progress():
         pass
 
     with st.expander("🧠 Analysis (stats + narrative)", expanded=True):
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m_dl = st.columns([1, 1, 1, 1, 1, 1.05])
         m1.metric("Objects scanned", f"{cur_objects:,}")
         m2.metric("Parts progress", f"{(pct_parts or 0):.1f}%" if pct_parts is not None else "N/A")
         m3.metric("Failed parts", f"{cur_failed_parts:,}")
@@ -13603,6 +13584,17 @@ def page_scan_progress():
         except Exception:
             runtime_str = 'N/A'
         m5.metric("Scan time (so far)", runtime_str)
+        with m_dl:
+            st.markdown('<div style="height:1.6rem"></div>', unsafe_allow_html=True)
+            if _md_rep is not None and _fn_base:
+                st.download_button(
+                    "Download Report (md)",
+                    data=_md_rep.encode("utf-8"),
+                    file_name=_fn_base + ".md",
+                    mime="text/markdown",
+                    key=f"dl_md_{_fn_safe_key}",
+                    use_container_width=True,
+                )
 
         st.divider()
         # Observations first so the three-column summary sits directly above Classifier / attribute hits (table + names).
