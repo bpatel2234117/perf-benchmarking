@@ -6244,6 +6244,95 @@ def build_scan_progress_manager_reports(
     return md, csv_text
 
 
+def _enrich_scan_insight_row_from_payload(row: Dict[str, Any], raw_payload: Any) -> Dict[str, Any]:
+    """When denormalized scan_insights columns are empty, fill from stored insight JSON (tracker/sync)."""
+    out = dict(row)
+    if not raw_payload:
+        return out
+    try:
+        if isinstance(raw_payload, (bytes, bytearray)):
+            raw_payload = raw_payload.decode("utf-8", "ignore")
+        if isinstance(raw_payload, str):
+            s = raw_payload.strip()
+            if not s:
+                return out
+            ip_obj = json.loads(s)
+        elif isinstance(raw_payload, dict):
+            ip_obj = raw_payload
+        else:
+            return out
+    except Exception:
+        return out
+    try:
+        mx = extract_scan_insight_metrics(ip_obj)
+    except Exception:
+        return out
+
+    def _blank_txt(v: Any) -> bool:
+        return v is None or str(v).strip() == ""
+
+    if _blank_txt(out.get("classifier_attribute_names")):
+        out["classifier_attribute_names"] = str(mx.get("classifier_attribute_names") or "").strip()
+    if _blank_txt(out.get("data_source_names")):
+        out["data_source_names"] = str(mx.get("data_source_names") or "").strip()
+    if out.get("distinct_classification_attributes") is None:
+        dca = mx.get("distinct_classification_attributes")
+        if dca is not None and str(dca).strip() != "":
+            try:
+                out["distinct_classification_attributes"] = int(dca)
+            except Exception:
+                pass
+    for kdb, kmx in (
+        ("objects_with_pi", "objects_with_pi"),
+        ("objects_scanned", "objects_scanned"),
+        ("objects_enumerated", "objects_enumerated"),
+        ("total_classification", "total_classification"),
+    ):
+        if out.get(kdb) is None:
+            v = mx.get(kmx)
+            if v is not None and str(v).strip() != "":
+                try:
+                    out[kdb] = int(float(v))
+                except Exception:
+                    pass
+    return out
+
+
+def _merge_scan_progress_into_insight_row(row: Dict[str, Any], prog: Dict[str, Any]) -> Dict[str, Any]:
+    """Fill missing counters from latest scan_progress (tracker snapshots)."""
+    out = dict(row)
+
+    def _to_int(v: Any) -> Optional[int]:
+        if v is None or (isinstance(v, str) and str(v).strip() == ""):
+            return None
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    if out.get("objects_scanned") is None:
+        v = _to_int(prog.get("objects_scanned"))
+        if v is not None:
+            out["objects_scanned"] = v
+    if out.get("objects_with_pi") is None:
+        v = _to_int(prog.get("objects_with_pi"))
+        if v is not None:
+            out["objects_with_pi"] = v
+    if out.get("total_classification") is None:
+        v = _to_int(prog.get("total_classifications"))
+        if v is not None:
+            out["total_classification"] = v
+    if out.get("new_attributes_count") is None:
+        v = _to_int(prog.get("newly_added_classifications"))
+        if v is not None:
+            out["new_attributes_count"] = v
+    if out.get("removed_attributes_count") is None:
+        v = _to_int(prog.get("false_removed_classifications"))
+        if v is not None:
+            out["removed_attributes_count"] = v
+    return out
+
+
 def load_scan_insight_map_for_scan_ids(scan_ids):
     """
     Batch-load scan insight metrics for many scan ids in one query.
@@ -6274,7 +6363,8 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                     total_classification,
                     new_attributes_count,
                     removed_attributes_count,
-                    total_size_gb
+                    total_size_gb,
+                    insight_payload
                 FROM scan_insights
                 WHERE scan_id IN :ids
             """).bindparams(bindparam("ids", expanding=True)), {"ids": cleaned_ids}).fetchall()
@@ -6366,6 +6456,41 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                 "removed_attributes_count": _pick_count(d_removed, si_removed_i, p_removed),
                 "total_size_gb": float(r[10]) if r[10] is not None and str(r[10]).strip() != "" else None,
             }
+            result[sid] = _enrich_scan_insight_row_from_payload(result[sid], r[11] if len(r) > 11 else None)
+
+        try:
+            prog_full = load_latest_scan_progress_map_for_scan_ids(cleaned_ids)
+        except Exception:
+            prog_full = {}
+        for sid in cleaned_ids:
+            if sid not in prog_full:
+                continue
+            if sid not in result:
+                result[sid] = {
+                    "distinct_classification_attributes": None,
+                    "classifier_attribute_names": "",
+                    "data_source_names": "",
+                    "objects_with_pi": None,
+                    "objects_scanned": None,
+                    "objects_enumerated": None,
+                    "total_classification": None,
+                    "new_attributes_count": None,
+                    "removed_attributes_count": None,
+                    "total_size_gb": None,
+                }
+                d_new2, d_removed2 = (delta_map.get(sid) or (0, 0))
+                p_new2, p_removed2 = (progress_map.get(sid) or (0, 0))
+
+                def _pick_count2(delta_val: int, prog_val: int):
+                    if int(delta_val or 0) > 0:
+                        return int(delta_val)
+                    if int(prog_val or 0) > 0:
+                        return int(prog_val)
+                    return None
+
+                result[sid]["new_attributes_count"] = _pick_count2(d_new2, p_new2)
+                result[sid]["removed_attributes_count"] = _pick_count2(d_removed2, p_removed2)
+            result[sid] = _merge_scan_progress_into_insight_row(result[sid], prog_full[sid])
     except Exception:
         return {}
     return result
@@ -9072,16 +9197,21 @@ def page_scan_status():
         if load_insights and scan_id:
             db_metrics = db_insight_map.get(scan_id)
             if db_metrics:
+                # dict.get(k, default) returns None when key exists with value None — normalize for display.
+                def _im_val(d: dict, k: str, dflt: str = ""):
+                    v = d.get(k)
+                    return dflt if v is None else v
+
                 insight_metrics.update({
-                    "distinct_classification_attributes": db_metrics.get("distinct_classification_attributes", ""),
-                    "classifier_attribute_names": db_metrics.get("classifier_attribute_names", ""),
-                    "data_source_names": db_metrics.get("data_source_names", ""),
-                    "objects_with_pi": db_metrics.get("objects_with_pi", ""),
-                    "objects_scanned": db_metrics.get("objects_scanned", ""),
-                    "objects_enumerated": db_metrics.get("objects_enumerated", ""),
-                    "total_classification": db_metrics.get("total_classification", ""),
-                    "new_attributes_count": db_metrics.get("new_attributes_count", ""),
-                    "removed_attributes_count": db_metrics.get("removed_attributes_count", ""),
+                    "distinct_classification_attributes": _im_val(db_metrics, "distinct_classification_attributes", ""),
+                    "classifier_attribute_names": _im_val(db_metrics, "classifier_attribute_names", ""),
+                    "data_source_names": _im_val(db_metrics, "data_source_names", ""),
+                    "objects_with_pi": _im_val(db_metrics, "objects_with_pi", ""),
+                    "objects_scanned": _im_val(db_metrics, "objects_scanned", ""),
+                    "objects_enumerated": _im_val(db_metrics, "objects_enumerated", ""),
+                    "total_classification": _im_val(db_metrics, "total_classification", ""),
+                    "new_attributes_count": _im_val(db_metrics, "new_attributes_count", ""),
+                    "removed_attributes_count": _im_val(db_metrics, "removed_attributes_count", ""),
                 })
 
         started_at = scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt")
