@@ -463,17 +463,22 @@ def load_data(include_inactive=False):
         has_total_classification = False
         has_removed_attributes = False
 
-    # Pull totals from scan_insights when available, without requiring benchmarks schema changes.
-    # If benchmarks has its own columns, prefer them but fall back to scan_insights.
+    # Classification columns: prefer non-null scan_insights (tracker/sync) over benchmark copies.
+    # Reason: "Save Benchmark Run" often stores total_catalog_items=0 when the form default was 0;
+    # COALESCE(b, si) also wrongly keeps benchmark 0 when si has the real counts after sync.
     total_class_expr = (
-        "COALESCE(b.total_classification, si.total_classification) as Total_Classification"
+        "CASE WHEN si.total_classification IS NOT NULL THEN si.total_classification ELSE b.total_classification END as Total_Classification"
         if has_total_classification
         else "si.total_classification as Total_Classification"
     )
     removed_attr_expr = (
-        "COALESCE(b.removed_attributes, si.removed_attributes_count) as Removed_Attributes"
+        "CASE WHEN si.removed_attributes_count IS NOT NULL THEN si.removed_attributes_count ELSE b.removed_attributes END as Removed_Attributes"
         if has_removed_attributes
         else "si.removed_attributes_count as Removed_Attributes"
+    )
+    # New attributes: benchmarks.total_catalog_items is the manual field; overlay si when populated.
+    new_attr_expr = (
+        "CASE WHEN si.new_attributes_count IS NOT NULL THEN si.new_attributes_count ELSE b.total_catalog_items END as New_Attributes"
     )
 
     query = f"""
@@ -492,7 +497,7 @@ def load_data(include_inactive=False):
             b.total_files as Total_Files,
             b.total_folders as Total_Folders,
             b.total_size_gb as Total_Size_GB,
-            b.total_catalog_items as New_Attributes,
+            {new_attr_expr},
             {total_class_expr},
             {removed_attr_expr},
             b.throughput_cluster_gb_hr,
