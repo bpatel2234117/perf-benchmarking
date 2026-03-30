@@ -1318,6 +1318,19 @@ def set_step_status(engine, step_id: int, status: str, **fields: Any) -> None:
         conn.commit()
 
 
+def touch_step_updated_at(engine, step_id: int) -> None:
+    """Bump updated_at only. Pass 1 must refresh liveness while status stays scan_running, or global stale cleanup resets long scans."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE workflow_steps SET updated_at=CURRENT_TIMESTAMP WHERE id=:id"),
+                {"id": int(step_id)},
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def ensure_runner_heartbeat_table(engine) -> None:
     """
     Ensure tracker_heartbeat exists so the runner can report liveness + last action.
@@ -2395,22 +2408,6 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         return False
     now = _now_utc()
 
-    # --- PASS 0: GLOBAL STALE STEP RECONCILIATION ---
-    # Recover steps stuck in 'scan_running' from ANY run if they haven't been updated in > 2 hours.
-    # This prevents old hung runs from blocking new ones via avoid_parallel scenario locks.
-    try:
-        with engine.connect() as conn:
-            stale_steps = conn.execute(
-                text("SELECT id, run_id, seq, scan_id FROM workflow_steps WHERE status='scan_running' AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 HOUR)")
-            ).fetchall()
-        for ss in stale_steps:
-            ss_id, ss_rid, ss_seq, ss_sid = ss
-            # Mark as error/pending so it's not blocking parallelism
-            set_step_status(engine, ss_id, "pending", scan_id=None, last_error="Global stale cleanup: step was stuck in scan_running for > 2h")
-            logger.info("global_cleanup: reset stale step_id=%s run_id=%s seq=%s", ss_id, ss_rid, ss_seq)
-    except Exception as ex:
-        logger.error("Pass 0 error: %s", ex)
-
     with engine.connect() as conn:
         run_rows = conn.execute(
             text("""
@@ -2602,6 +2599,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                             # Not terminal, just keep as scan_running
                             if st_status != "scan_running":
                                 set_step_status(engine, step_id, "scan_running")
+                            else:
+                                touch_step_updated_at(engine, step_id)
                             if env_id is not None:
                                 inflight_envs.add(int(env_id))
                         continue
@@ -2611,6 +2610,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         if (now - step_updated_at) < grace_delta:
                             if st_status != "scan_running":
                                 set_step_status(engine, step_id, "scan_running")
+                            else:
+                                touch_step_updated_at(engine, step_id)
                             if env_id is not None:
                                 inflight_envs.add(int(env_id))
                             continue
@@ -2628,6 +2629,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                             inflight_envs.add(int(env_id))
                     if sid and st_status != "scan_running":
                         set_step_status(engine, step_id, "scan_running")
+                    elif sid and st_status == "scan_running":
+                        # Tracker shows non-terminal scan; row already scan_running — still bump liveness.
+                        touch_step_updated_at(engine, step_id)
             
             if completed_any and completed_success_any:
                 try:
@@ -2637,6 +2641,35 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(c_min)))
         except Exception:
             pass
+
+    # --- GLOBAL STALE STEP RECONCILIATION (after Pass 1 so active scans get updated_at refreshed first) ---
+    try:
+        try:
+            stale_hours = int(os.getenv("WORKFLOW_STALE_SCAN_RUNNING_HOURS", "48") or "48")
+        except Exception:
+            stale_hours = 48
+        stale_hours = max(2, min(stale_hours, 168))
+        cutoff = now - timedelta(hours=float(stale_hours))
+        with engine.connect() as conn:
+            stale_steps = conn.execute(
+                text(
+                    "SELECT id, run_id, seq, scan_id FROM workflow_steps "
+                    "WHERE status='scan_running' AND updated_at < :cutoff"
+                ),
+                {"cutoff": cutoff},
+            ).fetchall()
+        for ss in stale_steps:
+            ss_id, ss_rid, ss_seq, ss_sid = ss
+            set_step_status(
+                engine,
+                ss_id,
+                "pending",
+                scan_id=None,
+                last_error=f"Global stale cleanup: step was stuck in scan_running for > {stale_hours}h",
+            )
+            logger.info("global_cleanup: reset stale step_id=%s run_id=%s seq=%s", ss_id, ss_rid, ss_seq)
+    except Exception as ex:
+        logger.error("Stale scan_running cleanup error: %s", ex)
 
     # Any env with a step in DS/profile/scan phase counts toward concurrency (not only scan_running).
     try:

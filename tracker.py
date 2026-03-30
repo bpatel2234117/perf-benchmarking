@@ -180,6 +180,7 @@ def _choose_best_state(parent_state: Any, insight_state: Any) -> str:
         return b
     if not b:
         return a
+    # insight_state must be scanInsights.state only (not scanProfile.progress.state); see _scan_row_from_insights.
     return a if _state_rank(a) >= _state_rank(b) else b
 
 
@@ -221,12 +222,13 @@ def build_api_url(base_url: str, api_path: str) -> str:
 def resolve_scan_status_value(scan: Dict[str, Any]) -> str:
     if not isinstance(scan, dict):
         return ""
+    top = str(scan.get("state") or scan.get("status") or "").strip()
+    if top:
+        return top
     progress = scan.get("progress")
     if isinstance(progress, dict):
-        state = str(progress.get("state") or "").strip()
-        if state:
-            return state
-    return str(scan.get("state") or scan.get("status") or "").strip()
+        return str(progress.get("state") or "").strip()
+    return ""
 
 
 def ensure_scan_tracking_tables(engine) -> None:
@@ -1106,8 +1108,9 @@ def _extract_live_state(insight_payload: Dict[str, Any]) -> str:
     si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
     if not si and isinstance(insight_payload, dict):
         si = insight_payload
-    prog = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    return str(si.get("state") or prog.get("state") or "").strip()
+    # Lifecycle state: use scanInsights.state only. progress.state tracks sub-progress and can read
+    # "Completed" before the parent scan is finished (do not use for DB/parent upserts).
+    return str(si.get("state") or "").strip()
 
 
 def _extract_scan_attributes_payload(payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
@@ -1565,7 +1568,7 @@ def upsert_scan_progress_record(
     data_sources = si.get("dataSources") if isinstance(si.get("dataSources"), dict) else {}
     classifications = data_sources.get("classifications") if isinstance(data_sources.get("classifications"), dict) else {}
     progress = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    scan_state = str(forced_state or si.get("state") or progress.get("state") or "").strip() or None
+    scan_state = str(forced_state or si.get("state") or "").strip() or None
 
     completed_sub = _to_int(subscans.get("completedSubScans", 0))
     failed_sub = _to_int(subscans.get("failedSubScans", 0))
@@ -2205,8 +2208,7 @@ def track_once(engine) -> Dict[str, Any]:
         if not si and isinstance(insight_payload, dict):
             si = insight_payload
         sp = si.get("scanProfile") if isinstance(si.get("scanProfile"), dict) else {}
-        prog = sp.get("progress") if isinstance(sp.get("progress"), dict) else {}
-        state = str(si.get("state") or prog.get("state") or "").strip()
+        state = str(si.get("state") or "").strip()
         name = str(sp.get("name") or "").strip()
         tmpl = str(sp.get("scanTemplateName") or "").strip()
         scan_row = {
@@ -2688,7 +2690,7 @@ def track_once(engine) -> Dict[str, Any]:
             # Attribute delta fetch can be slow; only do it when useful.
             try:
                 needs_terminal_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
-                if _is_terminal_state(state):
+                if _is_terminal_state(best_state):
                     if needs_terminal_attrs:
                         attrs = fetch_scan_classifier_attributes(
                             base_url,
@@ -2725,7 +2727,7 @@ def track_once(engine) -> Dict[str, Any]:
 
             # When scan is terminal, compute and persist throughput for existing auto row.
             try:
-                if _is_terminal_state(state):
+                if _is_terminal_state(best_state):
                     update_auto_scan_benchmarks_throughput(
                         engine,
                         scan_id,

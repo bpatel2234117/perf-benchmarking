@@ -428,6 +428,7 @@ def _ensure_throughput_columns(df: pd.DataFrame) -> pd.DataFrame:
         return out
     return out
 
+@st.cache_data(ttl=600)
 def load_data(include_inactive=False):
     if not engine: return pd.DataFrame()
     ensure_perf_indexes()
@@ -564,6 +565,7 @@ def load_data(include_inactive=False):
 
 # --- Pages ---
 
+@st.fragment
 def page_overview(df):
     st.markdown("## 📊 Strategic Overview")
     if df.empty:
@@ -1127,7 +1129,7 @@ def get_test_environment_by_id(env_id):
     return None
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=600)
 def load_test_environments():
     if not engine:
         return pd.DataFrame()
@@ -2263,12 +2265,14 @@ def post_ds_connection_test_with_auth_retry(env_row, broadcast_event, payload):
 def resolve_scan_status_value(scan):
     if not isinstance(scan, dict):
         return ""
+    # Prefer parent-scan top-level state/status; progress.state is sub-progress and can read "Completed" early.
+    top = str(scan.get("state") or scan.get("status") or "").strip()
+    if top:
+        return top
     progress = scan.get("progress")
     if isinstance(progress, dict):
-        state = str(progress.get("state") or "").strip()
-        if state:
-            return state
-    return str(scan.get("state") or scan.get("status") or "").strip()
+        return str(progress.get("state") or "").strip()
+    return ""
 
 
 def parse_iso_datetime(dt_value):
@@ -2339,6 +2343,10 @@ def extract_scan_insight_metrics(payload):
     data_block = root.get("data")
     if isinstance(data_block, dict):
         root = data_block
+    # BigID parent-scan payloads nest metrics under data.scanInsights (see tracker.upsert_scan_progress_record).
+    si_inner = root.get("scanInsights") if isinstance(root.get("scanInsights"), dict) else None
+    if si_inner:
+        root = si_inner
 
     classifications = deep_find(root, ["classifications"])
     if not isinstance(classifications, dict):
@@ -3869,6 +3877,7 @@ def create_workflow_run(
         return None
 
 
+@st.cache_data(ttl=300)
 def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
     if not engine:
         return pd.DataFrame()
@@ -3904,6 +3913,62 @@ def load_workflow_runs(limit: int = 30) -> pd.DataFrame:
         return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     except Exception:
         return pd.DataFrame()
+
+
+# Align with workflow_runner.WORKFLOW_ENV_OCCUPYING_STATUSES: show env as busy from step state, not only te.is_busy (API sync lags).
+_WORKFLOW_UI_ENV_BUSY_STATUSES = frozenset({
+    "running",
+    "pre_action_done",
+    "ds_created",
+    "ds_test_ok",
+    "scan_created",
+    "scan_running",
+    "scan_waiting",
+})
+
+
+def _workflow_norm_step_status(raw: Any) -> str:
+    """Avoid pandas NaN / literal 'nan' string breaking status checks (wrong 🟢 busy dot)."""
+    if raw is None:
+        return ""
+    try:
+        if pd.isna(raw):
+            return ""
+    except Exception:
+        pass
+    s = str(raw).strip().lower()
+    if s in ("nan", "nat", "none"):
+        return ""
+    return s
+
+
+def _workflow_step_implies_env_busy(rd: dict) -> bool:
+    """
+    Per-row env dot + derived env strip: busy if DB says so, step is in DS/scan pipeline,
+    or scan_id is set and step is not completed/disabled (covers error/pending + live BigID scan).
+    """
+    c = _workflow_norm_step_status(rd.get("status"))
+    if c == "disabled":
+        return False
+    try:
+        if rd.get("is_enabled") is not None and not bool(int(rd.get("is_enabled"))):
+            return False
+    except Exception:
+        if not bool(rd.get("is_enabled", True)):
+            return False
+    ei = rd.get("env_is_busy")
+    try:
+        db_busy = bool(ei) if ei is not None and not pd.isna(ei) else False
+    except Exception:
+        db_busy = bool(ei)
+    if db_busy:
+        return True
+    if c in _WORKFLOW_UI_ENV_BUSY_STATUSES:
+        return True
+    sid = str(rd.get("scan_id") or "").strip()
+    if sid and c not in ("completed", "disabled"):
+        return True
+    return False
 
 
 def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
@@ -4711,7 +4776,8 @@ def upsert_scan_progress_record(env_id, scan_id, scan_name, insight_payload, *, 
     data_sources = si.get("dataSources") if isinstance(si.get("dataSources"), dict) else {}
     classifications = data_sources.get("classifications") if isinstance(data_sources.get("classifications"), dict) else {}
     progress = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    scan_state = str(si.get("state") or progress.get("state") or "").strip() or None
+    # Store API scan lifecycle on scanInsights.state only (not progress.state — see tracker._choose_best_state).
+    scan_state = str(si.get("state") or "").strip() or None
     
     completed_sub = _to_int(subscans.get("completedSubScans", 0))
     failed_sub = _to_int(subscans.get("failedSubScans", 0))
@@ -5180,6 +5246,7 @@ def check_last_snapshot_is_zero(scan_id):
     except Exception:
         return False
 
+@st.cache_data(ttl=60)
 def get_scans_with_progress_ids():
     """
     Returns a set of scan_ids that have at least one snapshot in scan_progress.
@@ -5248,6 +5315,7 @@ def is_ignored_scan_name(scan_name):
     return bool(re.match(r"^instant\s+scan\s+data", name))
 
 
+@st.cache_data(ttl=60)
 def get_scan_parent_active_map(scan_ids):
     active_map = {}
     if not engine:
@@ -5353,6 +5421,7 @@ def load_scan_parents_from_db(environment_id, status_view="All", limit=200):
     return items
 
 
+@st.cache_data(ttl=300)
 def load_scan_parents_for_environments(environment_ids, status_view="All", limit=500):
     if not engine:
         return []
@@ -5439,6 +5508,7 @@ def set_scan_parent_active(scan_id, is_active):
         pass
 
 
+@st.cache_data(ttl=60)
 def get_saved_benchmark_scan_ids():
     """
     Returns a set of scan_ids that have already been converted to manual benchmarks.
@@ -6333,6 +6403,7 @@ def _merge_scan_progress_into_insight_row(row: Dict[str, Any], prog: Dict[str, A
     return out
 
 
+@st.cache_data(ttl=300)
 def load_scan_insight_map_for_scan_ids(scan_ids):
     """
     Batch-load scan insight metrics for many scan ids in one query.
@@ -6414,6 +6485,65 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                     progress_map[sid3] = (int(pr[1] or 0), int(pr[2] or 0))
                 except Exception:
                     progress_map[sid3] = (0, 0)
+
+            ds_by_scan: Dict[str, List[str]] = {}
+            attr_by_scan: Dict[str, List[str]] = {}
+            try:
+                ds_rows = conn.execute(
+                    text("""
+                        SELECT m.scan_id, d.name
+                        FROM scan_insight_data_source_map m
+                        JOIN scan_data_sources d ON d.id = m.data_source_id
+                        WHERE m.scan_id IN :ids
+                        ORDER BY m.scan_id ASC, d.name ASC
+                    """).bindparams(bindparam("ids", expanding=True)),
+                    {"ids": cleaned_ids},
+                ).fetchall()
+                for dr in ds_rows or []:
+                    sid_ds = str(dr[0] or "").strip()
+                    nm_ds = str(dr[1] or "").strip()
+                    if sid_ds and nm_ds:
+                        ds_by_scan.setdefault(sid_ds, []).append(nm_ds)
+            except Exception:
+                pass
+            try:
+                attr_rows = conn.execute(
+                    text("""
+                        SELECT m.scan_id, a.name
+                        FROM scan_insight_attribute_delta_map m
+                        JOIN scan_classifier_attributes a ON a.id = m.attribute_id
+                        WHERE m.scan_id IN :ids
+                        ORDER BY m.scan_id ASC, a.name ASC
+                    """).bindparams(bindparam("ids", expanding=True)),
+                    {"ids": cleaned_ids},
+                ).fetchall()
+                for ar in attr_rows or []:
+                    sid_at = str(ar[0] or "").strip()
+                    nm_at = str(ar[1] or "").strip()
+                    if sid_at and nm_at:
+                        attr_by_scan.setdefault(sid_at, []).append(nm_at)
+            except Exception:
+                pass
+
+        def _backfill_insight_maps(sid_key: str, row: Dict[str, Any]) -> Dict[str, Any]:
+            out = dict(row)
+            if not str(out.get("data_source_names") or "").strip():
+                names = ds_by_scan.get(sid_key) or []
+                if names:
+                    out["data_source_names"] = ", ".join(sorted(set(names)))
+            if not str(out.get("classifier_attribute_names") or "").strip():
+                anames = attr_by_scan.get(sid_key) or []
+                if anames:
+                    out["classifier_attribute_names"] = ", ".join(sorted(set(anames)))
+            if out.get("distinct_classification_attributes") is None:
+                anames2 = attr_by_scan.get(sid_key) or []
+                if anames2:
+                    try:
+                        out["distinct_classification_attributes"] = len(set(anames2))
+                    except Exception:
+                        pass
+            return out
+
         for r in rows:
             sid = str(r[0] or "").strip()
             if not sid:
@@ -6457,6 +6587,7 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                 "total_size_gb": float(r[10]) if r[10] is not None and str(r[10]).strip() != "" else None,
             }
             result[sid] = _enrich_scan_insight_row_from_payload(result[sid], r[11] if len(r) > 11 else None)
+            result[sid] = _backfill_insight_maps(sid, result[sid])
 
         try:
             prog_full = load_latest_scan_progress_map_for_scan_ids(cleaned_ids)
@@ -6491,6 +6622,7 @@ def load_scan_insight_map_for_scan_ids(scan_ids):
                 result[sid]["new_attributes_count"] = _pick_count2(d_new2, p_new2)
                 result[sid]["removed_attributes_count"] = _pick_count2(d_removed2, p_removed2)
             result[sid] = _merge_scan_progress_into_insight_row(result[sid], prog_full[sid])
+            result[sid] = _backfill_insight_maps(sid, result[sid])
     except Exception:
         return {}
     return result
@@ -8833,6 +8965,7 @@ def page_version_comparison():
         st.dataframe(pd.DataFrame({"Classifier": common}) if common else pd.DataFrame({"Classifier": []}), width="stretch")
 
 
+@st.fragment
 def page_scan_status():
     st.title("🛰️ Scan Status")
     st.caption("Combines in-progress and completed parent scans, merged by `_id`.")
@@ -9151,18 +9284,11 @@ def page_scan_status():
         except Exception:
             scan_env_row = None
 
-        # Keep Scan Status accurate when scan_parents lags (case/space-insensitive):
-        # - if scan_parents says running but scan_progress says terminal -> trust scan_progress
-        # - if scan_parents says terminal/unknown but scan_progress says running -> trust scan_progress
+        # Merge scan_progress only when it shows *running* and the parent row lags (non-running).
+        # Never promote to terminal from scan_progress alone: local snapshots can be wrong/stale and
+        # previously overwrote scan_parents via upsert — false "Completed" while BigID was still In Progress.
         try:
             p_state = str((latest_progress_state_map or {}).get(scan_id) or "").strip()
-            if p_state and (_compact_state(p_state) in completed_compact) and (_compact_state(state) in running_compact):
-                state = p_state
-                # Backfill scan_parents for consistency (best-effort).
-                try:
-                    upsert_scan_parent_record(scan_env_id or selected_env.get("id"), scan, state)
-                except Exception:
-                    pass
             if p_state and (_compact_state(p_state) in running_compact) and (_compact_state(state) not in running_compact) and (status_view != "Completed"):
                 state = p_state
         except Exception:
@@ -9246,7 +9372,9 @@ def page_scan_status():
             "Total Classification": insight_metrics["total_classification"],
             "New Attributes": insight_metrics["new_attributes_count"],
             "Removed Attributes": insight_metrics["removed_attributes_count"],
-            "Scan Time": format_scan_duration(started_at, completed_at),
+            "Scan Time": format_scan_duration(
+                started_at, completed_at, is_running=(cs in running_compact)
+            ),
         })
 
     summary_df = pd.DataFrame(summary_rows)
@@ -9421,6 +9549,7 @@ def page_scan_status():
             st.json(scan)
 
 # --- Build Analysis Page ---
+@st.fragment
 def page_build_analysis(df):
     st.markdown("## 🔍 Build Depth-Analysis")
     if df.empty:
@@ -11445,6 +11574,7 @@ def page_classifier_build_diffs():
                                         st.text(f"{k}: {va}")
 
 
+@st.cache_data(ttl=600)
 def load_auto_trend_dataset():
     if not engine:
         return pd.DataFrame()
@@ -12092,6 +12222,7 @@ def page_edit_benchmark(df):
 
 
 
+@st.cache_data(ttl=300)
 def load_scan_progress_history(scan_id):
     if not engine or not scan_id:
         return pd.DataFrame()
@@ -12202,6 +12333,7 @@ def merge_scanner_averages_into_progress_df(
     return merged
 
 
+@st.cache_data(ttl=300)
 def load_scanner_group_performance(env_id, start_dt, end_dt):
     if not engine or env_id is None:
         return pd.DataFrame()
@@ -12400,6 +12532,7 @@ def _spm_scanner_two_line_label(name: Any) -> str:
     return "<br>".join([" ".join(parts[:mid]), " ".join(parts[mid:])])
 
 
+@st.cache_data(ttl=300)
 def load_scanner_individual_performance(env_id, start_dt, end_dt):
     if not engine or env_id is None:
         return pd.DataFrame()
@@ -12474,6 +12607,7 @@ def load_scanner_individual_performance(env_id, start_dt, end_dt):
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=300)
 def load_latest_scan_progress_state_map(scan_ids):
     """
     Returns {scan_id: latest scan_state from scan_progress}.
@@ -12514,6 +12648,7 @@ def load_latest_scan_progress_state_map(scan_ids):
         return {}
 
 
+@st.cache_data(ttl=60)
 def load_latest_scan_progress_rows_for_environments(environment_ids):
     """
     Returns latest scan_progress rows per scan_id for given environment_ids.
@@ -12575,6 +12710,7 @@ def load_latest_scan_progress_rows_for_environments(environment_ids):
     except Exception:
         return []
 
+@st.fragment
 def page_scan_progress():
     st.title("📈 Scan Progress Details")
     query_params = st.query_params
@@ -12642,7 +12778,10 @@ def page_scan_progress():
 
     # Manual sync on-demand (event-driven).
     # Uses the same DB schema/slotting logic as the tracker (10-minute captured_at_utc + dedupe).
-    manual_sync = st.button("Sync now (manual)", type="primary")
+    is_terminal_now = _is_terminal_state(parent.get("scan_status"))
+    manual_sync = st.button("Sync now (manual)", type="primary", disabled=is_terminal_now)
+    if is_terminal_now:
+        st.caption("Manual sync is disabled because the scan has finished.")
     if manual_sync:
         ensure_scan_tracking_tables()
         sync_env_row = get_environment_row_for_scan_id(scan_id)
@@ -12683,7 +12822,7 @@ def page_scan_progress():
                         updated_at = sp.get("updatedAt")
                         completed_at = sp.get("completedAt")
                         template_name = str(sp.get("scanTemplateName") or "").strip()
-                        state = str(si.get("state") or (sp.get("progress") or {}).get("state") or "").strip()
+                        state = str(si.get("state") or "").strip()
                         scan_row = {
                             "_id": str(scan_id),
                             "name": scan_name,
@@ -13285,7 +13424,8 @@ def page_scan_progress():
         if exp_files is not None and exp_files > 0:
             lk = str(lookup_key or '').strip()
             observations.append(
-                f"Objects scanned: **{int(cur_objects):,} / {int(exp_files):,}**" + (f" (expected from `{lk}`)" if lk else "")
+                f"Objects scanned: **{int(cur_objects):,} / {int(exp_files):,}**"
+                + (f" (benchmark expected from `{lk}` — **not** scan status)" if lk else " (benchmark expected — **not** scan status)")
             )
             if short_by > 0:
                 observations.append(f"Object shortfall: **{short_by:,}**")
@@ -13676,9 +13816,10 @@ def page_scan_progress():
             short_now = max(0, int(exp_files_now) - int(cur_objects or 0))
             lk_now = str(lookup_key or "").strip()
             st.markdown("### Objects")
+            st.caption("Compared to **benchmark expected** counts only — does **not** determine In Progress vs Completed (use **Latest state** / API).")
             st.markdown(
                 f"- Objects scanned: **{int(cur_objects):,} / {int(exp_files_now):,}**"
-                + (f" (expected from `{lk_now}`)" if lk_now else "")
+                + (f" (benchmark `{lk_now}`)" if lk_now else "")
             )
             if short_now > 0:
                 st.markdown(f"- Object shortfall: **{int(short_now):,}**")
@@ -14056,11 +14197,9 @@ def page_scan_progress():
         try:
             running_states_local = {"started", "awaiting", "inprogress", "in progress", "running", "queued", "pending"}
             is_running = str(cur_state or "").strip().lower().replace(" ", "") in {s.replace(" ", "") for s in running_states_local}
-            # IMPORTANT:
-            # - Do not claim "finished" based on percent rounding (99.9%) or object-only stalls.
-            # - Treat "done" only when parts are actually complete OR expected object total is reached.
+            # Do not infer "scanning work done" from expected object totals (1,013,583/1,013,583).
+            # That ratio is a benchmark hint only — lifecycle status must follow API scan_state / parent scan.
             done_parts = bool(cur_parts_total and cur_parts_total > 0 and cur_parts_done >= cur_parts_total)
-            done_objects = bool(expected_total_files and expected_total_files > 0 and cur_objects >= int(expected_total_files))
 
             # "No scanning progress" should consider BOTH parts + objects.
             no_progress_last3 = False
@@ -14078,7 +14217,7 @@ def page_scan_progress():
             stalled = bool(no_progress_last3) or (
                 stall_minutes is not None and stall_minutes >= 30 and files_per_min is not None and abs(files_per_min) < 1e-9
             )
-            scanning_done = bool(done_parts or done_objects)
+            scanning_done = bool(done_parts)
 
             if is_running and stalled:
                 extra = []
@@ -15111,6 +15250,7 @@ def page_scan_progress():
         st.rerun()
 
 
+@st.cache_data(ttl=600)
 def _build_default_workflow_steps() -> List[Dict[str, Any]]:
     """
     UI plan (no side-effects). Backend runner will execute these sequentially.
@@ -15195,7 +15335,182 @@ def _build_default_workflow_steps() -> List[Dict[str, Any]]:
     return steps
 
 
+@st.fragment
+def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
+    def _env_label(r):
+        lbl = f"{r.env_name} (id={int(r.id)})"
+        if int(r.id) in in_use_env_ids:
+            lbl = f"⚠️ {lbl} [IN USE]"
+        return lbl
 
+    with st.expander("➕ Create New Workflow Run", expanded=False):
+        if wf_pool_df.empty:
+            st.warning(
+                "No environments are in the **workflow pool**. Enable **Use for workflow runs** "
+                "for at least one active environment in **Manage Test Environments**."
+            )
+        else:
+            if in_use_env_ids:
+                st.warning(
+                    "**Environments marked ⚠️ [IN USE]** are currently running another workflow. "
+                    "You can still create a plan; steps queue until capacity is free."
+                )
+
+            st.info(
+                "💡 **Tip:** Test Environments are mapped when you click **start** (▶️) on a run below, "
+                "so you can reuse workflow plans across different active environments."
+            )
+
+            c1, c2 = st.columns([2.0, 1.0])
+            wf_name = c1.text_input(
+                "Workflow name",
+                value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
+                key="wf_name_new_expander",
+            )
+            cooldown = int(
+                c2.number_input(
+                    "Cooldown (minutes)",
+                    min_value=1,
+                    max_value=180,
+                    value=15,
+                    step=1,
+                    key="wf_cd_new_expander",
+                )
+            )
+
+            create_disabled = False
+
+            preview_steps = _build_default_workflow_steps()
+            for stp in preview_steps or []:
+                if isinstance(stp, dict) and "is_enabled" not in stp:
+                    stp["is_enabled"] = True
+            with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
+                prev_df = pd.DataFrame(preview_steps)
+                show_cols = [
+                    "is_enabled",
+                    "environment_id",
+                    "ds_kind",
+                    "ds_name",
+                    "scan_kind",
+                    "file_set_type",
+                    "is_acl",
+                    "is_structured_ff",
+                    "is_ols",
+                    "feature_flags",
+                    "notes",
+                    "status",
+                ]
+                show_cols = [c for c in show_cols if c in prev_df.columns]
+                editable_df = st.data_editor(
+                    prev_df[show_cols],
+                    width="stretch",
+                    hide_index=True,
+                    key="wf_preview_steps_editor_new_expander",
+                    column_config={
+                        "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                    },
+                    disabled=[c for c in show_cols if c != "is_enabled"],
+                )
+                try:
+                    preview_steps = editable_df.to_dict("records")
+                except Exception:
+                    pass
+
+            if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
+                rid = create_workflow_run(
+                    wf_name,
+                    env1_id=None,
+                    env2_id=None,
+                    steps=preview_steps,
+                    cooldown_minutes=int(cooldown),
+                )
+                if rid:
+                    st.success(f"Created workflow run id={rid}. Reloading…")
+                    st.query_params["page"] = "Workflow Automation"
+                    st.query_params["run_id"] = str(int(rid))
+                    try:
+                        st.session_state["wf_run_sel_id"] = int(rid)
+                    except Exception:
+                        pass
+                    try:
+                        # Since we're in a fragment, we want to clear the whole app cache for new data
+                        st.cache_data.clear()
+                    except Exception:
+                        pass
+                    st.rerun()
+                else:
+                    st.error("Failed to create workflow plan.")
+
+@st.fragment
+def render_workflow_step_editor(run_id, selected_status):
+    steps_df = load_workflow_steps(int(run_id))
+    with st.expander("Edit steps (before run)", expanded=False):
+        st.caption("Toggle which steps should execute. Pause/Stop the run first.")
+        if selected_status == "running":
+            st.info("Pause/Stop the workflow run to edit steps.")
+        elif steps_df.empty:
+            st.info("No steps found for this run.")
+        else:
+            edit_df = steps_df.copy()
+            if "is_enabled" not in edit_df.columns:
+                edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
+            try: edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
+            except Exception: edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
+            show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
+            show_cols = [c for c in show_cols if c in edit_df.columns]
+            try:
+                env_df = load_test_environments()
+                if not env_df.empty and "is_active" in env_df.columns:
+                    active_envs = env_df[env_df["is_active"] == 1]["env_name"].tolist()
+                    env_map = {row["env_name"]: row["id"] for _, row in env_df.iterrows()}
+                else:
+                    active_envs, env_map = [], {}
+            except Exception:
+                active_envs, env_map = [], {}
+
+            view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
+            editor = st.data_editor(view, width="stretch", hide_index=True, key=f"wf_edit_steps_{run_id}",
+                column_config={
+                    "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
+                    "Env": st.column_config.SelectboxColumn("Env", options=active_envs, required=False),
+                },
+                disabled=[c for c in view.columns if c not in ("is_enabled", "Env")])
+            
+            if st.button("Save step modifications", type="primary", key=f"wf_save_steps_{run_id}"):
+                try:
+                    # 1. Handle Enable/Disable
+                    desired = editor[["id", "is_enabled"]].copy(); desired["id"] = desired["id"].astype(int)
+                    enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
+                    disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
+                    
+                    # 2. Handle Env Changes
+                    desired_env = editor[["id", "Env"]].copy(); desired_env["id"] = desired_env["id"].astype(int)
+                    env_updates = []
+                    for _, r in desired_env.iterrows():
+                        if pd.notna(r["Env"]) and str(r["Env"]).strip() and str(r["Env"]).strip() in env_map:
+                            env_updates.append({"id": int(r["id"]), "env_id": int(env_map[str(r["Env"]).strip()])})
+
+                    from sqlalchemy import bindparam
+                    with engine.connect() as conn:
+                        if disable_ids:
+                            conn.execute(text("UPDATE workflow_steps SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": disable_ids})
+                        if enable_ids:
+                            conn.execute(text("UPDATE workflow_steps SET is_enabled=1, status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END, last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END, updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": enable_ids})
+                        
+                        # Process environment updates
+                        for u in env_updates:
+                            conn.execute(text("UPDATE workflow_steps SET environment_id=:env_id, updated_at=CURRENT_TIMESTAMP WHERE id=:id AND COALESCE(status,'') NOT IN ('completed', 'scan_running')"), {"env_id": u["env_id"], "id": u["id"]})
+
+                        conn.commit()
+                    try: st.cache_data.clear()
+                    except Exception: pass
+                    st.success("Saved."); st.rerun()
+                except Exception as ex:
+                    st.error(f"Save failed: {ex}")
+
+
+
+@st.fragment
 def page_workflow_automation():
     global engine
     st.title("🧪 Workflow Automation")
@@ -15302,12 +15617,10 @@ def page_workflow_automation():
         return
     wf_pool_df = active_df[active_df["include_in_workflow_runs"] == True].copy().reset_index(drop=True)
 
-    st.divider()
-    with st.expander("➕ Create New Workflow Run", expanded=False):
-        # Detect which envs are used by currently-running workflows
-        try:
-            with engine.connect() as conn:
-                used_rows = conn.execute(text("""
+    try:
+        with engine.connect() as conn:
+            used_rows = conn.execute(
+                text("""
                     SELECT DISTINCT ws.environment_id
                     FROM workflow_steps ws
                     JOIN workflow_runs wr ON wr.id = ws.run_id
@@ -15315,112 +15628,14 @@ def page_workflow_automation():
                       AND ws.environment_id IS NOT NULL
                     UNION
                     SELECT id FROM test_environments WHERE is_busy = 1
-                """)).fetchall()
-            in_use_env_ids = {int(r[0]) for r in used_rows if r[0] is not None}
-        except Exception:
-            in_use_env_ids = set()
+                """)
+            ).fetchall()
+        in_use_env_ids = {int(r[0]) for r in used_rows if r[0] is not None}
+    except Exception:
+        in_use_env_ids = set()
 
-        def _env_label(r):
-            lbl = f"{r.env_name} (id={int(r.id)})"
-            if int(r.id) in in_use_env_ids:
-                lbl = f"⚠️ {lbl} [IN USE]"
-            return lbl
-
-        if wf_pool_df.empty:
-            st.warning(
-                "No environments are in the **workflow pool**. Enable **Use for workflow runs** "
-                "for at least one active environment in **Manage Test Environments**."
-            )
-        else:
-            if in_use_env_ids:
-                st.warning(
-                    "**Environments marked ⚠️ [IN USE]** are currently running another workflow. "
-                    "You can still create a plan; steps queue until capacity is free."
-                )
-
-            st.info(
-                "💡 **Tip:** Test Environments are mapped when you click **start** (▶️) on a run below, "
-                "so you can reuse workflow plans across different active environments."
-            )
-
-            c1, c2 = st.columns([2.0, 1.0])
-            wf_name = c1.text_input(
-                "Workflow name",
-                value=f"DS+Scan workflow {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-                key="wf_name_new_expander",
-            )
-            cooldown = int(
-                c2.number_input(
-                    "Cooldown (minutes)",
-                    min_value=1,
-                    max_value=180,
-                    value=15,
-                    step=1,
-                    key="wf_cd_new_expander",
-                )
-            )
-
-            create_disabled = False
-
-            preview_steps = _build_default_workflow_steps()
-            for stp in preview_steps or []:
-                if isinstance(stp, dict) and "is_enabled" not in stp:
-                    stp["is_enabled"] = True
-            with st.expander(f"Preview steps ({len(preview_steps or [])})", expanded=False):
-                prev_df = pd.DataFrame(preview_steps)
-                show_cols = [
-                    "is_enabled",
-                    "environment_id",
-                    "ds_kind",
-                    "ds_name",
-                    "scan_kind",
-                    "file_set_type",
-                    "is_acl",
-                    "is_structured_ff",
-                    "is_ols",
-                    "feature_flags",
-                    "notes",
-                    "status",
-                ]
-                show_cols = [c for c in show_cols if c in prev_df.columns]
-                editable_df = st.data_editor(
-                    prev_df[show_cols],
-                    width="stretch",
-                    hide_index=True,
-                    key="wf_preview_steps_editor_new_expander",
-                    column_config={
-                        "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
-                    },
-                    disabled=[c for c in show_cols if c != "is_enabled"],
-                )
-                try:
-                    preview_steps = editable_df.to_dict("records")
-                except Exception:
-                    pass
-
-            if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
-                rid = create_workflow_run(
-                    wf_name,
-                    env1_id=None,
-                    env2_id=None,
-                    steps=preview_steps,
-                    cooldown_minutes=int(cooldown),
-                )
-                if rid:
-                    st.success(f"Created workflow run id={rid}. Reloading…")
-                    st.query_params["page"] = "Workflow Automation"
-                    st.query_params["run_id"] = str(int(rid))
-                    try:
-                        st.session_state["wf_run_sel_id"] = int(rid)
-                    except Exception:
-                        pass
-                    try:
-                        st.cache_data.clear()
-                    except Exception:
-                        pass
-                    st.rerun()
-                else:
-                    st.error("Failed to create workflow plan.")
+    st.divider()
+    render_workflow_creation_section(wf_pool_df, in_use_env_ids)
 
     # --- Load runs ---
     st.markdown("### Workflow Runs")
@@ -15455,7 +15670,7 @@ def page_workflow_automation():
 
         # --- Progress flow helper ---
         def _pf(row_dict):
-            s = str(row_dict.get("status") or "").strip().lower()
+            s = _workflow_norm_step_status(row_dict.get("status"))
             if s == "disabled": return "🚫 Disabled"
             ds_id = str(row_dict.get("ds_id") or "").strip()
             spid = str(row_dict.get("scan_profile_id") or "").strip()
@@ -15507,7 +15722,29 @@ def page_workflow_automation():
             
             return " ➔ ".join(parts) if parts else "➖ DS"
 
-        # --- Pre-load env busy status for page-level indicator ---
+        # --- Pre-load step data first (derive env busy from steps + te.is_busy; API sync lags te.is_busy alone) ---
+        all_run_steps = {}
+        run_ids_list = runs_df["id"].tolist()
+        batch_steps_df = load_workflow_steps_batch(run_ids_list)
+        derived_busy_env_ids: set[int] = set()
+        if not batch_steps_df.empty:
+            for _, _sr in batch_steps_df.iterrows():
+                _rd = _sr.to_dict()
+                if not _workflow_step_implies_env_busy(_rd):
+                    continue
+                _eid = _rd.get("environment_id")
+                if _eid is None:
+                    continue
+                try:
+                    if isinstance(_eid, float) and pd.isna(_eid):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    derived_busy_env_ids.add(int(_eid))
+                except Exception:
+                    pass
+
         env_status_parts = []
         try:
             with engine.connect() as conn:
@@ -15516,16 +15753,16 @@ def page_workflow_automation():
                 )).fetchall()
             for er in env_busy_rows or []:
                 name = str(er[1] or "").strip() or f"id={er[0]}"
-                busy = bool(er[2]) if er[2] is not None else False
+                db_flag = bool(er[2]) if er[2] is not None else False
+                try:
+                    eid_int = int(er[0])
+                except Exception:
+                    eid_int = None
+                busy = db_flag or (eid_int is not None and eid_int in derived_busy_env_ids)
                 env_status_parts.append(f"{'🔴' if busy else '🟢'} {html.escape(name)} ({'busy' if busy else 'free'})")
         except Exception:
             pass
         env_status_line = " &nbsp; ".join(env_status_parts) if env_status_parts else ""
-
-        # --- Pre-load all step data ---
-        all_run_steps = {}
-        run_ids_list = runs_df["id"].tolist()
-        batch_steps_df = load_workflow_steps_batch(run_ids_list)
 
         for rid in run_ids_list:
             try:
@@ -15540,7 +15777,8 @@ def page_workflow_automation():
 
                 for _, sr in sdf.iterrows():
                     rd = sr.to_dict()
-                    c_status = str(rd.get("status") or "").strip().lower()
+                    c_status = _workflow_norm_step_status(rd.get("status"))
+                    last_err = str(rd.get("last_error") or "").strip()
                     is_en = bool(rd.get("is_enabled", True)) if rd.get("is_enabled") is not None else True
                     try:
                         if rd.get("is_enabled") is not None and not bool(int(rd.get("is_enabled"))):
@@ -15551,7 +15789,7 @@ def page_workflow_automation():
                     # Counts from DB status (emoji progress strings miss phases like ds_created → false "Pending")
                     if not is_en or c_status == "disabled":
                         disabled += 1
-                    elif c_status == "error":
+                    elif c_status == "error" or (last_err and c_status not in ("completed", "disabled")):
                         errors += 1
                     elif c_status == "completed":
                         completed += 1
@@ -15575,11 +15813,11 @@ def page_workflow_automation():
                     sid_val = str(rd.get("scan_id") or "").strip()
                     if sid_val:
                         scan_link = f'<a href="?page=Scan+Progress&scan_id={html.escape(sid_val)}" target="_blank" rel="noopener noreferrer" style="color:{PRIMARY_COLOR};text-decoration:none;font-size:0.8rem;">View Progress</a>'
-                    # Env with busy/free indicator: 🟢 free, 🔴 busy
+                    # Env with busy/free indicator: 🟢 free, 🔴 busy (derive from step + te.is_busy; API/te.is_busy can lag)
                     env_name = str(rd.get("environment") or "").strip()
-                    env_is_busy = rd.get("env_is_busy")
+                    row_env_busy = _workflow_step_implies_env_busy(rd)
                     if env_name:
-                        env_display = ("🔴 " if env_is_busy else "🟢 ") + env_name
+                        env_display = ("🔴 " if row_env_busy else "🟢 ") + env_name
                     else:
                         env_display = "—"
                     steps_to_show.append({
@@ -16059,69 +16297,7 @@ def page_workflow_automation():
             except Exception: pass
 
         # Edit steps
-        steps_df = load_workflow_steps(int(run_id))
-        if not steps_df.empty:
-            with st.expander("Edit steps (before run)", expanded=False):
-                st.caption("Toggle which steps should execute. Pause/Stop the run first.")
-                if selected_status == "running":
-                    st.info("Pause/Stop the workflow run to edit steps.")
-                else:
-                    edit_df = steps_df.copy()
-                    if "is_enabled" not in edit_df.columns:
-                        edit_df["is_enabled"] = edit_df["status"].fillna("").astype(str).str.strip().str.lower().ne("disabled").astype(int)
-                    try: edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(int(x)) if str(x).strip() else bool(x))
-                    except Exception: edit_df["is_enabled"] = edit_df["is_enabled"].apply(lambda x: bool(x))
-                    show_cols = ["id", "seq", "environment", "ds_kind", "ds_name", "file_set_type", "is_acl", "is_structured_ff", "is_ols", "status", "is_enabled"]
-                    show_cols = [c for c in show_cols if c in edit_df.columns]
-                    try:
-                        env_df = load_test_environments()
-                        if not env_df.empty and "is_active" in env_df.columns:
-                            active_envs = env_df[env_df["is_active"] == 1]["env_name"].tolist()
-                            env_map = {row["env_name"]: row["id"] for _, row in env_df.iterrows()}
-                        else:
-                            active_envs, env_map = [], {}
-                    except Exception:
-                        active_envs, env_map = [], {}
-
-                    view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
-                    editor = st.data_editor(view, width="stretch", hide_index=True, key=f"wf_edit_steps_{run_id}",
-                        column_config={
-                            "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
-                            "Env": st.column_config.SelectboxColumn("Env", options=active_envs, required=False),
-                        },
-                        disabled=[c for c in view.columns if c not in ("is_enabled", "Env")])
-                    
-                    if st.button("Save step modifications", type="primary", key=f"wf_save_steps_{run_id}"):
-                        try:
-                            # 1. Handle Enable/Disable
-                            desired = editor[["id", "is_enabled"]].copy(); desired["id"] = desired["id"].astype(int)
-                            enable_ids = [int(x) for x in desired[desired["is_enabled"] == True]["id"].tolist()]
-                            disable_ids = [int(x) for x in desired[desired["is_enabled"] == False]["id"].tolist()]
-                            
-                            # 2. Handle Env Changes
-                            desired_env = editor[["id", "Env"]].copy(); desired_env["id"] = desired_env["id"].astype(int)
-                            env_updates = []
-                            for _, r in desired_env.iterrows():
-                                if pd.notna(r["Env"]) and str(r["Env"]).strip() and str(r["Env"]).strip() in env_map:
-                                    env_updates.append({"id": int(r["id"]), "env_id": int(env_map[str(r["Env"]).strip()])})
-
-                            from sqlalchemy import bindparam
-                            with engine.connect() as conn:
-                                if disable_ids:
-                                    conn.execute(text("UPDATE workflow_steps SET is_enabled=0, status='disabled', updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": disable_ids})
-                                if enable_ids:
-                                    conn.execute(text("UPDATE workflow_steps SET is_enabled=1, status=CASE WHEN COALESCE(status,'')='disabled' THEN 'pending' ELSE status END, last_error=CASE WHEN COALESCE(status,'')='disabled' THEN NULL ELSE last_error END, updated_at=CURRENT_TIMESTAMP WHERE id IN :ids AND COALESCE(status,'')<>'completed'").bindparams(bindparam("ids", expanding=True)), {"ids": enable_ids})
-                                
-                                # Process environment updates
-                                for u in env_updates:
-                                    conn.execute(text("UPDATE workflow_steps SET environment_id=:env_id, updated_at=CURRENT_TIMESTAMP WHERE id=:id AND COALESCE(status,'') NOT IN ('completed', 'scan_running')"), {"env_id": u["env_id"], "id": u["id"]})
-
-                                conn.commit()
-                            try: st.cache_data.clear()
-                            except Exception: pass
-                            st.success("Saved."); st.rerun()
-                        except Exception as ex:
-                            st.error(f"Save failed: {ex}")
+        render_workflow_step_editor(run_id, selected_status)
 
         # Debug templates
         if st.query_params.get("debug") == "true" and not steps_df.empty:
