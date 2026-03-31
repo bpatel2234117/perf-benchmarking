@@ -3942,6 +3942,23 @@ def _workflow_norm_step_status(raw: Any) -> str:
     return s
 
 
+def _workflow_is_transient_step_message(msg: str) -> bool:
+    """Waiting/retry messages are informational, not hard workflow errors."""
+    t = str(msg or "").strip().lower()
+    if not t:
+        return False
+    needles = (
+        "will retry",
+        "waiting for it to clear",
+        "no free env this tick",
+        "env already has a running scan",
+        "env has a running scan",
+        "reserved by another workflow run",
+        "safety check failed",
+    )
+    return any(n in t for n in needles)
+
+
 def _workflow_step_implies_env_busy(rd: dict) -> bool:
     """
     Per-row env dot + derived env strip: busy if DB says so, step is in DS/scan pipeline,
@@ -12882,6 +12899,11 @@ def page_scan_progress():
                     except Exception:
                         pass
 
+                    try:
+                        # Avoid showing stale cached empty-history after a successful manual write.
+                        load_scan_progress_history.clear()
+                    except Exception:
+                        pass
                     st.success("Synced. Reloading…")
                     st.rerun()
                 except Exception as ex:
@@ -15789,7 +15811,11 @@ def page_workflow_automation():
                     # Counts from DB status (emoji progress strings miss phases like ds_created → false "Pending")
                     if not is_en or c_status == "disabled":
                         disabled += 1
-                    elif c_status == "error" or (last_err and c_status not in ("completed", "disabled")):
+                    elif c_status == "error" or (
+                        last_err
+                        and c_status not in ("completed", "disabled")
+                        and not _workflow_is_transient_step_message(last_err)
+                    ):
                         errors += 1
                     elif c_status == "completed":
                         completed += 1
@@ -15820,6 +15846,9 @@ def page_workflow_automation():
                         env_display = ("🔴 " if row_env_busy else "🟢 ") + env_name
                     else:
                         env_display = "—"
+                    display_err = str(rd.get("last_error") or "").strip()
+                    if c_status in {"scan_waiting", "scan_running", "scan_created", "ds_created", "ds_test_ok"} and _workflow_is_transient_step_message(display_err):
+                        display_err = ""
                     steps_to_show.append({
                         "seq": rd.get("seq", ""),
                         "env": env_display,
@@ -15832,7 +15861,7 @@ def page_workflow_automation():
                         "scan_id": sid_val,
                         "scan_link": scan_link,
                         "notes": str(rd.get("notes") or "").strip(),
-                        "last_error": str(rd.get("last_error") or "").strip(),
+                        "last_error": display_err,
                     })
                 all_run_steps[int(rid)] = {
                     "rows": steps_to_show,
