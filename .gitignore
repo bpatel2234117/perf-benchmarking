@@ -24,3 +24,8 @@ uploaded_media_*.webp
 *.pid
 .tracker*.pid
 .workflow_runner.pid
+
+# scanner ai outputs
+scanner_ai_*/
+scanner_forensic_output/
+scanner_logs_*/

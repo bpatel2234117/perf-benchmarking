@@ -5,6 +5,8 @@ Runs forever (default every 10 minutes):
 - pulls "running" parent scans from each active environment
 - fetches scan insights for each running scan
 - writes a snapshot row into MySQL table `scan_progress`
+- captures scanner-group + services-status metrics at the **same** `captured_at_utc` as that snapshot
+  (once per environment per slot when multiple scans run in parallel)
 
 Usage:
   python3 tracker.py
@@ -32,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from db_config import DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token
+from scanner_performance import capture_scanner_performance_for_env, ensure_scanner_performance_tables
 
 
 ENV_FILE_PATH = Path(__file__).parent / ".env"
@@ -177,6 +180,7 @@ def _choose_best_state(parent_state: Any, insight_state: Any) -> str:
         return b
     if not b:
         return a
+    # insight_state must be scanInsights.state only (not scanProfile.progress.state); see _scan_row_from_insights.
     return a if _state_rank(a) >= _state_rank(b) else b
 
 
@@ -218,12 +222,13 @@ def build_api_url(base_url: str, api_path: str) -> str:
 def resolve_scan_status_value(scan: Dict[str, Any]) -> str:
     if not isinstance(scan, dict):
         return ""
+    top = str(scan.get("state") or scan.get("status") or "").strip()
+    if top:
+        return top
     progress = scan.get("progress")
     if isinstance(progress, dict):
-        state = str(progress.get("state") or "").strip()
-        if state:
-            return state
-    return str(scan.get("state") or scan.get("status") or "").strip()
+        return str(progress.get("state") or "").strip()
+    return ""
 
 
 def ensure_scan_tracking_tables(engine) -> None:
@@ -578,6 +583,42 @@ def ensure_scan_progress_table(engine) -> None:
                 INDEX idx_state (scan_state)
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scanner_group_performance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                environment_id INT NOT NULL,
+                captured_at_utc DATETIME NOT NULL,
+                group_name VARCHAR(255) NULL,
+                running_scanners INT DEFAULT 0,
+                running_threads INT DEFAULT 0,
+                max_threads INT DEFAULT 0,
+                scanner_threads INT DEFAULT 0,
+                physical_memory_mb BIGINT DEFAULT 0,
+                free_memory_mb BIGINT DEFAULT 0,
+                avg_scan_speed FLOAT DEFAULT 0,
+                update_date_bigid DATETIME NULL,
+                INDEX idx_env_time_group (environment_id, captured_at_utc)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scanner_individual_performance (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                environment_id INT NOT NULL,
+                captured_at_utc DATETIME NOT NULL,
+                scanner_id VARCHAR(255) NULL,
+                name VARCHAR(255) NULL,
+                status VARCHAR(64) NULL,
+                group_name VARCHAR(255) NULL,
+                running_threads INT DEFAULT 0,
+                total_num_of_threads INT DEFAULT 0,
+                system_load_average FLOAT DEFAULT 0,
+                physical_memory_mb BIGINT DEFAULT 0,
+                free_memory_mb BIGINT DEFAULT 0,
+                scanner_threads INT DEFAULT 0,
+                update_date_bigid DATETIME NULL,
+                INDEX idx_env_time_scanner (environment_id, captured_at_utc, scanner_id)
+            )
+        """))
         # schema upgrades for existing DBs
         for stmt in [
             "ALTER TABLE scan_progress MODIFY COLUMN `timestamp` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP",
@@ -614,6 +655,10 @@ def ensure_scan_progress_table(engine) -> None:
         except Exception:
             pass
         conn.commit()
+    try:
+        ensure_scanner_performance_tables(engine)
+    except Exception:
+        pass
 
 
 def load_active_environments(engine) -> List[Dict[str, Any]]:
@@ -1022,6 +1067,10 @@ def sync_global_classifiers_for_env_build(engine, env_row: Dict[str, Any], token
     except Exception:
         min_expected = 40
     if (not force_on_version_change) and existing and existing > 0 and not stale and existing >= min_expected:
+        try:
+            sync_classifier_details_for_env_build(engine, env_row, token, str(build_version), force=False)
+        except Exception:
+            pass
         return True
 
     api_path = str(env_row.get("classifiers_api_path") or "").strip() or CLASSIFIERS_API_PATH
@@ -1048,14 +1097,20 @@ def sync_global_classifiers_for_env_build(engine, env_row: Dict[str, Any], token
         _kv_set(engine, f"global_cls_last_build::{env_key2}", str(build_version))
     except Exception:
         pass
+    try:
+        # List/mappings were just refreshed — pull full per-classifier metadata so Deep-Dive/diffs stay aligned.
+        sync_classifier_details_for_env_build(engine, env_row, token, str(build_version), force=True)
+    except Exception:
+        pass
     return True
 
 def _extract_live_state(insight_payload: Dict[str, Any]) -> str:
     si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
     if not si and isinstance(insight_payload, dict):
         si = insight_payload
-    prog = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    return str(si.get("state") or prog.get("state") or "").strip()
+    # Lifecycle state: use scanInsights.state only. progress.state tracks sub-progress and can read
+    # "Completed" before the parent scan is finished (do not use for DB/parent upserts).
+    return str(si.get("state") or "").strip()
 
 
 def _extract_scan_attributes_payload(payload: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
@@ -1208,42 +1263,48 @@ CLASSIFIER_DETAIL_KEYS = [
 ]
 
 
-def sync_classifier_details_for_env_build(engine, env_row: Dict[str, Any], token: str, build_version: str) -> bool:
+def sync_classifier_details_for_env_build(
+    engine, env_row: Dict[str, Any], token: str, build_version: str, *, force: bool = False
+) -> bool:
     """
     Fetch and store full detail snapshots for all enabled classifiers.
-    Staggered/Throttled to avoid overloading API.
+    Throttled by CLASSIFIER_DETAILS_SYNC_TTL_HOURS (default 6h) unless force=True or no rows yet.
     """
     base_url = str(env_row.get("base_url") or "").strip()
     env_id = env_row.get("id")
     if not base_url or not env_id or not build_version:
         return False
 
-    # Check if we already synced details for this build recently.
-    # We use a 24-hour TTL for full detail sync as it's expensive.
-    env_key = str(env_id)
     try:
-        # Check if we have ANY snapshots for this build in this environment
-        with engine.connect() as conn:
-            # First get the build_id
-            bid_res = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
-            if bid_res:
-                bid = int(bid_res[0])
-                # Check if we have snapshots
-                snap_count = conn.execute(text("""
-                    SELECT COUNT(*) FROM classifier_details_snapshots 
-                    WHERE build_id = :bid AND environment_id = :eid
-                """), {"bid": bid, "eid": int(env_id)}).scalar()
-                
-                # If we have data, respect the 24-hour TTL. If 0 rows, we FORCE sync.
-                if snap_count > 0:
-                    last_sync = _kv_get(engine, f"classifier_details_sync_last::{env_key}")
-                    last_build = _kv_get(engine, f"classifier_details_sync_build::{env_key}")
-                    if last_sync and last_build == build_version:
-                        dt = _parse_iso_dt(last_sync)
-                        if dt and (datetime.utcnow() - dt).total_seconds() < 86400: # 24h
-                            return True
+        ttl_h = float(os.getenv("CLASSIFIER_DETAILS_SYNC_TTL_HOURS", "6") or "6")
     except Exception:
-        pass
+        ttl_h = 6.0
+    ttl_sec = max(300, int(ttl_h * 3600))
+
+    env_key = str(env_id)
+    if not force:
+        try:
+            with engine.connect() as conn:
+                bid_res = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
+                if bid_res:
+                    bid = int(bid_res[0])
+                    snap_count = conn.execute(
+                        text("""
+                            SELECT COUNT(*) FROM classifier_details_snapshots
+                            WHERE build_id = :bid AND environment_id = :eid
+                        """),
+                        {"bid": bid, "eid": int(env_id)},
+                    ).scalar()
+
+                    if snap_count and int(snap_count or 0) > 0:
+                        last_sync = _kv_get(engine, f"classifier_details_sync_last::{env_key}")
+                        last_build = _kv_get(engine, f"classifier_details_sync_build::{env_key}")
+                        if last_sync and last_build == build_version:
+                            dt = _parse_iso_dt(last_sync)
+                            if dt and (datetime.utcnow() - dt).total_seconds() < float(ttl_sec):
+                                return True
+        except Exception:
+            pass
 
     api_path = str(env_row.get("classifiers_api_path") or "").strip() or "/api/v1/classifications"
     try:
@@ -1435,6 +1496,11 @@ def upsert_scan_parent_record(engine, env_id: Any, scan: Dict[str, Any], status:
     started_at = str(scan.get("startedAt") or scan.get("startTime") or scan.get("createdAt") or "").strip() or None
     completed_at = str(scan.get("completedAt") or scan.get("endTime") or scan.get("endedAt") or "").strip() or None
     status_val = str(status or "").strip() or None
+
+    # Hardening: Only accept completed_at if the scan is in a terminal state.
+    # Some BigID versions return a non-null endTime/completedAt for in-progress scans.
+    if status_val and not _is_terminal_state(status_val):
+        completed_at = None
     try:
         env_id_int = int(env_id) if env_id is not None and str(env_id).strip() != "" else None
     except Exception:
@@ -1477,9 +1543,13 @@ def upsert_scan_progress_record(
     scan_name: str,
     insight_payload: Dict[str, Any],
     forced_state: Optional[str] = None,
-) -> None:
+) -> Optional[datetime]:
+    """
+    Writes slot-aligned scan_progress row. Returns captured_at_utc used for the main upsert
+    so scanner performance can use the same timestamp as the insights snapshot.
+    """
     if not scan_id:
-        return
+        return None
 
     # Unwrap BigID response shape: {data:{scanInsights:{...}}}
     si = insight_payload.get("data", {}).get("scanInsights", {}) if isinstance(insight_payload, dict) else {}
@@ -1498,7 +1568,7 @@ def upsert_scan_progress_record(
     data_sources = si.get("dataSources") if isinstance(si.get("dataSources"), dict) else {}
     classifications = data_sources.get("classifications") if isinstance(data_sources.get("classifications"), dict) else {}
     progress = si.get("scanProfile", {}).get("progress", {}) if isinstance(si.get("scanProfile"), dict) else {}
-    scan_state = str(forced_state or si.get("state") or progress.get("state") or "").strip() or None
+    scan_state = str(forced_state or si.get("state") or "").strip() or None
 
     completed_sub = _to_int(subscans.get("completedSubScans", 0))
     failed_sub = _to_int(subscans.get("failedSubScans", 0))
@@ -1626,7 +1696,53 @@ def upsert_scan_progress_record(
                 "owp": objects_with_pi,
             },
         )
+        
+        # FINAL/TERMINAL row: If scan is terminal, insert a row with the ACTUAL completedAt as captured_at_utc
+        if scan_state and _is_terminal_state(scan_state):
+            try:
+                sp0 = si.get('scanProfile') if isinstance(si.get('scanProfile'), dict) else {}
+                completed_raw = sp0.get('completedAt') or sp0.get('endTime') or sp0.get('endedAt') or si.get('completedAt')
+                completed_dt = _parse_iso_dt(str(completed_raw or '')) if completed_raw else None
+                if completed_dt:
+                    cau_end = completed_dt.replace(microsecond=0)
+                    # Offset by 1s if it lands exactly on a slot to avoid collision with PULSE snapshots
+                    if (cau_end.second == 0) and (cau_end.minute % slot_m == 0):
+                        cau_end = cau_end + timedelta(seconds=1)
+                        
+                    conn.execute(text("""
+                        INSERT IGNORE INTO scan_progress (
+                            captured_at_utc, `timestamp`,
+                            scan_id, scan_name, environment_id,
+                            scan_state,
+                            completed_sub_scans, failed_sub_scans, total_sub_scans,
+                            completed_parts, failed_parts, total_parts_scanned,
+                            total_classifications, newly_added_classifications, false_removed_classifications,
+                            objects_scanned, objects_failed, objects_with_pi
+                        ) VALUES (
+                            :cau, :ts,
+                            :sid, :sname, :eid,
+                            :sst,
+                            :cs, :fs, :tsc,
+                            :cp, :fp, :tp,
+                            :tc, :nc, :fr,
+                            :os, :of, :owp
+                        )
+                    """), {
+                        'cau': cau_end,
+                        'ts': cau_end,
+                        'sid': str(scan_id),
+                        'sname': str(scan_name or ''),
+                        'eid': env_id_int,
+                        'sst': scan_state,
+                        'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
+                        'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
+                        'tc': total_class, 'nc': new_class, 'fr': false_removed,
+                        'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
+                    })
+            except Exception:
+                pass
         conn.commit()
+    return captured_at_utc
 
 
 def upsert_scan_insights_record(engine, scan_id: str, insight_payload: Dict[str, Any]) -> None:
@@ -1647,6 +1763,94 @@ def upsert_scan_insights_record(engine, scan_id: str, insight_payload: Dict[str,
             return int(v)
         except Exception:
             return None
+
+def _strip_mb_to_int(v: Any) -> int:
+    try:
+        if not v: return 0
+        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
+        return int(float(s))
+    except Exception:
+        return 0
+
+def get_scanner_group_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
+    """Fetch scanner group metrics from /api/v1/scanner-groups"""
+    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
+    try:
+        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            # Expecting data: { "status": "success", "data": [ { "scannerGroups": [...] } ] }
+            groups_outer = data.get("data", [])
+            if groups_outer and isinstance(groups_outer, list):
+                return groups_outer[0].get("scannerGroups", [])
+    except Exception:
+        pass
+    return []
+
+def get_individual_scanner_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
+    """Fetch individual scanner metrics from /api/v1/health-checks/services-status"""
+    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
+    try:
+        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list):
+                return [x for x in data if x.get("type") == "scanner"]
+    except Exception:
+        pass
+    return []
+
+def upsert_scanner_performance(engine, env_id: int, group_data: List[Dict[str, Any]], individual_data: List[Dict[str, Any]], captured_at=None) -> None:
+    now_utc = captured_at if captured_at else _now_utc_naive()
+    # If no captured_at was passed, we might still want to align to 20-min marks for the periodic loop.
+    # However, I'll move the alignment logic TO THE CALLER (the main loop) so manual calls aren't forced into buckets.
+    captured_at_utc = now_utc.replace(second=0, microsecond=0)
+    
+    with engine.connect() as conn:
+        # Save group stats
+        for g in group_data:
+            update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
+            conn.execute(text("""
+                INSERT IGNORE INTO scanner_group_performance (
+                    environment_id, captured_at_utc, group_name,
+                    running_scanners, running_threads, max_threads, scanner_threads,
+                    physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
+                ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
+            """), {
+                "eid": env_id, "cau": captured_at_utc, "gn": str(g.get("name") or ""),
+                "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
+                "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
+                "pm": int(g.get("physicalMemory") or 0), "fm": int(g.get("freeMemory") or 0),
+                "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
+            })
+            
+        # Save individual stats
+        for s in individual_data:
+            update_date = _parse_iso_dt(str(s.get("updateDate") or ""))
+            sid = str(s.get("id") or "")
+            s_name = str(s.get("name") or "")
+            # If multiple scanners have the same name, we suffix with ID to separate lines in charts
+            display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
+            
+            conn.execute(text("""
+                INSERT IGNORE INTO scanner_individual_performance (
+                    environment_id, captured_at_utc, scanner_id, name, status, group_name,
+                    running_threads, total_num_of_threads, system_load_average,
+                    physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
+                ) VALUES (
+                    :eid, :cau, :sid, :name, :status, :gn,
+                    :rt, :tt, :la, :pm, :fm, :st, :ud
+                )
+            """), {
+                "eid": env_id, "cau": captured_at_utc, "sid": sid,
+                "name": display_name, "status": str(s.get("status") or ""),
+                "gn": str(s.get("group") or ""),
+                "rt": int(s.get("runningThreads") or 0), "tt": int(s.get("totalNumOfThreads") or 0),
+                "la": float(s.get("systemLoadAverage") or 0),
+                "pm": _strip_mb_to_int(s.get("physicalMemory")), "fm": _strip_mb_to_int(s.get("freeMemory")),
+                "st": int(s.get("scannerThreads") or 0), "ud": update_date
+            })
+        conn.commit()
 
     ds_names = data_sources.get("dataSourceNames")
     if isinstance(ds_names, list):
@@ -2004,8 +2208,7 @@ def track_once(engine) -> Dict[str, Any]:
         if not si and isinstance(insight_payload, dict):
             si = insight_payload
         sp = si.get("scanProfile") if isinstance(si.get("scanProfile"), dict) else {}
-        prog = sp.get("progress") if isinstance(sp.get("progress"), dict) else {}
-        state = str(si.get("state") or prog.get("state") or "").strip()
+        state = str(si.get("state") or "").strip()
         name = str(sp.get("name") or "").strip()
         tmpl = str(sp.get("scanTemplateName") or "").strip()
         scan_row = {
@@ -2240,9 +2443,35 @@ def track_once(engine) -> Dict[str, Any]:
         except Exception:
             pass
 
+        # Global classifier list + metadata snapshots (throttled inside helpers; runs even with no active scans).
+        try:
+            if sync_global_classifiers_for_env_build(engine, env, token):
+                metrics["global_classifier_sync_ok"] += 1
+            else:
+                metrics["global_classifier_sync_fail"] += 1
+        except Exception:
+            metrics["global_classifier_sync_fail"] += 1
 
         try:
             scans = _fetch_running_parent_scans(base_url, token)
+            
+            # Performance tracking (every 20 minutes)
+            # ONLY if there are active scans (requested by user)
+            if scans:
+                try:
+                    now_p = _now_utc_naive()
+                    # We use 20-minute buckets (0-19, 20-39, 40-59)
+                    p_bucket = now_p.minute // 20
+                    p_key = f"scanner_perf_cap::{env_id}::{now_p.strftime('%Y%m%d%H')}_{p_bucket}"
+                    if not _kv_get(engine, p_key):
+                        p_groups = get_scanner_group_performance(base_url, token)
+                        p_inds = get_individual_scanner_performance(base_url, token)
+                        if p_groups or p_inds:
+                            aligned_p = now_p.replace(minute=p_bucket * 20, second=0, microsecond=0)
+                            upsert_scanner_performance(engine, env_id, p_groups, p_inds, captured_at=aligned_p)
+                            _kv_set(engine, p_key, "done", expire_seconds=1200)
+                except Exception:
+                    pass
         except Exception as ex:
             metrics["env_failures"] += 1
             metrics["fail_parent_scans"] += 1
@@ -2315,6 +2544,22 @@ def track_once(engine) -> Dict[str, Any]:
         )
         seen_scan_ids.add(sid)
 
+    # One scanner snapshot per (environment, progress slot) per cycle — aligned to the same
+    # captured_at_utc as scan_progress (not a separate timestamp at end of the cycle).
+    scanner_cap_state: Dict[str, Any] = {"lock": threading.Lock(), "done": set()}
+
+    def _scanner_snap_key(env_row: Dict[str, Any], cau: Optional[datetime]) -> Optional[Tuple[Any, str]]:
+        if cau is None:
+            return None
+        eid = env_row.get("id")
+        if eid is None:
+            return None
+        try:
+            ts = cau.replace(microsecond=0).isoformat(sep=" ")
+        except Exception:
+            ts = str(cau)
+        return (eid, ts)
+
     def process_scan(job: Tuple[str, Dict[str, Any], str, str, str]) -> Tuple[bool, str, int]:
         base_url, env_row, scan_id, scan_name, parent_state = job
         if not base_url or not scan_id:
@@ -2348,7 +2593,7 @@ def track_once(engine) -> Dict[str, Any]:
                 pass
 
             # Snapshot row (slot-aligned) + normalized insights summary
-            upsert_scan_progress_record(
+            cau = upsert_scan_progress_record(
                 engine,
                 env_row.get("id"),
                 scan_id,
@@ -2357,6 +2602,22 @@ def track_once(engine) -> Dict[str, Any]:
                 forced_state=best_state,
             )
             upsert_scan_insights_record(engine, scan_id, insight)
+
+            # Scanner-group + services-status at same captured_at_utc as this progress row (deduped per env+slot).
+            sk = _scanner_snap_key(env_row, cau)
+            if sk is not None:
+                do_cap = False
+                with scanner_cap_state["lock"]:
+                    if sk not in scanner_cap_state["done"]:
+                        scanner_cap_state["done"].add(sk)
+                        do_cap = True
+                if do_cap and cau is not None:
+                    try:
+                        capture_scanner_performance_for_env(
+                            engine, env_row, captured_at=cau.replace(microsecond=0)
+                        )
+                    except Exception:
+                        pass
 
             # Template classifier set sync (what user means by "template has ~72 classifiers").
             # Only when we are already processing a scan (no extra background /about polling).
@@ -2395,7 +2656,7 @@ def track_once(engine) -> Dict[str, Any]:
                             
                             # NEW: Also sync full details for the classifier_details_snapshots table
                             try:
-                                sync_classifier_details_for_env_build(engine, env_row, token, str(bver))
+                                sync_classifier_details_for_env_build(engine, env_row, token, str(bver), force=True)
                             except Exception:
                                 pass
                                 
@@ -2429,7 +2690,7 @@ def track_once(engine) -> Dict[str, Any]:
             # Attribute delta fetch can be slow; only do it when useful.
             try:
                 needs_terminal_attrs = bool(_needs_attribute_deltas(scan_id) or _needs_attribute_delta_counts(scan_id))
-                if _is_terminal_state(state):
+                if _is_terminal_state(best_state):
                     if needs_terminal_attrs:
                         attrs = fetch_scan_classifier_attributes(
                             base_url,
@@ -2466,7 +2727,7 @@ def track_once(engine) -> Dict[str, Any]:
 
             # When scan is terminal, compute and persist throughput for existing auto row.
             try:
-                if _is_terminal_state(state):
+                if _is_terminal_state(best_state):
                     update_auto_scan_benchmarks_throughput(
                         engine,
                         scan_id,
@@ -2618,8 +2879,15 @@ def run_for_scan_id(engine, scan_id: str, verbose: bool = True) -> bool:
             continue
         try:
             state = _extract_live_state(insight)
-            upsert_scan_progress_record(engine, env_id, scan_id, "", insight)
+            cau = upsert_scan_progress_record(engine, env_id, scan_id, "", insight)
             upsert_scan_insights_record(engine, scan_id, insight)
+            if cau is not None:
+                try:
+                    capture_scanner_performance_for_env(
+                        engine, env, captured_at=cau.replace(microsecond=0)
+                    )
+                except Exception:
+                    pass
             try:
                 attrs = fetch_scan_classifier_attributes(base_url, scan_id, token)
                 upsert_scan_attribute_deltas(engine, scan_id, attrs)

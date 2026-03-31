@@ -1,19 +1,36 @@
 """
 Workflow runner for DS + scan automation.
 
-Reads `workflow_runs` + `workflow_steps` produced by the Streamlit UI
-and executes them sequentially:
-  - create/update DS connection
-  - create scan profile
-  - start scan (best-effort across BigID versions)
-  - wait until scan reaches a terminal state
-  - enforce cooldown between steps (default 15 minutes)
+Reads `workflow_runs` + `workflow_steps` from the Streamlit UI and executes them with
+**parallelism up to the workflow pool size** (active envs with "Use for workflow runs").
 
-Secrets are not hardcoded: DS and scan payloads are stored in DB table
-`workflow_templates` as JSON strings (with {{PLACEHOLDER}} variables).
+Per-step pipeline on its assigned environment (odd steps → env1, even → env2 by default):
+  pre-action (optional) → create/update DS → test connection → create scan profile
+  → start parent scan → reconcile until terminal → cooldown → next step.
+
+With two environments, up to two steps can run at once when earlier steps have finished
+or are waiting on capacity; `WORKFLOW_MAX_CONCURRENT_SCANS` caps concurrency (default = env count).
+
+Secrets are not hardcoded: payloads live in `workflow_templates` with {{PLACEHOLDER}} variables.
 """
 
 from __future__ import annotations
+
+# Step is still using its environment (DS setup, profile, or scan) — keep env reserved / count toward concurrency.
+WORKFLOW_ENV_OCCUPYING_STATUSES: tuple[str, ...] = (
+    "running",
+    "pre_action_done",
+    "ds_created",
+    "ds_test_ok",
+    "scan_created",
+    "scan_running",
+    "scan_waiting",
+)
+
+
+def _workflow_env_occupying_sql_in() -> str:
+    return ",".join(f"'{s}'" for s in WORKFLOW_ENV_OCCUPYING_STATUSES)
+
 
 import argparse
 import json
@@ -506,6 +523,7 @@ def ensure_workflow_tables(engine) -> None:
                 "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN scan_template_id TEXT NULL",
             ]:
                 try:
                     conn.execute(text(stmt))
@@ -581,6 +599,7 @@ def ensure_workflow_tables(engine) -> None:
             "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
             "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
             "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
+            "ALTER TABLE workflow_runs ADD COLUMN scan_template_id VARCHAR(128) NULL",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -1097,6 +1116,22 @@ def _unresolved_placeholders(s: str) -> List[str]:
     except Exception:
         return []
 
+
+def scan_template_id_exists_on_server(base_url: str, token: str, template_id: str) -> bool:
+    tid = str(template_id or "").strip()
+    if not tid:
+        return False
+    try:
+        items = fetch_scan_templates(base_url, token, limit=400, skip=0)
+    except Exception:
+        return False
+    for it in items or []:
+        iid = str(it.get("_id") or it.get("id") or "").strip()
+        if iid and iid == tid:
+            return True
+    return False
+
+
 def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: str, token: str) -> str:
     keys = []
     if env_id is not None:
@@ -1104,28 +1139,102 @@ def resolve_default_scan_template_id(engine, env_id: Optional[int], base_url: st
     keys.append("config::scan_template_id")
     for k in keys:
         v = str(get_template(engine, k) or "").strip()
-        if v:
+        if v and scan_template_id_exists_on_server(base_url, token, v):
+            try: logger.info("resolved template key=%s value=%s", k, v)
+            except Exception: pass
             return v
+        if v:
+            try: logger.warning("configured scan template id not found in BigID, ignoring key=%s value=%s", k, v)
+            except Exception: pass
     # Env var fallback
     env_v = str(os.getenv("WORKFLOW_DEFAULT_SCAN_TEMPLATE_ID", "") or "").strip()
-    if env_v:
+    if env_v and scan_template_id_exists_on_server(base_url, token, env_v):
         return env_v
+    if env_v:
+        try: logger.warning("WORKFLOW_DEFAULT_SCAN_TEMPLATE_ID not found in BigID; ignoring value=%s", env_v)
+        except Exception: pass
     # Automatic fallback: fetch scan templates and pick "Data source scan"
     try:
         items = fetch_scan_templates(base_url, token, limit=200, skip=0)
         for it in items or []:
             nm = str(it.get("name") or "").strip().lower()
-            if nm == "data source scan":
+            if nm in {"data source scan", "datasource scan"}:
                 tid = str(it.get("_id") or it.get("id") or "").strip()
                 if tid:
                     if env_id is not None:
                         upsert_template_value(engine, f"config::scan_template_id::env={int(env_id)}", "config", tid)
                     else:
                         upsert_template_value(engine, "config::scan_template_id", "config", tid)
+                    try: logger.info("resolved default scan template '%s' -> %s", nm, tid)
+                    except Exception: pass
                     return tid
     except Exception:
         pass
     return ""
+
+
+def get_or_set_run_scan_template_id(
+    engine,
+    run_id: int,
+    env_id: Optional[int],
+    base_url: str,
+    token: str,
+) -> str:
+    """
+    First successful resolution for this workflow run is stored on workflow_runs.scan_template_id
+    and reused for every step in the run (consistent scanTemplateId on all scan profiles).
+    """
+    rid = int(run_id)
+    existing = ""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT scan_template_id FROM workflow_runs WHERE id=:rid LIMIT 1"),
+                {"rid": rid},
+            ).fetchone()
+        existing = str(row[0] or "").strip() if row and row[0] is not None else ""
+    except Exception:
+        pass
+    if existing:
+        if scan_template_id_exists_on_server(base_url, token, existing):
+            return existing
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("UPDATE workflow_runs SET scan_template_id=NULL WHERE id=:rid"), {"rid": rid})
+                conn.commit()
+        except Exception:
+            pass
+    tid = resolve_default_scan_template_id(engine, env_id, base_url, token)
+    if not tid:
+        return ""
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE workflow_runs SET scan_template_id=:tid, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=:rid AND (scan_template_id IS NULL OR TRIM(COALESCE(scan_template_id,''))='')"
+                ),
+                {"tid": tid, "rid": rid},
+            )
+            conn.commit()
+    except Exception:
+        pass
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT scan_template_id FROM workflow_runs WHERE id=:rid LIMIT 1"),
+                {"rid": rid},
+            ).fetchone()
+        out = str(row[0] or "").strip() if row and row[0] is not None else ""
+    except Exception:
+        out = ""
+    if out:
+        try:
+            logger.info("WORKFLOW_RUN_SCAN_TEMPLATE_PINNED run_id=%s scan_template_id=%s", rid, out)
+        except Exception:
+            pass
+        return out
+    return tid
 
 
 def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1155,12 +1264,26 @@ def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any
 
 
 def set_run_error(engine, run_id: int, message: str) -> None:
+    """
+    Record the latest step-level failure on the run. Does NOT set status=failed here:
+    marking failed/completed is done by _maybe_mark_run_completed when no active steps remain.
+    Otherwise a single step error would flip the whole run to failed, the runner would stop
+    loading it (only status='running' is processed), and other steps stay stuck mid-phase.
+    """
     with engine.connect() as conn:
         conn.execute(
-            text("UPDATE workflow_runs SET last_error=:e, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"),
+            text(
+                "UPDATE workflow_runs "
+                "SET last_error=:e, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,''))) = 'running'"
+            ),
             {"e": str(message)[:2000], "rid": int(run_id)},
         )
         conn.commit()
+    try:
+        _maybe_mark_run_completed(engine, int(run_id))
+    except Exception:
+        pass
 
 
 def clear_run_error(engine, run_id: int) -> None:
@@ -1193,6 +1316,19 @@ def set_step_status(engine, step_id: int, status: str, **fields: Any) -> None:
     with engine.connect() as conn:
         conn.execute(text(sql), params)
         conn.commit()
+
+
+def touch_step_updated_at(engine, step_id: int) -> None:
+    """Bump updated_at only. Pass 1 must refresh liveness while status stays scan_running, or global stale cleanup resets long scans."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("UPDATE workflow_steps SET updated_at=CURRENT_TIMESTAMP WHERE id=:id"),
+                {"id": int(step_id)},
+            )
+            conn.commit()
+    except Exception:
+        pass
 
 
 def ensure_runner_heartbeat_table(engine) -> None:
@@ -1355,7 +1491,9 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
     with engine.connect() as conn:
         row = conn.execute(
             text("""
-                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name, classifiers_api_path, is_active
+                SELECT id, env_name, base_url, version, auth_module_path, auth_function_name,
+                       classifiers_api_path, is_active,
+                       COALESCE(include_in_workflow_runs, 1) AS include_in_workflow_runs
                 FROM test_environments
                 WHERE id = :id
                 LIMIT 1
@@ -1373,6 +1511,7 @@ def load_env(engine, env_id: int) -> Dict[str, Any]:
         "auth_function_name": row[5],
         "classifiers_api_path": row[6],
         "is_active": row[7],
+        "include_in_workflow_runs": bool(int(row[8])) if row[8] is not None else True,
     }
 
 
@@ -1720,10 +1859,13 @@ def _grouped_statuses_reports_success(payload: Dict[str, Any], ds_name: str) -> 
         n = str(item.get("name") or item.get("ds_name") or "").strip()
         if n != name and name not in n:
             continue
+        ds_status = str(item.get("status") or item.get("state") or item.get("currentStatus") or "").strip().lower()
+        if ds_status in {"draft", "new", "disabled"}:
+            continue
         cst = item.get("connectionStatusTest") or item.get("connection_status_test")
         if isinstance(cst, dict) and (cst.get("is_success") is True or str(cst.get("is_success") or "").strip().lower() in ("true", "1", "yes")):
             return True
-        if item.get("lastTestSuccess") is True or str(item.get("connection_status") or "").strip().lower() in ("connected", "success"):
+        if item.get("lastTestSuccess") is True:
             return True
     return False
 
@@ -1774,13 +1916,18 @@ def wait_for_ds_connection_test_result(
         try:
             payload = fetch_ds_connection(base_url, token, ds_name, timeout_seconds=min(10.0, float(HTTP_TIMEOUT)))
             dc = payload.get("ds_connection") if isinstance(payload, dict) and isinstance(payload.get("ds_connection"), dict) else payload
+            ds_state = str((dc or {}).get("status") or (dc or {}).get("state") or "").strip().lower()
+            # Do not fail fast on DS state alone; many tenants lag status updates after test trigger.
             cst = dc.get("connectionStatusTest") if isinstance(dc, dict) else None
             if cst is None and (_now_utc() >= grace_decide_at):
-                # BigID often does not return connectionStatusTest in GET for MSSQL/S3/SMB. Test was already triggered (POST).
-                # Default: proceed so workflow continues; set WORKFLOW_DS_TEST_STRICT=1 to require connectionStatusTest.
-                if os.getenv("WORKFLOW_DS_TEST_STRICT", "").strip().lower() in ("1", "true", "yes"):
-                    return False, "connectionStatusTest missing; cannot confirm success (DS may stay Draft in BigID)"
-                return True, "no connectionStatusTest in response; test was triggered, proceeding so workflow can continue"
+                strict_mode = str(os.getenv("WORKFLOW_DS_TEST_STRICT", "0") or "0").strip().lower() in ("1", "true", "yes")
+                if strict_mode:
+                    # Strict mode: keep waiting until timeout/grouped-statuses fallback decides.
+                    pass
+                else:
+                    # Non-strict mode: if DS moved out of draft/new/disabled, accept as success.
+                    if ds_state and ds_state not in {"draft", "new", "disabled"}:
+                        return True, f"success (non-strict; ds_state={ds_state})"
             if isinstance(cst, dict):
                 last_conn = _parse_utc_dt(cst.get("last_connection"))
                 if last_conn:
@@ -1887,9 +2034,15 @@ def test_ds_connection_auto(
     did = str(ds_id or "").strip()
     # 1) ids-based test
     try:
-        return test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
+        out = test_ds_connections_by_ids(base_url, token, ids=[did or name], broadcast_event=broadcast_event)
+        # If ids endpoint explicitly reports success, no need to force fallback.
+        ov = str((out or {}).get("result") or (out or {}).get("status") or "").strip().lower() if isinstance(out, dict) else ""
+        if ov in {"ok", "success", "accepted", "queued", "running", "started"}:
+            return out
+        # If ids endpoint returns explicit failure markers, fallback to client endpoint.
     except Exception:
-        allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '0') or '0').strip().lower() in {'1','true','yes','y','on'}
+        out = {}
+        allow_fallback = str(os.getenv('WORKFLOW_DS_TEST_ALLOW_CLIENT_FALLBACK', '1') or '1').strip().lower() in {'1','true','yes','y','on'}
         if did and (not allow_fallback):
             raise
     # 2) client-style test (fallback) — matches UI POST body
@@ -1975,23 +2128,26 @@ def start_scan_profile(base_url: str, token: str, scan_profile_id: str) -> Dict[
     if not sid:
         raise RuntimeError("scan_profile_id is required")
     base = SCAN_PROFILES_PATH.rstrip("/")
+    scans_base = SCANS_TRIGGER_PATH.rstrip("/")
     candidates = [
         (f"{base}/{sid}/run", None),
         (f"{base}/{sid}/start", None),
         (f"{base}/{sid}/execute", None),
         (f"{base}/run", {"scanProfileId": sid}),
         (f"{base}/start", {"scanProfileId": sid}),
+        (f"{scans_base}/start", {"scanProfileId": sid, "scanType": "dsScan"}),
+        (f"{scans_base}", {"scanProfileId": sid, "scanType": "dsScan", "scanOrigin": "Invoked manually"}),
     ]
-    last_ex = None
+    errors: List[str] = []
     for path, body in candidates:
         url = build_api_url(base_url, path)
         try:
             resp = _request("POST", url, token, json_body=(body or {}))
             return resp.json() if resp.content else {}
         except Exception as ex:
-            last_ex = ex
+            errors.append(f"POST {url} -> {ex}")
             continue
-    raise RuntimeError(f"Failed to start scan profile via known endpoints: {last_ex}")
+    raise RuntimeError(f"Failed to start scan profile via known endpoints: {' | '.join(errors[:6])}")
 
 
 def trigger_scan(base_url: str, token: str, scan_profile_name: str, *, scan_type: str = "dsScan") -> Dict[str, Any]:
@@ -2168,32 +2324,83 @@ def _extract_id(payload: Dict[str, Any], keys: List[str]) -> str:
     if isinstance(v, str) and v.strip():
         return v.strip()
     if isinstance(v, dict):
-        for kk in ["_id", "id", "scanId", "scan_id", "parentScanId", "parent_scan_id"]:
-            if isinstance(v.get(kk), str) and v.get(kk).strip():
+        for kk in ["_id", "id", "ID", "Guid", "GUID", "scanId", "scan_id", "parentScanId", "parent_scan_id", "dsId", "ds_id"]:
+            if isinstance(v.get(kk), (str, int)) and str(v.get(kk)).strip():
                 return str(v.get(kk)).strip()
     return ""
 
 
-def _scenario_lock_key(ds_kind: Any, file_set_type: Any) -> str:
+_workflow_include_col_ready = False
+
+
+def _ensure_test_environments_workflow_column(engine) -> None:
+    """Adds include_in_workflow_runs if missing (runner may start before Streamlit runs ensure)."""
+    global _workflow_include_col_ready
+    if _workflow_include_col_ready:
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE"
+                )
+            )
+            conn.commit()
+    except Exception:
+        pass
+    _workflow_include_col_ready = True
+
+
+def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
     """
-    Lock key that prevents running the *same DS kind + file set* in parallel across envs.
-    Examples:
-      s3::Small Files
-      smb::Large Files
+    If a run was marked failed while enabled steps are still non-terminal, flip back to running.
+    Otherwise the runner never loads it (WHERE status='running') and parallelism / DS pipeline stall forever.
     """
-    dk = str(ds_kind or "").strip().lower()
-    fs = str(file_set_type or "").strip() or "default"
-    return f"{dk}::{fs}"
+    try:
+        with engine.connect() as conn:
+            st_row = conn.execute(
+                text("SELECT LOWER(TRIM(COALESCE(status,''))) FROM workflow_runs WHERE id=:rid LIMIT 1"),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not st_row or str(st_row[0] or "") != "failed":
+            return
+        with engine.connect() as conn:
+            act = conn.execute(
+                text(
+                    "SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,1)=1 "
+                    "AND LOWER(TRIM(COALESCE(status,''))) NOT IN ('completed','error','disabled') LIMIT 1"
+                ),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not act:
+            return
+        with engine.connect() as conn:
+            conn.execute(
+                text(
+                    "UPDATE workflow_runs SET status='running', finished_at=NULL, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,'')))='failed'"
+                ),
+                {"rid": int(run_id)},
+            )
+            conn.commit()
+        try:
+            print(f"[{_now_utc().isoformat()}Z] auto_resume_failed_run run_id={int(run_id)} (non-terminal steps remain)", flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def run_once(engine, *, quiet: bool = False) -> bool:
     """
-    Executes at most one step across all runs.
+    One scheduler tick: reconcile scans, then dispatch up to WORKFLOW_MAX_CONCURRENT_SCANS
+    steps (default = workflow-pool env count) across all running workflows.
     Returns True if any work was done.
     """
     logger = _get_logger(quiet=quiet)
     logger.info('run_once: tick quiet=%s', bool(quiet))
     ensure_workflow_tables(engine)
+    _ensure_test_environments_workflow_column(engine)
     set_runner_heartbeat(engine, status="running", message="tick", started=False)
     ok_lock, lock_msg = acquire_runner_lock(engine, ttl_seconds=120)
     if not ok_lock:
@@ -2201,34 +2408,25 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         return False
     now = _now_utc()
 
-    # --- PASS 0: GLOBAL STALE STEP RECONCILIATION ---
-    # Recover steps stuck in 'scan_running' from ANY run if they haven't been updated in > 2 hours.
-    # This prevents old hung runs from blocking new ones via avoid_parallel scenario locks.
-    try:
-        with engine.connect() as conn:
-            stale_steps = conn.execute(
-                text("SELECT id, run_id, seq, scan_id FROM workflow_steps WHERE status='scan_running' AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL 2 HOUR)")
-            ).fetchall()
-        for ss in stale_steps:
-            ss_id, ss_rid, ss_seq, ss_sid = ss
-            # Mark as error/pending so it's not blocking parallelism
-            set_step_status(engine, ss_id, "pending", scan_id=None, last_error="Global stale cleanup: step was stuck in scan_running for > 2h")
-            logger.info("global_cleanup: reset stale step_id=%s run_id=%s seq=%s", ss_id, ss_rid, ss_seq)
-    except Exception as ex:
-        logger.error("Pass 0 error: %s", ex)
-
     with engine.connect() as conn:
         run_rows = conn.execute(
             text("""
                 SELECT id, status, cooldown_minutes, next_eligible_at
                 FROM workflow_runs
-                WHERE status = 'running'
+                WHERE status IN ('running', 'failed')
                 ORDER BY id ASC
             """)
         ).fetchall()
     if not run_rows:
         set_runner_heartbeat(engine, status="idle", message="no running workflows", started=False)
         return False
+
+    # Failed runs with non-terminal enabled steps still need the runner (otherwise steps stay stuck forever).
+    for rr0 in run_rows:
+        try:
+            _auto_resume_failed_run_if_stuck(engine, int(rr0[0]))
+        except Exception:
+            pass
 
     # Track global state across all running workflows
     inflight_envs: Set[int] = set()
@@ -2257,8 +2455,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             r_status = str(r_row[0] or "").lower()
             r_next = r_row[1]
             
-            # Release if run is no longer active
-            if r_status not in {"running"}:
+            # Release if run is no longer active (keep failed runs reserved while steps still occupy envs).
+            if r_status not in {"running", "failed"}:
                 _set_env_busy(engine, be_id, None, False)
                 continue
             
@@ -2269,9 +2467,19 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 targeted_envs.add(be_id)
                 continue
             
-            # Cooldown is over or not set. Release if no active scan in DB.
+            # Cooldown is over or not set. Release only if no in-flight DS/scan work on this env for this run.
             with engine.connect() as conn:
-                active_step = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND environment_id=:eid AND status='scan_running' LIMIT 1"), {"rid": int(be_run_id), "eid": be_id}).fetchone()
+                active_step = conn.execute(
+                    text(
+                        f"""
+                        SELECT 1 FROM workflow_steps
+                        WHERE run_id=:rid AND environment_id=:eid
+                          AND LOWER(TRIM(COALESCE(status,''))) IN ({_workflow_env_occupying_sql_in()})
+                        LIMIT 1
+                        """
+                    ),
+                    {"rid": int(be_run_id), "eid": be_id},
+                ).fetchone()
             if not active_step:
                 _set_env_busy(engine, be_id, None, False)
             else:
@@ -2279,11 +2487,16 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     except Exception:
         pass
 
-    # Load active env ids (any non-zero is_active: 1, TRUE, etc.), then sync each env from API every tick
+    # Load workflow-pool env ids (active + include_in_workflow_runs), then sync each from API every tick
     try:
         with engine.connect() as conn:
             env_rows = conn.execute(text(
-                "SELECT id FROM test_environments WHERE COALESCE(is_active, 0) != 0 ORDER BY id"
+                """
+                SELECT id FROM test_environments
+                WHERE COALESCE(is_active, 0) != 0
+                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                ORDER BY id
+                """
             )).fetchall()
             active_env_ids = [int(r[0]) for r in env_rows if r[0] is not None]
         for eid in active_env_ids:
@@ -2293,7 +2506,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 pass
         with engine.connect() as conn:
             env_rows = conn.execute(text(
-                "SELECT id, is_busy, busy_by_run_id FROM test_environments WHERE COALESCE(is_active, 0) != 0 ORDER BY id"
+                """
+                SELECT id, is_busy, busy_by_run_id FROM test_environments
+                WHERE COALESCE(is_active, 0) != 0
+                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                ORDER BY id
+                """
             )).fetchall()
             env_db_busy = {int(r[0]): (bool(r[1]), r[2]) for r in env_rows if r[0] is not None}
             env_count = len(active_env_ids)
@@ -2354,6 +2572,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         completed_success_any = True
                     else:
                         set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
+                        set_run_error(engine, run_id, f"Step {seq}: scan ended in state {scan_status}")
                         set_run_next_eligible(engine, run_id, _now_utc())
                     completed_any = True
                     did_any_work = True
@@ -2373,12 +2592,15 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                                 set_step_status(engine, step_id, "completed", finished_at=_now_utc())
                             else:
                                 set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {api_status}")
+                                set_run_error(engine, run_id, f"Step {seq}: scan ended in state {api_status}")
                             completed_any = True
                             did_any_work = True
                         else:
                             # Not terminal, just keep as scan_running
                             if st_status != "scan_running":
                                 set_step_status(engine, step_id, "scan_running")
+                            else:
+                                touch_step_updated_at(engine, step_id)
                             if env_id is not None:
                                 inflight_envs.add(int(env_id))
                         continue
@@ -2388,6 +2610,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         if (now - step_updated_at) < grace_delta:
                             if st_status != "scan_running":
                                 set_step_status(engine, step_id, "scan_running")
+                            else:
+                                touch_step_updated_at(engine, step_id)
                             if env_id is not None:
                                 inflight_envs.add(int(env_id))
                             continue
@@ -2405,6 +2629,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                             inflight_envs.add(int(env_id))
                     if sid and st_status != "scan_running":
                         set_step_status(engine, step_id, "scan_running")
+                    elif sid and st_status == "scan_running":
+                        # Tracker shows non-terminal scan; row already scan_running — still bump liveness.
+                        touch_step_updated_at(engine, step_id)
             
             if completed_any and completed_success_any:
                 try:
@@ -2415,21 +2642,63 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         except Exception:
             pass
 
+    # --- GLOBAL STALE STEP RECONCILIATION (after Pass 1 so active scans get updated_at refreshed first) ---
+    try:
+        try:
+            stale_hours = int(os.getenv("WORKFLOW_STALE_SCAN_RUNNING_HOURS", "48") or "48")
+        except Exception:
+            stale_hours = 48
+        stale_hours = max(2, min(stale_hours, 168))
+        cutoff = now - timedelta(hours=float(stale_hours))
+        with engine.connect() as conn:
+            stale_steps = conn.execute(
+                text(
+                    "SELECT id, run_id, seq, scan_id FROM workflow_steps "
+                    "WHERE status='scan_running' AND updated_at < :cutoff"
+                ),
+                {"cutoff": cutoff},
+            ).fetchall()
+        for ss in stale_steps:
+            ss_id, ss_rid, ss_seq, ss_sid = ss
+            set_step_status(
+                engine,
+                ss_id,
+                "pending",
+                scan_id=None,
+                last_error=f"Global stale cleanup: step was stuck in scan_running for > {stale_hours}h",
+            )
+            logger.info("global_cleanup: reset stale step_id=%s run_id=%s seq=%s", ss_id, ss_rid, ss_seq)
+    except Exception as ex:
+        logger.error("Stale scan_running cleanup error: %s", ex)
+
+    # Any env with a step in DS/profile/scan phase counts toward concurrency (not only scan_running).
+    try:
+        with engine.connect() as conn:
+            occ_rows = conn.execute(
+                text(
+                    f"""
+                    SELECT DISTINCT ws.environment_id
+                    FROM workflow_steps ws
+                    INNER JOIN workflow_runs wr ON wr.id = ws.run_id
+                    WHERE wr.status = 'running'
+                      AND COALESCE(ws.is_enabled, 1) = 1
+                      AND ws.environment_id IS NOT NULL
+                      AND LOWER(TRIM(COALESCE(ws.status, ''))) IN ({_workflow_env_occupying_sql_in()})
+                    """
+                )
+            ).fetchall()
+        for orow in occ_rows or []:
+            if orow[0] is not None:
+                try:
+                    inflight_envs.add(int(orow[0]))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     # --- PASS 2: DISPATCH FOR ALL RUNS ---
     scans_at_capacity = bool(len(inflight_envs) >= int(max_scans))
     targeted_envs.update(inflight_envs)
-    
-    # Scenario parallelism guard
-    avoid_parallel = str(os.getenv("WORKFLOW_AVOID_PARALLEL_SAME_SCENARIO", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
-    running_keys: Set[str] = set()
-    if avoid_parallel:
-        try:
-            with engine.connect() as conn:
-                rrows = conn.execute(text("SELECT ds_kind, file_set_type FROM workflow_steps WHERE COALESCE(status,'') = 'scan_running'")).fetchall()
-                for rr in rrows or []:
-                    running_keys.add(_scenario_lock_key(rr[0], rr[1]))
-        except Exception:
-            pass
 
     # Cache environment busy status for this tick to avoid redundant API calls
     env_busy_cache: Dict[int, bool] = {}
@@ -2465,7 +2734,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         # Strategy for status filter
         retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
         if not retry_errors:
-            where_status = "AND COALESCE(status, 'pending') NOT IN ('scan_created', 'completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
+            # Include scan_created so a step can resume (e.g. trigger scan after profile) if the runner tick ended mid-pipeline.
+            where_status = "AND COALESCE(status, 'pending') NOT IN ('completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
         else:
             where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
 
@@ -2511,29 +2781,41 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     with engine.connect() as conn:
                         in_progress = conn.execute(
                             text(
-                                "SELECT COUNT(1) FROM workflow_steps WHERE run_id=:rid AND seq < :seq AND COALESCE(status,'') NOT IN ('completed','disabled','error')"
+                                f"SELECT COUNT(1) FROM workflow_steps WHERE run_id=:rid AND seq < :seq AND LOWER(TRIM(COALESCE(status,''))) IN ({_workflow_env_occupying_sql_in()})"
                             ),
                             {"rid": run_id, "seq": cand_seq},
                         ).fetchone()
                     count_before = int(in_progress[0]) if in_progress else 0
                     if count_before >= num_envs:
-                        continue  # no capacity: all envs are "used" by earlier steps
+                        continue  # no capacity: all envs are "used" by earlier steps or those with higher priority (lower seq)
 
                 c_status = str(cand[19] or '').strip().lower()
                 c_env = cand[2]
 
                 # Special case: already running?
-                if (not allow_scan_running) and c_status == 'scan_running': continue
+                if (not allow_scan_running) and c_status == 'scan_running':
+                    continue
                 if c_status == 'scan_running' and allow_scan_running:
                     # If it's already running, it must stay on its assigned env
-                    if c_env is None: continue
+                    if c_env is None:
+                        continue
                     return (cand, int(c_env))
 
-                # Search through ALL active environments. DB first (reserved by another run?), then API (scan running?).
+                # If step already owns an environment and is in an active DS/scan phase,
+                # keep advancing it even when global capacity is full.
+                if c_env is not None and c_status in WORKFLOW_ENV_OCCUPYING_STATUSES and c_status != 'scan_running':
+                    return (cand, int(c_env))
+
+                # Search through ALL active environments (or just the assigned one). DB first (reserved by another run?), then API (scan running?).
                 best_env = None
-                for eid in active_env_ids:
-                    if int(eid) in targeted_envs:
+                env_candidates = [int(c_env)] if c_env is not None else active_env_ids
+                for eid in env_candidates:
+                    if int(eid) not in active_env_ids:
                         continue
+                    if int(eid) in targeted_envs:
+                        # Allow the step that already owns this env to continue its own pipeline.
+                        if not (c_env is not None and int(c_env) == int(eid) and c_status in WORKFLOW_ENV_OCCUPYING_STATUSES):
+                            continue
                     db_busy, db_busy_by = env_db_busy.get(eid, (False, None))
                     if db_busy and db_busy_by is not None and int(db_busy_by) != int(run_id):
                         continue  # reserved by another run
@@ -2596,6 +2878,53 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
     return did_any_work
 
+
+def _maybe_mark_run_completed(engine, run_id: int) -> None:
+    """
+    If all steps in the run are in a terminal or non-actionable state
+    (completed, error, disabled) — i.e. nothing pending/active remains —
+    mark the workflow run as 'completed'. Called after auth failure so
+    runs don't stay stuck in 'running' forever when all work is done.
+    """
+    try:
+        with engine.connect() as conn:
+            any_active = conn.execute(
+                text(
+                    "SELECT 1 FROM workflow_steps "
+                    "WHERE run_id=:rid "
+                    "AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') "
+                    "AND COALESCE(is_enabled,1)=1 "
+                    "LIMIT 1"
+                ),
+                {"rid": int(run_id)},
+            ).fetchone()
+            any_error = conn.execute(
+                text(
+                    "SELECT 1 FROM workflow_steps "
+                    "WHERE run_id=:rid "
+                    "AND COALESCE(status,'')='error' "
+                    "AND COALESCE(is_enabled,1)=1 "
+                    "LIMIT 1"
+                ),
+                {"rid": int(run_id)},
+            ).fetchone()
+        if not any_active:
+            with engine.connect() as conn:
+                if any_error:
+                    conn.execute(
+                        text("UPDATE workflow_runs SET status='failed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid AND status NOT IN ('completed','stopped')"),
+                        {"rid": int(run_id)},
+                    )
+                else:
+                    conn.execute(
+                        text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid AND status NOT IN ('completed','stopped')"),
+                        {"rid": int(run_id)},
+                    )
+                conn.commit()
+    except Exception:
+        pass
+
+
 def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) -> bool:
     """Helper to process a single step. Extracted from original run_once."""
     step_id = int(step[0])
@@ -2626,6 +2955,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         set_step_error(engine, step_id, f"Auth failed: {ex}")
         set_run_error(engine, run_id, f"Step {seq}: auth failed")
         _set_env_busy(engine, env_id, run_id, False) # RELEASE
+        # If no other steps are pending/active, auto-complete the run.
+        _maybe_mark_run_completed(engine, run_id)
         return True
 
     cur_status = str(step[19] or "").strip().lower()
@@ -2911,8 +3242,12 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
 
         # Match BigID UI: PUT body must include isSavedAsDraft=false so DS is not left in Draft.
         if isinstance(ds_payload, dict):
+            # Same nesting-aware logic as _apply_runtime_flags
             ds_payload = dict(ds_payload)
-            ds_payload["isSavedAsDraft"] = False
+            if isinstance(ds_payload.get("ds_connection"), dict):
+                ds_payload["ds_connection"]["isSavedAsDraft"] = False
+            else:
+                ds_payload["isSavedAsDraft"] = False
 
         # Idempotency: if DS already exists for this step (ds_id stored) and name matches,
         # avoid re-PUT to prevent accidental duplicate DS artifacts.
@@ -2939,6 +3274,9 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
                 ds_id = ds_id or _extract_ds_id_from_payload(fetched)
         except Exception:
             pass
+        if not ds_id:
+            try: logger.warning("failed to extract ds_id from PUT or GET for ds_name=%s payload_keys=%s", desired_ds_name, list(out.keys()) if isinstance(out,dict) else 'non-dict')
+            except Exception: pass
         if ds_id:
             logger.info("WORKFLOW_STEP_DS_CREATED run_id=%s step_seq=%s ds_id=%s ds_name=%s", run_id, seq, ds_id, desired_ds_name)
             set_step_status(engine, step_id, "ds_created", ds_id=str(ds_id))
@@ -3061,7 +3399,13 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             scan_profile_name = existing_spname
             set_step_status(engine, step_id, "scan_created", scan_profile_id=existing_spid, scan_profile_name=(scan_profile_name or None))
         else:
-            template_id = resolve_default_scan_template_id(engine, int(env_id) if env_id is not None else None, base_url, token)
+            template_id = get_or_set_run_scan_template_id(
+                engine,
+                int(run_id),
+                int(env_id) if env_id is not None else None,
+                base_url,
+                token,
+            )
             if not template_id:
                 raise RuntimeError("No default scan template id resolved (expected 'Data source scan')")
 
@@ -3197,8 +3541,10 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         if scan_profile_name:
             try:
                 out3 = trigger_scan(base_url, token, scan_profile_name, scan_type="dsScan")
-            except Exception:
+            except Exception as trig_ex:
                 # Fallback for older deployments: try starting via scanProfileId endpoints.
+                if not spid:
+                    raise RuntimeError(f"Trigger by scan profile name failed and no scan_profile_id to fallback: {trig_ex}")
                 out3 = start_scan_profile(base_url, token, spid)
         else:
             # No name stored; fallback to id-based start.
