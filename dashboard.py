@@ -4,7 +4,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import altair as alt
 from sqlalchemy import create_engine, text
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import base64
 import numpy as np
