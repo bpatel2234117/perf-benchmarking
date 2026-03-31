@@ -1,12 +1,14 @@
-# Database Configuration
-# UPDATE THESE VALUES to match your Windows MySQL instance
+import os
 
+# Database Configuration
+# These values can be overridden by environment variables (e.g. in docker-compose.yml)
+# or will default to the below hardcoded values.
 DB_CONFIG = {
-    'host': '10.2.20.89',  # Replace with the IP address of your Windows machine
-    'port': 3306,             # Default MySQL port
-    'user': 'bigid',           # Your MySQL username
-    'password': 'bigid111!',   # Your MySQL password
-    'database': 'benchmark_db' # The database name you want to use
+    'host': os.getenv('DB_HOST', '10.2.20.89'),
+    'port': int(os.getenv('DB_PORT', 3306)),
+    'user': os.getenv('DB_USER', 'bigid'),
+    'password': os.getenv('DB_PASSWORD', 'bigid111!'),
+    'database': os.getenv('DB_NAME', 'benchmark_db')
 }
 
 # Connection String

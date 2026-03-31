@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  dashboard:
+    build: .
+    container_name: scan_benchmark_dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      # Disable embedded process autostarts since we use separate containers
+      - DISABLE_TRACKER_AUTOSTART=1
+      - DISABLE_WORKFLOW_AUTOSTART=1
+      
+      # Database environment overrides (defaults to db_config.py values if commented out)
+      # - DB_HOST=10.2.20.89
+      # - DB_PORT=3306
+      # - DB_USER=bigid
+      # - DB_PASSWORD=bigid111!
+      # - DB_NAME=benchmark_db
+    volumes:
+      - ./benchmark.db:/app/benchmark.db
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+  tracker:
+    build: .
+    container_name: scan_benchmark_tracker
+    command: ["python", "tracker.py", "--quiet"]
+    environment:
+      # These MUST match the dashboard service settings if overridden
+      # - DB_HOST=10.2.20.89
+      # - DB_PORT=3306
+      # - DB_USER=bigid
+      # - DB_PASSWORD=bigid111!
+      # - DB_NAME=benchmark_db
+      
+      # Name for tracking pid differences (not strictly needed in container, but kept for clarity)
+      - SCAN_TRACKER_NAME=default
+    volumes:
+      - ./benchmark.db:/app/benchmark.db
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+
+  runner:
+    build: .
+    container_name: scan_benchmark_runner
+    command: ["python", "workflow_runner.py", "--quiet"]
+    environment:
+      # These MUST match the dashboard service settings if overridden
+      # - DB_HOST=10.2.20.89
+      # - DB_PORT=3306
+      # - DB_USER=bigid
+      # - DB_PASSWORD=bigid111!
+      # - DB_NAME=benchmark_db
+    volumes:
+      - ./benchmark.db:/app/benchmark.db
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - dashboard

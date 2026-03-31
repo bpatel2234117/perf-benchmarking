@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Hide local environments and IDE configs
+.env
+.DS_Store
+.git/
+.idea/
+.vscode/
+
+# Ignore large/zip files
+*.zip
+
+# Ignore background tracker PID files
+*.pid
+.tracker.*.pid
+.workflow_runner.pid
+
+# Ignore local output/log directories so they don't overwrite volume mounts
+logs/
+benchmark_charts/
+scanner_*_output/
+scanner_logs_*/
+
+# Ignore sqlite DB just in case, preferring the volume mount
+benchmark.db
+*.db
+
+# Ignore local run scripts
+run_dashboard.bat
+run_dashboard.sh
