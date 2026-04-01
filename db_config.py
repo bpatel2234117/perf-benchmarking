@@ -186,6 +186,21 @@ DDL_STATEMENTS = {
             FOREIGN KEY (environment_id) REFERENCES test_environments(id)
         );
     """,
+    'scan_log_errors': """
+        CREATE TABLE IF NOT EXISTS scan_log_errors (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            environment_id INT NOT NULL,
+            log_timestamp VARCHAR(100),
+            error_context TEXT,
+            ai_analysis TEXT,
+            log_source VARCHAR(50) DEFAULT 'scanner',
+            scan_id VARCHAR(50),
+            subscan_id VARCHAR(50),
+            is_resolved BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+        );
+    """,
     'app_roles': """
         CREATE TABLE IF NOT EXISTS app_roles (
             id INT AUTO_INCREMENT PRIMARY KEY,

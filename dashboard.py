@@ -46,6 +46,12 @@ try:
 except Exception:
     ensure_workflow_runner_running = None
 
+try:
+    # Optional: auto-start AI log analyzer daemon.
+    from ai_log_autostart import ensure_ai_log_fetcher_running  # type: ignore
+except Exception:
+    ensure_ai_log_fetcher_running = None
+
 # --- Configuration & Styling ---
 st.set_page_config(
     page_title="BigID Scan Benchmark Dashboard",
@@ -305,6 +311,13 @@ try:
 except Exception:
     pass
 
+# Best-effort: auto-start AI scanner log analyzer daemon.
+# Can be disabled via DISABLE_LOG_ANALYZER_AUTOSTART=1.
+try:
+    if callable(ensure_ai_log_fetcher_running):
+        ensure_ai_log_fetcher_running()
+except Exception:
+    pass
 
 @st.cache_data(ttl=600)
 def _db_dialect_name() -> str:
@@ -12792,6 +12805,62 @@ def page_scan_progress():
         st.caption(f"Scan: **{display_name}** | Scan ID: `{scan_id}`")
     else:
         st.caption(f"Scan ID: `{scan_id}`")
+
+    # ---------------------------------------------
+    # 🚨 AI ERROR ANALYSIS SECTION
+    # ---------------------------------------------
+    env_id = parent.get("environment_id")
+    if env_id:
+        try:
+            # We try to get log_source, scan_id, subscan_id, gracefully fallback if columns don't exist
+            has_extra_cols = _db_has_column("scan_log_errors", "log_source")
+            cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols else "log_timestamp, error_context, ai_analysis, is_resolved"
+            
+            # Get all latest errors for this environment
+            query_str = f"SELECT {cols} FROM scan_log_errors WHERE environment_id = :eid ORDER BY id DESC LIMIT 10"
+            
+            errors_df = pd.read_sql(
+                text(query_str),
+                engine,
+                params={"eid": env_id}
+            )
+            if not errors_df.empty:
+                st.markdown("### 🚨 AI Log Analysis")
+                st.caption("Active background thread detected errors in this environment's application logs and analyzed them with Llama3. Showing latest 10.")
+                for _, row in errors_df.iterrows():
+                    source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols and pd.notnull(row.get('log_source')) else ""
+                    
+                    subscan_info = ""
+                    scan_match_info = ""
+                    
+                    if has_extra_cols:
+                        # Subscan check
+                        if pd.notnull(row.get('subscan_id')):
+                            ssid = str(row['subscan_id']).strip()
+                            if ssid and ssid != 'None' and ssid != 'nan':
+                                subscan_info = f" (Subscan: {ssid[:8]}...)"
+                                
+                        # Scan match info
+                        if pd.notnull(row.get('scan_id')):
+                            rsid = str(row['scan_id']).strip()
+                            if rsid and rsid != 'None' and rsid != 'nan':
+                                if str(scan_id) == rsid:
+                                    scan_match_info = " [✅ Scan Match]"
+                                else:
+                                    scan_match_info = f" [❌ Diff Scan: {rsid[:8]}]"
+                        else:
+                            scan_match_info = " [🌐 System-Wide]"
+                            
+                    title_str = f"⚠️ {source_badge}{scan_match_info} Error at {row['log_timestamp']}{subscan_info} - {'✅ Resolved' if row['is_resolved'] else '❌ Active'}"
+                    
+                    with st.expander(title_str):
+                        st.markdown("**🤖 AI Root Cause Analysis**:")
+                        st.info(row['ai_analysis'])
+                        st.markdown("**Original Log Context**:")
+                        st.code(row['error_context'], language="text")
+        except Exception as e:
+            # Table might not exist yet if daemon hasn't started
+            pass
 
     # Manual sync on-demand (event-driven).
     # Uses the same DB schema/slotting logic as the tracker (10-minute captured_at_utc + dedupe).
