@@ -226,5 +226,16 @@ DDL_STATEMENTS = {
             UNIQUE KEY uniq_role_page (role_id, page_name),
             FOREIGN KEY (role_id) REFERENCES app_roles(id)
         );
+    """,
+    'scan_log_correlations': """
+        CREATE TABLE IF NOT EXISTS scan_log_correlations (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            environment_id INT NOT NULL,
+            scan_id VARCHAR(50),
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            correlation_report TEXT,
+            is_final BOOLEAN DEFAULT FALSE,
+            FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+        );
     """
 }

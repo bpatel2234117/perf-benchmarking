@@ -36,6 +36,23 @@ def setup_db_engine():
             conn.commit()
     except Exception:
         pass
+        
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_log_correlations (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    scan_id VARCHAR(50),
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    correlation_report TEXT,
+                    is_final BOOLEAN DEFAULT FALSE,
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                );
+            """))
+            conn.commit()
+    except Exception:
+        pass
     return engine
 
 def get_active_environments(engine):
@@ -150,6 +167,46 @@ Provide a concise, highly technical answer.
     except Exception as e:
         return f"AI Analysis failed: {e}"
 
+def call_correlation_analyzer(error_batch):
+    """
+    Takes a list of multiple errors found in the current cycle and asks the LLM to correlate them.
+    error_batch: list of (source, context, scan_id)
+    """
+    if not error_batch:
+        return None
+        
+    contexts_str = ""
+    for idx, (source, ctx, sid) in enumerate(error_batch):
+        contexts_str += f"\n--- Error {idx+1} (Source: {source}, ScanID: {sid}) ---\n{ctx}\n"
+        
+    prompt = f"""
+You are a distributed systems forensic lead. I have detected multiple errors across different log sources during the current 5-minute polling window.
+
+ERRORS DETECTED:
+{contexts_str}
+
+Please correlate these events:
+1. What is the sequence of failure or the primary trigger?
+2. How do these errors relate to each other (e.g., did an Orchestrator timeout cause a Scanner crash)?
+3. What is the combined systemic impact?
+
+Provide a high-level, technical correlation report.
+"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=180
+        )
+        response.raise_for_status()
+        return response.json().get("response", "No correlation response from AI")
+    except Exception as e:
+        return f"Correlation Analysis failed: {e}"
+
 def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id):
     with engine.connect() as conn:
         conn.execute(
@@ -169,6 +226,22 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
         )
         conn.commit()
 
+def store_correlation_report(engine, env_id, scan_id, report_text, is_final=False):
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO scan_log_correlations (environment_id, scan_id, correlation_report, is_final)
+                VALUES (:eid, :sid, :rep, :fin)
+            """),
+            {
+                "eid": env_id,
+                "sid": scan_id,
+                "rep": report_text,
+                "fin": is_final
+            }
+        )
+        conn.commit()
+
 def run_once(engine):
     environments = get_active_environments(engine)
     print(f"[{datetime.utcnow().isoformat()}] Fetched {len(environments)} active environments.")
@@ -181,6 +254,8 @@ def run_once(engine):
             print(f"[{datetime.utcnow().isoformat()}] Fetching token for {env['env_name']}...")
             token = Get_auth_token(base_url, {"env_name": env["env_name"]})
             
+            new_errors_by_scan = {} # {scan_id: [(source, ctx, sid)]}
+            
             log_sources = ["scanner", "orch", "orch2", "aci"]
             for log_source in log_sources:
                 print(f"[{datetime.utcnow().isoformat()}] Fetching {log_source} logs from {base_url}...")
@@ -189,16 +264,14 @@ def run_once(engine):
                 print(f"[{datetime.utcnow().isoformat()}] Analyzing {log_source} logs for errors...")
                 errors = detect_errors_in_logs(log_text)
                 
-                # Limit the number of errors analyzed per cycle per source so we don't bombard the local LLM
+                # Limit to 3 per source per cycle to avoid flooding
                 max_errors_to_process = 3
                 processed_errors = 0
                 
                 for ctx in errors:
                     if processed_errors >= max_errors_to_process:
-                        print(f"[{datetime.utcnow().isoformat()}] Reached limit of {max_errors_to_process} AI analyses for {log_source}. Skipping remainder.")
                         break
                     
-                    # Deduplication check against the DB
                     with engine.connect() as conn:
                         existing = conn.execute(
                             text("SELECT id FROM scan_log_errors WHERE environment_id = :eid AND error_context = :ctx LIMIT 1"),
@@ -206,18 +279,29 @@ def run_once(engine):
                         ).fetchone()
                         
                     if existing:
-                        print(f"[{datetime.utcnow().isoformat()}] Error context already seen in DB. Skipping.")
                         continue
+                    
+                    parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
                     
                     print(f"[{datetime.utcnow().isoformat()}] Found new error in {log_source}. Querying AI...")
                     ai_analysis = call_ai_analyzer(ctx, log_source)
                     
-                    # Extract IDs
-                    parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
-                    
                     store_error_analysis(engine, env_id, ctx, ai_analysis, log_source, parsed_scan_id, parsed_subscan_id)
                     processed_errors += 1
-                    print(f"[{datetime.utcnow().isoformat()}] Saved AI analysis for {log_source} error (scan_id={parsed_scan_id}).")
+                    
+                    # Group for batch correlation analysis
+                    if parsed_scan_id:
+                        if parsed_scan_id not in new_errors_by_scan:
+                            new_errors_by_scan[parsed_scan_id] = []
+                        new_errors_by_scan[parsed_scan_id].append((log_source, ctx, parsed_scan_id))
+            
+            # Per-Scan-ID Batch Correlation
+            for sid, batch in new_errors_by_scan.items():
+                if len(batch) >= 1: # We correlate even if there's only one, as the prompt is different
+                    print(f"[{datetime.utcnow().isoformat()}] Generating correlation report for {sid}...")
+                    correlation_text = call_correlation_analyzer(batch)
+                    store_correlation_report(engine, env_id, sid, correlation_text, is_final=False)
+                    print(f"[{datetime.utcnow().isoformat()}] Saved interval correlation for {sid}.")
                 
         except Exception as e:
             print(f"[{datetime.utcnow().isoformat()}] Failed processing env {env['env_name']}: {e}")

@@ -6013,6 +6013,82 @@ def find_peer_scans_same_build(cur_scan_id: str, build_version: str, *, limit: i
         return []
 
 
+def get_ai_correlation_for_scan(scan_id: str, env_id: int, engine: Any, is_terminal: bool = False) -> Optional[str]:
+    """
+    Fetches the latest AI correlation analysis for a scan.
+    If terminal=True, it attempts to generate a 'Final Postmortem' if not already present.
+    """
+    try:
+        # 1. Look for a final postmortem first
+        with engine.connect() as conn:
+            res = conn.execute(
+                text("SELECT correlation_report FROM scan_log_correlations WHERE scan_id = :sid AND is_final = 1 ORDER BY id DESC LIMIT 1"),
+                {"sid": scan_id}
+            ).fetchone()
+            if res:
+                return res[0]
+                
+        # 2. If it's a terminal state and no final report yet, generate one on-the-fly (Option 1)
+        if is_terminal:
+            with engine.connect() as conn:
+                errors = conn.execute(
+                    text("SELECT log_source, error_context, log_timestamp FROM scan_log_errors WHERE scan_id = :sid ORDER BY id ASC"),
+                    {"sid": scan_id}
+                ).fetchall()
+                
+            if errors:
+                contexts_str = ""
+                for idx, row in enumerate(errors):
+                    contexts_str += f"\n--- Event {idx+1} (Source: {row[0]}, Time: {row[2]}) ---\n{row[1]}\n"
+                    
+                prompt = f"""
+You are a distributed systems principal architect. I am providing a full sequence of errors captured during a BigID scan (ScanID: {scan_id}). 
+
+HISTORY OF EVENTS:
+{contexts_str}
+
+Please provide a "Final Postmortem Correlation Report":
+1. What was the absolute root cause that started the failure chain?
+2. Detail the cascade (how Source A's failure impacted Source B).
+3. Summary of systemic impact and any observable resolution patterns.
+
+Provide a comprehensive, executive-level technical summary in Markdown.
+"""
+                ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+                ollama_model = os.getenv("OLLAMA_MODEL", "llama3")
+                
+                try:
+                    resp = requests.post(
+                        ollama_url,
+                        json={"model": ollama_model, "prompt": prompt, "stream": False},
+                        timeout=180
+                    )
+                    resp.raise_for_status()
+                    final_report = resp.json().get("response", "No response from AI")
+                    
+                    # Store it for future use
+                    with engine.connect() as conn:
+                        conn.execute(
+                            text("INSERT INTO scan_log_correlations (environment_id, scan_id, correlation_report, is_final) VALUES (:eid, :sid, :rep, 1)"),
+                            {"eid": env_id, "sid": scan_id, "rep": final_report}
+                        )
+                        conn.commit()
+                    return final_report
+                except Exception:
+                    return None
+
+        # 3. Fallback to latest interval correlation (Option 2)
+        with engine.connect() as conn:
+            res = conn.execute(
+                text("SELECT correlation_report FROM scan_log_correlations WHERE scan_id = :sid AND is_final = 0 ORDER BY id DESC LIMIT 1"),
+                {"sid": scan_id}
+            ).fetchone()
+            if res:
+                return res[0]
+    except Exception:
+        pass
+    return None
+
 def build_scan_progress_manager_reports(
     *,
     scan_id: str,
@@ -6039,6 +6115,7 @@ def build_scan_progress_manager_reports(
     completion_lag_summary: str,
     regression_warnings: List[str],
     observations: List[str],
+    ai_correlation_report: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Return (markdown_report, csv_report) for manager sharing."""
     import csv
@@ -6148,6 +6225,12 @@ def build_scan_progress_manager_reports(
 
     lines.append("## Classifier / attribute hits (snapshot)")
     lines.append("")
+    
+    if ai_correlation_report:
+        lines.append("## 🤖 AI Log Correlation Analysis (Cross-System)")
+        lines.append("")
+        lines.append(ai_correlation_report)
+        lines.append("")
     if classifier_hits_note:
         lines.append(classifier_hits_note.replace("**", ""))
         lines.append("")
@@ -13835,6 +13918,52 @@ def page_scan_progress():
         completion_lag_minutes = None
         completion_lag_summary = ""
 
+    # 🤖 AI Correlation Section (Live/Interval)
+    try:
+        is_terminal_now = _is_terminal_state(cur_state)
+        corr_report = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now)
+        if corr_report:
+            st.markdown("### 🤖 AI Cross-System Correlation")
+            st.info(corr_report)
+            st.caption("This analysis correlates errors across Orch, Scanner, and ACI from the most recent activity window.")
+
+        if not errors_df.empty:
+            st.markdown("### 🚨 Individual Error Analysis")
+            st.caption("Showing latest 10 individual errors detected in this environment.")
+            for _, row in errors_df.iterrows():
+                source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols and pd.notnull(row.get('log_source')) else ""
+                
+                subscan_info = ""
+                scan_match_info = ""
+                
+                if has_extra_cols:
+                    # Subscan check
+                    if pd.notnull(row.get('subscan_id')):
+                        ssid = str(row['subscan_id']).strip()
+                        if ssid and ssid != 'None' and ssid != 'nan':
+                            subscan_info = f" (Subscan: {ssid[:8]}...)"
+                            
+                    # Scan match info
+                    if pd.notnull(row.get('scan_id')):
+                        rsid = str(row['scan_id']).strip()
+                        if rsid and rsid != 'None' and rsid != 'nan':
+                            if str(scan_id) == rsid:
+                                scan_match_info = " [✅ Scan Match]"
+                            else:
+                                scan_match_info = f" [❌ Diff Scan: {rsid[:8]}]"
+                    else:
+                        scan_match_info = " [🌐 System-Wide]"
+                        
+                title_str = f"⚠️ {source_badge}{scan_match_info} Error at {row['log_timestamp']}{subscan_info} - {'✅ Resolved' if row['is_resolved'] else '❌ Active'}"
+                
+                with st.expander(title_str):
+                    st.markdown("**🤖 AI Root Cause Analysis**:")
+                    st.info(row['ai_analysis'])
+                    st.markdown("**Original Log Context**:")
+                    st.code(row['error_context'], language="text")
+    except Exception as e:
+        st.error(f"Error loading AI analysis: {e}")
+
     # Narrative (LLM-style, but local/deterministic)
     try:
         bits = []
@@ -13858,6 +13987,9 @@ def page_scan_progress():
     _fn_base = ""
     _fn_safe_key = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(scan_id).strip())[:48]
     try:
+        is_terminal_now = _is_terminal_state(cur_state)
+        report_correlation = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now)
+        
         wf_ctx_report = load_workflow_context_for_scan_id(str(scan_id))
         _rep_obs: List[str] = []
         for _o in observations or []:
@@ -13893,6 +14025,7 @@ def page_scan_progress():
             completion_lag_summary=str(completion_lag_summary or ""),
             regression_warnings=list(regression_warnings or []),
             observations=_rep_obs,
+            ai_correlation_report=report_correlation,
         )
         _fn_ts = datetime.utcnow().strftime("%Y%m%d_%H%MUTC")
         _fn_base = f"scan_manager_report_{_fn_safe_key}_{_fn_ts}"
