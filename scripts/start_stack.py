@@ -138,6 +138,16 @@ def start_tracker() -> Tuple[bool, str]:
                 start_new_session=True,
             )
         _write_pid(pf, p.pid)
+        # Verify it stays alive for at least 1 second
+        time.sleep(1.5)
+        if not _pid_is_running(p.pid):
+            err_content = ""
+            try:
+                err_content = err.read_text().splitlines()[-5:]
+                err_content = "\n  > ".join(err_content)
+            except Exception: pass
+            return False, f"tracker started (pid={p.pid}) but exited immediately.\nLast error lines:\n  > {err_content}"
+            
         return True, f"tracker started pid={p.pid} log={log}"
     except Exception as ex:
         return False, f"tracker start failed: {ex}"
@@ -184,6 +194,16 @@ def start_workflow_runner() -> Tuple[bool, str]:
                 start_new_session=True,
             )
         _write_pid(pf, p.pid)
+        # Verify it stays alive
+        time.sleep(1.5)
+        if not _pid_is_running(p.pid):
+            err_content = ""
+            try:
+                err_content = err.read_text().splitlines()[-5:]
+                err_content = "\n  > ".join(err_content)
+            except Exception: pass
+            return False, f"workflow_runner started (pid={p.pid}) but exited immediately.\nLast error lines:\n  > {err_content}"
+
         return True, f"workflow_runner started pid={p.pid} log={log}"
     except Exception as ex:
         return False, f"workflow_runner start failed: {ex}"
@@ -232,6 +252,16 @@ def start_ai_log_fetcher() -> Tuple[bool, str]:
                 start_new_session=True,
             )
         _write_pid(pf, p.pid)
+        # Verify it stays alive
+        time.sleep(1.5)
+        if not _pid_is_running(p.pid):
+            err_content = ""
+            try:
+                err_content = err.read_text().splitlines()[-5:]
+                err_content = "\n  > ".join(err_content)
+            except Exception: pass
+            return False, f"ai_log_fetcher started (pid={p.pid}) but exited immediately.\nCheck if Ollama is running at {os.getenv('OLLAMA_URL', 'http://localhost:11434')}\nLast error lines:\n  > {err_content}"
+
         return True, f"ai_log_fetcher started pid={p.pid} log={log}"
     except Exception as ex:
         return False, f"ai_log_fetcher start failed: {ex}"

@@ -19,15 +19,52 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 LOG_LEN = int(os.getenv("SCANNER_LOG_FETCH_LEN", "2000"))
 
+def check_ollama_ready():
+    """Verify that Ollama is reachable before starting the analyzer loop."""
+    print(f"[{datetime.utcnow().isoformat()}] Checking Ollama connection at {OLLAMA_URL}...")
+    try:
+        # Just check the base URL status
+        base_url = "/".join(OLLAMA_URL.split("/")[:3])
+        response = requests.get(base_url, timeout=5)
+        if response.status_code == 200:
+            print(f"[{datetime.utcnow().isoformat()}] [OK] Ollama is active.")
+            return True
+        else:
+            print(f"[{datetime.utcnow().isoformat()}] [ERROR] Ollama returned status {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"[{datetime.utcnow().isoformat()}] [ERROR] Cannot reach Ollama: {e}")
+        return False
+
 def setup_db_engine():
     engine = create_engine(DB_CONNECTION_STRING, echo=False)
-    # Ensure columns exist in case we are migrating from the old schema
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_log_errors (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    log_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    error_context TEXT,
+                    ai_analysis TEXT,
+                    is_resolved BOOLEAN DEFAULT FALSE,
+                    log_source VARCHAR(50) DEFAULT 'scanner',
+                    scan_id VARCHAR(50),
+                    subscan_id VARCHAR(50),
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                );
+            """))
+            conn.commit()
+    except Exception as e:
+        print(f"Error creating scan_log_errors: {e}")
+        
+    # Ensure columns exist for users on older schemas
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN log_source VARCHAR(50) DEFAULT 'scanner'"))
             conn.commit()
     except Exception:
-        pass # Column already exists or we don't have alter permissions
+        pass 
         
     try:
         with engine.connect() as conn:
@@ -54,6 +91,40 @@ def setup_db_engine():
     except Exception:
         pass
     return engine
+
+def write_heartbeat(engine, status="ok", message=""):
+    try:
+        with engine.connect() as conn:
+            # We use the same tracker_heartbeat table but with name='log_fetcher'
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Check if exists
+            exists = conn.execute(
+                text("SELECT name FROM tracker_heartbeat WHERE name = 'log_fetcher' LIMIT 1")
+            ).fetchone()
+            
+            if exists:
+                conn.execute(
+                    text("""
+                        UPDATE tracker_heartbeat 
+                        SET last_finished_at_utc = :now, 
+                            last_status = :status, 
+                            last_message = :msg 
+                        WHERE name = 'log_fetcher'
+                    """),
+                    {"now": now, "status": status, "msg": message}
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES ('log_fetcher', :now, :now, :status, :msg)
+                    """),
+                    {"now": now, "status": status, "msg": message}
+                )
+            conn.commit()
+    except Exception as e:
+        print(f"Failed to write heartbeat: {e}")
 
 def get_active_environments(engine):
     query = """
@@ -305,12 +376,21 @@ def run_once(engine):
                 
         except Exception as e:
             print(f"[{datetime.utcnow().isoformat()}] Failed processing env {env['env_name']}: {e}")
+            write_heartbeat(engine, status="error", message=str(e))
+            return
+            
+    write_heartbeat(engine, status="ok", message=f"Processed {len(envs)} environments")
 
 def main():
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     print(f"Starting Scanner AI Log Analyzer (Fetch Interval: {FETCH_INTERVAL_MINUTES} min, LLM: {OLLAMA_MODEL})")
+    
+    if not check_ollama_ready():
+        print(f"CRITICAL ERROR: Ollama is not reachable. Please ensure Ollama is running and the model '{OLLAMA_MODEL}' is downloaded.")
+        sys.exit(1)
+        
     engine = setup_db_engine()
     
     while True:

@@ -6013,7 +6013,8 @@ def find_peer_scans_same_build(cur_scan_id: str, build_version: str, *, limit: i
         return []
 
 
-def get_ai_correlation_for_scan(scan_id: str, env_id: int, engine: Any, is_terminal: bool = False) -> Optional[str]:
+@st.cache_data(ttl=120, show_spinner="Analyzing logs with AI...")
+def get_ai_correlation_for_scan(scan_id: str, env_id: int, _engine: Any, is_terminal: bool = False) -> Optional[str]:
     """
     Fetches the latest AI correlation analysis for a scan.
     If terminal=True, it attempts to generate a 'Final Postmortem' if not already present.
@@ -12830,6 +12831,11 @@ def page_scan_progress():
     scan_id = query_params.get("scan_id")
     if isinstance(scan_id, list): scan_id = scan_id[0]
     
+    # Initialize variables for AI analysis to avoid UnboundLocalError
+    errors_df = pd.DataFrame()
+    has_extra_cols = False
+    corr_report = None
+    
     if not scan_id:
         st.warning("No scan_id provided in URL.")
         if st.button("Go to Scan Status"):
@@ -12893,57 +12899,21 @@ def page_scan_progress():
     # 🚨 AI ERROR ANALYSIS SECTION
     # ---------------------------------------------
     env_id = parent.get("environment_id")
-    if env_id:
+    
+    # Fallback: if env_id is missing, try to find it from workflow_steps
+    if not env_id:
         try:
-            # We try to get log_source, scan_id, subscan_id, gracefully fallback if columns don't exist
-            has_extra_cols = _db_has_column("scan_log_errors", "log_source")
-            cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols else "log_timestamp, error_context, ai_analysis, is_resolved"
-            
-            # Get all latest errors for this environment
-            query_str = f"SELECT {cols} FROM scan_log_errors WHERE environment_id = :eid ORDER BY id DESC LIMIT 10"
-            
-            errors_df = pd.read_sql(
-                text(query_str),
-                engine,
-                params={"eid": env_id}
-            )
-            if not errors_df.empty:
-                st.markdown("### 🚨 AI Log Analysis")
-                st.caption("Active background thread detected errors in this environment's application logs and analyzed them with Llama3. Showing latest 10.")
-                for _, row in errors_df.iterrows():
-                    source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols and pd.notnull(row.get('log_source')) else ""
-                    
-                    subscan_info = ""
-                    scan_match_info = ""
-                    
-                    if has_extra_cols:
-                        # Subscan check
-                        if pd.notnull(row.get('subscan_id')):
-                            ssid = str(row['subscan_id']).strip()
-                            if ssid and ssid != 'None' and ssid != 'nan':
-                                subscan_info = f" (Subscan: {ssid[:8]}...)"
-                                
-                        # Scan match info
-                        if pd.notnull(row.get('scan_id')):
-                            rsid = str(row['scan_id']).strip()
-                            if rsid and rsid != 'None' and rsid != 'nan':
-                                if str(scan_id) == rsid:
-                                    scan_match_info = " [✅ Scan Match]"
-                                else:
-                                    scan_match_info = f" [❌ Diff Scan: {rsid[:8]}]"
-                        else:
-                            scan_match_info = " [🌐 System-Wide]"
-                            
-                    title_str = f"⚠️ {source_badge}{scan_match_info} Error at {row['log_timestamp']}{subscan_info} - {'✅ Resolved' if row['is_resolved'] else '❌ Active'}"
-                    
-                    with st.expander(title_str):
-                        st.markdown("**🤖 AI Root Cause Analysis**:")
-                        st.info(row['ai_analysis'])
-                        st.markdown("**Original Log Context**:")
-                        st.code(row['error_context'], language="text")
-        except Exception as e:
-            # Table might not exist yet if daemon hasn't started
+            with engine.connect() as conn:
+                res_ws = conn.execute(
+                    text("SELECT environment_id FROM workflow_steps WHERE scan_id = :sid ORDER BY id DESC LIMIT 1"),
+                    {"sid": str(scan_id)}
+                ).fetchone()
+                if res_ws and res_ws[0]:
+                    env_id = res_ws[0]
+        except Exception:
             pass
+
+    # (Rendering moved further down after Performance Metrics)
 
     # Manual sync on-demand (event-driven).
     # Uses the same DB schema/slotting logic as the tracker (10-minute captured_at_utc + dedupe).
@@ -13200,10 +13170,8 @@ def page_scan_progress():
             except Exception:
                 pass
             st.caption(
-                "Tracker heartbeat — "
-                + (f"status={stt} " if stt else "")
-                + (f"started={s.strftime('%Y-%m-%d %H:%M UTC')} " if s is not None and pd.notnull(s) else "")
-                + (f"finished={f.strftime('%Y-%m-%d %H:%M UTC')}" if f is not None and pd.notnull(f) else "")
+                "System Heartbeats — "
+                f"Tracker: (status={stt} finished={f.strftime('%H:%M UTC') if f is not None and pd.notnull(f) else 'N/A'})"
             )
     except Exception:
         pass
@@ -13918,51 +13886,7 @@ def page_scan_progress():
         completion_lag_minutes = None
         completion_lag_summary = ""
 
-    # 🤖 AI Correlation Section (Live/Interval)
-    try:
-        is_terminal_now = _is_terminal_state(cur_state)
-        corr_report = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now)
-        if corr_report:
-            st.markdown("### 🤖 AI Cross-System Correlation")
-            st.info(corr_report)
-            st.caption("This analysis correlates errors across Orch, Scanner, and ACI from the most recent activity window.")
-
-        if not errors_df.empty:
-            st.markdown("### 🚨 Individual Error Analysis")
-            st.caption("Showing latest 10 individual errors detected in this environment.")
-            for _, row in errors_df.iterrows():
-                source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols and pd.notnull(row.get('log_source')) else ""
-                
-                subscan_info = ""
-                scan_match_info = ""
-                
-                if has_extra_cols:
-                    # Subscan check
-                    if pd.notnull(row.get('subscan_id')):
-                        ssid = str(row['subscan_id']).strip()
-                        if ssid and ssid != 'None' and ssid != 'nan':
-                            subscan_info = f" (Subscan: {ssid[:8]}...)"
-                            
-                    # Scan match info
-                    if pd.notnull(row.get('scan_id')):
-                        rsid = str(row['scan_id']).strip()
-                        if rsid and rsid != 'None' and rsid != 'nan':
-                            if str(scan_id) == rsid:
-                                scan_match_info = " [✅ Scan Match]"
-                            else:
-                                scan_match_info = f" [❌ Diff Scan: {rsid[:8]}]"
-                    else:
-                        scan_match_info = " [🌐 System-Wide]"
-                        
-                title_str = f"⚠️ {source_badge}{scan_match_info} Error at {row['log_timestamp']}{subscan_info} - {'✅ Resolved' if row['is_resolved'] else '❌ Active'}"
-                
-                with st.expander(title_str):
-                    st.markdown("**🤖 AI Root Cause Analysis**:")
-                    st.info(row['ai_analysis'])
-                    st.markdown("**Original Log Context**:")
-                    st.code(row['error_context'], language="text")
-    except Exception as e:
-        st.error(f"Error loading AI analysis: {e}")
+    # (Rendering moved further down after Performance Metrics)
 
     # Narrative (LLM-style, but local/deterministic)
     try:
@@ -13982,13 +13906,14 @@ def page_scan_progress():
     except Exception:
         narrative = ""
 
-    # Markdown report payload for download inside Analysis expander (no separate section / no CSV).
+    # Markdown report payload for download
     _md_rep: Optional[str] = None
     _fn_base = ""
     _fn_safe_key = re.sub(r"[^0-9a-zA-Z_-]+", "_", str(scan_id).strip())[:48]
     try:
         is_terminal_now = _is_terminal_state(cur_state)
-        report_correlation = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now)
+        # Reuse the correlation report generated above
+        report_correlation = corr_report
         
         wf_ctx_report = load_workflow_context_for_scan_id(str(scan_id))
         _rep_obs: List[str] = []
@@ -15421,6 +15346,78 @@ def page_scan_progress():
                                 st.error(f"Raw tables tab: `{_raw_err!s}`")
     except Exception:
         pass
+
+    # ---------------------------------------------
+    # 🤖 AI LOG ANALYSIS & CORRELATION (Moved here)
+    # ---------------------------------------------
+    with st.expander("🚨 AI Log Analysis & Root Cause Correlation", expanded=False):
+        # Fetch status for log fetcher
+        lf_hb = None
+        try:
+            with engine.connect() as conn:
+                lf_hb = conn.execute(text("SELECT last_finished_at_utc, last_status, last_message FROM tracker_heartbeat WHERE name = 'log_fetcher' LIMIT 1")).fetchone()
+        except Exception:
+            pass
+
+        if lf_hb:
+            lf_f, lf_st, lf_msg = lf_hb
+            lf_f_dt = pd.to_datetime(lf_f, errors="coerce", utc=True) if lf_f else None
+            lf_age = (pd.Timestamp.utcnow() - lf_f_dt).total_seconds() / 60.0 if lf_f_dt is not None else 999
+            status_color = "green" if lf_st == "ok" and lf_age < 15 else "orange" if lf_age < 30 else "red"
+            st.caption(f"Log Monitor: :{status_color}[{lf_st.upper()}] | Last Check: `{lf_f_dt.strftime('%H:%M UTC') if lf_f_dt else 'N/A'}` ({lf_age:.1f} min ago)")
+        else:
+            st.caption("Log Monitor: :gray[NOT STARTED] | (Ensure `ai_log_fetcher.py` is running)")
+
+        if env_id:
+            try:
+                # 1. Cross-System Correlation
+                is_terminal_now_local = _is_terminal_state(cur_state)
+                corr_report = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now_local)
+                if corr_report:
+                    st.markdown("#### 🤖 AI Correlation Report")
+                    st.info(corr_report)
+                    st.divider()
+                
+                # 2. Individual Error Analysis
+                has_extra_cols_local = _db_has_column("scan_log_errors", "log_source")
+                cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols_local else "log_timestamp, error_context, ai_analysis, is_resolved"
+                
+                query_str = f"SELECT {cols} FROM scan_log_errors WHERE environment_id = :eid ORDER BY id DESC LIMIT 10"
+                e_df = pd.read_sql(text(query_str), engine, params={"eid": env_id})
+                
+                if not e_df.empty:
+                    st.markdown("#### ⚠️ Individual Error Context")
+                    st.caption("Latest 10 unique error signatures detected in application logs.")
+                    for _, row in e_df.iterrows():
+                        source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols_local and pd.notnull(row.get('log_source')) else ""
+                        
+                        subscan_info = ""
+                        scan_match_info = ""
+                        if has_extra_cols_local:
+                            if pd.notnull(row.get('subscan_id')):
+                                ssid = str(row['subscan_id']).strip()
+                                if ssid and ssid != 'None' and ssid != 'nan':
+                                    subscan_info = f" (Sub: {ssid[:8]}...)"
+                            if pd.notnull(row.get('scan_id')):
+                                rsid = str(row['scan_id']).strip()
+                                if rsid and rsid != 'None' and rsid != 'nan':
+                                    if str(scan_id) == rsid: scan_match_info = " [✅ Match]"
+                                    else: scan_match_info = f" [❌ Diff: {rsid[:8]}]"
+                            else:
+                                scan_match_info = " [🌐 System-Wide]"
+                        
+                        title_str = f"Error at {row['log_timestamp']} {source_badge}{scan_match_info}{subscan_info}"
+                        with st.expander(title_str, expanded=False):
+                            st.markdown("**🤖 AI Analysis**:")
+                            st.write(row['ai_analysis'])
+                            st.markdown("**Log Snippet**:")
+                            st.code(row['error_context'], language="text")
+                else:
+                    st.success("No recent application errors detected. System looks healthy.")
+            except Exception as ex:
+                st.exception(ex)
+        else:
+            st.warning("Environment ID not found. Results may be incomplete.")
 
     st.subheader("Raw Progress Data")
     # Show oldest first so the first row shows scan start time.
