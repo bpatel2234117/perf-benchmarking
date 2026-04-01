@@ -59,11 +59,11 @@ def get_active_environments(engine):
     query = """
         SELECT DISTINCT t.id, t.env_name, t.base_url 
         FROM test_environments t
-        JOIN benchmarks b ON b.environment_id = t.id
+        JOIN scan_parents sp ON sp.environment_id = t.id
         WHERE t.is_active = 1 
-          AND b.scan_status IS NOT NULL 
-          AND b.scan_status != ''
-          AND LOWER(REPLACE(b.scan_status, ' ', '')) NOT IN (
+          AND sp.scan_status IS NOT NULL 
+          AND sp.scan_status != ''
+          AND LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
               'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled'
           )
     """
