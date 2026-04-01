@@ -5,18 +5,19 @@ Start (or stop) the full local stack: background tracker + workflow runner + Str
 Usage:
   python3 scripts/start_stack.py              # tracker + workflow in background, dashboard in foreground
   python3 scripts/start_stack.py --all-bg     # all three detached (prints PIDs and log paths)
-  python3 scripts/start_stack.py --no-ui      # only tracker + workflow_runner
+  python3 scripts/start_stack.py --no-ui      # only tracker + workflow_runner + ai_log_fetcher
   python3 scripts/start_stack.py --status     # show PIDs / whether processes respond to signal 0
-  python3 scripts/start_stack.py --stop       # stop tracker + workflow started by this script
+  python3 scripts/start_stack.py --stop       # stop services started by this script
 
 Environment (optional):
   STREAMLIT_SERVER_PORT   — passed through to Streamlit (default 8501)
   SCAN_TRACKER_NAME     — tracker heartbeat name (default: default)
   TRACKER_INTERVAL_SEC  — tracker poll interval (default: 600)
   WORKFLOW_INTERVAL_SEC — workflow runner tick (default: 30)
+  SCAN_LOG_FETCH_MINUTES — log analyzer fetch interval (default: 5)
 
-Pidfiles (repo root): .stack.tracker.<name>.pid, .stack.workflow_runner.pid
-Logs: logs/stack_tracker.*.log, logs/stack_workflow_runner.log
+Pidfiles (repo root): .stack.tracker.<name>.pid, .stack.workflow_runner.pid, .ai_log_fetcher.pid
+Logs: logs/stack_tracker.*.log, logs/stack_workflow_runner.log, logs/ai_log_fetcher.out.log
 """
 
 from __future__ import annotations
@@ -51,6 +52,10 @@ def tracker_pidfile() -> Path:
 
 def workflow_pidfile() -> Path:
     return repo_root() / ".stack.workflow_runner.pid"
+
+
+def ai_log_pidfile() -> Path:
+    return repo_root() / ".ai_log_fetcher.pid"
 
 
 def dashboard_pidfile() -> Path:
@@ -184,6 +189,54 @@ def start_workflow_runner() -> Tuple[bool, str]:
         return False, f"workflow_runner start failed: {ex}"
 
 
+def start_ai_log_fetcher() -> Tuple[bool, str]:
+    if str(os.getenv("DISABLE_LOG_ANALYZER_AUTOSTART", "")).strip().lower() in {"1", "true", "yes", "y"}:
+        return False, "log analyzer disabled by disabled_log_analyzer_autostart=1"
+
+    pf = ai_log_pidfile()
+    pid = _read_pid(pf)
+    if pid and _pid_is_running(pid):
+        return True, f"ai_log_fetcher already running (pid={pid})"
+
+    py = sys.executable
+    root = repo_root()
+    script = root / "ai_log_fetcher.py"
+    if not script.is_file():
+        return False, f"missing {script}"
+
+    cmd = [py, str(script)]
+
+    log = logs_dir() / "ai_log_fetcher.out.log"
+    err = logs_dir() / "ai_log_fetcher.err.log"
+    try:
+        out_f = _open_log(log)
+        err_f = _open_log(err)
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                env=os.environ.copy(),
+                stdout=out_f,
+                stderr=err_f,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            )
+        else:
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                env=os.environ.copy(),
+                stdout=out_f,
+                stderr=err_f,
+                start_new_session=True,
+            )
+        _write_pid(pf, p.pid)
+        return True, f"ai_log_fetcher started pid={p.pid} log={log}"
+    except Exception as ex:
+        return False, f"ai_log_fetcher start failed: {ex}"
+
+
 def start_dashboard_background() -> Tuple[bool, str]:
     pf = dashboard_pidfile()
     pid = _read_pid(pf)
@@ -270,6 +323,7 @@ def stop_one(label: str, pidfile: Path) -> str:
 def cmd_stop() -> int:
     msgs = [
         stop_one("dashboard", dashboard_pidfile()),
+        stop_one("ai_log_fetcher", ai_log_pidfile()),
         stop_one("workflow_runner", workflow_pidfile()),
         stop_one("tracker", tracker_pidfile()),
     ]
@@ -283,6 +337,7 @@ def cmd_status() -> int:
     for label, pf in (
         ("tracker", tracker_pidfile()),
         ("workflow_runner", workflow_pidfile()),
+        ("ai_log_fetcher", ai_log_pidfile()),
         ("dashboard", dashboard_pidfile()),
     ):
         pid = _read_pid(pf)
@@ -300,6 +355,7 @@ def main() -> int:
     ap.add_argument("--no-ui", action="store_true", help="Only start tracker and workflow_runner")
     ap.add_argument("--no-tracker", action="store_true")
     ap.add_argument("--no-workflow", action="store_true")
+    ap.add_argument("--no-ai-log", action="store_true", help="Do not start the AI log fetcher")
     ap.add_argument("--stop", action="store_true", help="Stop services started with this script")
     ap.add_argument("--status", action="store_true", help="Print pidfile / process status")
     args = ap.parse_args()
@@ -318,9 +374,14 @@ def main() -> int:
         ok, msg = start_workflow_runner()
         print(msg)
         ok_all = ok_all and ok
+    if not args.no_ai_log:
+        ok, msg = start_ai_log_fetcher()
+        if msg:  # Can be silent if disabled via env var intentionally
+            print(msg)
+        ok_all = ok_all and ok
 
     if args.no_ui:
-        print("\nTracker/workflow running. Start dashboard manually: streamlit run dashboard.py")
+        print("\nBackground services running. Start dashboard manually: streamlit run dashboard.py")
         return 0 if ok_all else 1
 
     if args.all_bg:

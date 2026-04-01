@@ -21,4 +21,31 @@ Updates: **tracker** (per cycle) or **Scan Progress → Sync now (manual)**.
 
 **Scan Progress charts (default):** only pods in BigID’s **running** set (`scannersIDs` from `scanner-groups`), or — if that JSON isn’t in the DB yet — scanners whose **latest** row has **running_threads > 0** (non-failed). Enable **“Show all pods from services-status”** to see every historical UUID (noisy legends).
 
-**Scanner Infrastructure** menu page uses the **same** `scanner_individual_performance` / `scanner_group_performance` tables (not `scanner_pod_metrics`, unless you use the **Legacy** section at the bottom). That’s why you see **CPU %** (often ≫100%) instead of mislabeled “load as CPU”.
+Scanner Infrastructure menu page uses the **same** `scanner_individual_performance` / `scanner_group_performance` tables (not `scanner_pod_metrics`, unless you use the **Legacy** section at the bottom). That’s why you see **CPU %** (often ≫100%) instead of mislabeled “load as CPU”.
+
+## Running the Application
+
+The project includes a robust local process manager (`scripts/start_stack.py`) to launch the entire analytics stack (Dashboard, Workflow Runner, Scan Tracker, and AI Log Fetcher) without relying on Docker.
+
+To run the full stack:
+```bash
+# Starts the background systems automatically and launches the Dashboard in the foreground
+python3 scripts/start_stack.py
+```
+
+Other available options:
+```bash
+# Run everything completely detached in the background
+python3 scripts/start_stack.py --all-bg
+
+# Only run the background orchestrators without the dashboard UI
+python3 scripts/start_stack.py --no-ui
+
+# View the active process PID status
+python3 scripts/start_stack.py --status
+
+# Gracefully shutdown any tracker/workflow/log-analyzer processes started by the script
+python3 scripts/start_stack.py --stop
+```
+
+Note: Background processes automatically dump their outputs to the `logs/` directory. Standalone Streamlit launches (`streamlit run dashboard.py`) will also attempt to auto-spawn the orchestrators recursively unless specifically disabled via `.env` flags.
