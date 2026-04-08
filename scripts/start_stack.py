@@ -142,14 +142,14 @@ def _open_log(path: Path):
     return open(path, "ab", buffering=0)
 
 
-def start_tracker() -> Tuple[bool, str]:
+def start_tracker(force: bool = False) -> Tuple[bool, str]:
     tname = tracker_name()
     pf = tracker_pidfile()
     
     # 1. Check heartbeat
     engine = _get_db_engine()
     hb_age = _get_heartbeat_age_minutes(engine, tname)
-    if hb_age is not None and hb_age < 15:
+    if not force and hb_age is not None and hb_age < 15:
         return True, f"tracker '{tname}' already running (heartbeat fresh: {hb_age:.1f}m)"
 
     # 2. Check pidfile
@@ -210,13 +210,13 @@ def start_tracker() -> Tuple[bool, str]:
         return False, f"tracker start failed: {ex}"
 
 
-def start_workflow_runner() -> Tuple[bool, str]:
+def start_workflow_runner(force: bool = False) -> Tuple[bool, str]:
     pf = workflow_pidfile()
     
     # 1. Check heartbeat
     engine = _get_db_engine()
     hb_age = _get_heartbeat_age_minutes(engine, "workflow_runner")
-    if hb_age is not None and hb_age < 6:
+    if not force and hb_age is not None and hb_age < 6:
         return True, f"workflow_runner already running (heartbeat fresh: {hb_age:.1f}m)"
 
     # 2. Check pidfile
@@ -456,6 +456,7 @@ def main() -> int:
     ap.add_argument("--no-ai-log", action="store_true", help="Do not start the AI log fetcher")
     ap.add_argument("--stop", action="store_true", help="Stop services started with this script")
     ap.add_argument("--status", action="store_true", help="Print pidfile / process status")
+    ap.add_argument("--force", action="store_true", help="Ignore database heartbeats and force start")
     args = ap.parse_args()
 
     if args.stop:
@@ -465,11 +466,11 @@ def main() -> int:
 
     ok_all = True
     if not args.no_tracker:
-        ok, msg = start_tracker()
+        ok, msg = start_tracker(force=args.force)
         print(msg)
         ok_all = ok_all and ok
     if not args.no_workflow:
-        ok, msg = start_workflow_runner()
+        ok, msg = start_workflow_runner(force=args.force)
         print(msg)
         ok_all = ok_all and ok
     if not args.no_ai_log:
