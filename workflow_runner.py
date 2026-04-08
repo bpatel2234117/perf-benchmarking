@@ -126,7 +126,16 @@ def _git_head_short() -> str:
     try:
         repo_dir = Path(__file__).resolve().parent
         # Fast, best-effort. If git isn't available, just return "".
-        out = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=str(repo_dir), stderr=subprocess.DEVNULL, timeout=1.5)
+        flags = 0
+        if os.name == "nt":
+            flags = 0x08000000 # CREATE_NO_WINDOW
+        out = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], 
+            cwd=str(repo_dir), 
+            stderr=subprocess.DEVNULL, 
+            timeout=1.5,
+            creationflags=flags
+        )
         sha = out.decode("utf-8", errors="ignore").strip()
         return sha[:12]
     except Exception:
@@ -565,6 +574,7 @@ def ensure_workflow_tables(engine) -> None:
                 is_ocr BOOLEAN DEFAULT FALSE,
                 is_structured_ff BOOLEAN DEFAULT FALSE,
                 is_ols BOOLEAN DEFAULT FALSE,
+                is_lite BOOLEAN DEFAULT FALSE,
                 feature_flags VARCHAR(500) NULL,
                 notes VARCHAR(1000) NULL,
                 ds_id VARCHAR(128) NULL,
@@ -600,6 +610,7 @@ def ensure_workflow_tables(engine) -> None:
             "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
             "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
             "ALTER TABLE workflow_runs ADD COLUMN scan_template_id VARCHAR(128) NULL",
+            "ALTER TABLE workflow_steps ADD COLUMN is_lite BOOLEAN DEFAULT FALSE",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -1106,6 +1117,11 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
         out["MySQL_host"] = _getenv_any(["MySQL_host", "MYSQL_host", "MYSQL_HOST", "mysql_host", "MySQL_hostname", "MYSQL_HOSTNAME", "mysql_hostname"])
         out["MySQL_port"] = _getenv_any(["MySQL_port", "MYSQL_port", "MYSQL_PORT", "mysql_port"])
         out["MySQL_rdb_url"] = _getenv_any(["MySQL_rdb_url", "MYSQL_RDB_URL", "mysql_rdb_url"])
+    elif k in {"onedrive-v2", "sharepoint-online-v2"}:
+        prefix = "OneDrive" if k == "onedrive-v2" else "SharePoint"
+        out[f"{prefix}_tenantId"] = _getenv_any([f"{prefix}_tenantId", f"{prefix}_TENANTID", f"{k}_tenantId"])
+        out[f"{prefix}_principalId"] = _getenv_any([f"{prefix}_principalId", f"{prefix}_PRINCIPALID", f"{k}_principalId"])
+        out[f"{prefix}_principal_secret_enc"] = _getenv_any([f"{prefix}_principal_secret_enc", f"{prefix}_PRINCIPAL_SECRET_ENC", f"{k}_principal_secret_enc"])
     return out
 
 
@@ -1759,13 +1775,18 @@ def _apply_runtime_flags(step: Dict[str, Any], ds_payload: Dict[str, Any]) -> Di
     is_ocr = bool(step.get("is_ocr"))
 
     # Common connector fields for unstructured connectors (s3/smb)
-    if ds_kind in {"s3", "smb"}:
+    if ds_kind in {"s3", "smb", "onedrive-v2", "sharepoint-online-v2"}:
         # BigID sometimes stores these as strings "true"/"false"
         # Use booleans for newer connector compatibility
         ds_conn["metadataAclScanEnabled"] = bool(is_acl)
         ds_conn["dsAclScanEnabled"] = bool(is_acl)
         ds_conn["ocrEnabled"] = bool(is_ocr)
         
+        # O365 Lite Mode
+        if ds_kind in {"onedrive-v2", "sharepoint-online-v2"}:
+            is_lite = bool(step.get("is_lite") or step.get("lite_mode"))
+            ds_conn["enableLiteMode"] = bool(is_lite)
+
         trp = ds_conn.get("typeRequestProperties")
         if isinstance(trp, dict):
             trp["enableStructuredFilesDiscovery"] = bool(is_struct)
@@ -2377,7 +2398,8 @@ def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
         with engine.connect() as conn:
             conn.execute(
                 text(
-                    "UPDATE workflow_runs SET status='running', finished_at=NULL, updated_at=CURRENT_TIMESTAMP "
+                    "UPDATE workflow_runs SET status='running', finished_at=NULL, "
+                    "started_at=COALESCE(started_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP "
                     "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,'')))='failed'"
                 ),
                 {"rid": int(run_id)},
@@ -2743,7 +2765,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             candidates = conn.execute(
                 text(f"""
                     SELECT id, seq, environment_id, ds_kind, ds_name, scan_kind, file_set_type,
-                           is_acl, is_ocr, is_structured_ff, is_ols, feature_flags, notes,
+                           is_acl, is_ocr, is_structured_ff, is_ols, is_lite, feature_flags, notes,
                            ds_id, scan_profile_id, scan_profile_name, build_version, build_prefix, scan_id, status
                     FROM workflow_steps
                     WHERE run_id = :rid {where_status}

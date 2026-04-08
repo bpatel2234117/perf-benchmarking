@@ -1,0 +1,4 @@
+Starting Scanner AI Log Analyzer (Fetch Interval: 5 min, LLM: llama3)
+[2026-04-02T06:33:52.562137] Checking Ollama connection at http://localhost:11434/api/generate...
+[2026-04-02T06:33:52.568168] [ERROR] Cannot reach Ollama: HTTPConnectionPool(host='localhost', port=11434): Max retries exceeded with url: / (Caused by NewConnectionError('<urllib3.connection.HTTPConnection object at 0x107412f90>: Failed to establish a new connection: [Errno 61] Connection refused'))
+CRITICAL ERROR: Ollama is not reachable. Please ensure Ollama is running and the model 'llama3' is downloaded.

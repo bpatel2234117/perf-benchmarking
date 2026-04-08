@@ -24,7 +24,13 @@ def _pid_is_running(pid: int) -> bool:
         if os.name != "nt":
             os.kill(pid, 0)
             return True
-        out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], stderr=subprocess.STDOUT)
+        # Silencing tasklist flash on Windows
+        CREATE_NO_WINDOW = 0x08000000
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}"], 
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW
+        )
         s = out.decode("utf-8", errors="ignore").lower()
         return str(pid) in s
     except Exception:
@@ -79,13 +85,14 @@ def ensure_ai_log_fetcher_running() -> Tuple[bool, str]:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
             p = subprocess.Popen(
                 cmd,
                 cwd=str(repo_dir),
                 env=env,
                 stdout=stdout_f,
                 stderr=stderr_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(

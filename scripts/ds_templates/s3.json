@@ -1,0 +1,16 @@
+{
+  "ds_connection": {
+    "name": "{{DS_NAME}}",
+    "id": "{{DS_NAME}}",
+    "type": "s3-v2",
+    "scanner_group": "{{SCANNER_GROUP}}",
+    "authenticationProperties": {
+      "accessKey": "",
+      "secret_key": ""
+    },
+    "resourceProperties": {
+      "resourceAddress": "{{S3_BUCKET}}"
+    }
+  },
+  "isSavedAsDraft": false
+}

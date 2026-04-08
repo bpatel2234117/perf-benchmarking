@@ -81,6 +81,10 @@ def _infer_ds_kind(ds: Dict[str, Any]) -> str:
         return "postgres"
     if t in {"rdb-mysql", "mysql"}:
         return "mysql"
+    if t in {"onedrive-v2", "onedrive"}:
+        return "onedrive-v2"
+    if t in {"sharepoint-online-v2", "sharepoint-online", "sharepoint"}:
+        return "sharepoint-online-v2"
     return t or "unknown"
 
 
@@ -219,6 +223,20 @@ def _clean_ds_for_template(ds: Dict[str, Any], *, ds_kind: str) -> Dict[str, Any
                 ap.setdefault("password", "{{MySQL_password}}")
                 keep["authenticationProperties"] = ap
 
+    if ds_kind in {"onedrive-v2", "sharepoint-online-v2"}:
+        prefix = "OneDrive" if ds_kind == "onedrive-v2" else "SharePoint"
+        ap = keep.get("authenticationProperties")
+        if isinstance(ap, dict):
+            if FORCE_SECRET_PLACEHOLDERS or not PRESERVE_EXISTING_SECRETS:
+                ap["principalId"] = f"{{{{{prefix}_principalId}}}}"
+                ap["tenantId"] = f"{{{{{prefix}_tenantId}}}}"
+                ap["principal_secret_enc"] = f"{{{{{prefix}_principal_secret_enc}}}}"
+            else:
+                ap.setdefault("principalId", f"{{{{{prefix}_principalId}}}}")
+                ap.setdefault("tenantId", f"{{{{{prefix}_tenantId}}}}")
+                ap.setdefault("principal_secret_enc", f"{{{{{prefix}_principal_secret_enc}}}}")
+            keep["authenticationProperties"] = ap
+
     return keep
 
 def _score_ds_candidate(ds: Dict[str, Any], *, ds_kind: str) -> int:
@@ -331,7 +349,7 @@ def import_file(engine, path: str) -> Tuple[int, int]:
         file_set = _infer_file_set(ds)
         is_acl = _infer_acl(ds)
         is_struct = _infer_struct(ds)
-        if ds_kind not in {"smb", "s3", "mssql", "postgres", "mysql"}:
+        if ds_kind not in {"smb", "s3", "mssql", "postgres", "mysql", "onedrive-v2", "sharepoint-online-v2"}:
             continue
         k = key_for(ds_kind, file_set, is_acl, is_struct)
         eligible += 1

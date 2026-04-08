@@ -1,0 +1,16 @@
+{
+  "ds_connection": {
+    "name": "{{DS_NAME}}",
+    "id": "{{DS_NAME}}",
+    "type": "rdb-postgresql",
+    "scanner_group": "{{SCANNER_GROUP}}",
+    "username": "",
+    "password": "",
+    "rdb_url": "{{Postgres_rdb_url}}",
+    "authenticationProperties": {
+      "username": "",
+      "password": ""
+    }
+  },
+  "isSavedAsDraft": false
+}

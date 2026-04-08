@@ -4,20 +4,30 @@ import time
 import requests
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import create_engine, text
+
+# Force unbuffered output for cleaner logs
+sys.stdout.reconfigure(line_buffering=True)
+
+print(f"[{datetime.now().isoformat()}] INFO: Bootstrapping dependencies...")
 
 # Add the current directory to path so we can import local modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from db_config import DB_CONNECTION_STRING
-from bigid_auth import Get_auth_token
+def get_db_connection_string():
+    from db_config import DB_CONNECTION_STRING
+    return DB_CONNECTION_STRING
+
+def get_auth_token(base_url, env_row):
+    from bigid_auth import Get_auth_token
+    return Get_auth_token(base_url, env_row)
 
 # Configurations
 FETCH_INTERVAL_MINUTES = int(os.getenv("SCANNER_LOG_FETCH_MINUTES", "5"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
-LOG_LEN = int(os.getenv("SCANNER_LOG_FETCH_LEN", "2000"))
+LOG_LEN = int(os.getenv("SCANNER_LOG_FETCH_LEN", "3000"))
 
 def check_ollama_ready():
     """Verify that Ollama is reachable before starting the analyzer loop."""
@@ -37,9 +47,28 @@ def check_ollama_ready():
         return False
 
 def setup_db_engine():
-    engine = create_engine(DB_CONNECTION_STRING, echo=False)
+    engine = create_engine(get_db_connection_string(), echo=False)
     try:
         with engine.connect() as conn:
+            # Automatic Migration for error_hash
+            try:
+                conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN IF NOT EXISTS error_hash VARCHAR(32)"))
+                conn.commit()
+            except Exception as e:
+                print(f"Migration note (error_hash): {e}")
+            
+            # Tracker and Log Fetcher heartbeat table
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                    name VARCHAR(50) PRIMARY KEY,
+                    last_started_at_utc DATETIME,
+                    last_finished_at_utc DATETIME,
+                    last_status VARCHAR(20),
+                    last_message TEXT
+                )
+            """))
+            conn.commit()
+            
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS scan_log_errors (
                     id INT AUTO_INCREMENT PRIMARY KEY,
@@ -51,6 +80,7 @@ def setup_db_engine():
                     log_source VARCHAR(50) DEFAULT 'scanner',
                     scan_id VARCHAR(50),
                     subscan_id VARCHAR(50),
+                    error_hash VARCHAR(32),
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
                 );
             """))
@@ -90,6 +120,24 @@ def setup_db_engine():
             conn.commit()
     except Exception:
         pass
+    
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS scan_system_health (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    environment_id INT NOT NULL,
+                    captured_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    health_summary TEXT,
+                    log_window_start TIMESTAMP,
+                    log_window_end TIMESTAMP,
+                    FOREIGN KEY (environment_id) REFERENCES test_environments(id)
+                );
+            """))
+            conn.commit()
+    except Exception as e:
+        print(f"Error creating scan_system_health: {e}")
+        
     return engine
 
 def write_heartbeat(engine, status="ok", message=""):
@@ -132,10 +180,11 @@ def get_active_environments(engine):
         FROM test_environments t
         JOIN scan_parents sp ON sp.environment_id = t.id
         WHERE t.is_active = 1 
-          AND sp.scan_status IS NOT NULL 
-          AND sp.scan_status != ''
-          AND LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
-              'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled'
+          AND (
+              LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
+                  'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled'
+              )
+              OR sp.updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
           )
     """
     with engine.connect() as conn:
@@ -184,30 +233,109 @@ def extract_scan_ids(log_text):
 
 def detect_errors_in_logs(log_text):
     """
-    Scans logs line by line, keeping a sliding 5-line window.
-    Returns a list of 5-line contexts centered around 'ERROR', 'Exception', or 'Fail'.
+    Structural-aware log analysis. 
+    Finds error entry points (case-insensitive) and captures consecutive indented lines (stack traces).
     """
     lines = log_text.splitlines()
     error_contexts = []
-    seen_contexts = set()
+    seen_fingerprints = set()
     
-    for i, line in enumerate(lines):
-        line_lower = line.lower()
-        if "error" in line_lower or "exception" in line_lower or "fail" in line_lower:
-            # We don't want to capture every single error if it's flooded.
-            # But let's grab the context: 2 lines before, current, 2 lines after.
+    i = 0
+    # Broaden regex to include common fail states: O365 throttling, timeouts, refused, etc.
+    ERROR_PATTERN = re.compile(
+        r'(?i)\[?(?:error|fatal|fail|severe|exception|axioserror|nohttp|status\s+[45]\d{2}|timeout|timed? out|refused|unreachable|reset|denied|abort|exhausted|throttl|limitreached|graphservice|activitylimit)\]?'
+    )
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # 1. Detect starting line of an error block (Pattern-based)
+        if ERROR_PATTERN.search(line):
+            # Context before: capture 2 lines if possible for timestamps/IDs
             start = max(0, i - 2)
-            end = min(len(lines), i + 3)
-            context = "\\n".join(lines[start:end])
             
-            # Deduplicate within the same fetch text
-            if context not in seen_contexts:
-                seen_contexts.add(context)
-                error_contexts.append(context)
+            # 2. Greedy Multi-line Capture (Stack traces, indented JSON, etc)
+            end = i + 1
+            while end < len(lines) and (end - i) < 30: # Max 30 lines for context
+                next_line = lines[end]
+                # Match common stack trace/indented log markers
+                if next_line.startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
+                    end += 1
+                else: break
+            
+            # If no indentation, at least grab a tiny bit of following context
+            if end == i + 1:
+                end = min(len(lines), i + 4)
+            
+            ctx_lines = lines[start:end]
+            ctx_text = "\n".join(ctx_lines)
+            
+            # Deduplicate within this fetch cycle
+            fingerprint = ctx_text[:300]
+            if fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
+                error_contexts.append(ctx_text)
+                
+            i = end # Advance cursor
+        else:
+            i += 1
                 
     return error_contexts
 
+def call_health_summarizer(log_text):
+    if not check_ollama_ready():
+        return "[⚠️ System Health Review Offline] Ollama is unreachable."
+    
+    """
+    Sends a representative digest of the entire 3000-line window for a proactive health review.
+    """
+    lines = log_text.splitlines()
+    if len(lines) < 10:
+        return None
+        
+    # Take a digest: first 40, middle 40, last 40 lines to stay within typical LLM context tokens (Ollama)
+    digest_size = 40
+    if len(lines) <= digest_size * 3:
+        digest = log_text
+    else:
+        mid = len(lines) // 2
+        digest = (
+            "\n".join(lines[:digest_size]) + 
+            "\n\n[... middle omitted ...]\n\n" + 
+            "\n".join(lines[mid-digest_size//2 : mid+digest_size//2]) + 
+            "\n\n[... tail omitted ...]\n\n" + 
+            "\n".join(lines[-digest_size:])
+        )
+
+    prompt = f"""
+You are a site reliability engineer monitoring a BigID system. 
+Analyze the following representative log digest (samples from the start, middle, and end of a 3000-line window).
+
+LOG DIGEST:
+{digest}
+
+Task:
+1. Summarize the general health of this service in 2-3 sentences.
+2. Note any subtle warnings, high latencies, or repetitive non-error issues.
+3. If everything looks healthy, state that the system appears stable.
+
+Provide a concise, high-level structural health assessment.
+"""
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=180
+        )
+        response.raise_for_status()
+        return response.json().get("response", "Health summary unavailable")
+    except Exception as e:
+        return f"Health Review failed: {e}"
+
 def call_ai_analyzer(error_context, log_source):
+    if not check_ollama_ready():
+        return f"[⚠️ AI Analysis Offline] Ollama is not reachable at {OLLAMA_URL}. Please ensure Ollama is running. Raw error context: {error_context[:200]}..."
+    
     prompt = f"""
 You are an expert systems engineer and log analyst.
 I have extracted a severe error from our '{log_source}' application logs.
@@ -278,12 +406,12 @@ Provide a high-level, technical correlation report.
     except Exception as e:
         return f"Correlation Analysis failed: {e}"
 
-def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id):
+def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash=None):
     with engine.connect() as conn:
         conn.execute(
             text("""
-                INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id)
-                VALUES (:eid, :lt, :ctx, :ai, :ls, :sid, :ssid)
+                INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
+                VALUES (:eid, :lt, :ctx, :ai, :ls, :sid, :ssid, :hash)
             """),
             {
                 "eid": env_id,
@@ -292,94 +420,85 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
                 "ai": ai_analysis,
                 "ls": log_source,
                 "sid": scan_id,
-                "ssid": subscan_id
+                "ssid": subscan_id,
+                "hash": error_hash
             }
         )
         conn.commit()
 
-def store_correlation_report(engine, env_id, scan_id, report_text, is_final=False):
+def store_health_summary(engine, env_id, summary):
     with engine.connect() as conn:
         conn.execute(
             text("""
-                INSERT INTO scan_log_correlations (environment_id, scan_id, correlation_report, is_final)
-                VALUES (:eid, :sid, :rep, :fin)
+                INSERT INTO scan_system_health (environment_id, health_summary, captured_at_utc)
+                VALUES (:eid, :hs, :cat)
             """),
-            {
-                "eid": env_id,
-                "sid": scan_id,
-                "rep": report_text,
-                "fin": is_final
-            }
+            {"eid": env_id, "hs": summary, "cat": datetime.utcnow().isoformat() + "Z"}
         )
         conn.commit()
 
 def run_once(engine):
-    environments = get_active_environments(engine)
-    print(f"[{datetime.utcnow().isoformat()}] Fetched {len(environments)} active environments.")
-    
-    for env in environments:
-        env_id = env["id"]
-        base_url = env["base_url"]
-        
-        try:
-            print(f"[{datetime.utcnow().isoformat()}] Fetching token for {env['env_name']}...")
-            token = Get_auth_token(base_url, {"env_name": env["env_name"]})
-            
-            new_errors_by_scan = {} # {scan_id: [(source, ctx, sid)]}
-            
-            log_sources = ["scanner", "orch", "orch2", "aci"]
-            for log_source in log_sources:
-                print(f"[{datetime.utcnow().isoformat()}] Fetching {log_source} logs from {base_url}...")
-                log_text = fetch_logs(base_url, token, LOG_LEN, log_source)
-                
-                print(f"[{datetime.utcnow().isoformat()}] Analyzing {log_source} logs for errors...")
-                errors = detect_errors_in_logs(log_text)
-                
-                # Limit to 3 per source per cycle to avoid flooding
-                max_errors_to_process = 3
-                processed_errors = 0
-                
-                for ctx in errors:
-                    if processed_errors >= max_errors_to_process:
-                        break
-                    
-                    with engine.connect() as conn:
-                        existing = conn.execute(
-                            text("SELECT id FROM scan_log_errors WHERE environment_id = :eid AND error_context = :ctx LIMIT 1"),
-                            {"eid": env_id, "ctx": ctx}
-                        ).fetchone()
-                        
-                    if existing:
-                        continue
-                    
-                    parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
-                    
-                    print(f"[{datetime.utcnow().isoformat()}] Found new error in {log_source}. Querying AI...")
-                    ai_analysis = call_ai_analyzer(ctx, log_source)
-                    
-                    store_error_analysis(engine, env_id, ctx, ai_analysis, log_source, parsed_scan_id, parsed_subscan_id)
-                    processed_errors += 1
-                    
-                    # Group for batch correlation analysis
-                    if parsed_scan_id:
-                        if parsed_scan_id not in new_errors_by_scan:
-                            new_errors_by_scan[parsed_scan_id] = []
-                        new_errors_by_scan[parsed_scan_id].append((log_source, ctx, parsed_scan_id))
-            
-            # Per-Scan-ID Batch Correlation
-            for sid, batch in new_errors_by_scan.items():
-                if len(batch) >= 1: # We correlate even if there's only one, as the prompt is different
-                    print(f"[{datetime.utcnow().isoformat()}] Generating correlation report for {sid}...")
-                    correlation_text = call_correlation_analyzer(batch)
-                    store_correlation_report(engine, env_id, sid, correlation_text, is_final=False)
-                    print(f"[{datetime.utcnow().isoformat()}] Saved interval correlation for {sid}.")
-                
-        except Exception as e:
-            print(f"[{datetime.utcnow().isoformat()}] Failed processing env {env['env_name']}: {e}")
-            write_heartbeat(engine, status="error", message=str(e))
+    try:
+        envs = get_active_environments(engine)
+        if not envs:
+            print(f"[{datetime.now().isoformat()}] No active environments to process.")
+            write_heartbeat(engine, status="ok", message="No active environments")
             return
+
+        print(f"[{datetime.now().isoformat()}] Processing {len(envs)} environments...")
+        
+        for env in envs:
+            env_id = env['id']
+            base_url = env['base_url']
+            env_name = env['env_name']
             
-    write_heartbeat(engine, status="ok", message=f"Processed {len(envs)} environments")
+            try:
+                print(f"[{datetime.now().isoformat()}] [{env_name}] Fetching auth token...")
+                token = get_auth_token(base_url, env)
+                
+                new_errors_by_scan = {}
+                log_sources = ["scanner", "orch", "orch2", "aci", "api-gateway", "data-manager"]
+                
+                for log_source in log_sources:
+                    try:
+                        logs = fetch_logs(base_url, token, 3000, log_source)
+                        if not logs: continue
+                        
+                        errors = detect_errors_in_logs(logs)
+                        for ctx in errors:
+                            # 60 min deduplication
+                            with engine.connect() as conn:
+                                existing = conn.execute(
+                                    text("""
+                                        SELECT id FROM scan_log_errors 
+                                        WHERE environment_id = :eid 
+                                          AND error_context = :ctx 
+                                          AND log_timestamp > DATE_SUB(NOW(), INTERVAL 60 MINUTE)
+                                        LIMIT 1
+                                    """),
+                                    {"eid": env_id, "ctx": ctx}
+                                ).fetchone()
+                            if existing: continue
+                            
+                            parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
+                            ai_analysis = call_ai_analyzer(ctx, log_source)
+                            store_error_analysis(engine, env_id, ctx, ai_analysis, log_source, parsed_scan_id, parsed_subscan_id)
+                            
+                            if parsed_scan_id:
+                                if parsed_scan_id not in new_errors_by_scan:
+                                    new_errors_by_scan[parsed_scan_id] = []
+                                new_errors_by_scan[parsed_scan_id].append((log_source, ctx, parsed_scan_id))
+
+                    except Exception as source_err:
+                        print(f"[{datetime.now().isoformat()}] [{env_name}] Error processing source {log_source}: {source_err}")
+                
+            except Exception as env_err:
+                print(f"[{datetime.now().isoformat()}] [ERROR] Failed processing environment {env_name}: {env_err}")
+                continue
+
+        write_heartbeat(engine, status="ok", message=f"Processed {len(envs)} environments at {datetime.now().isoformat()}")
+    except Exception as global_err:
+        print(f"[{datetime.now().isoformat()}] CRITICAL: Global run_once failure: {global_err}")
 
 def main():
     import urllib3
@@ -388,8 +507,8 @@ def main():
     print(f"Starting Scanner AI Log Analyzer (Fetch Interval: {FETCH_INTERVAL_MINUTES} min, LLM: {OLLAMA_MODEL})")
     
     if not check_ollama_ready():
-        print(f"CRITICAL ERROR: Ollama is not reachable. Please ensure Ollama is running and the model '{OLLAMA_MODEL}' is downloaded.")
-        sys.exit(1)
+        print(f"WARNING: Ollama is not reachable at {OLLAMA_URL}. The monitor will continue to detect errors but AI analysis will be skipped until Ollama is active.")
+        # DO NOT EXIT - continue to monitor logs even without AI
         
     engine = setup_db_engine()
     

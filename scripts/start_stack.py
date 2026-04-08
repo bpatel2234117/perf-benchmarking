@@ -28,12 +28,53 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
 
 def repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
+
+
+# Add repo root to sys.path so we can import db_config
+if str(repo_root()) not in sys.path:
+    sys.path.insert(0, str(repo_root()))
+
+
+def _get_db_engine():
+    try:
+        from sqlalchemy import create_engine
+        from db_config import DB_CONNECTION_STRING
+        return create_engine(DB_CONNECTION_STRING)
+    except ImportError:
+        return None
+
+
+def _get_heartbeat_age_minutes(engine, name: str) -> Optional[float]:
+    if not engine:
+        return None
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT last_started_at_utc, last_finished_at_utc FROM tracker_heartbeat WHERE name = :n"),
+                {"n": name}
+            ).fetchone()
+            if not row:
+                return None
+            last = row[1] or row[0]
+            if not last:
+                return None
+            now_utc = datetime.now(timezone.utc)
+            if hasattr(last, "tzinfo") and last.tzinfo:
+                last_utc = last.astimezone(timezone.utc)
+            else:
+                last_utc = last.replace(tzinfo=timezone.utc)
+            age_sec = (now_utc - last_utc).total_seconds()
+            return max(0.0, age_sec) / 60.0
+    except Exception:
+        return None
 
 
 def logs_dir() -> Path:
@@ -47,11 +88,11 @@ def tracker_name() -> str:
 
 
 def tracker_pidfile() -> Path:
-    return repo_root() / f".stack.tracker.{tracker_name()}.pid"
+    return repo_root() / f".tracker.{tracker_name()}.pid"
 
 
 def workflow_pidfile() -> Path:
-    return repo_root() / ".stack.workflow_runner.pid"
+    return repo_root() / ".workflow_runner.pid"
 
 
 def ai_log_pidfile() -> Path:
@@ -69,7 +110,13 @@ def _pid_is_running(pid: int) -> bool:
         if os.name != "nt":
             os.kill(pid, 0)
             return True
-        out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}"], stderr=subprocess.STDOUT)
+        # Silencing tasklist flash on Windows
+        CREATE_NO_WINDOW = 0x08000000
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}"], 
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW
+        )
         return str(pid) in out.decode("utf-8", errors="ignore").lower()
     except Exception:
         return False
@@ -96,10 +143,19 @@ def _open_log(path: Path):
 
 
 def start_tracker() -> Tuple[bool, str]:
+    tname = tracker_name()
     pf = tracker_pidfile()
+    
+    # 1. Check heartbeat
+    engine = _get_db_engine()
+    hb_age = _get_heartbeat_age_minutes(engine, tname)
+    if hb_age is not None and hb_age < 15:
+        return True, f"tracker '{tname}' already running (heartbeat fresh: {hb_age:.1f}m)"
+
+    # 2. Check pidfile
     pid = _read_pid(pf)
     if pid and _pid_is_running(pid):
-        return True, f"tracker already running (pid={pid})"
+        return True, f"tracker '{tname}' already running (pid={pid})"
 
     py = sys.executable
     root = repo_root()
@@ -120,13 +176,14 @@ def start_tracker() -> Tuple[bool, str]:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
             p = subprocess.Popen(
                 cmd,
                 cwd=str(root),
                 env=env,
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -155,6 +212,14 @@ def start_tracker() -> Tuple[bool, str]:
 
 def start_workflow_runner() -> Tuple[bool, str]:
     pf = workflow_pidfile()
+    
+    # 1. Check heartbeat
+    engine = _get_db_engine()
+    hb_age = _get_heartbeat_age_minutes(engine, "workflow_runner")
+    if hb_age is not None and hb_age < 6:
+        return True, f"workflow_runner already running (heartbeat fresh: {hb_age:.1f}m)"
+
+    # 2. Check pidfile
     pid = _read_pid(pf)
     if pid and _pid_is_running(pid):
         return True, f"workflow_runner already running (pid={pid})"
@@ -176,13 +241,14 @@ def start_workflow_runner() -> Tuple[bool, str]:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
             p = subprocess.Popen(
                 cmd,
                 cwd=str(root),
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -234,13 +300,14 @@ def start_ai_log_fetcher() -> Tuple[bool, str]:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
             p = subprocess.Popen(
                 cmd,
                 cwd=str(root),
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -288,13 +355,14 @@ def start_dashboard_background() -> Tuple[bool, str]:
         if os.name == "nt":
             DETACHED_PROCESS = 0x00000008
             CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
             p = subprocess.Popen(
                 cmd,
                 cwd=str(root),
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(

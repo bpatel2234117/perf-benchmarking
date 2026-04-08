@@ -1704,19 +1704,24 @@ def extract_scan_attributes_payload(payload):
         data_block = payload.get("data")
         if isinstance(data_block, dict):
             for key in [
-                "attributes",
-                "items",
-                "results",
-                "dataSourcesInsights",
-                "classifierAttributes",
-                "classificationAttributes",
-                "classificationsAttributes",
-                "scanAttributes",
+                "attributes", "items", "results", "dataSourcesInsights",
+                "classifierAttributes", "classificationAttributes", "classificationsAttributes", "scanAttributes",
+                "classification_insights", "attribute_counts", "findings"
             ]:
                 if isinstance(data_block.get(key), list):
                     items = data_block.get(key)
                     break
-            if data_block.get("totalCount") is not None:
+            if not items:
+                # Some BigID versions nest data directly under payload as a list or under specific nested keys
+                for key in ["attributes", "items", "results"]:
+                    if isinstance(payload.get(key), list):
+                        items = payload.get(key)
+                        break
+        elif isinstance(payload, list):
+            # Payload IS the list of items
+            items = payload
+        
+        if data_block and isinstance(data_block, dict) and data_block.get("totalCount") is not None:
                 try:
                     total_count = int(data_block.get("totalCount"))
                 except Exception:
@@ -2373,9 +2378,15 @@ def extract_scan_insight_metrics(payload):
     if newly_added is None:
         newly_added = deep_find(root, ["newlyAdded", "new", "added"])
 
-    classifier_attribute_names = deep_find(root, ["classifierAttributeNames", "classifier_attribute_names"])
+    classifier_attribute_names = deep_find(root, ["classifierAttributeNames", "classifier_attribute_names", "classifier_attributes", "attribute_names"])
     if classifier_attribute_names is None:
-        classifier_attribute_names = classifications.get("classifierAttributeNames")
+        classifier_attribute_names = classifications.get("classifierAttributeNames") or classifications.get("attributeNames")
+    
+    # Final fallback: if we have a list of names but it's empty, try to get from dataSources.classifications map
+    if not classifier_attribute_names and classifications:
+        keys = [k for k in classifications.keys() if k not in ["newlyAdded", "new", "total", "added", "removed", "falseRemoved"]]
+        if keys:
+            classifier_attribute_names = ",".join(keys)
 
     if isinstance(newly_added, list):
         distinct_classification_attributes = len({str(x).strip() for x in newly_added if str(x).strip()})
@@ -3663,6 +3674,7 @@ def ensure_workflow_tables():
                         is_ocr INTEGER DEFAULT 0,
                         is_structured_ff INTEGER DEFAULT 0,
                         is_ols INTEGER DEFAULT 0,
+                        is_lite INTEGER DEFAULT 0,
                         feature_flags TEXT NULL,
                         notes TEXT NULL,
                         ds_id TEXT NULL,
@@ -3695,6 +3707,7 @@ def ensure_workflow_tables():
                     "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name TEXT NULL",
                     "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
                     "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
+                    "ALTER TABLE workflow_steps ADD COLUMN is_lite INTEGER DEFAULT 0",
                     "ALTER TABLE workflow_templates ADD COLUMN template_kind TEXT NULL",
                     "ALTER TABLE workflow_templates ADD COLUMN payload_json TEXT NULL",
                     "ALTER TABLE workflow_runs ADD COLUMN scan_template_id TEXT NULL",
@@ -3746,6 +3759,7 @@ def ensure_workflow_tables():
                     is_ocr BOOLEAN DEFAULT FALSE,
                     is_structured_ff BOOLEAN DEFAULT FALSE,
                     is_ols BOOLEAN DEFAULT FALSE,
+                    is_lite BOOLEAN DEFAULT FALSE,
                     feature_flags VARCHAR(500) NULL,
                     notes VARCHAR(1000) NULL,
                     ds_id VARCHAR(128) NULL,
@@ -3781,6 +3795,7 @@ def ensure_workflow_tables():
                 "ALTER TABLE workflow_steps ADD COLUMN scan_profile_name VARCHAR(500) NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_version VARCHAR(50) NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_prefix VARCHAR(20) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN is_lite BOOLEAN DEFAULT FALSE",
                 "ALTER TABLE workflow_templates ADD COLUMN template_kind VARCHAR(32) NULL",
                 "ALTER TABLE workflow_templates ADD COLUMN payload_json LONGTEXT NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN scan_template_id VARCHAR(128) NULL",
@@ -3859,6 +3874,7 @@ def create_workflow_run(
                 "ocr": 1 if bool(stp.get("is_ocr")) else 0,
                 "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
                 "ols": 1 if bool(stp.get("is_ols")) else 0,
+                "islite": 1 if bool(stp.get("is_lite")) else 0,
                 "ff": str(stp.get("feature_flags") or "").strip() or None,
                 "notes": str(stp.get("notes") or "").strip() or None,
                 "status": ("pending" if enabled else "disabled"),
@@ -3870,14 +3886,14 @@ def create_workflow_run(
                         run_id, seq, environment_id,
                         ds_kind, ds_name, scan_kind, file_set_type,
                         is_enabled,
-                        is_acl, is_ocr, is_structured_ff, is_ols,
+                        is_acl, is_ocr, is_structured_ff, is_ols, is_lite,
                         feature_flags, notes, status
                     )
                     VALUES (
                         :rid, :seq, :eid,
                         :dk, :dn, :sk, :fs,
                         :en,
-                        :acl, :ocr, :sff, :ols,
+                        :acl, :ocr, :sff, :ols, :islite,
                         :ff, :notes, :status
                     )
                 """),
@@ -4047,7 +4063,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
         cols = [
             "id","run_id","seq","environment_id","environment","env_is_busy",
             "ds_kind","ds_name","scan_kind","file_set_type",
-            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols","is_lite",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
@@ -4078,6 +4094,7 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
                         ws.is_ocr,
                         ws.is_structured_ff,
                         ws.is_ols,
+                        ws.is_lite,
                         ws.feature_flags,
                         ws.notes,
                         ws.ds_id,
@@ -4124,7 +4141,10 @@ def set_workflow_run_status(run_id: int, status: str, *, last_error: Optional[st
                 conn.execute(
                     text("""
                         UPDATE workflow_runs
-                        SET status = :s, last_error = COALESCE(:e, last_error), next_eligible_at = NULL
+                        SET status = :s, 
+                            last_error = COALESCE(:e, last_error), 
+                            next_eligible_at = NULL,
+                            started_at = COALESCE(started_at, CURRENT_TIMESTAMP)
                         WHERE id = :rid
                     """),
                     {"s": stv, "e": (str(last_error)[:2000] if last_error else None), "rid": int(run_id)},
@@ -7463,7 +7483,33 @@ def get_scan_attribute_findings_prefill(scan_id):
                 "Attribute Value": label,
                 "Findings": findings_count_val
             })
-    return prefill_rows
+    if not prefill_rows and scan_id:
+        # Fallback to scan_progress table if specific attributes are missing
+        try:
+            with engine.connect() as conn:
+                last_progress = conn.execute(
+                    text("SELECT total_classifications, newly_added_classifications FROM scan_progress WHERE scan_id = :sid ORDER BY id DESC LIMIT 1"),
+                    {"sid": str(scan_id)}
+                ).fetchone()
+                if last_progress and last_progress[0] > 0:
+                    prefill_rows.append({
+                        "Classifier Attribute": "General Classifications",
+                        "Attribute Value": "Aggregate",
+                        "Findings": int(last_progress[0])
+                    })
+        except Exception:
+            pass
+
+    # [FIX] Ensure we deduplicate General Classifications if it's already there
+    seen_names = set()
+    final_rows = []
+    for r in prefill_rows:
+        key = (r["Classifier Attribute"], r["Attribute Value"])
+        if key not in seen_names:
+            final_rows.append(r)
+            seen_names.add(key)
+
+    return final_rows
 
 
 def page_add_benchmark():
@@ -7750,18 +7796,51 @@ def page_add_benchmark():
     total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
     total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
     total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
-    # New Attributes: this is the value you historically stored in benchmarks.total_catalog_items
-    # and want used for trends. Prefer scan_insights.new_attributes_count when scan_id is provided.
+    # [FIX] Prefill volume metrics (Files/Size) from scan insights if available.
+    # This prevents the 0-throughput issue in Image 2 when a preset isn't matched.
+    total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
+    total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
+    total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
     total_catalog_items = 0
+
     try:
         if scan_prefill_id:
             m = load_scan_insight_map_for_scan_ids([scan_prefill_id]).get(str(scan_prefill_id), {}) or {}
+            
+            # Prioritize volumes from actual scan
+            osc = m.get("objects_scanned")
+            oen = m.get("objects_enumerated")
+            tgb = m.get("total_size_gb")
             nac = m.get("new_attributes_count")
+            
+            if osc is not None and str(osc).strip() != "":
+                total_files = int(osc)
+                st.caption(f"Prefilled from scan_insights: Total Files = `{total_files:,}`")
+            if oen is not None and str(oen).strip() != "":
+                total_folders = int(oen)
+            if tgb is not None and str(tgb).strip() != "":
+                total_gb = float(tgb)
+                st.caption(f"Prefilled from scan_insights: Total Size (GB) = `{total_gb:.2f}`")
             if nac is not None and str(nac).strip() != "":
                 total_catalog_items = int(nac)
-                st.caption(f"Prefilled from scan_insights: New Attributes = `{total_catalog_items:,}`")
     except Exception:
         pass
+
+    # Force sync button - outside of form
+    if scan_prefill_id:
+        c1, c2 = st.columns([3, 1])
+        with c1:
+            st.caption(f"🔄 **Sync findings directly from BigID API for scan `{scan_prefill_id}`**")
+        with c2:
+            if st.button("Sync Now", key="sync_findings_btn", help="Fetch latest findings from BigID"):
+                env_row = get_environment_row_for_scan_id(scan_prefill_id)
+                if env_row:
+                    with st.spinner("Syncing..."):
+                        if sync_single_scan_insight(scan_prefill_id, env_row):
+                            st.session_state["findings_prefill_rows"] = get_scan_attribute_findings_prefill(scan_prefill_id)
+                            st.rerun()
+                else:
+                    st.error("No tracked environment found for this scan ID.")
 
     with st.form("add_benchmark_form"):
         st.markdown("#### Scan Timing")
@@ -7836,7 +7915,8 @@ def page_add_benchmark():
         except Exception:
             pass
         if scan_prefill_id and not attr_options:
-            st.caption("No classifier attribute names found yet for this scan. Run/let `tracker.py` populate scan insights, or type manually.")
+            st.warning("No classifier attribute names found in DB. Use the 'Sync Now' button above the form, or type manually.")
+        
         default_findings_rows = st.session_state.get("findings_prefill_rows")
         if not isinstance(default_findings_rows, list) or not default_findings_rows:
             default_findings_rows = [{
@@ -8091,6 +8171,8 @@ def page_add_benchmark():
                            f"- Per Scanner: {tp_scanner_gb:.2f} GB/hr, {tp_scanner_files:,.0f} files/hr\n"
                            f"- Per Thread: {tp_thread_gb:.2f} GB/hr, {tp_thread_files:,.0f} files/hr")
                     st.toast("Data Saved!")
+                    # [FIX] Clear data cache so the new record is visible immediately in Edit Records
+                    st.cache_data.clear()
                     st.session_state["benchmark_saved"] = True
                     st.rerun()
                     
@@ -8686,8 +8768,8 @@ def page_manage_test_environments():
                     except Exception as ex:
                         st.warning(f"Environment saved, but classifier sync failed: {ex}")
                 
-                # Clear the cache so the updated active state renders immediately 
-                load_test_environments.clear()
+                # Clear cache so the new record appears immediately in Edit Records
+                st.cache_data.clear()
                 st.rerun()
             except Exception as e:
                 st.error(f"Error saving environment: {e}")
@@ -10859,7 +10941,19 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
     
     # Base filtering
     df_filtered = df.copy()
-    # Normalize key filter columns (prevents missing rows due to whitespace/casing inconsistencies)
+    
+    # Aggressive is_active filtering (client-side safety)
+    if 'is_active' in df_filtered.columns:
+        def is_really_active(x):
+            if x is None: return True # Default to active for historical nulls
+            s = str(x).strip().lower()
+            if s in ('1', '1.0', 'true', 'active', 't', 'y', 'yes'): return True
+            if s in ('0', '0.0', 'false', 'inactive', 'f', 'n', 'no'): return False
+            try: return bool(int(float(s)))
+            except: return bool(x)
+        df_filtered = df_filtered[df_filtered['is_active'].apply(is_really_active)]
+
+    # Normalize key filter columns
     try:
         for col in ["Build_Version", "Data_Source_Type", "Scan_Type", "file_set_type"]:
             if col in df_filtered.columns:
@@ -11205,14 +11299,7 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
 
     # Detailed Table
     st.markdown("### Summary Data")
-    # Filter for active rows (extra safety layer). Treat NULL/truthy as active.
-    try:
-        plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(int(x)) if str(x).strip().isdigit() else bool(x))]
-    except Exception:
-        try:
-            plot_df = plot_df[plot_df['is_active'].apply(lambda x: bool(x))]
-        except Exception:
-            pass
+    # (Filtering moved to top of function for consistency across charts and tables)
 
     # Table order: newest build first (descending) while charts remain ascending.
     try:
@@ -11716,13 +11803,15 @@ def load_auto_trend_dataset():
                     ab.total_classification,
                     ab.new_attributes,
                     ab.removed_attributes,
-                    ab.updated_at
+                    ab.updated_at,
+                    ab.is_active
                 FROM auto_scan_benchmarks ab
                 LEFT JOIN test_environments te ON te.id = ab.environment_id
                 LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
                 WHERE LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
                   AND LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'
+                  AND COALESCE(ab.is_active, 1) = 1
                 ORDER BY ab.run_date DESC, ab.updated_at DESC
             """)).fetchall()
         cols = [
@@ -11730,7 +11819,7 @@ def load_auto_trend_dataset():
             "scan_type", "data_source_type", "data_type", "file_set_type", "scan_name",
             "scan_start_time", "scan_end_time", "total_scan_hours",
             "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", 
-            "new_attributes", "removed_attributes", "updated_at"
+            "new_attributes", "removed_attributes", "updated_at", "is_active"
         ]
         df = pd.DataFrame(rows, columns=cols)
         if df.empty:
@@ -11783,6 +11872,7 @@ def load_auto_trend_as_manual_like_df():
     out["Data_Source_Type"] = out["data_source_type"].astype(str)
     out["Data_Type"] = out["data_type"].astype(str)
     out["scan_name"] = out.get("scan_name", "").astype(str)
+    out["is_active"] = out.get("is_active", 1)
 
     # Re-infer core fields from scan_name when the auto table fields are missing/garbage.
     try:
@@ -11843,7 +11933,6 @@ def load_auto_trend_as_manual_like_df():
     out["Total_Classification"] = pd.to_numeric(out.get("total_classification"), errors="coerce")
     out["Removed_Attributes"] = pd.to_numeric(out.get("removed_attributes"), errors="coerce")
     out["total_scan_hours"] = pd.to_numeric(out["total_scan_hours"], errors="coerce")
-    out["is_active"] = 1
     out["is_acl"] = 0
     out["is_ocr"] = 0
     out["is_feature_flags"] = 0
@@ -11967,16 +12056,18 @@ def load_scan_parents_runs_as_manual_like_df(*, include_inactive_envs: bool = Fa
                     sp.started_at,
                     sp.completed_at,
                     sp.updated_at,
+                    sp.is_active,
                     COALESCE(te.env_name,'') AS env_name
                 FROM scan_parents sp
                 LEFT JOIN test_environments te ON te.id = sp.environment_id
                 WHERE LOWER(COALESCE(sp.scan_status,'')) NOT IN ('stopped','aborted')
                   AND LOWER(COALESCE(sp.scan_name,'')) NOT LIKE 'instant scan data%'
+                  AND COALESCE(sp.is_active, 1) = 1
                   {where_env}
                 ORDER BY sp.updated_at DESC
                 LIMIT :lim
             """), {'lim': int(limit)}).fetchall()
-        cols = ['scan_id','scan_name','environment_id','scan_type_raw','scan_status','started_at','completed_at','updated_at','env_name']
+        cols = ['scan_id','scan_name','environment_id','scan_type_raw','scan_status','started_at','completed_at','updated_at','is_active','env_name']
         df = pd.DataFrame(rows, columns=cols)
     except Exception:
         return pd.DataFrame()
@@ -12085,7 +12176,7 @@ def load_scan_parents_runs_as_manual_like_df(*, include_inactive_envs: bool = Fa
 
     df['Total_Folders'] = pd.NA
     df['Data_Type'] = ''
-    df['is_active'] = 1
+    df['is_active'] = pd.to_numeric(df.get('is_active'), errors='coerce').fillna(1)
     df['id'] = df['scan_id'].astype(str)
     
     # Standardize column for dashboard consumption
@@ -12279,7 +12370,7 @@ def page_edit_benchmark(df):
                             UPDATE auto_scan_benchmarks 
                             SET scenario_type = :scn, scan_type = :st, data_source_type = :dst, data_type = :dtype,
                                 file_set_type = :fst, total_files = :tf, total_folders = :tfo, total_size_gb = :tgb,
-                                total_classification = :tcl
+                                total_classification = :tcl, is_active = :act
                             WHERE scan_id = :sid
                         """)
                         conn.execute(upd_stmt, {
@@ -12292,6 +12383,7 @@ def page_edit_benchmark(df):
                             'tfo': clean_value(row.get('Total_Folders')),
                             'tgb': clean_value(row.get('Total_Size_GB')),
                             'tcl': clean_value(row.get('New_Attributes')),
+                            'act': 1 if bool(row.get('is_active')) else 0,
                             'sid': row_id
                         })
                     else:
@@ -14084,6 +14176,8 @@ def page_scan_progress():
             pass
 
         st.divider()
+
+
         # Per-classifier / attribute hits (names + table) directly under Observations
         try:
             hits_df, hits_note = classifier_hits_df, classifier_hits_note
@@ -15370,6 +15464,25 @@ def page_scan_progress():
 
         if env_id:
             try:
+                # 0. Proactive System Health Review
+                try:
+                    with engine.connect() as conn:
+                        health_res = conn.execute(
+                            text("SELECT health_summary, captured_at_utc FROM scan_system_health WHERE environment_id = :eid ORDER BY id DESC LIMIT 1"),
+                            {"eid": env_id}
+                        ).fetchone()
+                    
+                    if health_res:
+                        st.markdown("#### 🤖 Proactive System Health Review")
+                        h_text, h_at = health_res
+                        h_at_dt = pd.to_datetime(h_at, errors="coerce", utc=True)
+                        h_age_min = (pd.Timestamp.utcnow() - h_at_dt).total_seconds() / 60.0 if h_at_dt else 0
+                        st.info(h_text)
+                        st.caption(f"Latest autonomous review performed {h_age_min:.1f} minutes ago (based on a 3000-line log window).")
+                        st.divider()
+                except Exception:
+                    pass
+
                 # 1. Cross-System Correlation
                 is_terminal_now_local = _is_terminal_state(cur_state)
                 corr_report = get_ai_correlation_for_scan(str(scan_id), env_id, engine, is_terminal=is_terminal_now_local)
@@ -15387,7 +15500,7 @@ def page_scan_progress():
                 
                 if not e_df.empty:
                     st.markdown("#### ⚠️ Individual Error Context")
-                    st.caption("Latest 10 unique error signatures detected in application logs.")
+                    st.caption("Latest 10 unique error signatures detected in logs.")
                     for _, row in e_df.iterrows():
                         source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols_local and pd.notnull(row.get('log_source')) else ""
                         
@@ -15406,7 +15519,23 @@ def page_scan_progress():
                             else:
                                 scan_match_info = " [🌐 System-Wide]"
                         
-                        title_str = f"Error at {row['log_timestamp']} {source_badge}{scan_match_info}{subscan_info}"
+                        # Time-based badging
+                        time_badge = ""
+                        try:
+                            ts_val = row['log_timestamp']
+                            ts_dt = pd.to_datetime(ts_val, errors="coerce", utc=True)
+                            if ts_dt and not pd.isnull(ts_dt):
+                                age_min = (pd.Timestamp.utcnow() - ts_dt).total_seconds() / 60.0
+                                if age_min < 15:
+                                    time_badge = " :red[[🔥 NEW]]"
+                                elif age_min < 60:
+                                    time_badge = " :orange[[⚠️ RECENT]]"
+                                else:
+                                    time_badge = " :gray[[🕰️ HISTORICAL]]"
+                        except Exception:
+                            pass
+
+                        title_str = f"⚠️ {source_badge}{scan_match_info}{time_badge} Error at {row['log_timestamp']}{subscan_info}"
                         with st.expander(title_str, expanded=False):
                             st.markdown("**🤖 AI Analysis**:")
                             st.write(row['ai_analysis'])
@@ -15487,29 +15616,19 @@ def _build_default_workflow_steps() -> List[Dict[str, Any]]:
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Large Files)"},
         {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Large Files)"},
 
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Small Files) ACL ON"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Small Files) ACL ON"},
-
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "S3 Full Scan (Large Files) ACL ON"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "feature_flags": "ACL", "notes": "SMB Full Scan (Large Files) ACL ON"},
-
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (CSV Files)"},
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "CSV Files", "is_acl": False, "is_ols": False, "is_structured_ff": True,  "feature_flags": "Structured Files Discovery", "notes": "S3 Full Scan (CSV Files) Structured Discovery FF ON"},
-
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Small Files) NO ACL + OLS (enable FF before OLS)"},
-
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Small Files) ACL ON + OLS (enable FF before OLS)"},
-
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "S3 Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": True, "is_structured_ff": False, "feature_flags": "OLS", "notes": "SMB Full Scan (Large Files) NO ACL + OLS (enable FF before OLS)"},
-
         {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
         {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+
+        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": None, "notes": "OneDrive Full Scan (Small Files)"},
+        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": "ACL", "notes": "OneDrive Full Scan (Small Files) WITH ACL"},
+        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": True, "feature_flags": "Lite Mode", "notes": "OneDrive Full Scan (Small Files) LITE MODE"},
+        
+        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": None, "notes": "SharePoint Online Full Scan (Small Files)"},
+        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": "ACL", "notes": "SharePoint Online Full Scan (Small Files) WITH ACL"},
+        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": True, "feature_flags": "Lite Mode", "notes": "SharePoint Online Full Scan (Small Files) LITE MODE"},
     ]
 
-    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool) -> str:
+    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool, is_lite: bool = False) -> str:
         k = str(ds_kind or "").strip().lower()
         fs = str(file_set_type or "").strip()
         if k in {"s3", "smb"}:
@@ -15532,12 +15651,23 @@ def _build_default_workflow_steps() -> List[Dict[str, Any]]:
 
             return nm.strip()
 
+        if k == "onedrive-v2" or k == "sharepoint-online-v2":
+            prefix = "OneDrive" if k == "onedrive-v2" else "SharePoint Online"
+            nm = f"{prefix} {fs}".strip()
+            if bool(is_acl): nm += " With ACL"
+            if bool(is_lite): nm += " Lite Mode"
+            return nm.strip()
+
         if k == "postgres":
             return "Postgres"
         if k == "mssql":
             return "MSSQL"
         if k == "mysql":
             return "MySQL"
+        if k == "onedrive-v2":
+            return f"OneDrive {fs}".strip()
+        if k == "sharepoint-online-v2":
+            return f"SharePoint Online {fs}".strip()
         return str(ds_kind or "").strip().upper() or "DS"
 
     steps: List[Dict[str, Any]] = []
@@ -15550,19 +15680,22 @@ def _build_default_workflow_steps() -> List[Dict[str, Any]]:
             bool(stp2.get("is_acl")),
             bool(stp2.get("is_ols")),
             bool(stp2.get("is_structured_ff")),
+            bool(stp2.get("is_lite")),
         )
         stp2["status"] = "pending"
         steps.append(stp2)
     return steps
 
 
+def _env_label(r, in_use_env_ids):
+    lbl = f"{r.env_name} (id={int(r.id)})"
+    if int(r.id) in in_use_env_ids:
+        lbl = f"⚠️ {lbl} [IN USE]"
+    return lbl
+
+
 @st.fragment
 def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
-    def _env_label(r):
-        lbl = f"{r.env_name} (id={int(r.id)})"
-        if int(r.id) in in_use_env_ids:
-            lbl = f"⚠️ {lbl} [IN USE]"
-        return lbl
 
     with st.expander("➕ Create New Workflow Run", expanded=False):
         if wf_pool_df.empty:
@@ -16341,7 +16474,7 @@ def page_workflow_automation():
                     "**Manage Test Environments**, then map envs here before starting."
                 )
             else:
-                env_labels_ctrl = [_env_label(r) for r in wf_pool_df.itertuples()]
+                env_labels_ctrl = [_env_label(r, in_use_env_ids) for r in wf_pool_df.itertuples()]
                 env_ids_ctrl = [int(r.id) for r in wf_pool_df.itertuples()]
 
             if env_ids_ctrl:
