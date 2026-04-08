@@ -53,6 +53,26 @@ from sqlalchemy import create_engine, text
 from db_config import DB_CONNECTION_STRING
 from bigid_auth import Get_auth_token
 
+def _sync_env_version_standalone_runner(env_id: int) -> None:
+    """Helper to refresh environment version from background runner context."""
+    try:
+        er = load_env(engine, env_id)
+        if not er or not er.get("base_url"):
+            return
+            
+        # Runner auth helper
+        token = ""
+        try:
+            token = Get_auth_token(er.get("base_url"), er.get("auth_module_path"), er.get("auth_function_name"))
+        except Exception:
+            token = ""
+            
+        bv = resolve_env_build_version(er, token)
+        if bv:
+            _update_env_version_in_db(engine, env_id, bv)
+    except Exception:
+        pass
+
 
 PARENT_SCANS_PATH = os.getenv("BIGID_PARENT_SCANS_API_PATH", "/api/v1/scans/parent-scans").strip() or "/api/v1/scans/parent-scans"
 INSIGHTS_PATH = os.getenv("BIGID_PARENT_SCAN_INSIGHTS_API_PATH", "/api/v1/scans/insights/parent-scans").strip() or "/api/v1/scans/insights/parent-scans"
@@ -420,12 +440,25 @@ def fetch_about(base_url: str, token: str) -> Dict[str, Any]:
         return {}
 
 
+
+# Global cache for build version checks to avoid BigID API spam (env_id -> (timestamp, version))
+_BUILD_VERSION_CACHE: Dict[int, Tuple[datetime, str]] = {}
+_BUILD_VERSION_CACHE_TTL_MINUTES = 15
+
 def resolve_env_build_version(env_row: Dict[str, Any], token: str) -> str:
     """
     Prefer /about; fallback to test_environments.version; fallback empty.
     """
     base_url = str(env_row.get("base_url") or "").strip()
     bv = ""
+    env_id = env_row.get("id")
+    if env_id is not None:
+        cache_entry = _BUILD_VERSION_CACHE.get(int(env_id))
+        if cache_entry:
+            last_check, cached_bv = cache_entry
+            if (datetime.utcnow() - last_check).total_seconds() < (_BUILD_VERSION_CACHE_TTL_MINUTES * 60):
+                return cached_bv
+
     try:
         about = fetch_about(base_url, token)
         # try common keys
@@ -456,6 +489,9 @@ def resolve_env_build_version(env_row: Dict[str, Any], token: str) -> str:
         bv = ""
     if not bv:
         bv = _parse_build_version_from_text(env_row.get("version") or "")
+    if bv and env_id is not None:
+        _BUILD_VERSION_CACHE[int(env_id)] = (datetime.utcnow(), bv)
+        
     return bv
 
 
@@ -1490,11 +1526,18 @@ def _update_env_version_in_db(engine, env_id: Any, build_version: str) -> None:
         return
     try:
         with engine.connect() as conn:
+            # Only update and insert if the version has actually changed
+            row = conn.execute(text('SELECT version FROM test_environments WHERE id=:id'), {'id': int(env_id)}).fetchone()
+            current_v = str(row[0] or '').strip() if row else ''
+            
+            if current_v == bv:
+                return # No change, skip database operations
+                
             conn.execute(text('UPDATE test_environments SET version=:v WHERE id=:id'), {'v': bv, 'id': int(env_id)})
             try:
                 conn.execute(
                     text('INSERT INTO test_environment_version_history (environment_id, version_value, change_note) VALUES (:eid, :v, :n)'),
-                    {'eid': int(env_id), 'v': bv, 'n': 'workflow_runner:/about'}
+                    {'eid': int(env_id), 'v': bv, 'n': 'workflow_runner:/start_run'}
                 )
             except Exception:
                 pass
@@ -1774,22 +1817,32 @@ def _apply_runtime_flags(step: Dict[str, Any], ds_payload: Dict[str, Any]) -> Di
     is_struct = bool(step.get("is_structured_ff"))
     is_ocr = bool(step.get("is_ocr"))
 
-    # Common connector fields for unstructured connectors (s3/smb)
-    if ds_kind in {"s3", "smb", "onedrive-v2", "sharepoint-online-v2"}:
-        # BigID sometimes stores these as strings "true"/"false"
-        # Use booleans for newer connector compatibility
-        ds_conn["metadataAclScanEnabled"] = bool(is_acl)
-        ds_conn["dsAclScanEnabled"] = bool(is_acl)
-        ds_conn["ocrEnabled"] = bool(is_ocr)
-        
-        # O365 Lite Mode
-        if ds_kind in {"onedrive-v2", "sharepoint-online-v2"}:
-            is_lite = bool(step.get("is_lite") or step.get("lite_mode"))
-            ds_conn["enableLiteMode"] = bool(is_lite)
+    # Define unstructured connectors that require specific enhancement fields
+    UNSTRUCTURED_KINDS = {
+        "s3", "smb", "onedrive-v2", "sharepoint-online-v2", 
+        "google-drive", "box", "azure-blob", "dropbox", "gmail",
+        "exchange-online", "file-system"
+    }
 
-        trp = ds_conn.get("typeRequestProperties")
-        if isinstance(trp, dict):
-            trp["enableStructuredFilesDiscovery"] = bool(is_struct)
+    if ds_kind in UNSTRUCTURED_KINDS:
+        # 1. Mandatory defaults for all unstructured DS per user request
+        ds_conn["liteModeNotification"] = ""
+        ds_conn["customFields"] = []
+        
+        # 2. Media Analysis (OCR): Force to False for now
+        ds_conn["ocrEnabled"] = False
+        
+        # 3. Permissions (ACL): Only set if explicitly enabled in workflow
+        if is_acl:
+            ds_conn["metadataAclScanEnabled"] = True
+            ds_conn["dsAclScanEnabled"] = True
+        
+        # 4. Structured Discovery: Only set if explicitly enabled in workflow
+        if is_struct:
+            trp = ds_conn.get("typeRequestProperties", {})
+            if not isinstance(trp, dict):
+                trp = {}
+            trp["enableStructuredFilesDiscovery"] = True
             ds_conn["typeRequestProperties"] = trp
 
     if isinstance(root.get("ds_connection"), dict):
@@ -2405,6 +2458,21 @@ def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
                 {"rid": int(run_id)},
             )
             conn.commit()
+
+        # Trigger version sync for environments associated with this run
+        try:
+            row = None
+            with engine.connect() as conn:
+                row = conn.execute(text("SELECT env1_id, env2_id FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)}).fetchone()
+            if row:
+                for eid in [row[0], row[1]]:
+                    if eid:
+                        try:
+                            _sync_env_version_standalone_runner(int(eid))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         try:
             print(f"[{_now_utc().isoformat()}Z] auto_resume_failed_run run_id={int(run_id)} (non-terminal steps remain)", flush=True)
         except Exception:
@@ -3118,19 +3186,10 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     except Exception:
         pass
 
-    # Build prefix should be refreshed when workflow starts / step executes.
-    try:
-        build_version = resolve_env_build_version(env_row, token)
-    except Exception:
-        build_version = ""
-    try:
-        _update_env_version_in_db(engine, env_id, build_version)
-    except Exception:
-        pass
-    try:
-        logger.info('env_build_version env_id=%s env_name=%s build_version=%s', env_id, str(env_row.get('env_name') or ''), build_version)
-    except Exception:
-        pass
+    # Version check removed from here to reduce DB/API noise.
+    # It now only runs when a workflow starts or is created.
+    
+    build_version = str(env_row.get('version') or '').strip()
     build_prefix = _build_prefix(build_version)
 
     # IMPORTANT:

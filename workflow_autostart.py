@@ -124,7 +124,7 @@ def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
                 env=env,
                 stdout=stdout_f,
                 stderr=stderr_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(

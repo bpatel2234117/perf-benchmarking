@@ -68,7 +68,7 @@ def ensure_ai_log_fetcher_running() -> Tuple[bool, str]:
     if not runner_path.exists():
         return False, "ai_log_fetcher.py not found"
 
-    cmd = [sys.executable, str(runner_path)]
+    cmd = [sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable, str(runner_path)]
     env = os.environ.copy()
 
     try:
@@ -92,7 +92,7 @@ def ensure_ai_log_fetcher_running() -> Tuple[bool, str]:
                 env=env,
                 stdout=stdout_f,
                 stderr=stderr_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(

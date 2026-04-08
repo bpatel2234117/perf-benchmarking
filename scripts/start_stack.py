@@ -157,7 +157,7 @@ def start_tracker() -> Tuple[bool, str]:
     if pid and _pid_is_running(pid):
         return True, f"tracker '{tname}' already running (pid={pid})"
 
-    py = sys.executable
+    py = sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable
     root = repo_root()
     script = root / "tracker.py"
     if not script.is_file():
@@ -183,7 +183,7 @@ def start_tracker() -> Tuple[bool, str]:
                 env=env,
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -224,7 +224,7 @@ def start_workflow_runner() -> Tuple[bool, str]:
     if pid and _pid_is_running(pid):
         return True, f"workflow_runner already running (pid={pid})"
 
-    py = sys.executable
+    py = sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable
     root = repo_root()
     script = root / "workflow_runner.py"
     if not script.is_file():
@@ -248,7 +248,7 @@ def start_workflow_runner() -> Tuple[bool, str]:
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -284,7 +284,7 @@ def start_ai_log_fetcher() -> Tuple[bool, str]:
     if pid and _pid_is_running(pid):
         return True, f"ai_log_fetcher already running (pid={pid})"
 
-    py = sys.executable
+    py = sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable
     root = repo_root()
     script = root / "ai_log_fetcher.py"
     if not script.is_file():
@@ -307,7 +307,7 @@ def start_ai_log_fetcher() -> Tuple[bool, str]:
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
@@ -340,7 +340,7 @@ def start_dashboard_background() -> Tuple[bool, str]:
     if pid and _pid_is_running(pid):
         return True, f"dashboard already running (pid={pid})"
 
-    py = sys.executable
+    py = sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable
     root = repo_root()
     dash = root / "dashboard.py"
     if not dash.is_file():
@@ -362,7 +362,7 @@ def start_dashboard_background() -> Tuple[bool, str]:
                 env=os.environ.copy(),
                 stdout=out_f,
                 stderr=err_f,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(

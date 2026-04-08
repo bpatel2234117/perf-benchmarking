@@ -2473,6 +2473,25 @@ def fetch_core_version_from_api(base_url, token, about_api_path=None):
     return clean_version, raw_version, url
 
 
+def _sync_env_version_on_demand(env_id: int):
+    """Fetch current version from BigID and update history only if changed."""
+    if not env_id: return
+    try:
+        env_row = get_test_environment_by_id(env_id)
+        if not env_row: return
+        
+        token = fetch_auth_token_for_env(env_row)
+        if not token: return
+        
+        clean_v, raw_v, _ = fetch_core_version_from_api(env_row['base_url'], token)
+        if clean_v:
+            record_environment_version(env_id, env_row['env_name'], clean_v)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def record_environment_version(environment_id, env_name, new_version, classifier_set_id=None):
     """
     Save environment version history only when changed from latest value.
@@ -3855,7 +3874,18 @@ def create_workflow_run(
             )
             run_id = conn.execute(text("SELECT LAST_INSERT_ID()")).fetchone()[0]
 
-        # Insert steps (seq starts at 1)
+        # Refresh environment versions on creation as requested by user
+        for eid in [env1_id, env2_id]:
+            if eid:
+                try:
+                    _sync_env_version_on_demand(int(eid))
+                except Exception:
+                    pass
+
+        # Force default steps if input is empty or just a placeholder
+        if not steps or len(steps) < 5:
+            steps = _build_default_workflow_steps()
+            
         seq_rows = []
         for i, stp in enumerate(steps or [], start=1):
             if not isinstance(stp, dict):
@@ -3864,7 +3894,7 @@ def create_workflow_run(
             seq_rows.append({
                 "rid": int(run_id),
                 "seq": int(i),
-                "eid": None,  # Set by runner when step actually starts; no pre-allocation so UI shows env only for running steps
+                "eid": None,
                 "dk": str(stp.get("ds_kind") or "").strip() or None,
                 "dn": str(stp.get("ds_name") or "").strip() or None,
                 "sk": str(stp.get("scan_kind") or "").strip() or None,
@@ -3874,7 +3904,7 @@ def create_workflow_run(
                 "ocr": 1 if bool(stp.get("is_ocr")) else 0,
                 "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
                 "ols": 1 if bool(stp.get("is_ols")) else 0,
-                "islite": 1 if bool(stp.get("is_lite")) else 0,
+                "islite": 1 if bool(stp.get("is_lite") or stp.get("lite_mode")) else 0,
                 "ff": str(stp.get("feature_flags") or "").strip() or None,
                 "notes": str(stp.get("notes") or "").strip() or None,
                 "status": ("pending" if enabled else "disabled"),
@@ -4063,7 +4093,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
         cols = [
             "id","run_id","seq","environment_id","environment","env_is_busy",
             "ds_kind","ds_name","scan_kind","file_set_type",
-            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols","is_lite",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
@@ -4094,14 +4124,13 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
                         ws.is_ocr,
                         ws.is_structured_ff,
                         ws.is_ols,
-                        ws.is_lite,
                         ws.feature_flags,
                         ws.notes,
                         ws.ds_id,
-                    ws.scan_profile_id,
-                    ws.scan_profile_name,
-                    ws.build_version,
-                    ws.build_prefix,
+                        ws.scan_profile_id,
+                        ws.scan_profile_name,
+                        ws.build_version,
+                        ws.build_prefix,
                         ws.scan_id,
                         ws.status,
                         ws.started_at,
@@ -15600,78 +15629,96 @@ def page_scan_progress():
         st.rerun()
 
 
-@st.cache_data(ttl=600)
 def _build_default_workflow_steps() -> List[Dict[str, Any]]:
-    """
-    UI plan (no side-effects). Backend runner will execute these sequentially.
-    Environment IDs are selected at execution time, not creation time.
-    """
-    base: List[Dict[str, Any]] = [
-        {"ds_kind": "postgres", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "Postgres Full Scan"},
-        {"ds_kind": "mssql", "scan_kind": "full_scan", "file_set_type": None, "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "MSSQL Full Scan"},
+    """Exact 28-step matrix: SQL -> Std -> ACL -> Cloud -> CSV -> OLS -> ACL+OLS last."""
+    def _stp(kind, fs, acl=False, ols=False, sff=False, notes=""):
+        ffs = []
+        if acl: ffs.append("ACL")
+        if ols: ffs.append("OLS")
+        if sff: ffs.append("Structured")
+        return {
+            "ds_kind": kind, "scan_kind": "full_scan", "file_set_type": fs,
+            "is_acl": acl, "is_ols": ols, "is_lite": False, "is_structured_ff": sff,
+            "feature_flags": ", ".join(ffs) if ffs else None, "notes": notes, "is_enabled": True
+        }
 
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Small Files)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Small Files)"},
+    base = [
+        # Group 1: SQL
+        _stp("mssql", None, notes="MSSQL Full Scan"),
+        _stp("postgres", None, notes="Postgres Full Scan"),
 
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "S3 Full Scan (Large Files)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "feature_flags": None, "notes": "SMB Full Scan (Large Files)"},
+        # Group 2: Standard Unstructured
+        _stp("s3", "Small Files", notes="S3 Small Files (Standard)"),
+        _stp("smb", "Small Files", notes="SMB Small Files (Standard)"),
+        _stp("s3", "Large Files", notes="S3 Large Files (Standard)"),
+        _stp("smb", "Large Files", notes="SMB Large Files (Standard)"),
 
-        {"ds_kind": "s3",  "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "S3 Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
-        {"ds_kind": "smb", "scan_kind": "full_scan", "file_set_type": "Large Files", "is_acl": True, "is_ols": True, "is_structured_ff": False, "feature_flags": "ACL, OLS", "notes": "SMB Full Scan (Large Files) ACL ON + OLS (enable FF before OLS)"},
+        # Group 3: ACL Only
+        _stp("s3", "Small Files", acl=True, notes="S3 Small Files WITH ACL"),
+        _stp("smb", "Small Files", acl=True, notes="SMB Small Files WITH ACL"),
+        _stp("s3", "Large Files", acl=True, notes="S3 Large Files WITH ACL"),
+        _stp("smb", "Large Files", acl=True, notes="SMB Large Files WITH ACL"),
 
-        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": None, "notes": "OneDrive Full Scan (Small Files)"},
-        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": "ACL", "notes": "OneDrive Full Scan (Small Files) WITH ACL"},
-        {"ds_kind": "onedrive-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": True, "feature_flags": "Lite Mode", "notes": "OneDrive Full Scan (Small Files) LITE MODE"},
-        
-        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": None, "notes": "SharePoint Online Full Scan (Small Files)"},
-        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": True, "is_ols": False, "is_structured_ff": False, "is_lite": False, "feature_flags": "ACL", "notes": "SharePoint Online Full Scan (Small Files) WITH ACL"},
-        {"ds_kind": "sharepoint-online-v2", "scan_kind": "full_scan", "file_set_type": "Small Files", "is_acl": False, "is_ols": False, "is_structured_ff": False, "is_lite": True, "feature_flags": "Lite Mode", "notes": "SharePoint Online Full Scan (Small Files) LITE MODE"},
+        # Group 4: Cloud Standard
+        _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
+        _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
+
+        # Group 5: Cloud ACL
+        _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
+        _stp("sharepoint-online-v2", "Small Files", acl=True, notes="SharePoint Online Small Files WITH ACL"),
+
+        # Group 6: CSV
+        _stp("file-system", "CSV Files", notes="CSV Small Files (Standard)"),
+        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITH STRUCTURED DISCOVERY"),
+
+        # Group 7: OLS Only (Move to end)
+        _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
+        _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
+        _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
+        _stp("smb", "Large Files", ols=True, notes="SMB Large Files WITH OLS"),
+        _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
+        _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
+
+        # Group 8: ACL + OLS (Absolute Last)
+        _stp("s3", "Small Files", acl=True, ols=True, notes="S3 Small Files WITH ACL + OLS"),
+        _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL + OLS"),
+        _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL + OLS"),
+        _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL + OLS"),
+        _stp("onedrive-v2", "Small Files", acl=True, ols=True, notes="OneDrive Small Files WITH ACL + OLS"),
+        _stp("sharepoint-online-v2", "Small Files", acl=True, ols=True, notes="SharePoint Online Small Files WITH ACL + OLS"),
     ]
 
-    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool, is_lite: bool = False) -> str:
+    def _standard_ds_name(ds_kind: str, file_set_type: Optional[str], is_acl: bool, is_ols: bool, is_structured_ff: bool) -> str:
         k = str(ds_kind or "").strip().lower()
         fs = str(file_set_type or "").strip()
-        if k in {"s3", "smb"}:
-            prefix = "S3" if k == "s3" else "SMB"
-            if fs:
-                nm = f"{prefix} {fs}"
-            else:
-                nm = prefix
+        
+        if k == "postgres": return "Postgres"
+        if k == "mssql": return "MSSQL"
+        if k == "mysql": return "MySQL"
+        
+        if k == "file-system" and fs == "CSV Files":
+            nm = "CSV Files"
+            if bool(is_structured_ff): nm += " Structured"
+            return nm
 
-            # Only tag when ACL is enabled; default case stays clean (no "No ACL")
-            if fs in {"Small Files", "Large Files"} and bool(is_acl):
-                nm += " With ACL"
-
-            # Structured discovery naming (esp for CSV)
-            if bool(is_structured_ff):
-                nm += " Structured Files Discovery"
-
-            if bool(is_ols):
-                nm += " With OLS"
-
-            return nm.strip()
-
-        if k == "onedrive-v2" or k == "sharepoint-online-v2":
-            prefix = "OneDrive" if k == "onedrive-v2" else "SharePoint Online"
-            nm = f"{prefix} {fs}".strip()
-            if bool(is_acl): nm += " With ACL"
-            if bool(is_lite): nm += " Lite Mode"
-            return nm.strip()
-
-        if k == "postgres":
-            return "Postgres"
-        if k == "mssql":
-            return "MSSQL"
-        if k == "mysql":
-            return "MySQL"
-        if k == "onedrive-v2":
-            return f"OneDrive {fs}".strip()
-        if k == "sharepoint-online-v2":
-            return f"SharePoint Online {fs}".strip()
-        return str(ds_kind or "").strip().upper() or "DS"
+        prefix = "Unknown"
+        if k == "s3": prefix = "S3"
+        elif k == "smb": prefix = "SMB"
+        elif k == "onedrive-v2": prefix = "OneDrive"
+        elif k == "sharepoint-online-v2": prefix = "SharePoint Online"
+        
+        nm = f"{prefix} {fs}".strip()
+        tags = []
+        if bool(is_acl): tags.append("ACL")
+        if bool(is_ols): tags.append("OLS")
+        if bool(is_structured_ff): tags.append("Structured")
+        
+        if tags:
+            nm += " With " + " + ".join(tags)
+        return nm.strip()
 
     steps: List[Dict[str, Any]] = []
-    for idx, stp in enumerate(base):
+    for stp in base:
         stp2 = dict(stp)
         stp2["environment_id"] = None
         stp2["ds_name"] = _standard_ds_name(
@@ -15679,8 +15726,7 @@ def _build_default_workflow_steps() -> List[Dict[str, Any]]:
             stp2.get("file_set_type"),
             bool(stp2.get("is_acl")),
             bool(stp2.get("is_ols")),
-            bool(stp2.get("is_structured_ff")),
-            bool(stp2.get("is_lite")),
+            bool(stp2.get("is_structured_ff"))
         )
         stp2["status"] = "pending"
         steps.append(stp2)

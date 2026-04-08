@@ -134,7 +134,7 @@ def ensure_tracker_running(engine, tracker_name: str = "default") -> Tuple[bool,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
             )
         else:
             p = subprocess.Popen(
