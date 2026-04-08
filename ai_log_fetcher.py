@@ -221,11 +221,19 @@ def extract_scan_ids(log_text):
     subscan_id = None
     
     # Common formats: scan_id=69c673df1e63fcb3cc6c69d9, scanId: "..." etc.
-    s_match = re.search(r'(?i)(?:scan[_-]?id|scan_profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
+    s_match = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
+    if not s_match:
+        # Handle O365 SDK format: sdk-object-scan-69d62cbf93c857d502eb0099-69d62d0193c857d502ebb349-0
+        s_match = re.search(r'sdk-object-scan-([a-f0-9]{24})', log_text)
+        
     if s_match:
         scan_id = s_match.group(1)
         
     ss_match = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
+    if not ss_match and s_match:
+        # Check for subscan ID following the scan ID in the SDK format
+        ss_match = re.search(fr'sdk-object-scan-{scan_id}-([a-f0-9]{24})', log_text)
+        
     if ss_match:
         subscan_id = ss_match.group(1)
         
@@ -241,7 +249,7 @@ def detect_errors_in_logs(log_text):
     seen_fingerprints = set()
     
     i = 0
-    # Broaden regex to include common fail states: O365 throttling, timeouts, refused, etc.
+    # Broaden regex to include ANY 'error' plus stealth O365 throttling fail states.
     ERROR_PATTERN = re.compile(
         r'(?i)\[?(?:error|fatal|fail|severe|exception|axioserror|nohttp|status\s+[45]\d{2}|timeout|timed? out|refused|unreachable|reset|denied|abort|exhausted|throttl|limitreached|graphservice|activitylimit)\]?'
     )
@@ -415,7 +423,7 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
             """),
             {
                 "eid": env_id,
-                "lt": datetime.utcnow().isoformat() + "Z",
+                "lt": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
                 "ctx": error_context,
                 "ai": ai_analysis,
                 "ls": log_source,
