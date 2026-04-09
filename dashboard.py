@@ -8200,8 +8200,9 @@ def page_add_benchmark():
                            f"- Per Scanner: {tp_scanner_gb:.2f} GB/hr, {tp_scanner_files:,.0f} files/hr\n"
                            f"- Per Thread: {tp_thread_gb:.2f} GB/hr, {tp_thread_files:,.0f} files/hr")
                     st.toast("Data Saved!")
-                    # [FIX] Clear data cache so the new record is visible immediately in Edit Records
-                    st.cache_data.clear()
+                    # Clear only benchmark data cache so the new record is visible immediately
+                    try: load_data.clear()
+                    except Exception: pass
                     st.session_state["benchmark_saved"] = True
                     st.rerun()
                     
@@ -8584,7 +8585,7 @@ def page_manage_test_environments():
                 if details:
                     st.caption(" | ".join(details[:6]) + (" ..." if len(details) > 6 else ""))
                 try:
-                    st.cache_data.clear()
+                    load_test_environments.clear()
                 except Exception:
                     pass
                 st.rerun()
@@ -8797,8 +8798,9 @@ def page_manage_test_environments():
                     except Exception as ex:
                         st.warning(f"Environment saved, but classifier sync failed: {ex}")
                 
-                # Clear cache so the new record appears immediately in Edit Records
-                st.cache_data.clear()
+                # Clear only env cache so the new record appears immediately
+                try: load_test_environments.clear()
+                except Exception: pass
                 st.rerun()
             except Exception as e:
                 st.error(f"Error saving environment: {e}")
@@ -8865,7 +8867,8 @@ def page_manage_test_environments():
                             except Exception as mex:
                                 st.caption(f"[{env_name_val}] Metadata snapshot check failed: {mex}")
                             if copied > 0:
-                                st.cache_data.clear()
+                                try: load_test_environments.clear()
+                                except Exception: pass
                             return
                     else:
                         st.warning(f"[{env_name_val}] Could not read releaseVersion from API response. URL: {about_url}")
@@ -8924,7 +8927,8 @@ def page_manage_test_environments():
                             f"{len(classifier_names)} classifiers mapped for this environment."
                         )
                 if data_changed:
-                    st.cache_data.clear()
+                    try: load_test_environments.clear()
+                    except Exception: pass
             except Exception as ex:
                 st.error(f"[{env_name_val}] Action failed: {ex}")
                 st.session_state["env_action_level"] = "warning"
@@ -9225,7 +9229,10 @@ def page_scan_status():
 
     if refresh:
         try:
-            st.cache_data.clear()
+            load_scan_parents_for_environments.clear()
+            get_scans_with_progress_ids.clear()
+            get_scan_parent_active_map.clear()
+            load_latest_scan_progress_rows_for_environments.clear()
         except Exception:
             pass
         st.rerun()
@@ -9301,7 +9308,10 @@ def page_scan_status():
 
                 st.success(f"Manual re-sync complete. Upserted {upserted} scans into DB.")
                 try:
-                    st.cache_data.clear()
+                    load_scan_parents_for_environments.clear()
+                    get_scans_with_progress_ids.clear()
+                    get_scan_parent_active_map.clear()
+                    load_latest_scan_progress_rows_for_environments.clear()
                 except Exception:
                     pass
                 st.rerun()
@@ -12450,7 +12460,8 @@ def page_edit_benchmark(df):
                 conn.commit()
 
             st.success("Table changes saved.")
-            st.cache_data.clear()
+            try: load_data.clear()
+            except Exception: pass
             st.rerun()
         except Exception as e:
             st.error(f"Error saving changes: {e}")
@@ -15834,7 +15845,7 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                         pass
                     try:
                         # Since we're in a fragment, we want to clear the whole app cache for new data
-                        st.cache_data.clear()
+                        load_workflow_runs.clear()
                     except Exception:
                         pass
                     st.rerun()
@@ -15902,7 +15913,9 @@ def render_workflow_step_editor(run_id, selected_status):
                             conn.execute(text("UPDATE workflow_steps SET environment_id=:env_id, updated_at=CURRENT_TIMESTAMP WHERE id=:id AND COALESCE(status,'') NOT IN ('completed', 'scan_running')"), {"env_id": u["env_id"], "id": u["id"]})
 
                         conn.commit()
-                    try: st.cache_data.clear()
+                    try:
+                        load_workflow_runs.clear()
+                        load_test_environments.clear()
                     except Exception: pass
                     st.success("Saved."); st.rerun()
                 except Exception as ex:
@@ -15992,7 +16005,8 @@ def page_workflow_automation():
             except Exception:
                 pass
             try:
-                st.cache_data.clear()
+                load_workflow_runs.clear()
+                load_test_environments.clear()
             except Exception:
                 pass
             st.rerun()
@@ -16591,13 +16605,17 @@ def page_workflow_automation():
             except Exception: pass
             st.rerun()
         if b4.button("Refresh"):
-            try: st.cache_data.clear()
+            try:
+                load_workflow_runs.clear()
+                load_test_environments.clear()
             except Exception: pass
             st.rerun()
         if b5.button("Reconcile from DB"):
             res = reconcile_workflow_run(int(run_id))
             st.caption(f"Reconciled: updated_steps={res.get('updated_steps')} completed_run={res.get('completed_run')}")
-            try: st.cache_data.clear()
+            try:
+                load_workflow_runs.clear()
+                load_test_environments.clear()
             except Exception: pass
             st.rerun()
 
@@ -16623,7 +16641,8 @@ def page_workflow_automation():
                         except Exception:
                             pass
                         try:
-                            st.cache_data.clear()
+                            load_workflow_runs.clear()
+                            load_test_environments.clear()
                         except Exception:
                             pass
                         st.success(
@@ -16672,7 +16691,9 @@ def page_workflow_automation():
                                 conn.execute(text("UPDATE workflow_runs SET last_error=NULL, next_eligible_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": int(run_id)})
                                 conn.commit()
                             del st.session_state["wf_confirm_reset"]
-                            try: st.cache_data.clear()
+                            try:
+                                load_workflow_runs.clear()
+                                load_test_environments.clear()
                             except Exception: pass
                             st.success("Reset done."); st.rerun()
                         except Exception as ex:
