@@ -1062,6 +1062,7 @@ def load_classifier_snapshots_for_build(environment_id, build_id):
         return []
 
 
+@st.cache_data(ttl=120)
 def load_classifier_detail_snapshot_builds_summary(environment_id: Optional[int]) -> pd.DataFrame:
     """
     Build versions that have at least one row in classifier_details_snapshots (metadata for Deep-Dive).
@@ -4340,10 +4341,15 @@ def upsert_workflow_template(key: str, template_kind: str, payload_json: str) ->
                     {"k": k, "t": tk, "p": pj},
                 )
             conn.commit()
+        try:
+            get_workflow_template_payload.clear()
+        except Exception:
+            pass
     except Exception:
         pass
 
 
+@st.cache_data(ttl=120)
 def get_workflow_template_payload(key: str) -> str:
     ensure_workflow_tables()
     if not engine:
@@ -5425,9 +5431,11 @@ def get_scan_parent_active_map(scan_ids):
         pass
     return active_map
 
-def get_scan_parent_details(scan_id):
+@st.cache_data(ttl=60)
+def get_scan_parent_details(scan_id: str):
     """
     Returns the scan_parent record (dict) for a given scan_id.
+    Cached briefly to avoid repeated DB hits on Scan Progress fragment reruns.
     """
     if not engine or not scan_id:
         return None
@@ -5436,7 +5444,7 @@ def get_scan_parent_details(scan_id):
             row = conn.execute(text("""
                 SELECT scan_id, scan_name, environment_id, scan_type, scan_status, is_active, started_at, completed_at
                 FROM scan_parents WHERE scan_id = :sid
-            """), {"sid": scan_id}).fetchone()
+            """), {"sid": str(scan_id).strip()}).fetchone()
             if row:
                 return {
                     "scan_id": row[0],
@@ -5448,6 +5456,24 @@ def get_scan_parent_details(scan_id):
                     "started_at": str(row[6] or "").strip(),
                     "completed_at": str(row[7] or "").strip(),
                 }
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=120)
+def _env_id_from_workflow_for_scan_cached(scan_id: str) -> Optional[int]:
+    """Resolve environment_id from workflow_steps when scan_parents row lacks it (cached)."""
+    if not engine or not str(scan_id or "").strip():
+        return None
+    try:
+        with engine.connect() as conn:
+            res_ws = conn.execute(
+                text("SELECT environment_id FROM workflow_steps WHERE scan_id = :sid ORDER BY id DESC LIMIT 1"),
+                {"sid": str(scan_id).strip()},
+            ).fetchone()
+            if res_ws and res_ws[0] is not None:
+                return int(res_ws[0])
     except Exception:
         pass
     return None
@@ -8219,9 +8245,16 @@ def page_manage_classifiers():
 
     ensure_build_templates_table()
 
-    with engine.connect() as conn:
-        build_versions = [r[0] for r in conn.execute(text("SELECT version FROM builds ORDER BY version DESC")).fetchall()]
+    @st.cache_data(ttl=300)
+    def _load_build_versions_for_classifiers():
+        if not engine: return []
+        try:
+            with engine.connect() as conn:
+                return [r[0] for r in conn.execute(text("SELECT version FROM builds ORDER BY version DESC")).fetchall()]
+        except Exception:
+            return []
 
+    build_versions = _load_build_versions_for_classifiers()
     c1, c2 = st.columns(2)
     build_version = c1.selectbox("Build Version", build_versions + ["Other (new build)"])
     if build_version == "Other (new build)":
@@ -8230,21 +8263,31 @@ def page_manage_classifiers():
     if template_name == "Other":
         template_name = c2.text_input("Custom Template Name")
 
-    existing_set = ""
-    if build_version and template_name:
+    @st.cache_data(ttl=120)
+    def _load_existing_classifier_set(build_version: str, template_name: str) -> str:
+        if not engine or not (build_version or "").strip() or not (template_name or "").strip():
+            return ""
         try:
             with engine.connect() as conn:
-                row = conn.execute(text("""
+                row = conn.execute(
+                    text("""
                     SELECT bt.classifier_set
                     FROM build_templates bt
                     JOIN builds b ON bt.build_id = b.id
                     WHERE b.version = :v AND bt.template_name = :t
                     LIMIT 1
-                """), {"v": build_version.strip(), "t": template_name.strip()}).fetchone()
+                """),
+                    {"v": build_version.strip(), "t": template_name.strip()},
+                ).fetchone()
                 if row and row[0]:
-                    existing_set = row[0]
+                    return str(row[0])
         except Exception:
-            existing_set = ""
+            pass
+        return ""
+
+    existing_set = ""
+    if build_version and template_name:
+        existing_set = _load_existing_classifier_set(str(build_version).strip(), str(template_name).strip())
 
     classifier_set = st.text_area("Classifiers (comma-separated)", value=existing_set, height=120)
     submitted = st.button("Save Build Template Classifiers", type="primary")
@@ -8269,6 +8312,10 @@ def page_manage_classifiers():
                     get_or_create_id(conn, "classifiers", "name", cl)
                 conn.commit()
             st.success("Build template classifiers saved.")
+            try:
+                _load_existing_classifier_set.clear()
+            except Exception:
+                pass
         except Exception as e:
             st.error(f"Error saving build template classifiers: {e}")
 
@@ -11431,9 +11478,10 @@ def page_classifier_build_diffs():
 
     ensure_build_templates_table()
     ensure_test_environments_table(engine)
+    # Use cached load_test_environments() instead of a raw inline query
     try:
-        with engine.connect() as conn:
-            env_rows = conn.execute(text("SELECT id, env_name, is_active FROM test_environments ORDER BY is_active DESC, env_name")).fetchall()
+        _env_df = load_test_environments()
+        env_rows = [(int(r["id"]), str(r.get("env_name") or ""), int(r.get("is_active", 1))) for _, r in _env_df.iterrows()] if not _env_df.empty else []
     except Exception:
         env_rows = []
 
@@ -11451,28 +11499,35 @@ def page_classifier_build_diffs():
             sel_env_id = eid
             break
 
-    # Load sets per build
-    try:
-        with engine.connect() as conn:
-            if sel_env_id is None:
-                rows = conn.execute(text("""
-                    SELECT b.version, c.name
-                    FROM build_classifier_mappings bcm
-                    JOIN builds b ON b.id = bcm.build_id
-                    JOIN classifiers c ON c.id = bcm.classifier_id
-                    ORDER BY b.version, c.name
-                """)).fetchall()
-            else:
-                rows = conn.execute(text("""
-                    SELECT b.version, c.name
-                    FROM build_classifier_mappings bcm
-                    JOIN builds b ON b.id = bcm.build_id
-                    JOIN classifiers c ON c.id = bcm.classifier_id
-                    WHERE bcm.environment_id = :e
-                    ORDER BY b.version, c.name
-                """), {"e": int(sel_env_id)}).fetchall()
-    except Exception as ex:
-        st.error(f"Failed to load classifier mappings: {ex}")
+    # Load sets per build — cached to avoid re-querying on every Streamlit re-run
+    @st.cache_data(ttl=300)
+    def _load_classifier_build_rows(env_id):
+        if not engine: return []
+        try:
+            with engine.connect() as conn:
+                if env_id is None:
+                    return conn.execute(text("""
+                        SELECT b.version, c.name
+                        FROM build_classifier_mappings bcm
+                        JOIN builds b ON b.id = bcm.build_id
+                        JOIN classifiers c ON c.id = bcm.classifier_id
+                        ORDER BY b.version, c.name
+                    """)).fetchall()
+                else:
+                    return conn.execute(text("""
+                        SELECT b.version, c.name
+                        FROM build_classifier_mappings bcm
+                        JOIN builds b ON b.id = bcm.build_id
+                        JOIN classifiers c ON c.id = bcm.classifier_id
+                        WHERE bcm.environment_id = :e
+                        ORDER BY b.version, c.name
+                    """), {"e": int(env_id)}).fetchall()
+        except Exception as ex:
+            st.error(f"Failed to load classifier mappings: {ex}")
+            return None
+
+    rows = _load_classifier_build_rows(sel_env_id)
+    if rows is None:
         return
 
     build_map: Dict[str, set] = {}
@@ -11683,6 +11738,10 @@ def page_classifier_build_diffs():
                                         st.success(
                                             f"Successfully captured {success_count} classifier snapshots for version {env_version}"
                                         )
+                                        try:
+                                            load_classifier_detail_snapshot_builds_summary.clear()
+                                        except Exception:
+                                            pass
                                         st.rerun()
                                     else:
                                         st.error(
@@ -13031,17 +13090,11 @@ def page_scan_progress():
     # 🚨 AI ERROR ANALYSIS SECTION
     # ---------------------------------------------
     env_id = parent.get("environment_id")
-    
-    # Fallback: if env_id is missing, try to find it from workflow_steps
+
+    # Fallback: if env_id is missing, try workflow_steps (cached lookup)
     if not env_id:
         try:
-            with engine.connect() as conn:
-                res_ws = conn.execute(
-                    text("SELECT environment_id FROM workflow_steps WHERE scan_id = :sid ORDER BY id DESC LIMIT 1"),
-                    {"sid": str(scan_id)}
-                ).fetchone()
-                if res_ws and res_ws[0]:
-                    env_id = res_ws[0]
+            env_id = _env_id_from_workflow_for_scan_cached(str(scan_id))
         except Exception:
             pass
 
@@ -13156,6 +13209,11 @@ def page_scan_progress():
                     try:
                         # Avoid showing stale cached empty-history after a successful manual write.
                         load_scan_progress_history.clear()
+                    except Exception:
+                        pass
+                    try:
+                        get_scan_parent_details.clear()
+                        _env_id_from_workflow_for_scan_cached.clear()
                     except Exception:
                         pass
                     st.success("Synced. Reloading…")
@@ -16837,11 +16895,17 @@ def page_create_data_source():
     st.caption("Saved to DB (used by workflow runner).")
     key_env = f"config::scan_template_id::env={int(env_id_val)}" if env_id_val is not None else ""
     key_global = "config::scan_template_id"
-    # Automatic: try to populate env scanTemplateId from API (Data source scan).
-    try:
-        auto_id = ensure_env_default_scan_template_id(selected_env)
-    except Exception:
-        auto_id = ""
+    # Automatic: populate scan template id from API only when selected environment changes (not every Streamlit rerun).
+    _last_auto_env = st.session_state.get("create_ds_last_env_for_auto_tpl")
+    if _last_auto_env != env_id_val:
+        st.session_state["create_ds_last_env_for_auto_tpl"] = env_id_val
+        try:
+            auto_id = ensure_env_default_scan_template_id(selected_env)
+        except Exception:
+            auto_id = ""
+        st.session_state["create_ds_auto_template_id_last"] = auto_id
+    else:
+        auto_id = st.session_state.get("create_ds_auto_template_id_last") or ""
     existing_id = (get_workflow_template_payload(key_env) if key_env else "") or get_workflow_template_payload(key_global) or ""
     if (not existing_id) and auto_id:
         existing_id = auto_id
@@ -17476,11 +17540,22 @@ def main():
         st.rerun()
 
     page = st.session_state.current_page
-    
-    data = load_data()
-    
+
+    # Pages that need the full benchmark dataset — load lazily only here
+    _DATA_PAGES = {
+        "Overview", "Build Analysis", "Comparison", "Data Source Trend Comparison",
+        "Small Files Trend Analysis", "Large Files Trend Analysis",
+        "Small Files OLS Trend", "Large Files OLS Trend",
+        "Auto Small Files Trend Analysis", "Auto Large Files Trend Analysis",
+        "Auto Small Files OLS Trend", "Auto Large Files OLS Trend",
+        "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)",
+        "Discover File FF On vs Off", "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)",
+    }
+    # Only run the expensive load_data() query when navigating to a page that needs it
+    data = load_data() if page in _DATA_PAGES else None
+
     # Standard Pages
-    if page == "Overview": 
+    if page == "Overview":
         page_overview(data)
     elif page == "Build Analysis":
         page_build_analysis(data)
@@ -17506,7 +17581,7 @@ def main():
         render_auto_trend_analysis("Auto Small Files OLS Trend", file_set_keyword="Small Files", scan_type_filter="OLS Scan")
     elif page == "Auto Large Files OLS Trend":
         render_auto_trend_analysis("Auto Large Files OLS Trend", file_set_keyword="Large Files", scan_type_filter="OLS Scan")
-    
+
     # Specialized Comparisons
     elif page == "OLS vs Full Scan (Small)":
         render_trend_analysis(data, "OLS vs Full Scan (Small Files)", file_set_filter="Small Files", compare_by="Scan_Type")
@@ -17515,14 +17590,12 @@ def main():
     elif page == "Discover File FF On vs Off":
         render_trend_analysis(data, "Discover File FF Comparison (Full Scan)", scan_type_filter="Full Scan", compare_by="is_feature_flags")
     elif page == "ACL ON vs OLS (ACL ON)":
-        # Compare Full Scan (ACL ON) vs OLS (ACL ON)
-        # We filter for ACL=1 and compare by Scan Type
         render_trend_analysis(data, "Full Scan vs OLS (ACL ON)", acl_filter=1, compare_by="Scan_Type")
     elif page == "ACL OFF vs OLS (ACL OFF)":
         render_trend_analysis(data, "Full Scan vs OLS (ACL OFF)", acl_filter=0, compare_by="Scan_Type")
-    
-    # Tools
-    elif page == "Add New Benchmark": 
+
+    # Tools — these pages load their own data internally, no benchmark data needed
+    elif page == "Add New Benchmark":
         page_add_benchmark()
     elif page == "Edit Records":
         mode = st.radio("Record Type", ["Manual Benchmarks", "Auto Scans"], horizontal=True)
