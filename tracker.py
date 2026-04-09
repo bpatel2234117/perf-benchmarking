@@ -1033,18 +1033,9 @@ def sync_global_classifiers_for_env_build(engine, env_row: Dict[str, Any], token
     except Exception:
         force_on_version_change = False
 
-    # Keep DB env version in sync with /about.
-    try:
-        if env_id is not None:
-            with engine.connect() as conn:
-                conn.execute(
-                    text("UPDATE test_environments SET version = :v WHERE id = :id"),
-                    {"v": str(build_version), "id": int(env_id)},
-                )
-                conn.commit()
-    except Exception:
-        pass
-
+    # Keep DB env version in sync with /about (handled in sync_env_version_from_about now)
+    # Removing redundant update here
+    
     ensure_classifier_mapping_tables(engine)
 
     # If already stored recently, do nothing. Otherwise refresh (mappings can drift).

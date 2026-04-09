@@ -1,0 +1,109 @@
+"""
+Auto-start `ai_log_fetcher.py` from Streamlit process.
+
+Goal: when a user runs Streamlit locally without Docker, ensure the background AI log analyzer
+is running on the same machine without manual commands.
+
+Safety:
+- Uses a pidfile to avoid spawning duplicates.
+- Can be disabled via DISABLE_LOG_ANALYZER_AUTOSTART=1
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import subprocess
+from pathlib import Path
+from typing import Optional, Tuple
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if os.name != "nt":
+            os.kill(pid, 0)
+            return True
+        # Silencing tasklist flash on Windows
+        CREATE_NO_WINDOW = 0x08000000
+        out = subprocess.check_output(
+            ["tasklist", "/FI", f"PID eq {pid}"], 
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW
+        )
+        s = out.decode("utf-8", errors="ignore").lower()
+        return str(pid) in s
+    except Exception:
+        return False
+
+def _read_pidfile(path: Path) -> Optional[int]:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore").strip()
+        return int(raw) if raw.isdigit() else None
+    except Exception:
+        return None
+
+def _write_pidfile(path: Path, pid: int) -> None:
+    try:
+        path.write_text(str(int(pid)), encoding="utf-8")
+    except Exception:
+        pass
+
+def ensure_ai_log_fetcher_running() -> Tuple[bool, str]:
+    """
+    Ensures ai log fetcher process is running unless disabled.
+    Returns: (started_or_running, message)
+    """
+    if str(os.getenv("DISABLE_LOG_ANALYZER_AUTOSTART", "")).strip().lower() in {"1", "true", "yes", "y"}:
+        return False, "log analyzer autostart disabled"
+
+    repo_dir = Path(__file__).resolve().parent
+    pidfile = repo_dir / ".ai_log_fetcher.pid"
+
+    pid = _read_pidfile(pidfile)
+    if pid and _pid_is_running(pid):
+        return True, f"pidfile alive (pid={pid})"
+
+    runner_path = repo_dir / "ai_log_fetcher.py"
+    if not runner_path.exists():
+        return False, "ai_log_fetcher.py not found"
+
+    cmd = [sys.executable.replace("python.exe", "pythonw.exe") if sys.platform == "win32" else sys.executable, str(runner_path)]
+    env = os.environ.copy()
+
+    try:
+        logs_dir = repo_dir / "logs"
+        try:
+            logs_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        out_path = logs_dir / "ai_log_fetcher.out.log"
+        err_path = logs_dir / "ai_log_fetcher.err.log"
+        stdout_f = open(out_path, "ab", buffering=0)
+        stderr_f = open(err_path, "ab", buffering=0)
+        
+        if os.name == "nt":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(repo_dir),
+                env=env,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                creationflags=CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            )
+        else:
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(repo_dir),
+                env=env,
+                stdout=stdout_f,
+                stderr=stderr_f,
+                start_new_session=True,
+            )
+        _write_pidfile(pidfile, int(p.pid))
+        return True, f"spawned (pid={p.pid})"
+    except Exception as ex:
+        return False, f"spawn failed: {ex}"

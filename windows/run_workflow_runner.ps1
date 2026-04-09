@@ -15,6 +15,8 @@ $outLog = Join-Path $LogsDir "workflow_runner.out.log"
 $errLog = Join-Path $LogsDir "workflow_runner.err.log"
 $superLog = Join-Path $LogsDir "workflow_runner.supervisor.log"
 
+$PidFile = Join-Path $RepoRoot ".workflow_runner.pid"
+
 function Get-ProcByCmdLike([string]$needle) {
   try {
     return Get-CimInstance Win32_Process | Where-Object { ($_.CommandLine -as [string]) -like "*$needle*" }
@@ -64,6 +66,12 @@ else:
   } catch { return -1 }
 }
 
+$age = Get-HeartbeatAgeMinutes
+if ($age -ge 0 -and $age -lt 6) {
+    Add-Content -Path $superLog -Value ("[{0}] Heartbeat fresh ({1}m). Another instance is likely running. Skipping startup." -f (Get-Date).ToString("s"), $age)
+    exit 0
+}
+
 Stop-ExistingRunner
 
 # Supervisor loop: restart on crash, and if heartbeat stops updating.
@@ -72,6 +80,7 @@ while ($true) {
     Add-Content -Path $superLog -Value ("[{0}] starting workflow_runner" -f (Get-Date).ToString("s"))
     $p = Start-Process -FilePath $Py -ArgumentList @("workflow_runner.py", "--quiet") -WorkingDirectory $RepoRoot `
       -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+    $p.Id | Out-File -FilePath $PidFile -Encoding ascii
     $procStart = Get-Date
 
     while (-not $p.HasExited) {

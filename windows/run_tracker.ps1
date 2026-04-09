@@ -14,6 +14,22 @@ $outLog = Join-Path $LogsDir "tracker.out.log"
 $errLog = Join-Path $LogsDir "tracker.err.log"
 $superLog = Join-Path $LogsDir "tracker.supervisor.log"
 
+$TrackerName = "default"
+try {
+  $envPath = Join-Path $RepoRoot ".env"
+  if (Test-Path $envPath) {
+    $lines = Get-Content $envPath -ErrorAction SilentlyContinue
+    foreach ($line in $lines) {
+      $s = ($line -as [string]).Trim()
+      if ($s -and $s.StartsWith('SCAN_TRACKER_NAME=')) {
+        $TrackerName = $s.Split('=',2)[1].Trim().Trim('\"').Trim("'")
+      }
+    }
+  }
+} catch {}
+
+$PidFile = Join-Path $RepoRoot ".tracker.$TrackerName.pid"
+
 function Get-ProcByCmdLike([string]$needle) {
   try {
     return Get-CimInstance Win32_Process | Where-Object { ($_.CommandLine -as [string]) -like "*$needle*" }
@@ -23,6 +39,8 @@ function Get-ProcByCmdLike([string]$needle) {
 function Stop-ExistingTracker {
   $procs = Get-ProcByCmdLike "tracker.py"
   foreach ($p in $procs) {
+    # If the process ID matches our PID file AND is healthy, we could skip it, 
+    # but for a supervisor, we generally want to be the one presiding over it.
     try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
   }
 }
@@ -83,6 +101,13 @@ else:
   } catch { return -1 }
 }
 
+$age = Get-HeartbeatAgeMinutes
+$slot = Get-SlotMinutes
+if ($age -ge 0 -and $age -lt ($slot + 5)) {
+    Add-Content -Path $superLog -Value ("[{0}] Heartbeat fresh ({1}m). Another instance is likely running. Skipping startup." -f (Get-Date).ToString("s"), $age)
+    exit 0
+}
+
 Stop-ExistingTracker
 
 while ($true) {
@@ -93,6 +118,7 @@ while ($true) {
 
     $p = Start-Process -FilePath $Py -ArgumentList @("tracker.py", "--quiet") -WorkingDirectory $RepoRoot `
       -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+    $p.Id | Out-File -FilePath $PidFile -Encoding ascii
     $procStart = Get-Date
 
     while (-not $p.HasExited) {

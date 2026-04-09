@@ -1,0 +1,16 @@
+{
+  "ds_connection": {
+    "name": "{{DS_NAME}}",
+    "id": "{{DS_NAME}}",
+    "type": "smb_v2",
+    "scanner_group": "{{SCANNER_GROUP}}",
+    "authenticationProperties": {
+      "username": "",
+      "password": ""
+    },
+    "resourceProperties": {
+      "resourceAddress": "{{SMB_resourceAddress}}"
+    }
+  },
+  "isSavedAsDraft": false
+}

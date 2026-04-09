@@ -48,12 +48,32 @@ services:
     container_name: scan_benchmark_runner
     command: ["python", "workflow_runner.py", "--quiet"]
     environment:
-      # These MUST match the dashboard service settings if overridden
       # - DB_HOST=10.2.20.89
       # - DB_PORT=3306
       # - DB_USER=bigid
       # - DB_PASSWORD=bigid111!
       # - DB_NAME=benchmark_db
+    volumes:
+      - ./benchmark.db:/app/benchmark.db
+      - ./logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      - dashboard
+
+  log_analyzer:
+    build: .
+    container_name: scan_benchmark_log_analyzer
+    command: ["python", "ai_log_fetcher.py"]
+    environment:
+      # - DB_HOST=10.2.20.89
+      # - DB_PORT=3306
+      # - DB_USER=bigid
+      # - DB_PASSWORD=bigid111!
+      # - DB_NAME=benchmark_db
+      
+      - SCANNER_LOG_FETCH_MINUTES=5
+      # Since we are inside docker, local llama model runs on host
+      - OLLAMA_URL=http://host.docker.internal:11434/api/generate
     volumes:
       - ./benchmark.db:/app/benchmark.db
       - ./logs:/app/logs
