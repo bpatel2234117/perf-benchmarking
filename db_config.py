@@ -237,5 +237,12 @@ DDL_STATEMENTS = {
             is_final BOOLEAN DEFAULT FALSE,
             FOREIGN KEY (environment_id) REFERENCES test_environments(id)
         );
+    """,
+    'app_settings': """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            setting_key VARCHAR(100) PRIMARY KEY,
+            setting_value LONGTEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        );
     """
 }

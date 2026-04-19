@@ -28,6 +28,78 @@ FETCH_INTERVAL_MINUTES = int(os.getenv("SCANNER_LOG_FETCH_MINUTES", "5"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
 LOG_LEN = int(os.getenv("SCANNER_LOG_FETCH_LEN", "3000"))
+DEFAULT_LOG_FETCH_SOURCES = ["scanner", "orch", "orch2", "aci", "api-gateway", "data-manager"]
+DEFAULT_LOG_SOURCE_OPTIONS = [
+    "web",
+    "orch",
+    "orch2",
+    "scanner",
+    "corr-new",
+    "clustering",
+    "data-catalog",
+    "aci",
+    "reports",
+    "secure-sensitive",
+    "ner",
+    "metadata-search",
+    "catalog-processor",
+    "cryptmgr",
+    "action-center",
+    "reporting-etl",
+    "api-gateway",
+    "data-manager",
+]
+
+
+def _normalize_log_source_name(value):
+    return str(value or "").strip().lower()
+
+
+def _ordered_unique_log_sources(values):
+    seen = set()
+    ordered = []
+    for raw in values or []:
+        item = _normalize_log_source_name(raw)
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def ensure_app_settings_table(engine):
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    setting_key VARCHAR(100) PRIMARY KEY,
+                    setting_value LONGTEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+    except Exception as e:
+        print(f"Error creating app_settings: {e}")
+
+
+def load_enabled_log_sources(engine):
+    ensure_app_settings_table(engine)
+    fallback = _ordered_unique_log_sources(DEFAULT_LOG_FETCH_SOURCES)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT setting_value FROM app_settings WHERE setting_key = :k LIMIT 1"),
+                {"k": "enabled_log_sources"}
+            ).fetchone()
+        if not row or not row[0]:
+            return fallback
+        payload = json.loads(str(row[0]))
+        enabled = payload.get("enabled") if isinstance(payload, dict) else payload
+        enabled_list = _ordered_unique_log_sources(enabled)
+        return enabled_list or fallback
+    except Exception as e:
+        print(f"Failed to load enabled_log_sources: {e}")
+        return fallback
 
 def check_ollama_ready():
     """Verify that Ollama is reachable before starting the analyzer loop."""
@@ -48,6 +120,7 @@ def check_ollama_ready():
 
 def setup_db_engine():
     engine = create_engine(get_db_connection_string(), echo=False)
+    ensure_app_settings_table(engine)
     try:
         with engine.connect() as conn:
             # Automatic Migration for error_hash
@@ -239,26 +312,92 @@ def extract_scan_ids(log_text):
         
     return scan_id, subscan_id
 
+
+def _skip_info_level_line(line: str) -> bool:
+    """
+    BigID scanner often logs normal work at [INFO], including URLs whose path contains
+    'failed-enumeration-objects' etc. Those must not be treated as errors.
+    Set SCANNER_LOG_SKIP_INFO_LEVEL=0 to revert to legacy behavior.
+    """
+    if os.getenv("SCANNER_LOG_SKIP_INFO_LEVEL", "1").strip().lower() not in ("1", "true", "yes", "on"):
+        return False
+    return bool(re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I))
+
+
+def _line_for_error_keyword_scan(line: str) -> str:
+    """Strip URLs so path segments like .../failed-enumeration-objects/... do not match 'fail'."""
+    return re.sub(r"https?://[^\s]+", " ", line, flags=re.I)
+
+
+def _looks_like_success_scan_summary(ctx: str) -> bool:
+    """
+    Drop contexts that are clearly completed scan payloads (often pulled in as trailing JSON)
+    when a noisy line above matched substring keywords (e.g. isAbort, preset, throttle).
+    """
+    if not re.search(r'"scanState"\s*:\s*"Completed"', ctx, re.I):
+        return False
+    if re.search(r'"totalFailedObjects"\s*:\s*0\b', ctx, re.I):
+        return True
+    if re.search(r'"total_failed_objects"\s*:\s*0\b', ctx, re.I):
+        return True
+    return False
+
+
+def _line_passes_error_level_gate(line: str) -> bool:
+    """
+    Require a real log severity on the trigger line (defense against keyword-only false positives).
+    Default: only [ERROR], [FATAL], [SEVERE]. Set SCANNER_LOG_ERROR_REQUIRE_LEVEL=warn to include
+    [WARN]/[WARNING], or any/legacy for keyword-only matching (old behavior).
+    """
+    mode = os.getenv("SCANNER_LOG_ERROR_REQUIRE_LEVEL", "error_fatal").strip().lower()
+    if mode in ("any", "legacy", "all", "0", "off", "false", "no"):
+        return True
+    if mode in ("warn", "warning"):
+        return bool(
+            re.search(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", line, re.I)
+        )
+    # error_fatal (default)
+    return bool(re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I))
+
+
 def detect_errors_in_logs(log_text):
     """
-    Structural-aware log analysis. 
+    Structural-aware log analysis.
     Finds error entry points (case-insensitive) and captures consecutive indented lines (stack traces).
+
+    By default (SCANNER_LOG_ERROR_REQUIRE_LEVEL=error_fatal) the trigger line must include
+    [ERROR], [FATAL], or [SEVERE] — keyword matches alone are ignored. Use warn or any for looser rules.
     """
     lines = log_text.splitlines()
     error_contexts = []
     seen_fingerprints = set()
-    
+
     i = 0
-    # Broaden regex to include ANY 'error' plus stealth O365 throttling fail states.
+    # Word-boundary tokens. Unbounded 'abort' matched isAbort; 'reset' matched preset; 'throttl' matched throttle.
+    # "failed" only when followed by whitespace so hyphenated API paths do not match.
     ERROR_PATTERN = re.compile(
-        r'(?i)\[?(?:error|fatal|fail|severe|exception|axioserror|nohttp|status\s+[45]\d{2}|timeout|timed? out|refused|unreachable|reset|denied|abort|exhausted|throttl|limitreached|graphservice|activitylimit)\]?'
+        r"(?i)(?:"
+        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|\bnohttp\b|"
+        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
+        r"\babort(?:ed|ing)?\b|\bexhausted\b|"
+        r"\bthrottl(?:ing|ed)\b|\blimitreached\b|\bgraphservice\b|\bactivitylimit\b"
+        r")"
     )
-    
+
     while i < len(lines):
         line = lines[i]
-        
+
+        if _skip_info_level_line(line):
+            i += 1
+            continue
+
+        scan_line = _line_for_error_keyword_scan(line)
+
         # 1. Detect starting line of an error block (Pattern-based)
-        if ERROR_PATTERN.search(line):
+        if ERROR_PATTERN.search(scan_line):
+            if not _line_passes_error_level_gate(line):
+                i += 1
+                continue
             # Context before: capture 2 lines if possible for timestamps/IDs
             start = max(0, i - 2)
             
@@ -266,6 +405,12 @@ def detect_errors_in_logs(log_text):
             end = i + 1
             while end < len(lines) and (end - i) < 30: # Max 30 lines for context
                 next_line = lines[end]
+
+                # CRITICAL FIX: If the next line itself is a NEW error marker, 
+                # BREAK the context here so it gets its own record instead of being swallowed.
+                if ERROR_PATTERN.search(_line_for_error_keyword_scan(next_line)) and _line_passes_error_level_gate(next_line):
+                    break
+
                 # Match common stack trace/indented log markers
                 if next_line.startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
                     end += 1
@@ -279,7 +424,15 @@ def detect_errors_in_logs(log_text):
             ctx_text = "\n".join(ctx_lines)
             
             # Deduplicate within this fetch cycle
-            fingerprint = ctx_text[:300]
+            if _looks_like_success_scan_summary(ctx_text):
+                i = end
+                continue
+
+            # IMPROVED FINGERPRINTING: Mask timestamps to avoid 
+            # skipping unique errors just because their log prefix is the same.
+            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_text)
+            fingerprint = fingerprint_text[:300]
+            
             if fingerprint not in seen_fingerprints:
                 seen_fingerprints.add(fingerprint)
                 error_contexts.append(ctx_text)
@@ -441,7 +594,7 @@ def store_health_summary(engine, env_id, summary):
                 INSERT INTO scan_system_health (environment_id, health_summary, captured_at_utc)
                 VALUES (:eid, :hs, :cat)
             """),
-            {"eid": env_id, "hs": summary, "cat": datetime.utcnow().isoformat() + "Z"}
+            {"eid": env_id, "hs": summary, "cat": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}
         )
         conn.commit()
 
@@ -465,7 +618,7 @@ def run_once(engine):
                 token = get_auth_token(base_url, env)
                 
                 new_errors_by_scan = {}
-                log_sources = ["scanner", "orch", "orch2", "aci", "api-gateway", "data-manager"]
+                log_sources = load_enabled_log_sources(engine)
                 
                 for log_source in log_sources:
                     try:

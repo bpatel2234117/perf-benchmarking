@@ -4574,6 +4574,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
                         ws.is_ocr,
                         ws.is_structured_ff,
                         ws.is_ols,
+                        ws.is_lite,
                         ws.feature_flags,
                         ws.notes,
                         ws.ds_id,
@@ -4597,7 +4598,7 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
         cols = [
             "id","run_id","seq","environment_id","environment","env_is_busy",
             "ds_kind","ds_name","scan_kind","file_set_type",
-            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols","is_lite",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
@@ -4628,6 +4629,7 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
                         ws.is_ocr,
                         ws.is_structured_ff,
                         ws.is_ols,
+                        ws.is_lite,
                         ws.feature_flags,
                         ws.notes,
                         ws.ds_id,
@@ -4651,7 +4653,7 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
         cols = [
             "id","run_id","seq","environment_id","environment",
             "ds_kind","ds_name","scan_kind","file_set_type",
-            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols",
+            "is_enabled","is_acl","is_ocr","is_structured_ff","is_ols","is_lite",
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
@@ -6643,18 +6645,89 @@ Provide a comprehensive, executive-level technical summary in Markdown.
                         timeout=180
                     )
                     resp.raise_for_status()
-                    final_report = resp.json().get("response", "No response from AI")
+                    report = resp.json().get("response", "No response from AI")
                     
-                    # Store it for future use
+                    # Store it
                     with engine.connect() as conn:
                         conn.execute(
                             text("INSERT INTO scan_log_correlations (environment_id, scan_id, correlation_report, is_final) VALUES (:eid, :sid, :rep, 1)"),
-                            {"eid": env_id, "sid": scan_id, "rep": final_report}
+                            {"eid": env_id, "sid": scan_id, "rep": report}
                         )
                         conn.commit()
-                    return final_report
+                    return report
                 except Exception:
                     return None
+    except Exception:
+        return None
+
+# --- AI Log Analysis Helpers (Synced with ai_log_fetcher.py) ---
+
+def _detect_log_errors_structural(log_text: str) -> List[str]:
+    """ estructural-aware log analysis mirroring ai_log_fetcher.py """
+    lines = log_text.splitlines()
+    error_contexts = []
+    seen = set()
+    ERROR_PATTERN = re.compile(
+        r"(?i)(?:"
+        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|"
+        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
+        r"\babort(?:ed|ing)?\b|\bexhausted\b|\bthrottl(?:ing|ed)\b"
+        r")"
+    )
+    # Mode: error_fatal (require [ERROR] etc)
+    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE)\]", re.I)
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if ERROR_PATTERN.search(line) and LEVEL_PATTERN.search(line):
+            start = max(0, i - 2)
+            end = i + 1
+            while end < len(lines) and (end - i) < 30:
+                # Mirroring ai_log_fetcher.py: Break if a new independent error is found
+                next_line_raw = lines[end]
+                next_line_scan = re.sub(r"https?://[^\s]+", " ", next_line_raw, flags=re.I)
+                if ERROR_PATTERN.search(next_line_scan) and LEVEL_PATTERN.search(next_line_raw):
+                    break
+
+                if lines[end].startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
+                    end += 1
+                else: break
+            if end == i + 1: end = min(len(lines), i + 4)
+            ctx = "\n".join(lines[start:end])
+            
+            # Mask timestamps for better deduplication
+            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx)
+            fingerprint = fingerprint_text[:200]
+            
+            if fingerprint not in seen:
+                seen.add(fingerprint)
+                error_contexts.append(ctx)
+            i = end
+        else:
+            i += 1
+    return error_contexts
+
+def _extract_ids_from_log_ctx(ctx: str):
+    sid = None
+    ssid = None
+    m1 = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
+    if not m1: m1 = re.search(r'sdk-object-scan-([a-f0-9]{24})', ctx)
+    if m1: sid = m1.group(1)
+    m2 = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
+    if not m2 and sid: m2 = re.search(fr'sdk-object-scan-{sid}-([a-f0-9]{24})', ctx)
+    if m2: ssid = m2.group(1)
+    return sid, ssid
+
+def _call_ollama_for_error(ctx: str, source: str):
+    url = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
+    model = os.getenv("OLLAMA_MODEL", "llama3")
+    prompt = f"Analyze this BigID '{source}' error and explain: 1. What failed? 2. Root cause category? 3. Fix recommended? \n\nCONTEXT:\n{ctx}"
+    try:
+        r = requests.post(url, json={"model": model, "prompt": prompt, "stream": False}, timeout=60)
+        return r.json().get("response", "AI analysis failed.")
+    except Exception as e:
+        return f"AI Offline: {e}"
 
         # 3. Fallback to latest interval correlation (Option 2)
         with engine.connect() as conn:
@@ -16354,12 +16427,78 @@ def page_scan_progress():
                 has_extra_cols_local = _db_has_column("scan_log_errors", "log_source")
                 cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols_local else "log_timestamp, error_context, ai_analysis, is_resolved"
                 
-                query_str = f"SELECT {cols} FROM scan_log_errors WHERE environment_id = :eid ORDER BY id DESC LIMIT 10"
-                e_df = pd.read_sql(text(query_str), engine, params={"eid": env_id})
+                # Fetch only relevant errors for this scan/environment since it started
+                q_params = {"eid": env_id}
+                q_filters = ["environment_id = :eid"]
+                if scan_id:
+                    # Match this scan_id or system-wide logs (often logged with no scan ID context)
+                    q_filters.append("(scan_id = :sid OR scan_id IS NULL OR scan_id = '' OR scan_id = 'None')")
+                    q_params["sid"] = str(scan_id)
                 
+                if db_started_at:
+                    # Ensure we don't show logs from BEFORE the scan started
+                    q_filters.append("log_timestamp >= :started")
+                    q_params["started"] = db_started_at
+                
+                q_where = " AND ".join(q_filters)
+                query_str = f"SELECT {cols} FROM scan_log_errors WHERE {q_where} ORDER BY id DESC LIMIT 20"
+                e_df = pd.read_sql(text(query_str), engine, params=q_params)
+                
+                st.markdown("#### ⚠️ Individual Error Context")
+                
+                # Manual Log Fetch Button
+                col_lf1, col_lf2 = st.columns([1, 2])
+                with col_lf1:
+                    if st.button("🔄 Fetch Latest Logs (AI)", key="btn_fetch_logs_ai", help="Trigger a fresh log fetch and AI analysis directly from the environment."):
+                        with st.spinner("Fetching and analyzing logs..."):
+                            try:
+                                # 1. Resolve Auth
+                                env_row = get_environment_row_for_scan_id(scan_id)
+                                if not env_row and engine:
+                                    try:
+                                        with engine.connect() as conn:
+                                            row = conn.execute(text("SELECT id, env_name, base_url FROM test_environments WHERE id = :eid"), {"eid": env_id}).fetchone()
+                                            if row: env_row = {"id": row[0], "env_name": row[1], "base_url": row[2]}
+                                    except Exception: pass
+                                
+                                if not env_row or not env_row.get("base_url"):
+                                    st.error("Cannot resolve environment URL to fetch logs.")
+                                else:
+                                    token = Get_auth_token(env_row["base_url"], env_row)
+                                    # Expanded sources including orch2 where the socket hang up error lives
+                                    sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "web", "aci"]
+                                    new_found = 0
+                                    for src in sources:
+                                        url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len=3000"
+                                        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=30)
+                                        if resp.status_code == 200:
+                                            log_text = resp.json().get("data") if isinstance(resp.json(), dict) else resp.text
+                                            if log_text:
+                                                found_errors = _detect_log_errors_structural(str(log_text))
+                                                for ctx in found_errors:
+                                                    # Dedupe (1 hour)
+                                                    with engine.connect() as conn:
+                                                        exist = conn.execute(text("SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_context=:ctx AND log_timestamp > DATE_SUB(NOW(), INTERVAL 60 MINUTE)"), {"eid": env_id, "ctx": ctx}).fetchone()
+                                                        if exist: continue
+                                                        
+                                                        psid, pssid = _extract_ids_from_log_ctx(ctx)
+                                                        ai_ans = _call_ollama_for_error(ctx, src)
+                                                        conn.execute(text("""
+                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id)
+                                                            VALUES (:eid, NOW(), :ctx, :ai, :src, :sid, :ssid)
+                                                        """), {"eid": env_id, "ctx": ctx, "ai": ai_ans, "src": src, "sid": psid or scan_id, "ssid": pssid})
+                                                        conn.commit()
+                                                        new_found += 1
+                                    st.success(f"Log fetch complete. Found/Analyzed {new_found} new error signatures.")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Manual fetch failed: {e}")
+                
+                with col_lf2:
+                    st.caption(f"Showing relevant errors since scan start `{db_started_at or 'N/A'}`")
+
                 if not e_df.empty:
-                    st.markdown("#### ⚠️ Individual Error Context")
-                    st.caption("Latest 10 unique error signatures detected in logs.")
+                    st.caption("Latest unique error signatures detected in logs.")
                     for _, row in e_df.iterrows():
                         source_badge = f"[{row['log_source'].upper()}]" if has_extra_cols_local and pd.notnull(row.get('log_source')) else ""
                         
@@ -16999,6 +17138,9 @@ def page_workflow_automation():
                     sid_val = str(rd.get("scan_id") or "").strip()
                     if sid_val:
                         scan_link = f'<a href="?page=Scan+Progress&scan_id={html.escape(sid_val)}" target="_blank" rel="noopener noreferrer" style="color:{PRIMARY_COLOR};text-decoration:none;font-size:0.8rem;">View Progress</a>'
+                    open_link = ""
+                    if sid_val:
+                        open_link = f'<a href="?page=Add+New+Benchmark&scan_id={html.escape(sid_val)}" target="_blank" rel="noopener noreferrer" style="color:{PRIMARY_COLOR};text-decoration:none;font-size:0.8rem;">Open</a>'
                     # Env with busy/free indicator: 🟢 free, 🔴 busy (derive from step + te.is_busy; API/te.is_busy can lag)
                     env_name = str(rd.get("environment") or "").strip()
                     row_env_busy = _workflow_step_implies_env_busy(rd)
@@ -17020,6 +17162,7 @@ def page_workflow_automation():
                         "progress": prog,
                         "scan_id": sid_val,
                         "scan_link": scan_link,
+                        "open_link": open_link,
                         "notes": str(rd.get("notes") or "").strip(),
                         "last_error": display_err,
                     })
@@ -17135,6 +17278,7 @@ def page_workflow_automation():
 <td style="padding:4px 8px;">{sr["progress"]}</td>
 <td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["scan_id"])}</td>
 <td style="padding:4px 8px;">{sr["scan_link"]}</td>
+<td style="padding:4px 8px;">{sr["open_link"]}</td>
 <td style="padding:4px 8px;font-size:0.82rem;">{html.escape(sr["notes"])}</td>
 <td style="padding:4px 8px;">{err_cell}</td>
 </tr>\n"""
@@ -17167,7 +17311,8 @@ def page_workflow_automation():
     <th style="padding:5px 8px;">Flags</th>
     <th style="padding:5px 8px;">Progress</th>
     <th style="padding:5px 8px;">Scan Id</th>
-    <th style="padding:5px 8px;">Link</th>
+    <th style="padding:5px 8px;">Progress</th>
+    <th style="padding:5px 8px;">Open</th>
     <th style="padding:5px 8px;">Notes</th>
     <th style="padding:5px 8px;">Error</th>
   </tr></thead>
