@@ -125,10 +125,12 @@ def setup_db_engine():
         with engine.connect() as conn:
             # Automatic Migration for error_hash
             try:
-                conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN IF NOT EXISTS error_hash VARCHAR(32)"))
+                # Version-agnostic way to add column: try it and let the except block catch 'already exists'
+                conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN error_hash VARCHAR(32)"))
                 conn.commit()
-            except Exception as e:
-                print(f"Migration note (error_hash): {e}")
+            except Exception:
+                # Column likely already exists, safe to ignore
+                pass
             
             # Tracker and Log Fetcher heartbeat table
             conn.execute(text("""
