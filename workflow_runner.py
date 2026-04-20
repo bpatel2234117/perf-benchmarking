@@ -905,6 +905,23 @@ def _sync_env_busy_from_api(engine, env_id: int) -> None:
                 except Exception:
                     pass
             break
+    # Cross-reference with workflow state: if scan belongs to a run that is already terminal,
+    # we should ignore BigID's stale status and release the env.
+    if has_running and run_id_from_scan is not None:
+        try:
+            with engine.connect() as conn:
+                r_row = conn.execute(
+                    text("SELECT status FROM workflow_runs WHERE id = :rid"),
+                    {"rid": int(run_id_from_scan)}
+                ).fetchone()
+                if r_row:
+                    r_status = str(r_row[0] or "").lower()
+                    if r_status in {"completed", "failed", "stopped"}:
+                        has_running = False
+                        run_id_from_scan = None
+        except Exception:
+            pass
+
     if not has_running:
         _set_env_busy(engine, env_id, None, False)
         return
@@ -930,7 +947,11 @@ def _workflow_ds_key(step: Dict[str, Any]) -> str:
     fs = str(step.get("file_set_type") or "").strip() or "default"
     acl = 1 if bool(step.get("is_acl")) else 0
     struct = 1 if bool(step.get("is_structured_ff")) else 0
-    return f"ds::{ds_kind}::{fs}::acl={acl}::struct={struct}"
+    # Add debug logging for diagnostics
+    res = f"ds::{ds_kind}::{fs}::acl={acl}::struct={struct}"
+    # try: logging.debug("workflow_ds_key result=%s (raw: kind=%s fs=%s acl=%s struct=%s)", res, ds_kind, fs, acl, struct)
+    # except: pass
+    return res
 
 
 def _workflow_ds_key_candidates(step: Dict[str, Any]) -> List[str]:
@@ -1493,12 +1514,13 @@ def _standard_ds_base_name(step: Dict[str, Any]) -> str:
     if k in {"s3", "smb"}:
         prefix = "S3" if k == "s3" else "SMB"
         nm = f"{prefix} {fs}".strip() if fs else prefix
+        # Use 'AND' instead of '+' to avoid URL routing/validation issues (400 Bad Request)
         if fs in {"Small Files", "Large Files"} and is_acl:
-            nm += " With ACL"
+            nm += " WITH ACL"
         if is_struct:
             nm += " Structured Files Discovery"
         if is_ols:
-            nm += " With OLS"
+            nm += " AND OLS"
         return nm.strip()
 
     if k == "postgres":
@@ -1666,6 +1688,7 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
         pw_enc = _get("SMB_password_enc")
         pw = _get("SMB_password")
         ra = _get("SMB_resourceAddress")
+
         # Some exports store SMB creds at top-level, some under authenticationProperties.
         if u:
             ds_conn["username"] = u
@@ -1827,15 +1850,24 @@ def _apply_runtime_flags(step: Dict[str, Any], ds_payload: Dict[str, Any]) -> Di
     if ds_kind in UNSTRUCTURED_KINDS:
         # 1. Mandatory defaults for all unstructured DS per user request
         ds_conn["liteModeNotification"] = ""
-        ds_conn["customFields"] = []
+        # BigID UI uses 'custom_fields' (underscore) in some versions/payloads.
+        # We'll set both to be safe, including the Lite Mode flag requested.
+        lite_mode_field = {
+            "field_type": "clear",
+            "field_name": "DS_LITE_MODE_ENABLED",
+            "field_value": "true",
+            "enable": True
+        }
+        ds_conn["customFields"] = [lite_mode_field]
+        ds_conn["custom_fields"] = [lite_mode_field]
         
-        # 2. Media Analysis (OCR): Force to False for now
-        ds_conn["ocrEnabled"] = False
+        # 2. Media Analysis (OCR): Force to False as string for API stability
+        ds_conn["ocrEnabled"] = "false"
         
-        # 3. Permissions (ACL): Only set if explicitly enabled in workflow
+        # 3. Permissions (ACL): Use STRINGS "true" to match BigID UI payload
         if is_acl:
-            ds_conn["metadataAclScanEnabled"] = True
-            ds_conn["dsAclScanEnabled"] = True
+            ds_conn["metadataAclScanEnabled"] = "true"
+            ds_conn["dsAclScanEnabled"] = "true"
         
         # 4. Structured Discovery: Only set if explicitly enabled in workflow
         if is_struct:
@@ -2847,11 +2879,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             try:
                 with engine.connect() as conn:
                     any_left = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid {where_status} LIMIT 1"), {"rid": run_id}).fetchone()
-                if not any_left:
-                    with engine.connect() as conn:
-                        conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id})
-                        conn.commit()
-                    did_any_work = True
+                    if not any_left:
+                        with engine.connect() as conn:
+                            # Re-verify one last time before closing
+                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, 1) = 1 LIMIT 1"), {"rid": run_id}).fetchone()
+                            if not any_active:
+                                # Mark as failed if ANY enabled step hit an error, otherwise completed
+                                has_err = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,1)=1 LIMIT 1"), {"rid": run_id}).fetchone()
+                                final_s = 'failed' if has_err else 'completed'
+                                conn.execute(text("UPDATE workflow_runs SET status=:s, finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id, "s": final_s})
+                                conn.commit()
+                        did_any_work = True
             except Exception:
                 pass
             continue
@@ -3049,7 +3087,7 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         _maybe_mark_run_completed(engine, run_id)
         return True
 
-    cur_status = str(step[19] or "").strip().lower()
+    cur_status = str(step[20] or "").strip().lower() # index 20 is status
     
     # Prep step_dict and wf_tag for recovery/tracking
     step_dict = {
@@ -3061,8 +3099,9 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         "is_ocr": bool(step[8]),
         "is_structured_ff": bool(step[9]),
         "is_ols": bool(step[10]),
-        "feature_flags": step[11],
-        "notes": step[12],
+        "is_lite": bool(step[11]),
+        "feature_flags": step[12],
+        "notes": step[13],
     }
     try:
         wf_tag = f"(wf {int(run_id)}-{int(seq)})"
@@ -3074,7 +3113,7 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     # This prevents the "Busy Environment" check from stalling a step that has actually already started.
     if cur_status in {"scan_running", "scan_waiting"}:
         try:
-            sid_db = str(step[18] or "").strip()
+            sid_db = str(step[19] or "").strip() # index 19 is scan_id
         except Exception:
             sid_db = ""
 
@@ -3152,7 +3191,7 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
 
     # Fast-path: if this step already has a scan_id and DB says it's terminal, mark completed.
     try:
-        sid = str(step[18] or "").strip()
+        sid = str(step[19] or "").strip() # index 19 is scan_id
         if sid:
             # 1. Check local DB (populated by tracker)
             with engine.connect() as conn:
@@ -3205,7 +3244,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     # Ensure we don't accumulate duplicate workflow suffixes on retries.
     _wf_suffix = f"(wf {run_id}-{seq})"
     base_with_prefix_clean = re.sub(r"(?:\s*\(wf\s+\d+\-\d+\)\s*)+$", "", str(base_with_prefix or '').strip()).strip()
-    desired_ds_name = f"{base_with_prefix_clean} {_wf_suffix}".strip()
+    # CRITICAL FIX: Mandatory scrub of '+' to satisfy BigID alphanumeric validation (400 Bad Request)
+    desired_ds_name = f"{base_with_prefix_clean} {_wf_suffix}".strip().replace("+", "AND")
     try:
         logger.info('desired_ds_name step=%s ds_name=%s', seq, desired_ds_name)
     except Exception:
@@ -3332,8 +3372,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
 
         # Idempotency: if DS already exists for this step (ds_id stored) and name matches,
         # avoid re-PUT to prevent accidental duplicate DS artifacts.
-        existing_ds_id = str(step[13] or '').strip()
-        existing_ds_name_db = str(step[4] or '').strip()
+        existing_ds_id = str(step[14] or '').strip() # index 14 is ds_id
+        existing_ds_name_db = str(step[4] or '').strip() # index 4 is ds_name
         skip_put = bool(existing_ds_id) and (str(cur_status or '').strip().lower() in {'ds_created','ds_test_ok','scan_created','scan_running','scan_waiting'}) and (existing_ds_name_db == desired_ds_name)
         if skip_put:
             try:
