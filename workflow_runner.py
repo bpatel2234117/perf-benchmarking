@@ -2694,7 +2694,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         completed_success_any = True
                         # Auto-save benchmark when scan completes/completes-with-failures through workflow
                         try:
-                            _auto_save_benchmark_from_step(engine, step_id, sid, run_id)
+                            _auto_save_benchmark_from_step(engine, step_id, sid, run_id, finished_at=_now_utc())
                         except Exception:
                             pass
                     else:
@@ -3012,7 +3012,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     return did_any_work
 
 
-def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: int) -> None:
+def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: int, finished_at=None) -> None:
     """
     Called when a workflow step scan reaches Completed / CompletedWithFailures.
     Pulls scan_parents + scan_progress + scan_insights data and inserts a
@@ -3048,20 +3048,24 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
         file_set_type = str(step_row[2] or "").strip() or None
         build_version = str(step_row[4] or "").strip() or "unknown"
 
-        # Pull scan timing from scan_parents
+        # Pull scan timing:
+        # - start: scan_parents.started_at (BigID-reported scan start, most accurate)
+        # - end:   finished_at passed from runner (_now_utc() at step completion moment)
+        #          Fallback to scan_parents.last_seen_at only if finished_at is missing.
         with engine.connect() as conn:
             sp_row = conn.execute(
                 text("SELECT started_at, last_seen_at FROM scan_parents WHERE scan_id = :sid LIMIT 1"),
                 {"sid": scan_id},
             ).fetchone()
-        if not sp_row or not sp_row[0] or not sp_row[1]:
+        if not sp_row or not sp_row[0]:
             return
         scan_start = sp_row[0]
-        scan_end   = sp_row[1]
+        scan_end = finished_at if finished_at else (sp_row[1] if sp_row[1] else _now_utc())
         try:
             scan_duration_h = max(0.001, (scan_end - scan_start).total_seconds() / 3600)
         except Exception:
             scan_duration_h = 0.001
+        print(f"[AUTO-BENCHMARK] scan_id={scan_id} start={scan_start} end={scan_end} duration_h={scan_duration_h:.3f}", flush=True)
 
         # Pull classification metrics from scan_insights
         total_classification = None
@@ -3096,16 +3100,43 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
                 conn.commit()
                 b_id = int(conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()[0])
 
+        # Pull peak scanner count + threads from scanner_group_performance during scan window
+        scanner_count = 0
+        thread_count  = 0
+        try:
+            with engine.connect() as conn:
+                gp_row = conn.execute(
+                    text("""
+                        SELECT MAX(running_scanners), MAX(scanner_threads)
+                        FROM scanner_group_performance
+                        WHERE environment_id = :eid
+                          AND captured_at_utc BETWEEN :start AND :end
+                    """),
+                    {"eid": step_row[10] if step_row and step_row[10] else -1,
+                     "start": scan_start, "end": scan_end},
+                ).fetchone()
+            if gp_row and gp_row[0]:
+                scanner_count = max(0, int(gp_row[0] or 0))
+                thread_count  = max(0, int(gp_row[1] or 0))
+        except Exception:
+            pass
+        print(f"[AUTO-BENCHMARK] scanners={scanner_count} threads={thread_count} files={objects_scanned}", flush=True)
+
+        # Compute all three throughput tiers
         tp_cluster_files = objects_scanned / scan_duration_h
+        tp_scanner_files = (tp_cluster_files / scanner_count) if scanner_count > 0 else 0.0
+        tp_thread_files  = (tp_cluster_files / thread_count)  if thread_count  > 0 else 0.0
 
         # Build INSERT dynamically based on schema
         cols = [
             "build_id", "run_date", "scenario_type", "data_source_type", "file_set_type",
             "total_files", "scan_start_time", "scan_end_time",
-            "total_scan_hours", "throughput_cluster_files_hr",
+            "total_scan_hours",
+            "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
         ]
         vals = [":b_id", "CURRENT_DATE", ":scenario", ":dst", ":fstype",
-                ":tf", ":ss", ":se", ":tsh", ":tpcf"]
+                ":tf", ":ss", ":se", ":tsh",
+                ":tpcf", ":tpsf", ":tptf"]
         params: Dict[str, Any] = {
             "b_id": b_id,
             "scenario": ds_name or ds_kind or "Workflow Auto",
@@ -3116,7 +3147,11 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
             "se": scan_end,
             "tsh": scan_duration_h,
             "tpcf": tp_cluster_files,
+            "tpsf": tp_scanner_files,
+            "tptf": tp_thread_files,
         }
+        # Optionally include scanner/thread counts if schema has config_id or we write them directly
+        # (benchmarks links to configurations for scanner_count/thread_count, so we store them as notes here)
         with engine.connect() as conn:
             try:
                 has_sid = bool(conn.execute(text(
