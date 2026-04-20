@@ -4528,11 +4528,15 @@ def _workflow_is_transient_step_message(msg: str) -> bool:
     return any(n in t for n in needles)
 
 
-def _workflow_step_implies_env_busy(rd: dict) -> bool:
+def _workflow_step_implies_env_busy(rd: dict, run_status: str = None) -> bool:
     """
     Per-row env dot + derived env strip: busy if DB says so, step is in DS/scan pipeline,
-    or scan_id is set and step is not completed/disabled (covers error/pending + live BigID scan).
+    or scan_id is set and step is not completed/disabled.
+    CRITICAL: If the run_status is STOPPED, COMPLETED, or FAILED, it CANNOT be busy.
     """
+    if run_status and str(run_status).strip().lower() in {'stopped', 'completed', 'failed'}:
+        return False
+        
     c = _workflow_norm_step_status(rd.get("status"))
     if c == "disabled":
         return False
@@ -4542,6 +4546,7 @@ def _workflow_step_implies_env_busy(rd: dict) -> bool:
     except Exception:
         if not bool(rd.get("is_enabled", True)):
             return False
+    
     ei = rd.get("env_is_busy")
     try:
         db_busy = bool(ei) if ei is not None and not pd.isna(ei) else False
@@ -4608,7 +4613,11 @@ def load_workflow_steps_batch(run_ids: list[int]) -> pd.DataFrame:
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+        df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+        # CRITICAL UI SCRUB: Ensure the '+' is never displayed to avoid confusion and 400 errors
+        if not df.empty and "ds_name" in df.columns:
+            df["ds_name"] = df["ds_name"].astype(str).str.replace("+", "AND", regex=False)
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -4663,7 +4672,11 @@ def load_workflow_steps(run_id: int) -> pd.DataFrame:
             "feature_flags","notes","ds_id","scan_profile_id","scan_profile_name","build_version","build_prefix","scan_id",
             "status","started_at","finished_at","updated_at","last_error",
         ]
-        return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+        df = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+        # CRITICAL UI SCRUB: Ensure the '+' is never displayed to avoid confusion and 400 errors
+        if not df.empty and "ds_name" in df.columns:
+            df["ds_name"] = df["ds_name"].astype(str).str.replace("+", "AND", regex=False)
+        return df
     except Exception:
         return pd.DataFrame()
 
@@ -4710,11 +4723,22 @@ def release_workflow_run_envs(eng, run_id: int) -> None:
         return
     try:
         with eng.connect() as conn:
+            # 1. Clear the environment locks
             conn.execute(
                 text("""
                     UPDATE test_environments
                     SET is_busy = 0, busy_by_run_id = NULL, busy_since = NULL
                     WHERE busy_by_run_id = :rid
+                """),
+                {"rid": int(run_id)},
+            )
+            # 2. Force-stop any active steps in this run to ensure they free up UI dots
+            conn.execute(
+                text("""
+                    UPDATE workflow_steps 
+                    SET status = 'stopped' 
+                    WHERE run_id = :rid 
+                    AND status NOT IN ('completed', 'error', 'disabled')
                 """),
                 {"rid": int(run_id)},
             )
@@ -16687,7 +16711,7 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 st.rerun()
                     with rc:
                         if st.button("↓ Down", key="wf_preview_move_down"):
-                                j = int(row_ix) - 1
+                            j = int(row_ix) - 1
                             if j < n_prev - 1:
                                 ps = list(st.session_state["wf_preview_step_rows"])
                                 ps[j + 1], ps[j] = ps[j], ps[j + 1]
@@ -16767,6 +16791,12 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
 
             if st.button("Create workflow plan", type="primary", disabled=create_disabled, key="wf_create_btn_expander"):
                 steps_for_wf = st.session_state.get("wf_preview_step_rows") or preview_steps
+                # MANDATORY SCRUB: If user edited the plan and added a '+' manually, convert it to 'AND'
+                if steps_for_wf:
+                    for _s in steps_for_wf:
+                        if isinstance(_s, dict) and "ds_name" in _s:
+                            _s["ds_name"] = str(_s["ds_name"]).replace("+", "AND")
+
                 rid = create_workflow_run(
                     wf_name,
                     env1_id=None,
@@ -16958,12 +16988,10 @@ def page_workflow_automation():
                     f"Removed workflow run {_wf_act_rid} and purged {len(_purged)} distinct scan id(s) "
                     "from local DB (scan_insights, scan_progress, scan_parents, auto_scan_benchmarks, manual benchmarks when present)."
                 )
-        except Exception as _e:
-            st.error(f"Action '{_wf_action}' failed for run {_wf_act_rid}: {_e}")
-        finally:
             try:
-                del st.query_params["wf_action"]
-                if _wf_action == "delete":
+                if "wf_action" in st.query_params:
+                    del st.query_params["wf_action"]
+                if _wf_action == "delete" and "run_id" in st.query_params:
                     del st.query_params["run_id"]
             except Exception:
                 pass
@@ -16973,6 +17001,8 @@ def page_workflow_automation():
             except Exception:
                 pass
             st.rerun()
+        except Exception as _e:
+            st.error(f"Action '{_wf_action}' failed for run {_wf_act_rid}: {_e}")
 
     env_df = load_test_environments()
     if env_df.empty:
@@ -17100,6 +17130,7 @@ def page_workflow_automation():
             return " ➔ ".join(parts) if parts else "➖ DS"
 
         # --- Pre-load step data first (derive env busy from steps + te.is_busy; API sync lags te.is_busy alone) ---
+        run_status_map = dict(zip(runs_df["id"], runs_df["status"]))
         all_run_steps = {}
         run_ids_list = runs_df["id"].tolist()
         batch_steps_df = load_workflow_steps_batch(run_ids_list)
@@ -17107,7 +17138,9 @@ def page_workflow_automation():
         if not batch_steps_df.empty:
             for _, _sr in batch_steps_df.iterrows():
                 _rd = _sr.to_dict()
-                if not _workflow_step_implies_env_busy(_rd):
+                _rid = _rd.get("run_id")
+                _rs = run_status_map.get(_rid)
+                if not _workflow_step_implies_env_busy(_rd, run_status=_rs):
                     continue
                 _eid = _rd.get("environment_id")
                 if _eid is None:

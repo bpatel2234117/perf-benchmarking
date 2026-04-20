@@ -3244,7 +3244,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     # Ensure we don't accumulate duplicate workflow suffixes on retries.
     _wf_suffix = f"(wf {run_id}-{seq})"
     base_with_prefix_clean = re.sub(r"(?:\s*\(wf\s+\d+\-\d+\)\s*)+$", "", str(base_with_prefix or '').strip()).strip()
-    desired_ds_name = f"{base_with_prefix_clean} {_wf_suffix}".strip()
+    # CRITICAL FIX: Mandatory scrub of '+' to satisfy BigID alphanumeric validation (400 Bad Request)
+    desired_ds_name = f"{base_with_prefix_clean} {_wf_suffix}".strip().replace("+", "AND")
     try:
         logger.info('desired_ds_name step=%s ds_name=%s', seq, desired_ds_name)
     except Exception:
