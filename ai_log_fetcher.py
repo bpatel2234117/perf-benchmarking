@@ -251,20 +251,19 @@ def write_heartbeat(engine, status="ok", message=""):
 
 def get_active_environments(engine):
     query = """
-        SELECT DISTINCT t.id, t.env_name, t.base_url 
+        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at
         FROM test_environments t
         JOIN scan_parents sp ON sp.environment_id = t.id
         WHERE t.is_active = 1 
           AND (
               LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
-                  'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled'
+                  'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled', 'paused', 'pause'
               )
-              OR sp.updated_at > DATE_SUB(NOW(), INTERVAL 24 HOUR)
           )
     """
     with engine.connect() as conn:
         result = conn.execute(text(query)).fetchall()
-        return [{"id": row[0], "env_name": row[1], "base_url": row[2]} for row in result]
+        return [{"id": row[0], "env_name": row[1], "base_url": row[2], "active_scan_id": row[3], "scan_start_time": row[4]} for row in result]
 
 def fetch_logs(base_url, token, num_lines, log_source="scanner"):
     url = f"{base_url.rstrip('/')}/api/v1/logs/{log_source}?len={num_lines}"
@@ -362,6 +361,25 @@ def _line_passes_error_level_gate(line: str) -> bool:
     return bool(re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I))
 
 
+import hashlib
+
+def _parse_log_timestamp(line: str) -> Optional[datetime]:
+    """
+    Parses BigID log timestamps: [2026-04-15 17:27:04.729Z] or [2026-04-20 10:08:26]
+    Returns a UTC datetime object or None.
+    """
+    match = re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\]', line)
+    if not match:
+        return None
+    ts_str = match.group(1).replace('T', ' ').replace('Z', '')
+    try:
+        # Normalize to avoid fractional second matching issues
+        if '.' in ts_str:
+            ts_str = ts_str.split('.')[0]
+        return datetime.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+    except Exception:
+        return None
+
 def detect_errors_in_logs(log_text):
     """
     Structural-aware log analysis.
@@ -422,9 +440,16 @@ def detect_errors_in_logs(log_text):
             if end == i + 1:
                 end = min(len(lines), i + 4)
             
-            ctx_lines = lines[start:end]
             ctx_text = "\n".join(ctx_lines)
             
+            # Extract timestamp from the trigger line or context
+            log_ts = _parse_log_timestamp(line)
+            if not log_ts:
+                # Fallback: check first line of context
+                for cl in ctx_lines:
+                    log_ts = _parse_log_timestamp(cl)
+                    if log_ts: break
+
             # Deduplicate within this fetch cycle
             if _looks_like_success_scan_summary(ctx_text):
                 i = end
@@ -437,7 +462,13 @@ def detect_errors_in_logs(log_text):
             
             if fingerprint not in seen_fingerprints:
                 seen_fingerprints.add(fingerprint)
-                error_contexts.append(ctx_text)
+                # Calculate hash for DB deduplication (stable across fetches)
+                error_hash = hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
+                error_contexts.append({
+                    "text": ctx_text,
+                    "timestamp": log_ts,
+                    "hash": error_hash
+                })
                 
             i = end # Advance cursor
         else:
@@ -569,8 +600,12 @@ Provide a high-level, technical correlation report.
     except Exception as e:
         return f"Correlation Analysis failed: {e}"
 
-def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash=None):
+def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash=None, actual_log_ts=None):
     with engine.connect() as conn:
+        ts_to_store = actual_log_ts if actual_log_ts else datetime.utcnow()
+        if isinstance(ts_to_store, datetime):
+            ts_to_store = ts_to_store.strftime('%Y-%m-%d %H:%M:%S')
+
         conn.execute(
             text("""
                 INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
@@ -578,7 +613,7 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
             """),
             {
                 "eid": env_id,
-                "lt": datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                "lt": ts_to_store,
                 "ctx": error_context,
                 "ai": ai_analysis,
                 "ls": log_source,
@@ -628,29 +663,50 @@ def run_once(engine):
                         if not logs: continue
                         
                         errors = detect_errors_in_logs(logs)
-                        for ctx in errors:
-                            # 60 min deduplication
+                        for err_obj in errors:
+                            ctx = err_obj["text"]
+                            log_ts = err_obj["timestamp"] or datetime.utcnow()
+                            err_hash = err_obj["hash"]
+                            
+                            # CRITICAL FIX 1: Age Gate (Post-Scan Start Time Only)
+                            scan_start = env.get("scan_start_time")
+                            if scan_start and log_ts < scan_start:
+                                # This is a stale log from April 15th or previous run. SKIP.
+                                continue
+
+                            # CRITICAL FIX 2: Global Deduplication (Hash-based)
                             with engine.connect() as conn:
+                                # We check hash AND recently (within 24h) to allow same error in future scans, 
+                                # but ignore "bursts" of same error in current scan.
                                 existing = conn.execute(
                                     text("""
                                         SELECT id FROM scan_log_errors 
                                         WHERE environment_id = :eid 
-                                          AND error_context = :ctx 
-                                          AND log_timestamp > DATE_SUB(NOW(), INTERVAL 60 MINUTE)
+                                          AND error_hash = :hash 
+                                          AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)
                                         LIMIT 1
                                     """),
-                                    {"eid": env_id, "ctx": ctx}
+                                    {"eid": env_id, "hash": err_hash}
                                 ).fetchone()
                             if existing: continue
                             
                             parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
                             ai_analysis = call_ai_analyzer(ctx, log_source)
-                            store_error_analysis(engine, env_id, ctx, ai_analysis, log_source, parsed_scan_id, parsed_subscan_id)
                             
-                            if parsed_scan_id:
-                                if parsed_scan_id not in new_errors_by_scan:
-                                    new_errors_by_scan[parsed_scan_id] = []
-                                new_errors_by_scan[parsed_scan_id].append((log_source, ctx, parsed_scan_id))
+                            # CRITICAL FIX 3: Store REAL log timestamp
+                            store_error_analysis(
+                                engine, env_id, ctx, ai_analysis, log_source, 
+                                parsed_scan_id or env.get("active_scan_id"), 
+                                parsed_subscan_id, 
+                                error_hash=err_hash,
+                                actual_log_ts=log_ts
+                            )
+                            
+                            p_sid = parsed_scan_id or env.get("active_scan_id")
+                            if p_sid:
+                                if p_sid not in new_errors_by_scan:
+                                    new_errors_by_scan[p_sid] = []
+                                new_errors_by_scan[p_sid].append((log_source, ctx, p_sid))
 
                     except Exception as source_err:
                         print(f"[{datetime.now().isoformat()}] [{env_name}] Error processing source {log_source}: {source_err}")

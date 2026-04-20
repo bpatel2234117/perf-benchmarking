@@ -16495,9 +16495,16 @@ def page_scan_progress():
                                     st.error("Cannot resolve environment URL to fetch logs.")
                                 else:
                                     token = Get_auth_token(env_row["base_url"], env_row)
-                                    # Expanded sources including orch2 where the socket hang up error lives
-                                    sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "web", "aci"]
+                                    # Use ALL configured log sources - not a hardcoded list
+                                    try:
+                                        from ai_log_fetcher import load_enabled_log_sources as _load_sources
+                                        sources = _load_sources(engine)
+                                    except Exception:
+                                        sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "aci"]
+                                    
+                                    import hashlib as _hashlib
                                     new_found = 0
+                                    scan_start_gate = db_started_at  # Only keep logs >= scan start
                                     for src in sources:
                                         url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len=3000"
                                         resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=30)
@@ -16506,17 +16513,43 @@ def page_scan_progress():
                                             if log_text:
                                                 found_errors = _detect_log_errors_structural(str(log_text))
                                                 for ctx in found_errors:
-                                                    # Dedupe (1 hour)
+                                                    # GATE: Extract real log timestamp and skip pre-scan-start logs
+                                                    import re as _re
+                                                    ts_match = _re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(ctx))
+                                                    if ts_match and scan_start_gate:
+                                                        try:
+                                                            from datetime import datetime as _dt
+                                                            log_ts_str = ts_match.group(1).replace('T', ' ')
+                                                            log_ts = _dt.strptime(log_ts_str[:19], '%Y-%m-%d %H:%M:%S')
+                                                            scan_start_dt = _dt.strptime(str(scan_start_gate)[:19], '%Y-%m-%d %H:%M:%S')
+                                                            if log_ts < scan_start_dt:
+                                                                continue  # Skip stale log
+                                                            actual_ts = log_ts.strftime('%Y-%m-%d %H:%M:%S')
+                                                        except Exception:
+                                                            actual_ts = None
+                                                    else:
+                                                        actual_ts = None
+
+                                                    # Hash-based dedup (match background fetcher behavior)
+                                                    fp_text = _re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', str(ctx))
+                                                    err_hash = _hashlib.md5(fp_text[:300].encode('utf-8')).hexdigest()
                                                     with engine.connect() as conn:
-                                                        exist = conn.execute(text("SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_context=:ctx AND log_timestamp > DATE_SUB(NOW(), INTERVAL 60 MINUTE)"), {"eid": env_id, "ctx": ctx}).fetchone()
+                                                        exist = conn.execute(text(
+                                                            "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:hash AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                                                        ), {"eid": env_id, "hash": err_hash}).fetchone()
                                                         if exist: continue
                                                         
                                                         psid, pssid = _extract_ids_from_log_ctx(ctx)
                                                         ai_ans = _call_ollama_for_error(ctx, src)
                                                         conn.execute(text("""
-                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id)
-                                                            VALUES (:eid, NOW(), :ctx, :ai, :src, :sid, :ssid)
-                                                        """), {"eid": env_id, "ctx": ctx, "ai": ai_ans, "src": src, "sid": psid or scan_id, "ssid": pssid})
+                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
+                                                            VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
+                                                        """), {
+                                                            "eid": env_id,
+                                                            "ts": actual_ts or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                                                            "ctx": ctx, "ai": ai_ans, "src": src,
+                                                            "sid": psid or scan_id, "ssid": pssid, "hash": err_hash
+                                                        })
                                                         conn.commit()
                                                         new_found += 1
                                     st.success(f"Log fetch complete. Found/Analyzed {new_found} new error signatures.")
