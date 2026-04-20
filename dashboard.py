@@ -16701,21 +16701,15 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                     _stp["is_enabled"] = True
                             st.rerun()
 
-                    # Master Toggle logic
-                    ps_all = list(st.session_state["wf_preview_step_rows"])
+                    def _on_master_toggle():
+                        toggle_val = st.session_state.get("wf_master_toggle_checkbox")
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        for p in ps: p["is_enabled"] = toggle_val
+                        st.session_state["wf_preview_step_rows"] = ps
+
+                    ps_all = st.session_state["wf_preview_step_rows"]
                     all_enabled = all(bool(p.get("is_enabled", True)) for p in ps_all)
-                    
-                    st.write("") # Spacer
-                    if st.checkbox("✅ Select / Unselect All Steps", value=all_enabled, key="wf_master_toggle_checkbox"):
-                        if not all_enabled:
-                            for p in ps_all: p["is_enabled"] = True
-                            st.session_state["wf_preview_step_rows"] = ps_all
-                            st.rerun()
-                    else:
-                        if all_enabled:
-                            for p in ps_all: p["is_enabled"] = False
-                            st.session_state["wf_preview_step_rows"] = ps_all
-                            st.rerun()
+                    st.checkbox("✅ Select / Unselect All Steps", value=all_enabled, key="wf_master_toggle_checkbox", on_change=_on_master_toggle)
 
                 preview_steps = st.session_state["wf_preview_step_rows"]
                 prev_df = pd.DataFrame(preview_steps)
@@ -16734,11 +16728,23 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                     "status",
                 ]
                 show_cols = [c for c in show_cols if c in prev_df.columns]
+                def _on_editor_change():
+                    # Captures the very first click on a checkbox
+                    ed_state = st.session_state.get("wf_preview_steps_editor_new_expander")
+                    if ed_state and "edited_rows" in ed_state:
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        for idx_str, changes in ed_state["edited_rows"].items():
+                            idx = int(idx_str)
+                            if idx < len(ps) and "is_enabled" in changes:
+                                ps[idx]["is_enabled"] = bool(changes["is_enabled"])
+                        st.session_state["wf_preview_step_rows"] = ps
+
                 editable_df = st.data_editor(
                     prev_df[show_cols],
                     width="stretch",
                     hide_index=True,
                     key="wf_preview_steps_editor_new_expander",
+                    on_change=_on_editor_change,
                     column_config={
                         "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
                     },
@@ -16934,10 +16940,12 @@ def page_workflow_automation():
                 set_workflow_run_status(_wf_act_rid, "running")
             elif _wf_action == "stop":
                 set_workflow_run_status(_wf_act_rid, "stopped")
-                release_workflow_run_envs(engine, _wf_act_rid)
+                # Nuclear Release: mark steps stopped so they free up Env Dots immediately
                 with engine.connect() as conn:
+                    conn.execute(text("UPDATE workflow_steps SET status='stopped' WHERE run_id=:rid AND status NOT IN ('completed', 'error', 'disabled')"), {"rid": _wf_act_rid})
                     conn.execute(text("UPDATE workflow_runs SET finished_at=COALESCE(finished_at,CURRENT_TIMESTAMP) WHERE id=:rid"), {"rid": _wf_act_rid})
                     conn.commit()
+                release_workflow_run_envs(engine, _wf_act_rid)
             elif _wf_action == "reconcile":
                 res = reconcile_workflow_run(_wf_act_rid)
                 st.session_state["wf_reconcile_flash"] = (
