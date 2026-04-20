@@ -2692,6 +2692,11 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if _compact(scan_status) in {"completed", "completedwithfailures"}:
                         set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
                         completed_success_any = True
+                        # Auto-save benchmark when scan completes/completes-with-failures through workflow
+                        try:
+                            _auto_save_benchmark_from_step(engine, step_id, sid, run_id)
+                        except Exception:
+                            pass
                     else:
                         set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
                         set_run_error(engine, run_id, f"Step {seq}: scan ended in state {scan_status}")
@@ -3005,6 +3010,147 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             pass
 
     return did_any_work
+
+
+def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: int) -> None:
+    """
+    Called when a workflow step scan reaches Completed / CompletedWithFailures.
+    Pulls scan_parents + scan_progress + scan_insights data and inserts a
+    benchmark row only if one does not already exist for this scan_id.
+    """
+    if not scan_id or not scan_id.strip():
+        return
+    scan_id = scan_id.strip()
+    try:
+        # Guard: skip if already saved
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT id FROM benchmarks WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if exists:
+            print(f"[AUTO-BENCHMARK] scan_id={scan_id} already saved (id={exists[0]}), skipping.", flush=True)
+            return
+
+        # Pull step metadata
+        with engine.connect() as conn:
+            step_row = conn.execute(
+                text("""
+                    SELECT ds_kind, ds_name, file_set_type, feature_flags, build_version
+                    FROM workflow_steps WHERE id = :sid LIMIT 1
+                """),
+                {"sid": step_id},
+            ).fetchone()
+        if not step_row:
+            return
+        ds_kind       = str(step_row[0] or "").strip()
+        ds_name       = str(step_row[1] or "").strip()
+        file_set_type = str(step_row[2] or "").strip() or None
+        build_version = str(step_row[4] or "").strip() or "unknown"
+
+        # Pull scan timing from scan_parents
+        with engine.connect() as conn:
+            sp_row = conn.execute(
+                text("SELECT started_at, last_seen_at FROM scan_parents WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if not sp_row or not sp_row[0] or not sp_row[1]:
+            return
+        scan_start = sp_row[0]
+        scan_end   = sp_row[1]
+        try:
+            scan_duration_h = max(0.001, (scan_end - scan_start).total_seconds() / 3600)
+        except Exception:
+            scan_duration_h = 0.001
+
+        # Pull classification metrics from scan_insights
+        total_classification = None
+        with engine.connect() as conn:
+            si_row = conn.execute(
+                text("SELECT total_classification FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if si_row:
+            total_classification = si_row[0]
+
+        # Pull peak object count from scan_progress
+        objects_scanned = 0
+        with engine.connect() as conn:
+            pr_row = conn.execute(
+                text("SELECT MAX(CAST(COALESCE(objects_scanned, 0) AS SIGNED)) FROM scan_progress WHERE scan_id = :sid"),
+                {"sid": scan_id},
+            ).fetchone()
+        if pr_row and pr_row[0]:
+            try:
+                objects_scanned = int(pr_row[0])
+            except Exception:
+                pass
+
+        # Get or create build record
+        with engine.connect() as conn:
+            b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()
+            if b_row:
+                b_id = int(b_row[0])
+            else:
+                conn.execute(text("INSERT INTO builds (version) VALUES (:v)"), {"v": build_version})
+                conn.commit()
+                b_id = int(conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()[0])
+
+        tp_cluster_files = objects_scanned / scan_duration_h
+
+        # Build INSERT dynamically based on schema
+        cols = [
+            "build_id", "run_date", "scenario_type", "data_source_type", "file_set_type",
+            "total_files", "scan_start_time", "scan_end_time",
+            "total_scan_hours", "throughput_cluster_files_hr",
+        ]
+        vals = [":b_id", "CURRENT_DATE", ":scenario", ":dst", ":fstype",
+                ":tf", ":ss", ":se", ":tsh", ":tpcf"]
+        params: Dict[str, Any] = {
+            "b_id": b_id,
+            "scenario": ds_name or ds_kind or "Workflow Auto",
+            "dst": ds_kind or None,
+            "fstype": file_set_type,
+            "tf": objects_scanned,
+            "ss": scan_start,
+            "se": scan_end,
+            "tsh": scan_duration_h,
+            "tpcf": tp_cluster_files,
+        }
+        with engine.connect() as conn:
+            try:
+                has_sid = bool(conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='benchmarks' AND column_name='scan_id' LIMIT 1"
+                )).fetchone())
+            except Exception:
+                has_sid = False
+            if has_sid:
+                cols.append("scan_id")
+                vals.append(":sid")
+                params["sid"] = scan_id
+
+            try:
+                has_cls = bool(conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='benchmarks' AND column_name='total_classification' LIMIT 1"
+                )).fetchone())
+            except Exception:
+                has_cls = False
+            if has_cls and total_classification is not None:
+                cols.append("total_classification")
+                vals.append(":tclass")
+                params["tclass"] = total_classification
+
+            conn.execute(
+                text(f"INSERT INTO benchmarks ({', '.join(cols)}) VALUES ({', '.join(vals)})"),
+                params,
+            )
+            conn.commit()
+
+        print(f"[AUTO-BENCHMARK] Saved scan_id={scan_id} build={build_version} run_id={run_id}", flush=True)
+    except Exception as ex:
+        print(f"[AUTO-BENCHMARK] Failed for scan_id={scan_id}: {ex}", flush=True)
 
 
 def _maybe_mark_run_completed(engine, run_id: int) -> None:

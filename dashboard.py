@@ -8795,6 +8795,22 @@ def page_add_benchmark():
                         except Exception:
                             pass
 
+                    # --- Duplicate Guard: check if this scan_id is already saved ---
+                    if scan_prefill_id:
+                        try:
+                            dup_row = conn.execute(
+                                text("SELECT id FROM benchmarks WHERE scan_id = :sid LIMIT 1"),
+                                {"sid": str(scan_prefill_id).strip()},
+                            ).fetchone()
+                            if dup_row:
+                                st.info(
+                                    f"ℹ️ Benchmark for scan `{scan_prefill_id}` is already saved "
+                                    f"(benchmark id={dup_row[0]}). No duplicate created."
+                                )
+                                return
+                        except Exception:
+                            pass  # scan_id column may not exist; proceed normally
+
                     ins_bench = text(f"""
                         INSERT INTO benchmarks 
                         ({', '.join(cols_list)})
