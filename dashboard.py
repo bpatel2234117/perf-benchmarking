@@ -16694,6 +16694,18 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 if isinstance(_stp, dict) and "is_enabled" not in _stp:
                                     _stp["is_enabled"] = True
                             st.rerun()
+                    
+                    c_all1, c_all2, _ = st.columns([1, 1, 3])
+                    if c_all1.button("✅ Select All", key="wf_preview_select_all"):
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        for p in ps: p["is_enabled"] = True
+                        st.session_state["wf_preview_step_rows"] = ps
+                        st.rerun()
+                    if c_all2.button("⬛ Unselect All", key="wf_preview_unselect_all"):
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        for p in ps: p["is_enabled"] = False
+                        st.session_state["wf_preview_step_rows"] = ps
+                        st.rerun()
 
                 preview_steps = st.session_state["wf_preview_step_rows"]
                 prev_df = pd.DataFrame(preview_steps)
@@ -16723,12 +16735,16 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                     disabled=[c for c in show_cols if c != "is_enabled"],
                 )
                 try:
-                    edited = editable_df.to_dict("records")
-                    ps = list(st.session_state["wf_preview_step_rows"])
-                    for i, row in enumerate(edited):
-                        if i < len(ps) and isinstance(row, dict) and "is_enabled" in row:
-                            ps[i]["is_enabled"] = bool(row["is_enabled"])
-                    st.session_state["wf_preview_step_rows"] = ps
+                    # Sync editor changes back to session state immediately
+                    if "wf_preview_steps_editor_new_expander" in st.session_state:
+                        ed_state = st.session_state["wf_preview_steps_editor_new_expander"]
+                        if ed_state and "edited_rows" in ed_state:
+                            ps = list(st.session_state["wf_preview_step_rows"])
+                            for idx_str, changes in ed_state["edited_rows"].items():
+                                idx = int(idx_str)
+                                if idx < len(ps) and "is_enabled" in changes:
+                                    ps[idx]["is_enabled"] = bool(changes["is_enabled"])
+                            st.session_state["wf_preview_step_rows"] = ps
                 except Exception:
                     pass
                 preview_steps = st.session_state.get("wf_preview_step_rows") or preview_steps
@@ -16787,12 +16803,34 @@ def render_workflow_step_editor(run_id, selected_status):
                 active_envs, env_map = [], {}
 
             view = edit_df[show_cols].rename(columns={"seq": "Step", "environment": "Env", "ds_kind": "DS Type", "ds_name": "DS Name", "file_set_type": "File Set", "status": "Step Status"})
-            editor = st.data_editor(view, width="stretch", hide_index=True, key=f"wf_edit_steps_{run_id}",
+            editor_key = f"wf_edit_steps_{run_id}"
+            editor = st.data_editor(view, width="stretch", hide_index=True, key=editor_key,
                 column_config={
                     "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
                     "Env": st.column_config.SelectboxColumn("Env", options=active_envs, required=False),
                 },
                 disabled=[c for c in view.columns if c not in ("is_enabled", "Env")])
+
+            try:
+                # Sync editor changes back to view dataframe immediately to avoid double-click issues
+                if editor_key in st.session_state:
+                    ed_state = st.session_state[editor_key]
+                    if ed_state and "edited_rows" in ed_state:
+                        # We apply these to the buttons below if they hit 'Save'
+                        pass
+            except Exception: pass
+
+            row1, row2, row3 = st.columns([1, 1, 3])
+            if row1.button("✅ Select All", key=f"wf_bulk_enable_{run_id}"):
+                with engine.connect() as conn:
+                    conn.execute(text("UPDATE workflow_steps SET is_enabled=1, status=CASE WHEN status='disabled' THEN 'pending' ELSE status END WHERE run_id=:rid AND status <> 'completed'"), {"rid": int(run_id)})
+                    conn.commit()
+                st.rerun()
+            if row2.button("⬛ Unselect All", key=f"wf_bulk_disable_{run_id}"):
+                with engine.connect() as conn:
+                    conn.execute(text("UPDATE workflow_steps SET is_enabled=0, status='disabled' WHERE run_id=:rid AND status <> 'completed'"), {"rid": int(run_id)})
+                    conn.commit()
+                st.rerun()
             
             if st.button("Save step modifications", type="primary", key=f"wf_save_steps_{run_id}"):
                 try:
@@ -17075,10 +17113,12 @@ def page_workflow_automation():
             for er in env_busy_rows or []:
                 name = str(er[1] or "").strip() or f"id={er[0]}"
                 db_flag = bool(er[2]) if er[2] is not None else False
-                try:
+                eid_int = None
+                try: 
                     eid_int = int(er[0])
-                except Exception:
-                    eid_int = None
+                except Exception: pass
+
+                # Unify logic: Busy if DB flag OR derived from active steps
                 busy = db_flag or (eid_int is not None and eid_int in derived_busy_env_ids)
                 env_status_parts.append(f"{'🔴' if busy else '🟢'} {html.escape(name)} ({'busy' if busy else 'free'})")
         except Exception:

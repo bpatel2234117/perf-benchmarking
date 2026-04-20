@@ -2879,11 +2879,17 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             try:
                 with engine.connect() as conn:
                     any_left = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid {where_status} LIMIT 1"), {"rid": run_id}).fetchone()
-                if not any_left:
-                    with engine.connect() as conn:
-                        conn.execute(text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id})
-                        conn.commit()
-                    did_any_work = True
+                    if not any_left:
+                        with engine.connect() as conn:
+                            # Re-verify one last time before closing
+                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, 1) = 1 LIMIT 1"), {"rid": run_id}).fetchone()
+                            if not any_active:
+                                # Mark as failed if ANY enabled step hit an error, otherwise completed
+                                has_err = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,1)=1 LIMIT 1"), {"rid": run_id}).fetchone()
+                                final_s = 'failed' if has_err else 'completed'
+                                conn.execute(text("UPDATE workflow_runs SET status=:s, finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id, "s": final_s})
+                                conn.commit()
+                        did_any_work = True
             except Exception:
                 pass
             continue
