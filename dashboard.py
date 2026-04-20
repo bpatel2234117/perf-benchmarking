@@ -1236,12 +1236,12 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Large Files", ols=True, notes="SMB Large Files WITH OLS"),
         _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
         _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
-        _stp("s3", "Small Files", acl=True, ols=True, notes="S3 Small Files WITH ACL + OLS"),
-        _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL + OLS"),
-        _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL + OLS"),
-        _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL + OLS"),
-        _stp("onedrive-v2", "Small Files", acl=True, ols=True, notes="OneDrive Small Files WITH ACL + OLS"),
-        _stp("sharepoint-online-v2", "Small Files", acl=True, ols=True, notes="SharePoint Online Small Files WITH ACL + OLS"),
+        _stp("s3", "Small Files", acl=True, ols=True, notes="S3 Small Files WITH ACL AND OLS"),
+        _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL AND OLS"),
+        _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL AND OLS"),
+        _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL AND OLS"),
+        _stp("onedrive-v2", "Small Files", acl=True, ols=True, notes="OneDrive Small Files WITH ACL AND OLS"),
+        _stp("sharepoint-online-v2", "Small Files", acl=True, ols=True, notes="SharePoint Online Small Files WITH ACL AND OLS"),
     ]
 
 
@@ -1339,6 +1339,12 @@ def load_workflow_default_step_catalog() -> List[Dict[str, Any]]:
         for item in payload:
             if not isinstance(item, dict):
                 continue
+            # CRITICAL FIX: Scrub '+' from DS Name and Notes to avoid BigID API validation errors (400 Bad Request)
+            if "ds_name" in item and "+" in str(item["ds_name"]):
+                item["ds_name"] = str(item["ds_name"]).replace("+", "AND")
+            if "notes" in item and "+" in str(item["notes"]):
+                item["notes"] = str(item["notes"]).replace("+", "AND")
+                
             norm = _normalize_workflow_default_step_row(item)
             if str(norm.get("ds_kind") or "").strip():
                 normalized.append(norm)
@@ -16681,7 +16687,7 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 st.rerun()
                     with rc:
                         if st.button("↓ Down", key="wf_preview_move_down"):
-                            j = int(row_ix) - 1
+                                j = int(row_ix) - 1
                             if j < n_prev - 1:
                                 ps = list(st.session_state["wf_preview_step_rows"])
                                 ps[j + 1], ps[j] = ps[j], ps[j + 1]
@@ -16694,18 +16700,22 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 if isinstance(_stp, dict) and "is_enabled" not in _stp:
                                     _stp["is_enabled"] = True
                             st.rerun()
+
+                    # Master Toggle logic
+                    ps_all = list(st.session_state["wf_preview_step_rows"])
+                    all_enabled = all(bool(p.get("is_enabled", True)) for p in ps_all)
                     
-                    c_all1, c_all2, _ = st.columns([1, 1, 3])
-                    if c_all1.button("✅ Select All", key="wf_preview_select_all"):
-                        ps = list(st.session_state["wf_preview_step_rows"])
-                        for p in ps: p["is_enabled"] = True
-                        st.session_state["wf_preview_step_rows"] = ps
-                        st.rerun()
-                    if c_all2.button("⬛ Unselect All", key="wf_preview_unselect_all"):
-                        ps = list(st.session_state["wf_preview_step_rows"])
-                        for p in ps: p["is_enabled"] = False
-                        st.session_state["wf_preview_step_rows"] = ps
-                        st.rerun()
+                    st.write("") # Spacer
+                    if st.checkbox("✅ Select / Unselect All Steps", value=all_enabled, key="wf_master_toggle_checkbox"):
+                        if not all_enabled:
+                            for p in ps_all: p["is_enabled"] = True
+                            st.session_state["wf_preview_step_rows"] = ps_all
+                            st.rerun()
+                    else:
+                        if all_enabled:
+                            for p in ps_all: p["is_enabled"] = False
+                            st.session_state["wf_preview_step_rows"] = ps_all
+                            st.rerun()
 
                 preview_steps = st.session_state["wf_preview_step_rows"]
                 prev_df = pd.DataFrame(preview_steps)
