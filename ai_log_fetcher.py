@@ -5,6 +5,8 @@ import requests
 import json
 import re
 from datetime import datetime, timedelta
+from typing import Optional
+
 from sqlalchemy import create_engine, text
 
 # Force unbuffered output for cleaner logs
@@ -439,7 +441,9 @@ def detect_errors_in_logs(log_text):
             # If no indentation, at least grab a tiny bit of following context
             if end == i + 1:
                 end = min(len(lines), i + 4)
-            
+
+            # Slice includes trigger line (i) and up to 2 lines before (start) through end-1
+            ctx_lines = lines[start:end]
             ctx_text = "\n".join(ctx_lines)
             
             # Extract timestamp from the trigger line or context
