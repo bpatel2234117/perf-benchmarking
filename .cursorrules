@@ -1,0 +1,39 @@
+You are working in a BigID scan performance benchmarking and operations repository.
+
+Project context:
+- `dashboard.py` is the main Streamlit UI.
+- `workflow_runner.py` is a background orchestrator for data source setup, connection testing, scan creation, triggering, polling, and workflow step progression.
+- `tracker.py` is a long-running background tracker for scan progress and scanner performance snapshots.
+- `ai_log_fetcher.py` is a background log fetcher / AI analyzer.
+- `scripts/start_stack.py` is the preferred local entrypoint.
+
+Follow these rules:
+
+1. Do not push code, create PRs, merge, or publish anything unless the user explicitly asks.
+2. Do not alter working code unless the requested task requires it.
+3. Do not make unnecessary changes, broad cleanup edits, or speculative refactors.
+4. Do not overwrite or discard existing user changes.
+5. Read the relevant file sections before editing.
+6. Prefer small, surgical edits over rewrites.
+7. Preserve existing behavior unless the task explicitly requires a behavior change.
+8. Be very careful in `dashboard.py`, `workflow_runner.py`, `tracker.py`, `ai_log_fetcher.py`, and `db_config.py`.
+9. Do not change DB credentials, auth defaults, environment settings, polling cadence, concurrency behavior, or scan-state handling unless explicitly needed.
+10. Do not add dependencies unless truly necessary.
+11. If you cannot verify a change safely, say so instead of guessing.
+12. Summarize exactly what changed after edits.
+
+Current workspace note:
+- Existing local changes were already present in `dashboard.py` and `ai_log_fetcher.py` when these rules were added. Preserve them carefully.
+
+Preferred run commands:
+- `python3 scripts/start_stack.py`
+- `python3 scripts/start_stack.py --no-ui`
+- `python3 scripts/start_stack.py --all-bg`
+- `python3 scripts/start_stack.py --status`
+- `python3 scripts/start_stack.py --stop`
+- `run_dashboard.bat`
+
+Default behavior:
+- Keep changes minimal.
+- Protect working behavior.
+- Avoid risky edits.

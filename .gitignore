@@ -29,3 +29,4 @@ uploaded_media_*.webp
 scanner_ai_*/
 scanner_forensic_output/
 scanner_logs_*/
+*.prof
