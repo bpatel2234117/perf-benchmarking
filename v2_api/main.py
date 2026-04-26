@@ -8,6 +8,12 @@ import os
 import hashlib
 from datetime import datetime, timedelta
 
+import sys
+import os
+
+# Ensure we can import from v2_api and the root project directory
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # Import our normalized Postgres config
 from v2_api.db_config_pg import DB_CONNECTION_STRING
 
