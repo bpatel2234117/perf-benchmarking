@@ -150,3 +150,15 @@ def run_migration():
                             pg_conn.execute(insert_query, mapped_dicts)
                         print(f"  Successfully mapped and migrated {len(rows)} rows to classifier_details_snapshots.")
                         continue
+                        
+                    # Default execution for all other normal tables
+                    pg_conn.execute(insert_query, data_dicts)
+                    print(f"  Successfully migrated {len(rows)} rows to {table}.")
+                    
+                except Exception as e:
+                    print(f"  Error migrating {table}: {e}")
+                    
+    print("\nMigration Complete!")
+
+if __name__ == "__main__":
+    run_migration()
