@@ -36,8 +36,19 @@ body {
 /* Layout */
 .main-content {
   padding: 2rem;
-  max-width: 1400px;
+  width: 96%;
+  max-width: 2560px; /* Allows ultra-wide 29-inch monitors to use screen space */
   margin: 0 auto;
+}
+
+@media (max-width: 1024px) {
+  .main-content {
+    width: 100%;
+    padding: 1rem;
+  }
+  .navbar {
+    padding: 1rem;
+  }
 }
 
 .navbar {
