@@ -29,3 +29,12 @@ uploaded_media_*.webp
 scanner_ai_*/
 scanner_forensic_output/
 scanner_logs_*/
+
+# frontend
+node_modules/
+dist/
+build/
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
