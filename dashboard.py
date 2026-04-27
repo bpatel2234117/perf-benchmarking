@@ -16795,12 +16795,31 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 st.session_state["wf_preview_step_rows"] = ps
                                 st.rerun()
                     with rd:
-                        if st.button("Reset order to default (28-step matrix)", key="wf_preview_reset_order"):
+                        c_rd1, c_rd2 = st.columns(2)
+                        if c_rd1.button("Reset order to default", key="wf_preview_reset_order", use_container_width=True):
                             st.session_state["wf_preview_step_rows"] = _build_default_workflow_steps()
                             for _stp in st.session_state["wf_preview_step_rows"] or []:
                                 if isinstance(_stp, dict) and "is_enabled" not in _stp:
                                     _stp["is_enabled"] = True
                             st.rerun()
+                        
+                        if c_rd2.button("💾 Set as System Default", key="wf_preview_save_as_default", use_container_width=True, help="Saves the current 28-step matrix above as the new system default for all future runs."):
+                            try:
+                                ensure_app_settings_table(engine)
+                                current_steps = st.session_state["wf_preview_step_rows"]
+                                with engine.begin() as conn:
+                                    conn.execute(text("""
+                                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                                        ON DUPLICATE KEY UPDATE 
+                                            setting_value = VALUES(setting_value),
+                                            updated_at = CURRENT_TIMESTAMP
+                                    """), {"val": json.dumps(current_steps)})
+                                st.success("Matrix saved as System Default! The code defaults will no longer be used.")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to save defaults: {e}")
 
                     def _on_master_toggle():
                         toggle_val = st.session_state.get("wf_master_toggle_checkbox")
