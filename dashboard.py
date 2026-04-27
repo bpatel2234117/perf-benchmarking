@@ -19,6 +19,18 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skipping load_dotenv()
+    pass
+
+# UI Defaults from .env
+DEFAULT_SCANNER_COUNT = int(os.getenv("BENCHMARK_STANDARD_SCANNER_COUNT", "5"))
+DEFAULT_THREAD_COUNT = int(os.getenv("BENCHMARK_STANDARD_TOTAL_THREADS", "50"))
+LEGACY_THREAD_COUNT = int(os.getenv("BENCHMARK_LEGACY_INCORRECT_THREAD_TOTAL", "25"))
 
 # db_config may only define DB_CONNECTION_STRING (e.g. on Windows); DB_CONFIG is optional.
 try:
@@ -1224,22 +1236,32 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, notes="SMB Small Files WITH ACL"),
         _stp("s3", "Large Files", acl=True, notes="S3 Large Files WITH ACL"),
         _stp("smb", "Large Files", acl=True, notes="SMB Large Files WITH ACL"),
-        _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
-        _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
-        _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
-        _stp("sharepoint-online-v2", "Small Files", acl=True, notes="SharePoint Online Small Files WITH ACL"),
-        _stp("file-system", "CSV Files", notes="CSV Small Files (Standard)"),
-        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITH STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", notes="CSV Small Files WITHOUT ACL"),
+        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
+        # OLS Setup
+        _stp("action", None, notes="ENABLE OLS FEATURE FLAGS"),
         _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
         _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
         _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
         _stp("smb", "Large Files", ols=True, notes="SMB Large Files WITH OLS"),
-        _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
-        _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
         _stp("s3", "Small Files", acl=True, ols=True, notes="S3 Small Files WITH ACL AND OLS"),
         _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL AND OLS"),
         _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL AND OLS"),
         _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL AND OLS"),
+        # CSV OLS
+        _stp("file-system", "CSV Files", ols=True, notes="CSV Small Files WITHOUT ACL WITH OLS"),
+        _stp("file-system", "CSV Files", sff=True, ols=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, ols=True, notes="CSV Small Files WITH ACL WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, ols=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        # Cloud (End)
+        _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
+        _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
+        _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
+        _stp("sharepoint-online-v2", "Small Files", acl=True, notes="SharePoint Online Small Files WITH ACL"),
+        _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
+        _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
         _stp("onedrive-v2", "Small Files", acl=True, ols=True, notes="OneDrive Small Files WITH ACL AND OLS"),
         _stp("sharepoint-online-v2", "Small Files", acl=True, ols=True, notes="SharePoint Online Small Files WITH ACL AND OLS"),
     ]
@@ -1250,14 +1272,24 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
     fs = str(file_set_type or "").strip()
     if k == "postgres":
         return "Postgres"
+    if k == "action":
+        return "🛠️ Action"
     if k == "mssql":
         return "MSSQL"
     if k == "mysql":
         return "MySQL"
     if k == "file-system" and fs == "CSV Files":
         nm = "CSV Files"
+        if bool(is_acl):
+            nm += " WITH ACL"
+        else:
+            nm += " WITHOUT ACL"
+        
         if bool(is_structured_ff):
-            nm += " Structured"
+            nm += " WITH STRUCTURED DISCOVERY"
+        
+        if bool(is_ols):
+            nm += " WITH OLS"
         return nm
 
     prefix = ""
@@ -1331,6 +1363,16 @@ def load_workflow_default_step_catalog() -> List[Dict[str, Any]]:
                 {"k": "workflow_default_steps"},
             ).fetchone()
         if not row or not row[0]:
+            # Auto-seed the DB if it's empty to make it the source of truth immediately
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+                    """), {"val": json.dumps(fallback)})
+            except Exception:
+                pass
             return fallback
         payload = json.loads(str(row[0]))
         if not isinstance(payload, list):
@@ -8258,13 +8300,13 @@ def page_add_benchmark():
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
     c3, c4, c5, c6 = st.columns(4)
-    scan_count = c3.number_input("Scanner Count", min_value=1, value=5)
+    scan_count = c3.number_input("Scanner Count", min_value=1, value=DEFAULT_SCANNER_COUNT)
     thread_count = c4.number_input(
         "Total threads (all scanners)",
         min_value=1,
-        value=25,
-        help="Per-thread throughput = (cluster throughput) / (this number). "
-        "Example: 5 scanners × 5 threads each → enter 25 (not 5).",
+        value=DEFAULT_THREAD_COUNT,
+        help=f"Per-thread throughput = (cluster throughput) / (this number). "
+        f"Example: {DEFAULT_SCANNER_COUNT} scanners × {DEFAULT_THREAD_COUNT // DEFAULT_SCANNER_COUNT if DEFAULT_SCANNER_COUNT > 0 else 0} threads each → enter {DEFAULT_THREAD_COUNT}."
     )
     
     is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
@@ -16767,18 +16809,40 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 st.session_state["wf_preview_step_rows"] = ps
                                 st.rerun()
                     with rd:
-                        if st.button("Reset order to default (28-step matrix)", key="wf_preview_reset_order"):
+                        c_rd1, c_rd2 = st.columns(2)
+                        if c_rd1.button("Reset order to default", key="wf_preview_reset_order", use_container_width=True):
                             st.session_state["wf_preview_step_rows"] = _build_default_workflow_steps()
                             for _stp in st.session_state["wf_preview_step_rows"] or []:
                                 if isinstance(_stp, dict) and "is_enabled" not in _stp:
                                     _stp["is_enabled"] = True
                             st.rerun()
+                        
+                        if c_rd2.button("💾 Set as System Default", key="wf_preview_save_as_default", use_container_width=True, help="Saves the current 28-step matrix above as the new system default for all future runs."):
+                            try:
+                                ensure_app_settings_table(engine)
+                                current_steps = st.session_state["wf_preview_step_rows"]
+                                with engine.begin() as conn:
+                                    conn.execute(text("""
+                                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                                        ON DUPLICATE KEY UPDATE 
+                                            setting_value = VALUES(setting_value),
+                                            updated_at = CURRENT_TIMESTAMP
+                                    """), {"val": json.dumps(current_steps)})
+                                st.success("Matrix saved as System Default! The code defaults will no longer be used.")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to save defaults: {e}")
 
                     def _on_master_toggle():
                         toggle_val = st.session_state.get("wf_master_toggle_checkbox")
                         ps = list(st.session_state["wf_preview_step_rows"])
                         for p in ps: p["is_enabled"] = toggle_val
                         st.session_state["wf_preview_step_rows"] = ps
+                        # Clear editor state to avoid conflict with master toggle
+                        if "wf_preview_steps_editor_new_expander" in st.session_state:
+                            del st.session_state["wf_preview_steps_editor_new_expander"]
 
                     ps_all = st.session_state["wf_preview_step_rows"]
                     all_enabled = all(bool(p.get("is_enabled", True)) for p in ps_all)
