@@ -1248,6 +1248,11 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL AND OLS"),
         _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL AND OLS"),
         _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL AND OLS"),
+        # CSV OLS
+        _stp("file-system", "CSV Files", ols=True, notes="CSV Small Files WITHOUT ACL WITH OLS"),
+        _stp("file-system", "CSV Files", sff=True, ols=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, ols=True, notes="CSV Small Files WITH ACL WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, ols=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY WITH OLS"),
         # Cloud (End)
         _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
         _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
@@ -1278,7 +1283,9 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
         
         if bool(is_structured_ff):
             nm += " WITH STRUCTURED DISCOVERY"
-        # Optional: could add WITHOUT STRUCTURED DISCOVERY here if they really want it on every row
+        
+        if bool(is_ols):
+            nm += " WITH OLS"
         return nm
 
     prefix = ""
