@@ -13,7 +13,7 @@ const Logs: React.FC<LogsProps> = ({ token }) => {
   const { data: logs, isLoading } = useQuery({
     queryKey: ['logs'],
     queryFn: async () => {
-      const res = await axios.get('http://localhost:8000/api/logs', authConfig);
+      const res = await axios.get('http://localhost:8000/api/logs/errors', authConfig);
       return res.data;
     },
     refetchInterval: 10000 // Poll every 10s

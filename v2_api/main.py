@@ -134,7 +134,8 @@ async def get_benchmarks(token: str = Depends(oauth2_scheme), limit: int = 50):
     with engine.connect() as conn:
         res = conn.execute(text("""
             SELECT b.id, b.run_date, b.scenario_type, b.scan_type, 
-                   t.name as data_source_type, f.name as file_set_type
+                   t.name as data_source_type, f.name as file_set_type,
+                   f.total_files, b.throughput_cluster_files_hr
             FROM benchmarks b
             LEFT JOIN data_source_types t ON b.data_source_type_id = t.id
             LEFT JOIN file_set_types f ON b.file_set_type_id = f.id
@@ -149,7 +150,9 @@ async def get_benchmarks(token: str = Depends(oauth2_scheme), limit: int = 50):
             "scenario_type": r[2],
             "scan_type": r[3],
             "data_source_type": r[4],
-            "file_set_type": r[5]
+            "file_set_type": r[5],
+            "total_files": r[6],
+            "throughput_cluster_files_hr": r[7]
         })
     return benchmarks
 
@@ -158,9 +161,9 @@ class Classifier(BaseModel):
     name: str
 
 class BenchmarkCreate(BaseModel):
-    build_id: int
-    config_id: int
-    classifier_set_id: int
+    build_id: Optional[int] = None
+    config_id: Optional[int] = None
+    classifier_set_id: Optional[int] = None
     scenario_type: str
     scan_type: str
     data_source_type_id: int
