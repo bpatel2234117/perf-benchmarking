@@ -1359,6 +1359,16 @@ def load_workflow_default_step_catalog() -> List[Dict[str, Any]]:
                 {"k": "workflow_default_steps"},
             ).fetchone()
         if not row or not row[0]:
+            # Auto-seed the DB if it's empty to make it the source of truth immediately
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+                    """), {"val": json.dumps(fallback)})
+            except Exception:
+                pass
             return fallback
         payload = json.loads(str(row[0]))
         if not isinstance(payload, list):
