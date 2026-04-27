@@ -8262,9 +8262,9 @@ def page_add_benchmark():
     thread_count = c4.number_input(
         "Total threads (all scanners)",
         min_value=1,
-        value=25,
+        value=50,
         help="Per-thread throughput = (cluster throughput) / (this number). "
-        "Example: 5 scanners × 5 threads each → enter 25 (not 5).",
+        "Example: 5 scanners × 10 threads each → enter 50 (not 10).",
     )
     
     is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
