@@ -19,6 +19,15 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
+
+# UI Defaults from .env
+DEFAULT_SCANNER_COUNT = int(os.getenv("BENCHMARK_STANDARD_SCANNER_COUNT", "5"))
+DEFAULT_THREAD_COUNT = int(os.getenv("BENCHMARK_STANDARD_TOTAL_THREADS", "50"))
+LEGACY_THREAD_COUNT = int(os.getenv("BENCHMARK_LEGACY_INCORRECT_THREAD_TOTAL", "25"))
 
 # db_config may only define DB_CONNECTION_STRING (e.g. on Windows); DB_CONFIG is optional.
 try:
@@ -8258,13 +8267,13 @@ def page_add_benchmark():
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
     c3, c4, c5, c6 = st.columns(4)
-    scan_count = c3.number_input("Scanner Count", min_value=1, value=5)
+    scan_count = c3.number_input("Scanner Count", min_value=1, value=DEFAULT_SCANNER_COUNT)
     thread_count = c4.number_input(
         "Total threads (all scanners)",
         min_value=1,
-        value=50,
-        help="Per-thread throughput = (cluster throughput) / (this number). "
-        "Example: 5 scanners × 10 threads each → enter 50 (not 10).",
+        value=DEFAULT_THREAD_COUNT,
+        help=f"Per-thread throughput = (cluster throughput) / (this number). "
+        f"Example: {DEFAULT_SCANNER_COUNT} scanners × {DEFAULT_THREAD_COUNT // DEFAULT_SCANNER_COUNT if DEFAULT_SCANNER_COUNT > 0 else 0} threads each → enter {DEFAULT_THREAD_COUNT}."
     )
     
     is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
