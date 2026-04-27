@@ -1236,10 +1236,10 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, notes="SMB Small Files WITH ACL"),
         _stp("s3", "Large Files", acl=True, notes="S3 Large Files WITH ACL"),
         _stp("smb", "Large Files", acl=True, notes="SMB Large Files WITH ACL"),
-        _stp("file-system", "CSV Files", notes="CSV Small Files (Standard)"),
-        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITH STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", notes="CSV Small Files WITHOUT ACL"),
+        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
         _stp("file-system", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
-        _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL AND STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
         _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
         _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
         _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
@@ -1271,13 +1271,14 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
         return "MySQL"
     if k == "file-system" and fs == "CSV Files":
         nm = "CSV Files"
-        tags = []
         if bool(is_acl):
-            tags.append("ACL")
+            nm += " WITH ACL"
+        else:
+            nm += " WITHOUT ACL"
+        
         if bool(is_structured_ff):
-            tags.append("Structured")
-        if tags:
-            nm += " " + " + ".join(tags)
+            nm += " WITH STRUCTURED DISCOVERY"
+        # Optional: could add WITHOUT STRUCTURED DISCOVERY here if they really want it on every row
         return nm
 
     prefix = ""
