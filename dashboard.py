@@ -1240,6 +1240,8 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
         _stp("file-system", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
         _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
+        # OLS Setup
+        _stp("action", None, notes="ENABLE OLS FEATURE FLAGS"),
         _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
         _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
         _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
@@ -1270,6 +1272,8 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
     fs = str(file_set_type or "").strip()
     if k == "postgres":
         return "Postgres"
+    if k == "action":
+        return "🛠️ Action"
     if k == "mssql":
         return "MSSQL"
     if k == "mysql":
