@@ -1310,25 +1310,30 @@ def get_or_set_run_scan_template_id(
     return tid
 
 
-def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_action_template(base_url: str, token: str, action_payload: Any) -> Any:
     """
-    Execute a generic API call described by JSON:
-      {
-        "method": "POST",
-        "path": "/api/v1/...",
-        "params": {...},        # optional
-        "body": {...}           # optional
-      }
+    Execute a generic API call described by JSON or a list of such calls.
+    Single: {"method": "POST", "path": "/api/v1/...", "body": {...}}
+    List: [{"method": "PUT", "path": "..."}, {"method": "PUT", "path": "..."}]
     """
+    if isinstance(action_payload, list):
+        results = []
+        for item in action_payload:
+            results.append(run_action_template(base_url, token, item))
+        return results
+
     if not isinstance(action_payload, dict):
-        raise RuntimeError("action template must be a JSON object")
+        raise RuntimeError("action template must be a JSON object or list")
+    
     method = str(action_payload.get("method") or "POST").strip().upper()
     path = str(action_payload.get("path") or "").strip()
     if not path:
         raise RuntimeError("action template missing 'path'")
+    
     params = action_payload.get("params")
     body = action_payload.get("body")
     url = build_api_url(base_url, path)
+    
     resp = _request(method, url, token, params=(params if isinstance(params, dict) else None), json_body=body)
     try:
         return resp.json() if resp.content else {}
@@ -2692,6 +2697,11 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if _compact(scan_status) in {"completed", "completedwithfailures"}:
                         set_step_status(engine, step_id, "completed", finished_at=_now_utc(), last_error=None)
                         completed_success_any = True
+                        # Auto-save benchmark when scan completes/completes-with-failures through workflow
+                        try:
+                            _auto_save_benchmark_from_step(engine, step_id, sid, run_id, finished_at=_now_utc())
+                        except Exception:
+                            pass
                     else:
                         set_step_status(engine, step_id, "error", finished_at=_now_utc(), last_error=f"Scan ended in state: {scan_status}")
                         set_run_error(engine, run_id, f"Step {seq}: scan ended in state {scan_status}")
@@ -3007,6 +3017,182 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     return did_any_work
 
 
+def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: int, finished_at=None) -> None:
+    """
+    Called when a workflow step scan reaches Completed / CompletedWithFailures.
+    Pulls scan_parents + scan_progress + scan_insights data and inserts a
+    benchmark row only if one does not already exist for this scan_id.
+    """
+    if not scan_id or not scan_id.strip():
+        return
+    scan_id = scan_id.strip()
+    try:
+        # Guard: skip if already saved
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT id FROM benchmarks WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if exists:
+            print(f"[AUTO-BENCHMARK] scan_id={scan_id} already saved (id={exists[0]}), skipping.", flush=True)
+            return
+
+        # Pull step metadata
+        with engine.connect() as conn:
+            step_row = conn.execute(
+                text("""
+                    SELECT ds_kind, ds_name, file_set_type, feature_flags, build_version
+                    FROM workflow_steps WHERE id = :sid LIMIT 1
+                """),
+                {"sid": step_id},
+            ).fetchone()
+        if not step_row:
+            return
+        ds_kind       = str(step_row[0] or "").strip()
+        ds_name       = str(step_row[1] or "").strip()
+        file_set_type = str(step_row[2] or "").strip() or None
+        build_version = str(step_row[4] or "").strip() or "unknown"
+
+        # Pull scan timing:
+        # - start: scan_parents.started_at (BigID-reported scan start, most accurate)
+        # - end:   finished_at passed from runner (_now_utc() at step completion moment)
+        #          Fallback to scan_parents.last_seen_at only if finished_at is missing.
+        with engine.connect() as conn:
+            sp_row = conn.execute(
+                text("SELECT started_at, last_seen_at FROM scan_parents WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if not sp_row or not sp_row[0]:
+            return
+        scan_start = sp_row[0]
+        scan_end = finished_at if finished_at else (sp_row[1] if sp_row[1] else _now_utc())
+        try:
+            scan_duration_h = max(0.001, (scan_end - scan_start).total_seconds() / 3600)
+        except Exception:
+            scan_duration_h = 0.001
+        print(f"[AUTO-BENCHMARK] scan_id={scan_id} start={scan_start} end={scan_end} duration_h={scan_duration_h:.3f}", flush=True)
+
+        # Pull classification metrics from scan_insights
+        total_classification = None
+        with engine.connect() as conn:
+            si_row = conn.execute(
+                text("SELECT total_classification FROM scan_insights WHERE scan_id = :sid LIMIT 1"),
+                {"sid": scan_id},
+            ).fetchone()
+        if si_row:
+            total_classification = si_row[0]
+
+        # Pull peak object count from scan_progress
+        objects_scanned = 0
+        with engine.connect() as conn:
+            pr_row = conn.execute(
+                text("SELECT MAX(CAST(COALESCE(objects_scanned, 0) AS SIGNED)) FROM scan_progress WHERE scan_id = :sid"),
+                {"sid": scan_id},
+            ).fetchone()
+        if pr_row and pr_row[0]:
+            try:
+                objects_scanned = int(pr_row[0])
+            except Exception:
+                pass
+
+        # Get or create build record
+        with engine.connect() as conn:
+            b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()
+            if b_row:
+                b_id = int(b_row[0])
+            else:
+                conn.execute(text("INSERT INTO builds (version) VALUES (:v)"), {"v": build_version})
+                conn.commit()
+                b_id = int(conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()[0])
+
+        # Pull peak scanner count + threads from scanner_group_performance during scan window
+        scanner_count = 0
+        thread_count  = 0
+        try:
+            with engine.connect() as conn:
+                gp_row = conn.execute(
+                    text("""
+                        SELECT MAX(running_scanners), MAX(scanner_threads)
+                        FROM scanner_group_performance
+                        WHERE environment_id = :eid
+                          AND captured_at_utc BETWEEN :start AND :end
+                    """),
+                    {"eid": step_row[10] if step_row and step_row[10] else -1,
+                     "start": scan_start, "end": scan_end},
+                ).fetchone()
+            if gp_row and gp_row[0]:
+                scanner_count = max(0, int(gp_row[0] or 0))
+                thread_count  = max(0, int(gp_row[1] or 0))
+        except Exception:
+            pass
+        print(f"[AUTO-BENCHMARK] scanners={scanner_count} threads={thread_count} files={objects_scanned}", flush=True)
+
+        # Compute all three throughput tiers
+        tp_cluster_files = objects_scanned / scan_duration_h
+        tp_scanner_files = (tp_cluster_files / scanner_count) if scanner_count > 0 else 0.0
+        tp_thread_files  = (tp_cluster_files / thread_count)  if thread_count  > 0 else 0.0
+
+        # Build INSERT dynamically based on schema
+        cols = [
+            "build_id", "run_date", "scenario_type", "data_source_type", "file_set_type",
+            "total_files", "scan_start_time", "scan_end_time",
+            "total_scan_hours",
+            "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+        ]
+        vals = [":b_id", "CURRENT_DATE", ":scenario", ":dst", ":fstype",
+                ":tf", ":ss", ":se", ":tsh",
+                ":tpcf", ":tpsf", ":tptf"]
+        params: Dict[str, Any] = {
+            "b_id": b_id,
+            "scenario": ds_name or ds_kind or "Workflow Auto",
+            "dst": ds_kind or None,
+            "fstype": file_set_type,
+            "tf": objects_scanned,
+            "ss": scan_start,
+            "se": scan_end,
+            "tsh": scan_duration_h,
+            "tpcf": tp_cluster_files,
+            "tpsf": tp_scanner_files,
+            "tptf": tp_thread_files,
+        }
+        # Optionally include scanner/thread counts if schema has config_id or we write them directly
+        # (benchmarks links to configurations for scanner_count/thread_count, so we store them as notes here)
+        with engine.connect() as conn:
+            try:
+                has_sid = bool(conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='benchmarks' AND column_name='scan_id' LIMIT 1"
+                )).fetchone())
+            except Exception:
+                has_sid = False
+            if has_sid:
+                cols.append("scan_id")
+                vals.append(":sid")
+                params["sid"] = scan_id
+
+            try:
+                has_cls = bool(conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='benchmarks' AND column_name='total_classification' LIMIT 1"
+                )).fetchone())
+            except Exception:
+                has_cls = False
+            if has_cls and total_classification is not None:
+                cols.append("total_classification")
+                vals.append(":tclass")
+                params["tclass"] = total_classification
+
+            conn.execute(
+                text(f"INSERT INTO benchmarks ({', '.join(cols)}) VALUES ({', '.join(vals)})"),
+                params,
+            )
+            conn.commit()
+
+        print(f"[AUTO-BENCHMARK] Saved scan_id={scan_id} build={build_version} run_id={run_id}", flush=True)
+    except Exception as ex:
+        print(f"[AUTO-BENCHMARK] Failed for scan_id={scan_id}: {ex}", flush=True)
+
+
 def _maybe_mark_run_completed(engine, run_id: int) -> None:
     """
     If all steps in the run are in a terminal or non-actionable state
@@ -3264,56 +3450,37 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         pass
     step_dict["ds_name"] = desired_ds_name
 
-    # --- Pre-step action (feature flags on/off etc) ---
-    # If a matching action template exists, run it before DS/scan creation.
-    if not _run_is_running(engine, int(run_id)):
-        return True
-    try:
-        action_tpl = ""
-        action_key_used = ""
-        env_int = int(env_id) if env_id is not None else None
-        candidates: List[str] = []
-        candidates.extend(_action_pre_step_keys(step_dict, env_int))
-        # Backward-compat: for OLS steps, also allow the old pre_ols action key.
-        if bool(step_dict.get("is_ols")):
-            candidates.extend(_action_pre_ols_key(env_int))
-        for k in candidates:
-            action_tpl = get_template(engine, k)
-            if action_tpl:
-                action_key_used = k
-                break
-        if action_tpl:
-            action_raw = _render_template(
-                action_tpl,
-                {
-                    "ENV_ID": str(env_id or ""),
-                    "DS_NAME": desired_ds_name,
-                    "DS_KIND": str(step_dict.get("ds_kind") or "").strip(),
-                    "FILE_SET_TYPE": str(step_dict.get("file_set_type") or "").strip(),
-                    "IS_ACL": "1" if bool(step_dict.get("is_acl")) else "0",
-                    "IS_OLS": "1" if bool(step_dict.get("is_ols")) else "0",
-                    "IS_STRUCTURED_FF": "1" if bool(step_dict.get("is_structured_ff")) else "0",
-                    "FEATURE_FLAGS": str(step_dict.get("feature_flags") or "").strip(),
-                    "NOTES": str(step_dict.get("notes") or "").strip(),
-                    "BUILD_VERSION": build_version,
-                    "BUILD_PREFIX": build_prefix,
-                    "ACTION_KEY": action_key_used,
-                },
-            )
-            unresolved = _unresolved_placeholders(action_raw)
-            if unresolved:
-                raise RuntimeError(f"Unresolved action placeholders: {', '.join(unresolved[:20])}")
+    # --- Action Step Type ---
+    # If ds_kind is 'action', we look for an action template matching the name/notes and execute it.
+    if str(step_dict.get("ds_kind") or "").strip().lower() == "action":
+        try:
+            # For action steps, we use the notes or ds_name as the template key
+            action_key = str(step_dict.get("notes") or step_dict.get("ds_name") or "").strip()
+            action_tpl = get_template(engine, action_key)
+            if not action_tpl:
+                # Try prefixing with action::
+                action_tpl = get_template(engine, f"action::{action_key}")
+            
+            if not action_tpl:
+                raise RuntimeError(f"Missing action template for key: {action_key}")
+                
+            action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
             action_payload = json.loads(action_raw)
             run_action_template(base_url, token, action_payload)
-            set_step_status(engine, step_id, "pre_action_done")
-    except Exception as ex:
-        # Don't block forever: mark error so user can fix template/payload.
-        set_step_error(engine, step_id, f"Pre-step action failed: {ex}")
-        set_run_error(engine, run_id, f"Step {seq}: pre-step action failed")
-        _set_env_busy(engine, env_id, run_id, False) # RELEASE
-        # Move on to next step (do not pause entire run).
-        set_run_next_eligible(engine, run_id, _now_utc())
-        return True
+            
+            # Action completed successfully, mark step as completed
+            set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+            _set_env_busy(engine, env_id, run_id, False) # RELEASE
+            set_run_next_eligible(engine, run_id, _now_utc())
+            return True
+        except Exception as ex:
+            set_step_error(engine, step_id, f"Action failed: {ex}")
+            set_run_error(engine, run_id, f"Step {seq}: action failed")
+            _set_env_busy(engine, env_id, run_id, False) # RELEASE
+            set_run_next_eligible(engine, run_id, _now_utc())
+            return True
+
+    # --- Pre-step action (feature flags on/off etc) ---
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):

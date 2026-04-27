@@ -19,6 +19,18 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skipping load_dotenv()
+    pass
+
+# UI Defaults from .env
+DEFAULT_SCANNER_COUNT = int(os.getenv("BENCHMARK_STANDARD_SCANNER_COUNT", "5"))
+DEFAULT_THREAD_COUNT = int(os.getenv("BENCHMARK_STANDARD_TOTAL_THREADS", "50"))
+LEGACY_THREAD_COUNT = int(os.getenv("BENCHMARK_LEGACY_INCORRECT_THREAD_TOTAL", "25"))
 
 # db_config may only define DB_CONNECTION_STRING (e.g. on Windows); DB_CONFIG is optional.
 try:
@@ -1224,22 +1236,32 @@ def _seed_default_workflow_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, notes="SMB Small Files WITH ACL"),
         _stp("s3", "Large Files", acl=True, notes="S3 Large Files WITH ACL"),
         _stp("smb", "Large Files", acl=True, notes="SMB Large Files WITH ACL"),
-        _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
-        _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
-        _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
-        _stp("sharepoint-online-v2", "Small Files", acl=True, notes="SharePoint Online Small Files WITH ACL"),
-        _stp("file-system", "CSV Files", notes="CSV Small Files (Standard)"),
-        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITH STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", notes="CSV Small Files WITHOUT ACL"),
+        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
+        _stp("file-system", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
+        # OLS Setup
+        _stp("action", None, notes="ENABLE OLS FEATURE FLAGS"),
         _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
         _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
         _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
         _stp("smb", "Large Files", ols=True, notes="SMB Large Files WITH OLS"),
-        _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
-        _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
         _stp("s3", "Small Files", acl=True, ols=True, notes="S3 Small Files WITH ACL AND OLS"),
         _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL AND OLS"),
         _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL AND OLS"),
         _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL AND OLS"),
+        # CSV OLS
+        _stp("file-system", "CSV Files", ols=True, notes="CSV Small Files WITHOUT ACL WITH OLS"),
+        _stp("file-system", "CSV Files", sff=True, ols=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, ols=True, notes="CSV Small Files WITH ACL WITH OLS"),
+        _stp("file-system", "CSV Files", acl=True, sff=True, ols=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        # Cloud (End)
+        _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
+        _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
+        _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
+        _stp("sharepoint-online-v2", "Small Files", acl=True, notes="SharePoint Online Small Files WITH ACL"),
+        _stp("onedrive-v2", "Small Files", ols=True, notes="OneDrive Small Files WITH OLS"),
+        _stp("sharepoint-online-v2", "Small Files", ols=True, notes="SharePoint Online Small Files WITH OLS"),
         _stp("onedrive-v2", "Small Files", acl=True, ols=True, notes="OneDrive Small Files WITH ACL AND OLS"),
         _stp("sharepoint-online-v2", "Small Files", acl=True, ols=True, notes="SharePoint Online Small Files WITH ACL AND OLS"),
     ]
@@ -1250,14 +1272,24 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
     fs = str(file_set_type or "").strip()
     if k == "postgres":
         return "Postgres"
+    if k == "action":
+        return "🛠️ Action"
     if k == "mssql":
         return "MSSQL"
     if k == "mysql":
         return "MySQL"
     if k == "file-system" and fs == "CSV Files":
         nm = "CSV Files"
+        if bool(is_acl):
+            nm += " WITH ACL"
+        else:
+            nm += " WITHOUT ACL"
+        
         if bool(is_structured_ff):
-            nm += " Structured"
+            nm += " WITH STRUCTURED DISCOVERY"
+        
+        if bool(is_ols):
+            nm += " WITH OLS"
         return nm
 
     prefix = ""
@@ -1331,6 +1363,16 @@ def load_workflow_default_step_catalog() -> List[Dict[str, Any]]:
                 {"k": "workflow_default_steps"},
             ).fetchone()
         if not row or not row[0]:
+            # Auto-seed the DB if it's empty to make it the source of truth immediately
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text("""
+                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                        ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)
+                    """), {"val": json.dumps(fallback)})
+            except Exception:
+                pass
             return fallback
         payload = json.loads(str(row[0]))
         if not isinstance(payload, list):
@@ -8258,13 +8300,13 @@ def page_add_benchmark():
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
     c3, c4, c5, c6 = st.columns(4)
-    scan_count = c3.number_input("Scanner Count", min_value=1, value=5)
+    scan_count = c3.number_input("Scanner Count", min_value=1, value=DEFAULT_SCANNER_COUNT)
     thread_count = c4.number_input(
         "Total threads (all scanners)",
         min_value=1,
-        value=25,
-        help="Per-thread throughput = (cluster throughput) / (this number). "
-        "Example: 5 scanners × 5 threads each → enter 25 (not 5).",
+        value=DEFAULT_THREAD_COUNT,
+        help=f"Per-thread throughput = (cluster throughput) / (this number). "
+        f"Example: {DEFAULT_SCANNER_COUNT} scanners × {DEFAULT_THREAD_COUNT // DEFAULT_SCANNER_COUNT if DEFAULT_SCANNER_COUNT > 0 else 0} threads each → enter {DEFAULT_THREAD_COUNT}."
     )
     
     is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
@@ -8794,6 +8836,22 @@ def page_add_benchmark():
                                 params_dict.setdefault("trem", None)
                         except Exception:
                             pass
+
+                    # --- Duplicate Guard: check if this scan_id is already saved ---
+                    if scan_prefill_id:
+                        try:
+                            dup_row = conn.execute(
+                                text("SELECT id FROM benchmarks WHERE scan_id = :sid LIMIT 1"),
+                                {"sid": str(scan_prefill_id).strip()},
+                            ).fetchone()
+                            if dup_row:
+                                st.info(
+                                    f"ℹ️ Benchmark for scan `{scan_prefill_id}` is already saved "
+                                    f"(benchmark id={dup_row[0]}). No duplicate created."
+                                )
+                                return
+                        except Exception:
+                            pass  # scan_id column may not exist; proceed normally
 
                     ins_bench = text(f"""
                         INSERT INTO benchmarks 
@@ -16495,9 +16553,16 @@ def page_scan_progress():
                                     st.error("Cannot resolve environment URL to fetch logs.")
                                 else:
                                     token = Get_auth_token(env_row["base_url"], env_row)
-                                    # Expanded sources including orch2 where the socket hang up error lives
-                                    sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "web", "aci"]
+                                    # Use ALL configured log sources - not a hardcoded list
+                                    try:
+                                        from ai_log_fetcher import load_enabled_log_sources as _load_sources
+                                        sources = _load_sources(engine)
+                                    except Exception:
+                                        sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "aci"]
+                                    
+                                    import hashlib as _hashlib
                                     new_found = 0
+                                    scan_start_gate = db_started_at  # Only keep logs >= scan start
                                     for src in sources:
                                         url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len=3000"
                                         resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=30)
@@ -16506,17 +16571,43 @@ def page_scan_progress():
                                             if log_text:
                                                 found_errors = _detect_log_errors_structural(str(log_text))
                                                 for ctx in found_errors:
-                                                    # Dedupe (1 hour)
+                                                    # GATE: Extract real log timestamp and skip pre-scan-start logs
+                                                    import re as _re
+                                                    ts_match = _re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(ctx))
+                                                    if ts_match and scan_start_gate:
+                                                        try:
+                                                            from datetime import datetime as _dt
+                                                            log_ts_str = ts_match.group(1).replace('T', ' ')
+                                                            log_ts = _dt.strptime(log_ts_str[:19], '%Y-%m-%d %H:%M:%S')
+                                                            scan_start_dt = _dt.strptime(str(scan_start_gate)[:19], '%Y-%m-%d %H:%M:%S')
+                                                            if log_ts < scan_start_dt:
+                                                                continue  # Skip stale log
+                                                            actual_ts = log_ts.strftime('%Y-%m-%d %H:%M:%S')
+                                                        except Exception:
+                                                            actual_ts = None
+                                                    else:
+                                                        actual_ts = None
+
+                                                    # Hash-based dedup (match background fetcher behavior)
+                                                    fp_text = _re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', str(ctx))
+                                                    err_hash = _hashlib.md5(fp_text[:300].encode('utf-8')).hexdigest()
                                                     with engine.connect() as conn:
-                                                        exist = conn.execute(text("SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_context=:ctx AND log_timestamp > DATE_SUB(NOW(), INTERVAL 60 MINUTE)"), {"eid": env_id, "ctx": ctx}).fetchone()
+                                                        exist = conn.execute(text(
+                                                            "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:hash AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                                                        ), {"eid": env_id, "hash": err_hash}).fetchone()
                                                         if exist: continue
                                                         
                                                         psid, pssid = _extract_ids_from_log_ctx(ctx)
                                                         ai_ans = _call_ollama_for_error(ctx, src)
                                                         conn.execute(text("""
-                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id)
-                                                            VALUES (:eid, NOW(), :ctx, :ai, :src, :sid, :ssid)
-                                                        """), {"eid": env_id, "ctx": ctx, "ai": ai_ans, "src": src, "sid": psid or scan_id, "ssid": pssid})
+                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
+                                                            VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
+                                                        """), {
+                                                            "eid": env_id,
+                                                            "ts": actual_ts or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                                                            "ctx": ctx, "ai": ai_ans, "src": src,
+                                                            "sid": psid or scan_id, "ssid": pssid, "hash": err_hash
+                                                        })
                                                         conn.commit()
                                                         new_found += 1
                                     st.success(f"Log fetch complete. Found/Analyzed {new_found} new error signatures.")
@@ -16718,18 +16809,40 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                                 st.session_state["wf_preview_step_rows"] = ps
                                 st.rerun()
                     with rd:
-                        if st.button("Reset order to default (28-step matrix)", key="wf_preview_reset_order"):
+                        c_rd1, c_rd2 = st.columns(2)
+                        if c_rd1.button("Reset order to default", key="wf_preview_reset_order", use_container_width=True):
                             st.session_state["wf_preview_step_rows"] = _build_default_workflow_steps()
                             for _stp in st.session_state["wf_preview_step_rows"] or []:
                                 if isinstance(_stp, dict) and "is_enabled" not in _stp:
                                     _stp["is_enabled"] = True
                             st.rerun()
+                        
+                        if c_rd2.button("💾 Set as System Default", key="wf_preview_save_as_default", use_container_width=True, help="Saves the current 28-step matrix above as the new system default for all future runs."):
+                            try:
+                                ensure_app_settings_table(engine)
+                                current_steps = st.session_state["wf_preview_step_rows"]
+                                with engine.begin() as conn:
+                                    conn.execute(text("""
+                                        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+                                        VALUES ('workflow_default_steps', :val, CURRENT_TIMESTAMP)
+                                        ON DUPLICATE KEY UPDATE 
+                                            setting_value = VALUES(setting_value),
+                                            updated_at = CURRENT_TIMESTAMP
+                                    """), {"val": json.dumps(current_steps)})
+                                st.success("Matrix saved as System Default! The code defaults will no longer be used.")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Failed to save defaults: {e}")
 
                     def _on_master_toggle():
                         toggle_val = st.session_state.get("wf_master_toggle_checkbox")
                         ps = list(st.session_state["wf_preview_step_rows"])
                         for p in ps: p["is_enabled"] = toggle_val
                         st.session_state["wf_preview_step_rows"] = ps
+                        # Clear editor state to avoid conflict with master toggle
+                        if "wf_preview_steps_editor_new_expander" in st.session_state:
+                            del st.session_state["wf_preview_steps_editor_new_expander"]
 
                     ps_all = st.session_state["wf_preview_step_rows"]
                     all_enabled = all(bool(p.get("is_enabled", True)) for p in ps_all)
