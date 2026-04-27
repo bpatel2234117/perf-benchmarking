@@ -1310,25 +1310,30 @@ def get_or_set_run_scan_template_id(
     return tid
 
 
-def run_action_template(base_url: str, token: str, action_payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_action_template(base_url: str, token: str, action_payload: Any) -> Any:
     """
-    Execute a generic API call described by JSON:
-      {
-        "method": "POST",
-        "path": "/api/v1/...",
-        "params": {...},        # optional
-        "body": {...}           # optional
-      }
+    Execute a generic API call described by JSON or a list of such calls.
+    Single: {"method": "POST", "path": "/api/v1/...", "body": {...}}
+    List: [{"method": "PUT", "path": "..."}, {"method": "PUT", "path": "..."}]
     """
+    if isinstance(action_payload, list):
+        results = []
+        for item in action_payload:
+            results.append(run_action_template(base_url, token, item))
+        return results
+
     if not isinstance(action_payload, dict):
-        raise RuntimeError("action template must be a JSON object")
+        raise RuntimeError("action template must be a JSON object or list")
+    
     method = str(action_payload.get("method") or "POST").strip().upper()
     path = str(action_payload.get("path") or "").strip()
     if not path:
         raise RuntimeError("action template missing 'path'")
+    
     params = action_payload.get("params")
     body = action_payload.get("body")
     url = build_api_url(base_url, path)
+    
     resp = _request(method, url, token, params=(params if isinstance(params, dict) else None), json_body=body)
     try:
         return resp.json() if resp.content else {}
@@ -3467,56 +3472,37 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         pass
     step_dict["ds_name"] = desired_ds_name
 
-    # --- Pre-step action (feature flags on/off etc) ---
-    # If a matching action template exists, run it before DS/scan creation.
-    if not _run_is_running(engine, int(run_id)):
-        return True
-    try:
-        action_tpl = ""
-        action_key_used = ""
-        env_int = int(env_id) if env_id is not None else None
-        candidates: List[str] = []
-        candidates.extend(_action_pre_step_keys(step_dict, env_int))
-        # Backward-compat: for OLS steps, also allow the old pre_ols action key.
-        if bool(step_dict.get("is_ols")):
-            candidates.extend(_action_pre_ols_key(env_int))
-        for k in candidates:
-            action_tpl = get_template(engine, k)
-            if action_tpl:
-                action_key_used = k
-                break
-        if action_tpl:
-            action_raw = _render_template(
-                action_tpl,
-                {
-                    "ENV_ID": str(env_id or ""),
-                    "DS_NAME": desired_ds_name,
-                    "DS_KIND": str(step_dict.get("ds_kind") or "").strip(),
-                    "FILE_SET_TYPE": str(step_dict.get("file_set_type") or "").strip(),
-                    "IS_ACL": "1" if bool(step_dict.get("is_acl")) else "0",
-                    "IS_OLS": "1" if bool(step_dict.get("is_ols")) else "0",
-                    "IS_STRUCTURED_FF": "1" if bool(step_dict.get("is_structured_ff")) else "0",
-                    "FEATURE_FLAGS": str(step_dict.get("feature_flags") or "").strip(),
-                    "NOTES": str(step_dict.get("notes") or "").strip(),
-                    "BUILD_VERSION": build_version,
-                    "BUILD_PREFIX": build_prefix,
-                    "ACTION_KEY": action_key_used,
-                },
-            )
-            unresolved = _unresolved_placeholders(action_raw)
-            if unresolved:
-                raise RuntimeError(f"Unresolved action placeholders: {', '.join(unresolved[:20])}")
+    # --- Action Step Type ---
+    # If ds_kind is 'action', we look for an action template matching the name/notes and execute it.
+    if str(step_dict.get("ds_kind") or "").strip().lower() == "action":
+        try:
+            # For action steps, we use the notes or ds_name as the template key
+            action_key = str(step_dict.get("notes") or step_dict.get("ds_name") or "").strip()
+            action_tpl = get_template(engine, action_key)
+            if not action_tpl:
+                # Try prefixing with action::
+                action_tpl = get_template(engine, f"action::{action_key}")
+            
+            if not action_tpl:
+                raise RuntimeError(f"Missing action template for key: {action_key}")
+                
+            action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
             action_payload = json.loads(action_raw)
             run_action_template(base_url, token, action_payload)
-            set_step_status(engine, step_id, "pre_action_done")
-    except Exception as ex:
-        # Don't block forever: mark error so user can fix template/payload.
-        set_step_error(engine, step_id, f"Pre-step action failed: {ex}")
-        set_run_error(engine, run_id, f"Step {seq}: pre-step action failed")
-        _set_env_busy(engine, env_id, run_id, False) # RELEASE
-        # Move on to next step (do not pause entire run).
-        set_run_next_eligible(engine, run_id, _now_utc())
-        return True
+            
+            # Action completed successfully, mark step as completed
+            set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+            _set_env_busy(engine, env_id, run_id, False) # RELEASE
+            set_run_next_eligible(engine, run_id, _now_utc())
+            return True
+        except Exception as ex:
+            set_step_error(engine, step_id, f"Action failed: {ex}")
+            set_run_error(engine, run_id, f"Step {seq}: action failed")
+            _set_env_busy(engine, env_id, run_id, False) # RELEASE
+            set_run_next_eligible(engine, run_id, _now_utc())
+            return True
+
+    # --- Pre-step action (feature flags on/off etc) ---
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):

@@ -39,7 +39,8 @@ def run_migration():
         "build_classifier_mappings", "configurations", "benchmarks",
         "benchmark_findings", "classifier_details_snapshots",
         "scan_log_errors", "scan_log_correlations",
-        "app_roles", "app_users", "app_role_pages", "app_settings"
+        "app_roles", "app_users", "app_role_pages", "app_settings",
+        "workflow_runs", "workflow_steps", "workflow_templates"
     ]
     
     with mysql_engine.connect() as mysql_conn:

@@ -223,5 +223,63 @@ DDL_STATEMENTS = {
             setting_value TEXT,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
+    """,
+    'workflow_runs': """
+        CREATE TABLE IF NOT EXISTS workflow_runs (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NULL,
+            status VARCHAR(32) NULL,
+            env1_id INT NULL,
+            env2_id INT NULL,
+            cooldown_minutes INT DEFAULT 15,
+            next_eligible_at TIMESTAMP NULL,
+            last_error TEXT NULL,
+            started_at TIMESTAMP NULL,
+            finished_at TIMESTAMP NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            scan_template_id VARCHAR(128) NULL
+        );
+    """,
+    'workflow_steps': """
+        CREATE TABLE IF NOT EXISTS workflow_steps (
+            id SERIAL PRIMARY KEY,
+            run_id INT NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+            seq INT NOT NULL,
+            environment_id INT NULL,
+            ds_kind VARCHAR(64) NULL,
+            ds_name VARCHAR(500) NULL,
+            scan_kind VARCHAR(64) NULL,
+            file_set_type VARCHAR(150) NULL,
+            is_enabled BOOLEAN DEFAULT TRUE,
+            is_acl BOOLEAN DEFAULT FALSE,
+            is_ocr BOOLEAN DEFAULT FALSE,
+            is_structured_ff BOOLEAN DEFAULT FALSE,
+            is_ols BOOLEAN DEFAULT FALSE,
+            is_lite BOOLEAN DEFAULT FALSE,
+            feature_flags VARCHAR(500) NULL,
+            notes VARCHAR(1000) NULL,
+            ds_id VARCHAR(128) NULL,
+            scan_profile_id VARCHAR(128) NULL,
+            scan_profile_name VARCHAR(500) NULL,
+            build_version VARCHAR(50) NULL,
+            build_prefix VARCHAR(20) NULL,
+            scan_id VARCHAR(128) NULL,
+            status VARCHAR(32) NULL,
+            last_error TEXT NULL,
+            started_at TIMESTAMP NULL,
+            finished_at TIMESTAMP NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(run_id, seq)
+        );
+    """,
+    'workflow_templates': """
+        CREATE TABLE IF NOT EXISTS workflow_templates (
+            k VARCHAR(200) PRIMARY KEY,
+            template_kind VARCHAR(32) NULL,
+            payload_json TEXT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """
 }
