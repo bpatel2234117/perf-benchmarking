@@ -19,10 +19,13 @@ import re
 import textwrap
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from dotenv import load_dotenv
-
-# Load environment variables from .env
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    # Load environment variables from .env
+    load_dotenv()
+except ImportError:
+    # python-dotenv not installed, skipping load_dotenv()
+    pass
 
 # UI Defaults from .env
 DEFAULT_SCANNER_COUNT = int(os.getenv("BENCHMARK_STANDARD_SCANNER_COUNT", "5"))
