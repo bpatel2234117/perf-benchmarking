@@ -10,8 +10,7 @@ import {
   workflowNormStepStatus,
   workflowStepImpliesEnvBusy,
 } from '../utils/workflowProgress';
-
-const API = 'http://localhost:8000';
+import { API_BASE } from '../apiConfig';
 
 interface WorkflowProps {
   token: string;
@@ -74,6 +73,7 @@ interface EnvironmentRow {
   base_url: string;
   is_active: boolean;
   is_busy: boolean;
+  is_default?: boolean;
 }
 
 interface StepCatalogRow {
@@ -255,7 +255,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   } = useQuery({
     queryKey: ['workflowStepCatalog', token],
     queryFn: async () => {
-      const res = await axios.get(`${API}/api/workflow/step-catalog`, authConfig);
+      const res = await axios.get(`${API_BASE}/api/workflow/step-catalog`, authConfig);
       return res.data as { steps: StepCatalogRow[] };
     },
   });
@@ -274,7 +274,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const { data: runs = [], isLoading: runsLoading, error: runsError } = useQuery({
     queryKey: ['workflowRuns', token],
     queryFn: async () => {
-      const res = await axios.get(`${API}/api/workflow/runs`, { ...authConfig, params: { limit: 10000 } });
+      const res = await axios.get(`${API_BASE}/api/workflow/runs`, { ...authConfig, params: { limit: 10000 } });
       return res.data as WorkflowRun[];
     },
     refetchInterval: 8000,
@@ -286,7 +286,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     queryKey: ['workflowStepsBatch', token, runIdsCsv],
     queryFn: async () => {
       if (!runIdsCsv) return {};
-      const res = await axios.get(`${API}/api/workflow/steps/batch`, {
+      const res = await axios.get(`${API_BASE}/api/workflow/steps/batch`, {
         ...authConfig,
         params: { run_ids: runIdsCsv },
       });
@@ -299,7 +299,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const { data: envChips = [] } = useQuery({
     queryKey: ['workflowEnvStatus', token],
     queryFn: async () => {
-      const res = await axios.get(`${API}/api/workflow/env-status`, authConfig);
+      const res = await axios.get(`${API_BASE}/api/workflow/env-status`, authConfig);
       return res.data as EnvChip[];
     },
     refetchInterval: 8000,
@@ -308,7 +308,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const { data: environments = [] } = useQuery({
     queryKey: ['environments', token],
     queryFn: async () => {
-      const res = await axios.get(`${API}/api/environments`, authConfig);
+      const res = await axios.get(`${API_BASE}/api/environments`, authConfig);
       return res.data as EnvironmentRow[];
     },
   });
@@ -381,7 +381,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           notes: row.notes ?? null,
         }));
       }
-      const res = await axios.post(`${API}/api/workflow/runs`, body, authConfig);
+      const res = await axios.post(`${API_BASE}/api/workflow/runs`, body, authConfig);
       return res.data as { id: number };
     },
     onSuccess: (data) => {
@@ -394,7 +394,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
 
   const controlMutation = useMutation({
     mutationFn: async (vars: { runId: number; action: 'start' | 'pause' | 'resume' | 'stop' }) => {
-      await axios.post(`${API}/api/workflow/runs/${vars.runId}/control`, { action: vars.action }, authConfig);
+      await axios.post(`${API_BASE}/api/workflow/runs/${vars.runId}/control`, { action: vars.action }, authConfig);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
@@ -416,11 +416,6 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           </span>
           <div>
             <h2 style={{ color: 'var(--text-primary)', fontSize: '1.5rem', fontWeight: 700, margin: 0 }}>Workflow Automation</h2>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.35rem', lineHeight: 1.55, maxWidth: '52rem' }}>
-              Workflow data is PostgreSQL only (shared v2 DB, or <code style={{ fontSize: '0.85em' }}>WORKFLOW_DB_URI</code> to point at another Postgres instance).
-              Runs use pooled test environments where configured; concurrency is capped by{' '}
-              <code style={{ fontSize: '0.85em' }}>WORKFLOW_MAX_CONCURRENT_SCANS</code>.
-            </p>
           </div>
         </div>
 
@@ -718,9 +713,6 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
             </div>
           ) : null}
 
-          <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginTop: '0.75rem', marginBottom: 0 }}>
-            Same default planner matrix as Streamlit when all steps stay enabled (or omit catalog on error — server defaults).
-          </p>
         </div>
 
         {runsError && (
@@ -730,12 +722,6 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
         )}
 
         <h3 style={{ fontSize: '1.1rem', fontWeight: 700, margin: '0.75rem 0 0.35rem', color: 'var(--text-primary)' }}>Workflow Runs</h3>
-        <p style={{ color: 'var(--text-secondary)', fontSize: '0.82rem', marginBottom: '0.75rem', maxWidth: '52rem', lineHeight: 1.45 }}>
-          Expand a run for steps and throughput-style metrics. This UI reads{' '}
-          <strong style={{ fontWeight: 600, color: 'var(--text-primary)' }}>PostgreSQL only</strong>; runs you created in legacy Streamlit/dashboard against MySQL do not appear until you copy them into the same Postgres your v2 API uses (run{' '}
-          <code style={{ fontSize: '0.85em' }}>python3 scripts/migrate_workflow_mysql_to_postgres.py</code>
-          , see script header for env vars).
-        </p>
 
         {envChips.length > 0 && (
           <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '10px', lineHeight: 1.6 }}>
@@ -881,6 +867,8 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                           <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
                                           <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
                                           <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
+                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
+                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
                                           <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
                                           <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
                                         </tr>
@@ -919,14 +907,22 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                 <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
                                                   {computeProgressEmoji(rd)}
                                                 </td>
-                                                <td
-                                                  style={{
-                                                    padding: '6px 8px',
-                                                    fontFamily: 'ui-monospace, monospace',
-                                                    fontSize: '0.78rem',
-                                                  }}
-                                                >
+                                                <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
                                                   {fmtCell(st.scan_id)}
+                                                </td>
+                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                  {st.scan_id ? (
+                                                    <a href={`/scan-progress?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
+                                                      View Progress
+                                                    </a>
+                                                  ) : '—'}
+                                                </td>
+                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                  {st.scan_id ? (
+                                                    <a href={`/benchmark/new?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
+                                                      Open
+                                                    </a>
+                                                  ) : '—'}
                                                 </td>
                                                 <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
                                                   {fmtCell(st.notes)}

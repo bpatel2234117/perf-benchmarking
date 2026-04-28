@@ -14,6 +14,7 @@ import {
   Legend,
   ResponsiveContainer,
 } from 'recharts';
+import { API_BASE } from '../apiConfig';
 
 interface DashboardProps {
   token: string;
@@ -84,8 +85,6 @@ function toChartPoints(rows: TrendRow[]) {
     catalog: r.total_catalog_items != null ? Number(r.total_catalog_items) : null,
   }));
 }
-
-const API = 'http://localhost:8000';
 
 export const LAST_BUILD_OPTIONS: { label: string; value: number | 'all' }[] = [
   { label: 'Last 5 builds', value: 5 },
@@ -273,7 +272,7 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
   const { data: trendRows = [], isLoading: trendLoading, error: trendError } = useQuery({
     queryKey: ['trends-small-files', token],
     queryFn: async () => {
-      const res = await axios.get(`${API}/api/trends/small-files`, {
+      const res = await axios.get(`${API_BASE}/api/trends/small-files`, {
         ...authConfig,
         params: { max_builds: 250 },
       });
@@ -310,9 +309,6 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
           <TrendingUp size={28} style={{ color: 'var(--primary-color)' }} />
           <div>
             <h2 style={{ color: 'var(--text-primary)', fontSize: '1.35rem', fontWeight: 700 }}>Small Files Trend Analysis</h2>
-            <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem', marginTop: '0.15rem' }}>
-              Unstructured (including S3 / SMB) is shown first; relational DB (MSSQL, PostgreSQL, MySQL, …) and structured-discovery-style runs appear below.
-            </p>
           </div>
         </div>
 
