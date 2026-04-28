@@ -1111,6 +1111,30 @@ def _getenv_any(names: List[str]) -> str:
     return ""
 
 
+def credential_kind_from_ds_template(ds_tpl: str, step_dict: Dict[str, Any]) -> str:
+    """
+    Secrets follow ds_connection.type in the DS JSON template, not the workflow step ds_kind
+    (e.g. 'file-system' labels CSV scenarios; connector may still be s3/smb/...).
+    """
+    tpl = str(ds_tpl or "")
+    probe = tpl
+    m_ds = re.search(r'"ds_connection"\s*:', tpl)
+    if m_ds:
+        probe = tpl[m_ds.start() : m_ds.start() + 12000]
+    for m in re.finditer(r'"type"\s*:\s*"([^"]+)"', probe):
+        raw = (m.group(1) or "").strip()
+        if not raw or raw.startswith("{{"):
+            continue
+        return raw.lower()
+    if str(step_dict.get("ds_kind") or "").strip().lower() == "file-system":
+        alt = _getenv_any(
+            ["WORKFLOW_FILESYSTEM_CREDENTIAL_KIND", "WORKFLOW_CSV_CREDENTIAL_DS_TYPE", "CSV_DS_CREDENTIAL_TYPE"]
+        )
+        if alt:
+            return alt.strip().lower()
+    return str(step_dict.get("ds_kind") or "").strip().lower()
+
+
 def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     """
     Pull secrets from environment variables (user will put in .env).
@@ -1343,20 +1367,33 @@ def run_action_template(base_url: str, token: str, action_payload: Any) -> Any:
 
 def set_run_error(engine, run_id: int, message: str) -> None:
     """
-    Record the latest step-level failure on the run. Does NOT set status=failed here:
-    marking failed/completed is done by _maybe_mark_run_completed when no active steps remain.
-    Otherwise a single step error would flip the whole run to failed, the runner would stop
-    loading it (only status='running' is processed), and other steps stay stuck mid-phase.
+    Record step failures. Optionally set run status failed immediately (UI); runner loads
+    both running + failed (see run_once). WORKFLOW_MARK_RUN_FAILED_ON_STEP_ERROR=0 for legacy.
     """
+    msg = str(message)[:2000]
+    mark_failed = str(os.getenv("WORKFLOW_MARK_RUN_FAILED_ON_STEP_ERROR", "1") or "1").strip().lower() in (
+        "1", "true", "yes", "y", "on",
+    )
     with engine.connect() as conn:
-        conn.execute(
-            text(
-                "UPDATE workflow_runs "
-                "SET last_error=:e, updated_at=CURRENT_TIMESTAMP "
-                "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,''))) = 'running'"
-            ),
-            {"e": str(message)[:2000], "rid": int(run_id)},
-        )
+        if mark_failed:
+            conn.execute(
+                text(
+                    "UPDATE workflow_runs "
+                    "SET last_error=:e, updated_at=CURRENT_TIMESTAMP, "
+                    "status=CASE WHEN LOWER(TRIM(COALESCE(status,''))) = 'running' THEN 'failed' ELSE status END "
+                    "WHERE id=:rid"
+                ),
+                {"e": msg, "rid": int(run_id)},
+            )
+        else:
+            conn.execute(
+                text(
+                    "UPDATE workflow_runs "
+                    "SET last_error=:e, updated_at=CURRENT_TIMESTAMP "
+                    "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,''))) = 'running'"
+                ),
+                {"e": msg, "rid": int(run_id)},
+            )
         conn.commit()
     try:
         _maybe_mark_run_completed(engine, int(run_id))
@@ -1674,7 +1711,10 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
                 ap["accessKey"] = ak
             sk_enc = _get("S3_secret_key_enc")
             sk = _get("S3_secret_key")
-            if sk_enc:
+            if sk and sk_enc:
+                ap["secret_key_enc"] = sk
+                ap.pop("secret_key", None)
+            elif sk_enc:
                 ap["secret_key_enc"] = sk_enc
                 ap.pop("secret_key", None)
             elif sk:
@@ -1699,7 +1739,10 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
             ds_conn["username"] = u
         if d and ("domain" in ds_conn):
             ds_conn["domain"] = d
-        if pw_enc:
+        if pw and pw_enc:
+            ds_conn["password_enc"] = pw
+            ds_conn.pop("password", None)
+        elif pw_enc:
             ds_conn["password_enc"] = pw_enc
             ds_conn.pop("password", None)
         elif pw:
@@ -1719,7 +1762,10 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
                 ap["username"] = u
             if d and ("domain" in ap):
                 ap["domain"] = d
-            if pw_enc:
+            if pw and pw_enc:
+                ap["password_enc"] = pw
+                ap.pop("password", None)
+            elif pw_enc:
                 ap["password_enc"] = pw_enc
                 ap.pop("password", None)
             elif pw:
@@ -2000,6 +2046,49 @@ def _parse_utc_dt(v: Any) -> Optional[datetime]:
         return None
 
 
+def _format_connection_test_detail(cst: Any) -> str:
+    if not isinstance(cst, dict):
+        return str(cst)[:2000] if cst is not None else "unknown"
+    for key in (
+        "message",
+        "errorMessage",
+        "error_message",
+        "lastError",
+        "last_error",
+        "error",
+        "details",
+        "description",
+        "reason",
+        "failureReason",
+        "failure_reason",
+        "userMessage",
+        "user_message",
+        "resultMessage",
+        "result_message",
+    ):
+        v = cst.get(key)
+        if v is not None and str(v).strip() and str(v).strip().lower() not in ("null", "none", ""):
+            return str(v).strip()[:2000]
+    for container_key in ("result", "data", "response"):
+        sub = cst.get(container_key)
+        if isinstance(sub, dict):
+            inner = _format_connection_test_detail(sub)
+            if inner and inner not in ("unknown", "{}"):
+                return inner
+    slim = {k: cst.get(k) for k in (
+        "is_success",
+        "last_connection",
+        "is_connection_ever_succeeded",
+        "status",
+        "testStatus",
+    ) if k in cst}
+    try:
+        j = json.dumps(slim, default=str, separators=(",", ":"))[:1900]
+        return f"BigID reported test failed (no message field). {j}"
+    except Exception:
+        return str(cst)[:2000]
+
+
 def wait_for_ds_connection_test_result(
     base_url: str,
     token: str,
@@ -2047,13 +2136,15 @@ def wait_for_ds_connection_test_result(
                 if last_conn and last_conn >= (_test_started - timedelta(seconds=2)):
                     is_success = cst.get("is_success")
                     if isinstance(is_success, bool):
-                        return is_success, json.dumps({k: cst.get(k) for k in ["is_success", "last_connection", "is_connection_ever_succeeded"]}, separators=(",", ":"))[:500]
+                        if is_success:
+                            return True, "success"
+                        return False, _format_connection_test_detail(cst)
                     # if it's present but not bool, treat truthy strings
                     s = str(is_success or "").strip().lower()
                     if s in {"true", "1", "yes", "ok", "success"}:
                         return True, "success"
                     if s in {"false", "0", "no", "fail", "failed", "error"}:
-                        return False, "failed"
+                        return False, _format_connection_test_detail(cst)
                 # Fallback: last_connection may be in server/local time or update slowly; accept success within 15 min window
                 if last_conn and last_conn >= (_test_started - timedelta(minutes=15)) and (_now_utc() >= grace_decide_at):
                     is_success = cst.get("is_success")
@@ -2066,7 +2157,9 @@ def wait_for_ds_connection_test_result(
                 if (not last_conn) and (_now_utc() >= grace_decide_at):
                     is_success = cst.get("is_success")
                     if isinstance(is_success, bool):
-                        return is_success, json.dumps({k: cst.get(k) for k in ["is_success", "last_connection", "is_connection_ever_succeeded"]}, separators=(",", ":"))[:500]
+                        if is_success:
+                            return True, "success"
+                        return False, _format_connection_test_detail(cst)
         except Exception:
             pass
         time.sleep(max(2, int(poll_seconds)))
@@ -3226,12 +3319,18 @@ def _maybe_mark_run_completed(engine, run_id: int) -> None:
             with engine.connect() as conn:
                 if any_error:
                     conn.execute(
-                        text("UPDATE workflow_runs SET status='failed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid AND status NOT IN ('completed','stopped')"),
+                        text(
+                            "UPDATE workflow_runs SET status='failed', finished_at=CURRENT_TIMESTAMP "
+                            "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,''))) IN ('running','failed')"
+                        ),
                         {"rid": int(run_id)},
                     )
                 else:
                     conn.execute(
-                        text("UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP WHERE id=:rid AND status NOT IN ('completed','stopped')"),
+                        text(
+                            "UPDATE workflow_runs SET status='completed', finished_at=CURRENT_TIMESTAMP "
+                            "WHERE id=:rid AND LOWER(TRIM(COALESCE(status,''))) = 'running'"
+                        ),
                         {"rid": int(run_id)},
                     )
                 conn.commit()
@@ -3499,7 +3598,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
         _set_env_busy(engine, env_id, run_id, False) # RELEASE
         return True
     try:
-        secret_vars = resolve_secret_vars(str(step_dict.get("ds_kind") or ""))
+        cred_kind = credential_kind_from_ds_template(ds_tpl, step_dict)
+        secret_vars = resolve_secret_vars(cred_kind)
         scanner_group = resolve_default_scanner_group(engine, int(env_id) if env_id is not None else None)
         ds_payload_raw = _render_template(
             ds_tpl,
@@ -3524,7 +3624,7 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             raise RuntimeError(f"Unresolved template placeholders: {', '.join(unresolved[:20])}")
         ds_payload = json.loads(ds_payload_raw)
         # Force secrets from .env when present (even if template contains old values).
-        ds_payload = _apply_runtime_secrets(str(step_dict.get("ds_kind") or ""), ds_payload, secret_vars)
+        ds_payload = _apply_runtime_secrets(cred_kind, ds_payload, secret_vars)
         # Apply ACL/Structured flags at runtime (so one base template is enough).
         ds_payload = _apply_runtime_flags(step_dict, ds_payload)
 

@@ -4,8 +4,9 @@ import time
 import requests
 import json
 import re
+from datetime import date as date_cls
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
 
@@ -51,6 +52,31 @@ DEFAULT_LOG_SOURCE_OPTIONS = [
     "api-gateway",
     "data-manager",
 ]
+
+
+def _coerce_to_datetime(value: Any) -> Optional[datetime]:
+    """Normalize DB/driver timestamps (datetime, date, str) for comparisons."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date_cls):
+        return datetime.combine(value, datetime.min.time())
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace("T", " ").rstrip("Z")
+    if "+" in s and " " in s:
+        s = s.split("+", 1)[0].strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s[:26], fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _normalize_log_source_name(value):
@@ -673,8 +699,11 @@ def run_once(engine):
                             err_hash = err_obj["hash"]
                             
                             # CRITICAL FIX 1: Age Gate (Post-Scan Start Time Only)
-                            scan_start = env.get("scan_start_time")
-                            if scan_start and log_ts < scan_start:
+                            ts_cmp = _coerce_to_datetime(log_ts) or (
+                                log_ts if isinstance(log_ts, datetime) else datetime.utcnow()
+                            )
+                            scan_start = _coerce_to_datetime(env.get("scan_start_time"))
+                            if scan_start is not None and ts_cmp < scan_start:
                                 # This is a stale log from April 15th or previous run. SKIP.
                                 continue
 

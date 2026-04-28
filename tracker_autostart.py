@@ -22,6 +22,16 @@ from typing import Optional, Tuple
 from sqlalchemy import text
 
 
+def _win_background_python() -> str:
+    """On Windows detached spawns prefer pythonw.exe to avoid a black console window."""
+    exe = sys.executable
+    if sys.platform == "win32" and exe.lower().endswith("python.exe"):
+        cand = exe[:-10] + "pythonw.exe"
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
 def _now_epoch() -> float:
     return time.time()
 
@@ -119,7 +129,7 @@ def ensure_tracker_running(engine, tracker_name: str = "default") -> Tuple[bool,
     if not tracker_path.exists():
         return False, "tracker.py not found"
 
-    cmd = [sys.executable, str(tracker_path), "--quiet"]
+    cmd = [_win_background_python(), str(tracker_path), "--quiet"]
     env = os.environ.copy()
     env["SCAN_TRACKER_NAME"] = tracker_name
 

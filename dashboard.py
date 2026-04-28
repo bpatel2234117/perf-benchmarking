@@ -1158,6 +1158,17 @@ def ensure_app_settings_table(_eng):
         pass
 
 
+@st.cache_resource
+def initialize_app_tables(_eng):
+    """Run expensive DDL checks only once per application instance."""
+    ensure_rbac_tables(_eng)
+    ensure_test_environments_table(_eng)
+    ensure_app_settings_table(_eng)
+    # Other table checks will run if they don't exist during first loader hit,
+    # but these core ones are ensured at startup.
+    return True
+
+
 def load_log_fetch_service_settings():
     ensure_app_settings_table(engine)
     default_enabled = _ordered_unique_log_sources(DEFAULT_LOG_FETCH_SOURCES)
@@ -1504,16 +1515,6 @@ def _workflow_ds_json_dialog(step: Dict[str, Any]) -> None:
         st.rerun()
 
 if engine:
-    @st.cache_resource
-    def initialize_app_tables(_eng):
-        """Run expensive DDL checks only once per application instance."""
-        ensure_rbac_tables(_eng)
-        ensure_test_environments_table(_eng)
-        ensure_app_settings_table(_eng)
-        # Other table checks will run if they don't exist during first loader hit,
-        # but these core ones are ensured at startup.
-        return True
-    
     initialize_app_tables(engine)
 
 
@@ -16865,39 +16866,25 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                     "status",
                 ]
                 show_cols = [c for c in show_cols if c in prev_df.columns]
-                def _on_editor_change():
-                    # Captures the very first click on a checkbox
-                    ed_state = st.session_state.get("wf_preview_steps_editor_new_expander")
-                    if ed_state and "edited_rows" in ed_state:
-                        ps = list(st.session_state["wf_preview_step_rows"])
-                        for idx_str, changes in ed_state["edited_rows"].items():
-                            idx = int(idx_str)
-                            if idx < len(ps) and "is_enabled" in changes:
-                                ps[idx]["is_enabled"] = bool(changes["is_enabled"])
-                        st.session_state["wf_preview_step_rows"] = ps
-
                 editable_df = st.data_editor(
                     prev_df[show_cols],
                     width="stretch",
                     hide_index=True,
                     key="wf_preview_steps_editor_new_expander",
-                    on_change=_on_editor_change,
                     column_config={
                         "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
                     },
                     disabled=[c for c in show_cols if c != "is_enabled"],
                 )
                 try:
-                    # Sync editor changes back to session state immediately
-                    if "wf_preview_steps_editor_new_expander" in st.session_state:
-                        ed_state = st.session_state["wf_preview_steps_editor_new_expander"]
-                        if ed_state and "edited_rows" in ed_state:
-                            ps = list(st.session_state["wf_preview_step_rows"])
-                            for idx_str, changes in ed_state["edited_rows"].items():
-                                idx = int(idx_str)
-                                if idx < len(ps) and "is_enabled" in changes:
-                                    ps[idx]["is_enabled"] = bool(changes["is_enabled"])
-                            st.session_state["wf_preview_step_rows"] = ps
+                    if editable_df is not None and len(editable_df) and "is_enabled" in getattr(
+                        editable_df, "columns", []
+                    ):
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        n = min(len(ps), len(editable_df))
+                        for i in range(n):
+                            ps[i]["is_enabled"] = bool(editable_df["is_enabled"].iloc[i])
+                        st.session_state["wf_preview_step_rows"] = ps
                 except Exception:
                     pass
                 preview_steps = st.session_state.get("wf_preview_step_rows") or preview_steps
@@ -17467,7 +17454,7 @@ def page_workflow_automation():
                         err_val = ""
                     _err_full = str(sr.get("last_error") or "")
                     err_cell = (
-                        f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(_err_full)}">{html.escape(err_val[:40])}</span>'
+                        f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(_err_full)}">{html.escape(err_val[:200])}</span>'
                         if err_val
                         else ""
                     )
