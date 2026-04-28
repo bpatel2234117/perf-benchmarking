@@ -1135,12 +1135,29 @@ def credential_kind_from_ds_template(ds_tpl: str, step_dict: Dict[str, Any]) -> 
     return str(step_dict.get("ds_kind") or "").strip().lower()
 
 
+def _credential_kind_secret_namespace(cred_kind: str) -> str:
+    """
+    BigID ds_connection.type often differs from the .env namespace (e.g. type \"s3-v2\"
+    but variables S3_accessKey / S3_secret_key). Map connector types to the same namespace
+    resolve_secret_vars and _apply_runtime_secrets use for standalone S3/SMB steps.
+    """
+    k = str(cred_kind or "").strip().lower()
+    if k in {"s3", "s3-v2", "s3_v2", "s3v2"}:
+        return "s3"
+    if k.startswith("s3-"):
+        return "s3"
+    # smb.json uses type \"smb_v2\"; env uses SMB_* (same rule as SMB small/large)
+    if k in {"smb", "smb_v2", "smb-v2", "smbv2"}:
+        return "smb"
+    return k
+
+
 def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
     """
     Pull secrets from environment variables (user will put in .env).
     Keys match placeholders used by import_bigid_datasources.py.
     """
-    k = str(ds_kind or "").strip().lower()
+    k = _credential_kind_secret_namespace(str(ds_kind or ""))
     out: Dict[str, str] = {}
     # Generic support for current + future DS kinds:
     # include ALL env/.env variables with prefix "<ds_kind>_" (case-insensitive),
@@ -1652,7 +1669,7 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
     """
     if not isinstance(ds_payload, dict):
         return ds_payload
-    k = str(ds_kind or "").strip().lower()
+    k = _credential_kind_secret_namespace(str(ds_kind or ""))
     root = ds_payload
     ds_conn = root.get("ds_connection") if isinstance(root.get("ds_connection"), dict) else None
     if not isinstance(ds_conn, dict):
