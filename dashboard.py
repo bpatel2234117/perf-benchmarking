@@ -13600,8 +13600,9 @@ def load_scanner_group_performance(env_id, start_dt, end_dt):
 
 def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
     """
-    Fallback when `group_scanner_ids_json` was not stored yet: pods whose **latest** row is
-    not failed/inactive and has **running_threads > 0** (typical BigID "busy" running set).
+    Fallback when `group_scanner_ids_json` was not stored yet: active pods from the
+    latest services-status rows. A scanner with 0 running threads still counts as an
+    active scanner in the BigID scanners table.
     """
     if df_i is None or df_i.empty or "scanner_id" not in df_i.columns:
         return set()
@@ -13615,9 +13616,7 @@ def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
                 continue
             if _scanner_status_inactive(r.get("status")):
                 continue
-            rt = int(pd.to_numeric(r.get("running_threads"), errors="coerce") or 0)
-            if rt > 0:
-                out.add(sid)
+            out.add(sid)
         return out
     except Exception:
         return set()
@@ -13626,14 +13625,14 @@ def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
 def spm_effective_running_scanner_id_set(df_g: pd.DataFrame, df_i: pd.DataFrame) -> Tuple[set, str]:
     """
     Prefer scanner-groups `scannersIDs` (matches BigID runningScanners count).
-    Else infer from services-status latest rows (threads > 0, non-failed).
+    Else infer active scanner IDs from services-status latest rows.
     """
     ids = spm_latest_group_scanner_id_set(df_g)
     if ids:
         return ids, "scanner-groups `scannersIDs`"
     ids2 = spm_infer_running_scanner_ids_from_individual(df_i)
     if ids2:
-        return ids2, "inferred (latest non-failed + running_threads > 0)"
+        return ids2, "inferred (latest active services-status scanners)"
     return set(), ""
 
 
@@ -16088,6 +16087,26 @@ def page_scan_progress():
                                     g_sum["avg_scan_speed_kib_s"] = pd.to_numeric(
                                         g_sum["avg_scan_speed"], errors="coerce"
                                     ).fillna(0.0) / 1024.0
+                                    st.markdown("**Total running threads over time**")
+                                    fig_threads_total = go.Figure()
+                                    fig_threads_total.add_trace(
+                                        go.Scatter(
+                                            x=g_sum["captured_at_utc"],
+                                            y=g_sum["running_threads"],
+                                            mode="lines+markers",
+                                            name="Total running threads",
+                                            line=dict(color="#7C3AED", width=2),
+                                        )
+                                    )
+                                    fig_threads_total.update_layout(
+                                        **_spm_layout_merge(
+                                            _spm_m,
+                                            yaxis=dict(title="Threads", rangemode="tozero"),
+                                            height=360,
+                                        ),
+                                    )
+                                    spm_apply_plotly_ticks(fig_threads_total, g_sum["captured_at_utc"])
+                                    st.plotly_chart(fig_threads_total, width="stretch")
                                     # Pod CPU → group-level trend: mean CPU % per scanner group per slot, then mean across groups (matches BigID group × pods).
                                     _cpu_t = pd.DataFrame()
                                     try:
@@ -17145,7 +17164,15 @@ def page_workflow_automation():
     render_workflow_creation_section(wf_pool_df, in_use_env_ids)
 
     # --- Load runs ---
-    st.markdown("### Workflow Runs")
+    wf_runs_title_col, wf_runs_refresh_col = st.columns([4, 1])
+    wf_runs_title_col.markdown("### Workflow Runs")
+    if wf_runs_refresh_col.button("Refresh Workflow Runs", key="wf_runs_refresh_top", use_container_width=True):
+        try:
+            load_workflow_runs.clear()
+            load_test_environments.clear()
+        except Exception:
+            pass
+        st.rerun()
     st.caption(
         "Click a run id to expand details. Row **🔁** = quick reconcile from DB. **Reset** options live under "
         "**Controls — Run …** below the table (scroll down). **Delete** (🗑️) purges local DB rows for that run’s "
@@ -17309,7 +17336,7 @@ def page_workflow_automation():
                         errors += 1
                     elif c_status == "completed":
                         completed += 1
-                    elif c_status in {"", "pending"}:
+                    elif c_status in {"", "pending", "stopped", "aborted", "cancelled", "canceled"}:
                         pass  # included in metrics.pending below (residual)
                     else:
                         in_prog += 1

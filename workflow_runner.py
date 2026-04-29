@@ -3037,7 +3037,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if count_before >= num_envs:
                         continue  # no capacity: all envs are "used" by earlier steps or those with higher priority (lower seq)
 
-                c_status = str(cand[19] or '').strip().lower()
+                c_status = str(cand[20] or '').strip().lower()
                 c_env = cand[2]
 
                 # Special case: already running?
@@ -3101,7 +3101,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if candidates:
                         first_ready = candidates[0]
                         fr_id = int(first_ready[0])
-                        fr_status = str(first_ready[19] or '').strip().lower()
+                        fr_status = str(first_ready[20] or '').strip().lower()
                         if fr_status not in {'completed','error','disabled','scan_running'}:
                             set_step_status(engine, fr_id, 'scan_waiting', last_error='No free env this tick; will retry next tick.')
                             # Do NOT set next_eligible_at — run stays eligible so next runner tick retries immediately
@@ -3702,7 +3702,8 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     try:
         # Skip retesting if we already have ds_test_ok (or beyond).
         st_db = str(cur_status or "").strip().lower()
-        skip_ds_test = st_db in {"ds_test_ok", "scan_created", "scan_running", "scan_waiting"}
+        has_scan_or_profile = bool(str(step[15] or "").strip() or str(step[19] or "").strip())
+        skip_ds_test = st_db in {"ds_test_ok", "scan_created", "scan_running"} or (st_db == "scan_waiting" and has_scan_or_profile)
         if not skip_ds_test:
             # ds_payload was either {"ds_connection": {...}, ...} or connector payload.
             ds_conn_obj = ds_payload.get("ds_connection") if isinstance(ds_payload, dict) else None
