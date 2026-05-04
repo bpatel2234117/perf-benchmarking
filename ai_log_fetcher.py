@@ -278,20 +278,49 @@ def write_heartbeat(engine, status="ok", message=""):
         print(f"Failed to write heartbeat: {e}")
 
 def get_active_environments(engine):
+    """
+    Return one row per active environment for the currently running scan only.
+
+    Log tracking runs ONLY while a scan is active. Once a scan reaches a
+    terminal state it drops out of this query immediately — no idle polling,
+    no re-processing of old logs between scans.
+
+    The final in-flight cycle (the poll that runs just as a scan completes)
+    still captures the last errors because run_once uses scan_start→scan_end
+    as the time-window filter, so nothing is lost.
+    """
     query = """
-        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at
+        SELECT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at, sp.completed_at,
+               sp.updated_at
         FROM test_environments t
         JOIN scan_parents sp ON sp.environment_id = t.id
-        WHERE t.is_active = 1 
-          AND (
-              LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
-                  'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled', 'paused', 'pause'
-              )
+        WHERE t.is_active = 1
+          AND LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
+              'completed','completedwithfailures','failed','stopped','stop',
+              'aborted','cancelled','canceled','paused','pause'
           )
+        ORDER BY t.id, sp.updated_at DESC
     """
     with engine.connect() as conn:
-        result = conn.execute(text(query)).fetchall()
-        return [{"id": row[0], "env_name": row[1], "base_url": row[2], "active_scan_id": row[3], "scan_start_time": row[4]} for row in result]
+        rows = conn.execute(text(query)).fetchall()
+
+    # One row per environment — most recently updated running scan wins.
+    seen_envs: set = set()
+    result = []
+    for row in rows:
+        env_id = row[0]
+        if env_id in seen_envs:
+            continue
+        seen_envs.add(env_id)
+        result.append({
+            "id":              row[0],
+            "env_name":        row[1],
+            "base_url":        row[2],
+            "active_scan_id":  row[3],
+            "scan_start_time": row[4],
+            "scan_end_time":   row[5],   # None while scan is running
+        })
+    return result
 
 def fetch_logs(base_url, token, num_lines, log_source="scanner"):
     url = f"{base_url.rstrip('/')}/api/v1/logs/{log_source}?len={num_lines}"
@@ -301,12 +330,8 @@ def fetch_logs(base_url, token, num_lines, log_source="scanner"):
         "Cache-Control": "no-cache",
         "Pragma": "no-cache"
     }
-    
-    # User curl uses --insecure
     response = requests.get(url, headers=headers, verify=False, timeout=60)
     response.raise_for_status()
-    
-    # Sometimes it returns a bare string, sometimes JSON
     try:
         data = response.json()
         if isinstance(data, dict) and "data" in data:
@@ -315,42 +340,183 @@ def fetch_logs(base_url, token, num_lines, log_source="scanner"):
     except json.JSONDecodeError:
         return response.text
 
+
+def _estimate_fetch_lines(
+    scan_start: Optional[datetime],
+    scan_end: Optional[datetime],
+    cursor: Optional[datetime] = None,
+) -> int:
+    """
+    Estimate how many log lines to fetch.
+
+    Two distinct cases:
+
+    RUNNING scan (scan_end is None):
+      - If a cursor exists: fetch one poll interval worth of new lines.
+        Window = now - cursor, typically FETCH_INTERVAL_MINUTES wide.
+      - First cycle (no cursor): scan may have been running for hours already.
+        Fetch from scan_start to now, capped at MAX_LINES.
+      Regardless of scan duration (2 h or 20 h), each cycle only fetches
+      the delta since the last cursor — keeping fetch size small and constant.
+
+    COMPLETED scan (scan_end is set):
+      - Fetch the full scan_start→scan_end window (used for one final pass).
+
+    Heuristic: ~10 log lines/sec under load, +20% buffer.
+    Clamped between MIN_LINES (200) and MAX_LINES (8000).
+    """
+    MIN_LINES     = 200
+    MAX_LINES     = 8000
+    LINES_PER_SEC = 10
+
+    if scan_end is None:
+        # Running scan
+        if cursor is not None:
+            # Normal cycle: estimate lines since last cursor (one interval)
+            window_secs = max(0, (datetime.utcnow() - cursor).total_seconds())
+        elif scan_start is not None:
+            # First cycle: scan may have been running a while — fetch from start
+            window_secs = max(0, (datetime.utcnow() - scan_start).total_seconds())
+        else:
+            # No timing info at all — use one interval as fallback
+            window_secs = FETCH_INTERVAL_MINUTES * 60
+    else:
+        # Completed scan: full window
+        start = scan_start if scan_start is not None else scan_end
+        window_secs = max(0, (scan_end - start).total_seconds())
+
+    if window_secs == 0:
+        return MIN_LINES
+
+    estimated = int(window_secs * LINES_PER_SEC * 1.2)
+    return max(MIN_LINES, min(MAX_LINES, estimated))
+
+
+def _log_cursor_key(env_id: int, log_source: str, scan_id: str) -> str:
+    """app_settings key for the last-processed log timestamp cursor, scoped to a specific scan."""
+    return f"log_cursor:{env_id}:{log_source}:{scan_id}"
+
+
+def _get_log_cursor(engine, env_id: int, log_source: str, scan_id: str) -> Optional[datetime]:
+    """Return the last successfully processed log timestamp for this env+source+scan, or None."""
+    key = _log_cursor_key(env_id, log_source, scan_id)
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT setting_value FROM app_settings WHERE setting_key = :k LIMIT 1"),
+                {"k": key}
+            ).fetchone()
+        if row and row[0]:
+            return _coerce_to_datetime(row[0])
+    except Exception:
+        pass
+    return None
+
+
+def _set_log_cursor(engine, env_id: int, log_source: str, scan_id: str, ts: datetime) -> None:
+    """Persist the last-processed log timestamp cursor for this env+source+scan."""
+    key = _log_cursor_key(env_id, log_source, scan_id)
+    val = ts.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        with engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO app_settings (setting_key, setting_value)
+                    VALUES (:k, :v)
+                    ON DUPLICATE KEY UPDATE setting_value = :v
+                """),
+                {"k": key, "v": val}
+            )
+            conn.commit()
+    except Exception as e:
+        print(f"[log cursor] Failed to save cursor for {key}: {e}")
+
+
+def _filter_lines_to_scan_window(
+    raw_text: str,
+    scan_start: Optional[datetime],
+    scan_end: Optional[datetime],
+) -> str:
+    """
+    Keep only log lines whose timestamp falls within [scan_start, scan_end].
+
+    scan_end=None means the scan is still running — no upper bound is applied,
+    so all lines from scan_start onward are kept.
+
+    Lines with no parseable timestamp (stack trace continuations, indented JSON)
+    are kept only when they immediately follow an in-window line.
+    """
+    lines = raw_text.splitlines()
+    result = []
+    last_in_window = False
+
+    for line in lines:
+        ts = _parse_log_timestamp(line)
+        if ts is not None:
+            in_window = True
+            if scan_start is not None and ts < scan_start:
+                in_window = False
+            if scan_end is not None and ts > scan_end:
+                in_window = False
+            last_in_window = in_window
+            if in_window:
+                result.append(line)
+        else:
+            # No timestamp — treat as continuation of the previous line
+            if last_in_window:
+                result.append(line)
+
+    return "\n".join(result)
+
 def extract_scan_ids(log_text):
     """
-    Attempts to extract BigID scan_id and subscan_id (24 char hex strings) from the context.
+    Best-effort extraction of a subscan_id from log context.
+    We no longer use this to link errors to a parent scan — that is done
+    exclusively via the time-window gate in run_once using scan_start/scan_end.
+
+    Supports 24-char hex MongoDB ObjectIDs and 36-char UUID format.
+    Returns (scan_id, subscan_id) — scan_id is kept for legacy callers but
+    run_once ignores it in favour of the DB active_scan_id.
     """
     scan_id = None
     subscan_id = None
-    
-    # Common formats: scan_id=69c673df1e63fcb3cc6c69d9, scanId: "..." etc.
-    s_match = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
+
+    # 24-char hex MongoDB ObjectID
+    s_match = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
     if not s_match:
-        # Handle O365 SDK format: sdk-object-scan-69d62cbf93c857d502eb0099-69d62d0193c857d502ebb349-0
         s_match = re.search(r'sdk-object-scan-([a-f0-9]{24})', log_text)
-        
     if s_match:
         scan_id = s_match.group(1)
-        
+
     ss_match = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
     if not ss_match and s_match:
-        # Check for subscan ID following the scan ID in the SDK format
         ss_match = re.search(fr'sdk-object-scan-{scan_id}-([a-f0-9]{24})', log_text)
-        
     if ss_match:
         subscan_id = ss_match.group(1)
-        
+
     return scan_id, subscan_id
 
 
 def _skip_info_level_line(line: str) -> bool:
     """
-    BigID scanner often logs normal work at [INFO], including URLs whose path contains
-    'failed-enumeration-objects' etc. Those must not be treated as errors.
-    Set SCANNER_LOG_SKIP_INFO_LEVEL=0 to revert to legacy behavior.
+    Skip pure INFO/DEBUG/TRACE lines UNLESS they contain a strong error signal
+    that BigID sometimes logs at INFO level (e.g. 401, 403, 500, exception, stacktrace).
+    Set SCANNER_LOG_SKIP_INFO_LEVEL=0 to disable all INFO skipping.
     """
     if os.getenv("SCANNER_LOG_SKIP_INFO_LEVEL", "1").strip().lower() not in ("1", "true", "yes", "on"):
         return False
-    return bool(re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I))
+    if not re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I):
+        return False
+    # Even on INFO/DEBUG/TRACE — keep the line if it has a strong signal
+    STRONG_SIGNALS = re.compile(
+        r"(?i)(?:"
+        r"\bexception\b|\bstacktrace\b|\bstack.?trace\b|\bnullpointer\b|\bnull.?pointer\b|"
+        r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        r"\b(?:40[0-9]|5[0-9]{2})\b|"          # HTTP 4xx/5xx status codes
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail"
+        r")"
+    )
+    return not bool(STRONG_SIGNALS.search(line))
 
 
 def _line_for_error_keyword_scan(line: str) -> str:
@@ -411,99 +577,131 @@ def _parse_log_timestamp(line: str) -> Optional[datetime]:
 def detect_errors_in_logs(log_text):
     """
     Structural-aware log analysis.
-    Finds error entry points (case-insensitive) and captures consecutive indented lines (stack traces).
 
-    By default (SCANNER_LOG_ERROR_REQUIRE_LEVEL=error_fatal) the trigger line must include
-    [ERROR], [FATAL], or [SEVERE] — keyword matches alone are ignored. Use warn or any for looser rules.
+    Capture strategy (two independent paths — either is sufficient):
+      A) Line has a severity tag [ERROR], [FATAL], [SEVERE], [WARN], [WARNING]
+         → always captured regardless of message body content.
+      B) Line has no severity tag but contains a known error keyword
+         (exception, timeout, refused, 4xx/5xx status, etc.)
+         → captured only when SCANNER_LOG_ERROR_REQUIRE_LEVEL allows it.
+
+    This ensures lines like:
+        [2026-04-29 08:52:34.712Z] [ERROR] scanner_file - <message with no keyword>
+    are never silently dropped.
     """
     lines = log_text.splitlines()
     error_contexts = []
     seen_fingerprints = set()
 
-    i = 0
-    # Word-boundary tokens. Unbounded 'abort' matched isAbort; 'reset' matched preset; 'throttl' matched throttle.
-    # "failed" only when followed by whitespace so hyphenated API paths do not match.
-    ERROR_PATTERN = re.compile(
+    # Severity-tag pattern — presence alone is enough to capture the line
+    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", re.I)
+
+    # Keyword pattern — used as a secondary path when no severity tag is present.
+    # Covers: HTTP error codes, auth failures, resource exhaustion, connectivity,
+    # JVM/runtime crashes, and BigID-specific signals.
+    KEYWORD_PATTERN = re.compile(
         r"(?i)(?:"
-        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|\bnohttp\b|"
-        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
-        r"\babort(?:ed|ing)?\b|\bexhausted\b|"
-        r"\bthrottl(?:ing|ed)\b|\blimitreached\b|\bgraphservice\b|\bactivitylimit\b"
+        # Explicit error/failure words
+        r"\berror\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bsevere\b|\bexception\b|"
+        r"\baxioserror\b|\bnohttp\b|"
+        # HTTP status codes (4xx and 5xx)
+        r"\bstatus\s+[45]\d{2}\b|\bhttp\s+[45]\d{2}\b|"
+        r"\b(?:400|401|403|404|408|409|429|500|502|503|504)\b|"
+        # Auth / access
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail|\baccess.?denied\b|"
+        r"\btoken.?(?:expired|invalid|fail)\b|\bcredential\b|"
+        # Connectivity
+        r"\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\bconnection.?(?:reset|closed|lost|drop)\b|"
+        r"\bsocket\b|\beof\b|\bbroken.?pipe\b|"
+        # Resource exhaustion / JVM
+        r"\bdenied\b|\bexhausted\b|\bout.?of.?memory\b|\boom\b|"
+        r"\bnull.?pointer\b|\bnullpointer\b|\bstack.?(?:trace|overflow)\b|\bstacktrace\b|"
+        r"\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        # Abort / throttle / limit
+        r"\babort(?:ed|ing)?\b|\bthrottl(?:ing|ed)?\b|\blimitreached\b|"
+        r"\bcircuit.?breaker\b|\bretry.?(?:limit|exhaust)\b|"
+        # BigID-specific
+        r"\bgraphservice\b|\bactivitylimit\b|\breset\b"
         r")"
     )
 
+    i = 0
     while i < len(lines):
         line = lines[i]
 
+        # Skip pure INFO/DEBUG/TRACE lines — they are never errors
         if _skip_info_level_line(line):
             i += 1
             continue
 
-        scan_line = _line_for_error_keyword_scan(line)
+        scan_line = _line_for_error_keyword_scan(line)  # URLs stripped for keyword matching
 
-        # 1. Detect starting line of an error block (Pattern-based)
-        if ERROR_PATTERN.search(scan_line):
-            if not _line_passes_error_level_gate(line):
-                i += 1
-                continue
-            # Context before: capture 2 lines if possible for timestamps/IDs
-            start = max(0, i - 2)
-            
-            # 2. Greedy Multi-line Capture (Stack traces, indented JSON, etc)
-            end = i + 1
-            while end < len(lines) and (end - i) < 30: # Max 30 lines for context
-                next_line = lines[end]
+        # Path A: severity tag present → always a candidate
+        has_level_tag = bool(LEVEL_PATTERN.search(line))
+        # Path B: keyword match on URL-stripped line (only when no level tag)
+        has_keyword   = bool(KEYWORD_PATTERN.search(scan_line)) if not has_level_tag else False
 
-                # CRITICAL FIX: If the next line itself is a NEW error marker, 
-                # BREAK the context here so it gets its own record instead of being swallowed.
-                if ERROR_PATTERN.search(_line_for_error_keyword_scan(next_line)) and _line_passes_error_level_gate(next_line):
+        is_trigger = has_level_tag or (has_keyword and _line_passes_error_level_gate(line))
+
+        if not is_trigger:
+            i += 1
+            continue
+
+        # Context before: capture 2 lines for timestamps/IDs
+        start = max(0, i - 2)
+
+        # Greedy multi-line capture (stack traces, indented JSON, etc.)
+        end = i + 1
+        while end < len(lines) and (end - i) < 30:
+            next_line = lines[end]
+            # If the next line is itself a new independent error, stop here
+            next_has_level = bool(LEVEL_PATTERN.search(next_line))
+            next_scan = _line_for_error_keyword_scan(next_line)
+            next_has_kw = bool(KEYWORD_PATTERN.search(next_scan)) if not next_has_level else False
+            if next_has_level or (next_has_kw and _line_passes_error_level_gate(next_line)):
+                break
+            if next_line.startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
+                end += 1
+            else:
+                break
+
+        # If no indented continuation, grab a small trailing context anyway
+        if end == i + 1:
+            end = min(len(lines), i + 4)
+
+        ctx_lines = lines[start:end]
+        ctx_text  = "\n".join(ctx_lines)
+
+        # Extract timestamp from trigger line, fall back to context lines
+        log_ts = _parse_log_timestamp(line)
+        if not log_ts:
+            for cl in ctx_lines:
+                log_ts = _parse_log_timestamp(cl)
+                if log_ts:
                     break
 
-                # Match common stack trace/indented log markers
-                if next_line.startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
-                    end += 1
-                else: break
-            
-            # If no indentation, at least grab a tiny bit of following context
-            if end == i + 1:
-                end = min(len(lines), i + 4)
+        if _looks_like_success_scan_summary(ctx_text):
+            i = end
+            continue
 
-            # Slice includes trigger line (i) and up to 2 lines before (start) through end-1
-            ctx_lines = lines[start:end]
-            ctx_text = "\n".join(ctx_lines)
-            
-            # Extract timestamp from the trigger line or context
-            log_ts = _parse_log_timestamp(line)
-            if not log_ts:
-                # Fallback: check first line of context
-                for cl in ctx_lines:
-                    log_ts = _parse_log_timestamp(cl)
-                    if log_ts: break
+        # Fingerprint with timestamps masked so the same error at different times
+        # is still deduplicated within a single fetch cycle
+        fingerprint_text = re.sub(
+            r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_text
+        )
+        fingerprint = fingerprint_text[:300]
 
-            # Deduplicate within this fetch cycle
-            if _looks_like_success_scan_summary(ctx_text):
-                i = end
-                continue
+        if fingerprint not in seen_fingerprints:
+            seen_fingerprints.add(fingerprint)
+            error_hash = hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
+            error_contexts.append({
+                "text":      ctx_text,
+                "timestamp": log_ts,
+                "hash":      error_hash,
+            })
 
-            # IMPROVED FINGERPRINTING: Mask timestamps to avoid 
-            # skipping unique errors just because their log prefix is the same.
-            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_text)
-            fingerprint = fingerprint_text[:300]
-            
-            if fingerprint not in seen_fingerprints:
-                seen_fingerprints.add(fingerprint)
-                # Calculate hash for DB deduplication (stable across fetches)
-                error_hash = hashlib.md5(fingerprint.encode('utf-8')).hexdigest()
-                error_contexts.append({
-                    "text": ctx_text,
-                    "timestamp": log_ts,
-                    "hash": error_hash
-                })
-                
-            i = end # Advance cursor
-        else:
-            i += 1
-                
+        i = end
+
     return error_contexts
 
 def call_health_summarizer(log_text):
@@ -560,21 +758,20 @@ def call_ai_analyzer(error_context, log_source):
     if not check_ollama_ready():
         return f"[⚠️ AI Analysis Offline] Ollama is not reachable at {OLLAMA_URL}. Please ensure Ollama is running. Raw error context: {error_context[:200]}..."
     
-    prompt = f"""
-You are an expert systems engineer and log analyst.
-I have extracted a severe error from our '{log_source}' application logs.
-Below is the exact error line with two lines of context before and after.
+    prompt = f"""You are an expert systems engineer and log analyst specializing in BigID data intelligence platform.
+I have extracted a log entry from the '{log_source}' service logs.
 
 LOG CONTEXT:
 {error_context}
 
-Please explain:
-1. What exactly went wrong here?
-2. Is this a network, authentication, resource, or logic/code bug?
-3. What is the recommended fix or area to investigate?
+Analyze this and provide:
+1. SEVERITY: Rate as CRITICAL / HIGH / MEDIUM / LOW
+2. WHAT FAILED: One sentence describing exactly what went wrong
+3. ROOT CAUSE CATEGORY: Choose from: Network | Authentication | Resource | Configuration | Bug | Timeout | Permission | Unknown
+4. IMPACT: What does this mean for the running scan or system?
+5. RECOMMENDED ACTION: Specific steps to investigate or fix
 
-Provide a concise, highly technical answer.
-"""
+Be concise and technical. If the log line looks like a normal operational message with no real problem, say "NOT AN ERROR - normal operation"."""
     try:
         response = requests.post(
             OLLAMA_URL,
@@ -589,6 +786,100 @@ Provide a concise, highly technical answer.
         return response.json().get("response", "No response from AI")
     except Exception as e:
         return f"AI Analysis failed: {e}"
+
+
+def call_llm_log_scanner(log_text, log_source, scan_start=None, scan_end=None):
+    """
+    Send the full log window to the LLM and ask it to identify any anomalies,
+    errors, or suspicious patterns that regex-based detection may have missed.
+
+    Returns a list of dicts: [{"text": <context>, "severity": <str>, "summary": <str>}]
+    or an empty list if nothing found or LLM is offline.
+    """
+    if not check_ollama_ready():
+        return []
+
+    lines = log_text.splitlines()
+    if len(lines) < 5:
+        return []
+
+    # Send up to 200 lines to keep within LLM context limits.
+    # Prefer the full window; if larger, sample start + middle + end.
+    MAX_LINES = 200
+    if len(lines) <= MAX_LINES:
+        window = log_text
+    else:
+        chunk = MAX_LINES // 3
+        mid = len(lines) // 2
+        window = (
+            "\n".join(lines[:chunk]) +
+            "\n\n[... middle section ...]\n\n" +
+            "\n".join(lines[mid - chunk // 2: mid + chunk // 2]) +
+            "\n\n[... tail section ...]\n\n" +
+            "\n".join(lines[-chunk:])
+        )
+
+    time_ctx = ""
+    if scan_start:
+        time_ctx = f"Scan started at: {scan_start}"
+    if scan_end:
+        time_ctx += f"  |  Scan ended at: {scan_end}"
+
+    prompt = f"""You are a senior BigID platform engineer reviewing logs from the '{log_source}' service.
+{time_ctx}
+
+Your job is to find ANY of the following in the log window below — even if they are not tagged [ERROR]:
+- Authentication failures (401, 403, token expired, login failed)
+- HTTP 4xx or 5xx responses
+- Exceptions, stack traces, null pointer errors
+- Timeouts, connection refused, socket errors
+- Out of memory, resource exhaustion, process killed
+- Repeated warnings that indicate a degraded state
+- Any line that looks abnormal for a healthy scan
+
+LOG WINDOW:
+{window}
+
+Respond ONLY as a JSON array. Each item must have:
+  "line": the exact log line or short excerpt (max 300 chars)
+  "severity": one of CRITICAL / HIGH / MEDIUM / LOW
+  "category": one of Network | Authentication | Resource | Configuration | Bug | Timeout | Permission | Unknown
+  "summary": one sentence explaining what is wrong
+
+If you find nothing suspicious, respond with an empty array: []
+Do not include normal operational log lines. Only real problems.
+Respond with valid JSON only, no markdown, no explanation outside the array."""
+
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=180
+        )
+        response.raise_for_status()
+        raw = response.json().get("response", "[]").strip()
+
+        # Strip markdown code fences if LLM wraps in ```json ... ```
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        findings = json.loads(raw)
+        if not isinstance(findings, list):
+            return []
+        # Validate shape
+        result = []
+        for f in findings:
+            if isinstance(f, dict) and f.get("line") and f.get("summary"):
+                result.append({
+                    "text":     str(f.get("line", ""))[:500],
+                    "severity": str(f.get("severity", "MEDIUM")),
+                    "category": str(f.get("category", "Unknown")),
+                    "summary":  str(f.get("summary", "")),
+                })
+        return result
+    except Exception as e:
+        print(f"[LLM log scanner] Failed for source={log_source}: {e}")
+        return []
 
 def call_correlation_analyzer(error_batch):
     """
@@ -669,86 +960,206 @@ def run_once(engine):
     try:
         envs = get_active_environments(engine)
         if not envs:
-            print(f"[{datetime.now().isoformat()}] No active environments to process.")
-            write_heartbeat(engine, status="ok", message="No active environments")
+            print(f"[{datetime.now().isoformat()}] No active scans — log tracking idle.")
+            write_heartbeat(engine, status="ok", message="No active scans")
             return
 
         print(f"[{datetime.now().isoformat()}] Processing {len(envs)} environments...")
-        
+
         for env in envs:
-            env_id = env['id']
-            base_url = env['base_url']
-            env_name = env['env_name']
-            
+            env_id     = env['id']
+            base_url   = env['base_url']
+            env_name   = env['env_name']
+
             try:
                 print(f"[{datetime.now().isoformat()}] [{env_name}] Fetching auth token...")
                 token = get_auth_token(base_url, env)
-                
+
                 new_errors_by_scan = {}
                 log_sources = load_enabled_log_sources(engine)
-                
+
                 for log_source in log_sources:
                     try:
-                        logs = fetch_logs(base_url, token, 3000, log_source)
-                        if not logs: continue
-                        
-                        errors = detect_errors_in_logs(logs)
-                        for err_obj in errors:
-                            ctx = err_obj["text"]
-                            log_ts = err_obj["timestamp"] or datetime.utcnow()
-                            err_hash = err_obj["hash"]
-                            
-                            # CRITICAL FIX 1: Age Gate (Post-Scan Start Time Only)
-                            ts_cmp = _coerce_to_datetime(log_ts) or (
-                                log_ts if isinstance(log_ts, datetime) else datetime.utcnow()
-                            )
-                            scan_start = _coerce_to_datetime(env.get("scan_start_time"))
-                            if scan_start is not None and ts_cmp < scan_start:
-                                # This is a stale log from April 15th or previous run. SKIP.
-                                continue
+                        scan_start     = _coerce_to_datetime(env.get("scan_start_time"))
+                        scan_end       = _coerce_to_datetime(env.get("scan_end_time"))
+                        linked_scan_id = env.get("active_scan_id")
+                        # get_active_environments only returns running scans, so scan_end
+                        # is always None here. Keep the check for safety.
+                        is_running = scan_end is None
 
-                            # CRITICAL FIX 2: Global Deduplication (Hash-based)
+                        # ── Cursor logic ───────────────────────────────────────────────
+                        # Cursor is scoped to (env_id, log_source, scan_id) so a new scan
+                        # always starts fresh — it never inherits the previous scan's cursor.
+                        if is_running:
+                            cursor = _get_log_cursor(engine, env_id, log_source, str(linked_scan_id or ""))
+                        else:
+                            cursor = None
+
+                        # effective_start = where to begin filtering this cycle.
+                        # Guard: if both scan_start and cursor are None we have no anchor —
+                        # skip this source rather than processing the entire log file.
+                        if scan_start is None and cursor is None:
+                            print(f"[{datetime.now().isoformat()}] [{env_name}] [{log_source}] No scan_start or cursor — skipping.")
+                            continue
+
+                        if is_running:
+                            if scan_start and cursor:
+                                effective_start = max(scan_start, cursor)
+                            else:
+                                effective_start = cursor or scan_start
+                        else:
+                            effective_start = scan_start  # completed scan: full window
+
+                        # ── Fetch ──────────────────────────────────────────────────────
+                        # For a running scan with a cursor, fetch only one interval's worth.
+                        # For first cycle (no cursor), fetch from scan_start to now (capped).
+                        fetch_count = _estimate_fetch_lines(scan_start, scan_end, cursor=cursor)
+                        raw_logs = fetch_logs(base_url, token, fetch_count, log_source)
+                        if not raw_logs:
+                            continue
+
+                        # ── Filter to scan window ──────────────────────────────────────
+                        # effective_start is the lower bound; scan_end is the upper bound
+                        # (None = no upper bound for running scans).
+                        filtered_logs = _filter_lines_to_scan_window(raw_logs, effective_start, scan_end)
+                        if not filtered_logs.strip():
+                            # No new lines in window — advance cursor to now so next cycle
+                            # doesn't re-fetch the same empty window.
+                            if is_running:
+                                _set_log_cursor(engine, env_id, log_source,
+                                                str(linked_scan_id or ""), datetime.utcnow())
+                            continue
+
+                        # ── Helpers (defined here with explicit captures to avoid closure bugs) ──
+
+                        def _line_hash(text: str, _re=re, _md5=hashlib.md5) -> str:
+                            """Stable hash for a log line with timestamps masked."""
+                            masked = _re.sub(
+                                r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?',
+                                '[TS]', text
+                            )
+                            return _md5(masked[:300].encode('utf-8')).hexdigest()
+
+                        # Capture loop variables explicitly so closures are safe
+                        _env_id         = env_id
+                        _linked_scan_id = linked_scan_id
+                        _log_source     = log_source
+
+                        def _store_if_new(ctx, log_ts, err_hash, ai_analysis, subscan_id=None,
+                                          _eid=_env_id, _sid=_linked_scan_id, _src=_log_source):
+                            """Dedup-check against scan_id scope, then store. Returns True if stored."""
                             with engine.connect() as conn:
-                                # We check hash AND recently (within 24h) to allow same error in future scans, 
-                                # but ignore "bursts" of same error in current scan.
                                 existing = conn.execute(
                                     text("""
-                                        SELECT id FROM scan_log_errors 
-                                        WHERE environment_id = :eid 
-                                          AND error_hash = :hash 
-                                          AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                                        SELECT id FROM scan_log_errors
+                                        WHERE environment_id = :eid
+                                          AND scan_id        = :scan_id
+                                          AND error_hash     = :hash
                                         LIMIT 1
                                     """),
-                                    {"eid": env_id, "hash": err_hash}
+                                    {"eid": _eid, "scan_id": str(_sid or ""), "hash": err_hash}
                                 ).fetchone()
-                            if existing: continue
-                            
-                            parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
-                            ai_analysis = call_ai_analyzer(ctx, log_source)
-                            
-                            # CRITICAL FIX 3: Store REAL log timestamp
+                            if existing:
+                                return False
                             store_error_analysis(
-                                engine, env_id, ctx, ai_analysis, log_source, 
-                                parsed_scan_id or env.get("active_scan_id"), 
-                                parsed_subscan_id, 
+                                engine, _eid, ctx, ai_analysis, _src,
+                                _sid, subscan_id,
                                 error_hash=err_hash,
                                 actual_log_ts=log_ts
                             )
-                            
-                            p_sid = parsed_scan_id or env.get("active_scan_id")
-                            if p_sid:
-                                if p_sid not in new_errors_by_scan:
-                                    new_errors_by_scan[p_sid] = []
-                                new_errors_by_scan[p_sid].append((log_source, ctx, p_sid))
+                            return True
+
+                        # ── Track latest timestamp in this batch (for cursor advance) ──
+                        latest_ts_in_batch: Optional[datetime] = None
+
+                        def _update_latest(ts_val):
+                            nonlocal latest_ts_in_batch
+                            ts = _coerce_to_datetime(ts_val)
+                            if ts and (latest_ts_in_batch is None or ts > latest_ts_in_batch):
+                                latest_ts_in_batch = ts
+
+                        # Seed latest_ts from all lines in the filtered window upfront,
+                        # so the cursor advances even if no errors are found.
+                        for _line in filtered_logs.splitlines():
+                            _update_latest(_parse_log_timestamp(_line))
+
+                        # ── Pass 1: regex-based detection ──────────────────────────────
+                        seen_line_hashes: set = set()
+                        errors = detect_errors_in_logs(filtered_logs)
+
+                        for err_obj in errors:
+                            ctx      = err_obj["text"]
+                            log_ts   = err_obj["timestamp"] or datetime.utcnow()
+                            err_hash = err_obj["hash"]
+
+                            _update_latest(log_ts)
+
+                            # Mark all lines in this context as seen so LLM skips them
+                            for _ln in ctx.splitlines():
+                                if _ln.strip():
+                                    seen_line_hashes.add(_line_hash(_ln))
+
+                            _, parsed_subscan_id = extract_scan_ids(ctx)
+                            ai_analysis = call_ai_analyzer(ctx, log_source)
+
+                            if _store_if_new(ctx, log_ts, err_hash, ai_analysis, parsed_subscan_id):
+                                new_errors_by_scan.setdefault(linked_scan_id, [])
+                                new_errors_by_scan[linked_scan_id].append((log_source, ctx, linked_scan_id))
+
+                        # ── Pass 2: LLM on deduplicated remainder ──────────────────────
+                        # Only lines not already flagged by regex are sent to the LLM.
+                        llm_input_lines = [
+                            ln for ln in filtered_logs.splitlines()
+                            if ln.strip() and _line_hash(ln) not in seen_line_hashes
+                        ]
+
+                        if llm_input_lines:
+                            llm_findings = call_llm_log_scanner(
+                                "\n".join(llm_input_lines), log_source,
+                                scan_start=str(effective_start) if effective_start else None,
+                                scan_end=str(scan_end) if scan_end else None,
+                            )
+                            for finding in llm_findings:
+                                ctx_text = (
+                                    f"[LLM-DETECTED | {finding['severity']} | {finding['category']}]\n"
+                                    f"{finding['text']}\n\n"
+                                    f"AI Summary: {finding['summary']}"
+                                )
+                                fp = re.sub(
+                                    r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?',
+                                    '[TS]', ctx_text
+                                )
+                                err_hash   = hashlib.md5(fp[:300].encode('utf-8')).hexdigest()
+                                log_ts     = _parse_log_timestamp(finding["text"]) or datetime.utcnow()
+                                ai_detail  = call_ai_analyzer(finding["text"], log_source)
+                                full_analysis = f"[LLM Scanner: {finding['summary']}]\n\n{ai_detail}"
+
+                                if _store_if_new(ctx_text, log_ts, err_hash, full_analysis):
+                                    new_errors_by_scan.setdefault(linked_scan_id, [])
+                                    new_errors_by_scan[linked_scan_id].append(
+                                        (log_source, ctx_text, linked_scan_id)
+                                    )
+                                    print(f"[{datetime.now().isoformat()}] [{env_name}] "
+                                          f"LLM found new issue in {log_source}: {finding['summary'][:80]}")
+
+                        # ── Advance cursor ─────────────────────────────────────────────
+                        # Only for running scans. Scoped to scan_id so a new scan starts
+                        # fresh. We always advance even if no errors were found, so the
+                        # next cycle doesn't re-process the same lines.
+                        if is_running and latest_ts_in_batch:
+                            _set_log_cursor(engine, env_id, log_source,
+                                            str(linked_scan_id or ""), latest_ts_in_batch)
 
                     except Exception as source_err:
-                        print(f"[{datetime.now().isoformat()}] [{env_name}] Error processing source {log_source}: {source_err}")
-                
+                        print(f"[{datetime.now().isoformat()}] [{env_name}] "
+                              f"Error processing source {log_source}: {source_err}")
+
             except Exception as env_err:
                 print(f"[{datetime.now().isoformat()}] [ERROR] Failed processing environment {env_name}: {env_err}")
                 continue
 
-        write_heartbeat(engine, status="ok", message=f"Processed {len(envs)} environments at {datetime.now().isoformat()}")
+        write_heartbeat(engine, status="ok",
+                        message=f"Processed {len(envs)} environments at {datetime.now().isoformat()}")
     except Exception as global_err:
         print(f"[{datetime.now().isoformat()}] CRITICAL: Global run_once failure: {global_err}")
 

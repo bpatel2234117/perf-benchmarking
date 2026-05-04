@@ -6736,55 +6736,106 @@ Provide a comprehensive, executive-level technical summary in Markdown.
 # --- AI Log Analysis Helpers (Synced with ai_log_fetcher.py) ---
 
 def _detect_log_errors_structural(log_text: str) -> List[str]:
-    """ estructural-aware log analysis mirroring ai_log_fetcher.py """
+    """
+    Structural-aware log analysis mirroring ai_log_fetcher.detect_errors_in_logs.
+
+    Two independent capture paths — either is sufficient:
+      A) Line has [ERROR], [FATAL], [SEVERE], [WARN], [WARNING] tag → always captured.
+      B) Line has no severity tag but contains a known error keyword → captured
+         (exception, timeout, refused, 4xx/5xx status, etc.)
+
+    Previously both conditions were required (AND), which silently dropped lines like:
+        [2026-04-29 08:52:34.712Z] [ERROR] scanner_file - <message with no keyword>
+    """
     lines = log_text.splitlines()
     error_contexts = []
     seen = set()
-    ERROR_PATTERN = re.compile(
+
+    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", re.I)
+    KEYWORD_PATTERN = re.compile(
         r"(?i)(?:"
-        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|"
-        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
-        r"\babort(?:ed|ing)?\b|\bexhausted\b|\bthrottl(?:ing|ed)\b"
+        r"\berror\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bsevere\b|\bexception\b|\baxioserror\b|"
+        r"\bstatus\s+[45]\d{2}\b|\bhttp\s+[45]\d{2}\b|"
+        r"\b(?:400|401|403|404|408|409|429|500|502|503|504)\b|"
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail|\baccess.?denied\b|"
+        r"\btoken.?(?:expired|invalid|fail)\b|\bcredential\b|"
+        r"\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\bconnection.?(?:reset|closed|lost|drop)\b|"
+        r"\bsocket\b|\beof\b|\bbroken.?pipe\b|"
+        r"\bdenied\b|\bexhausted\b|\bout.?of.?memory\b|\boom\b|"
+        r"\bnull.?pointer\b|\bnullpointer\b|\bstack.?(?:trace|overflow)\b|\bstacktrace\b|"
+        r"\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        r"\babort(?:ed|ing)?\b|\bthrottl(?:ing|ed)?\b|\blimitreached\b|"
+        r"\bcircuit.?breaker\b|\bretry.?(?:limit|exhaust)\b|"
+        r"\bgraphservice\b|\bactivitylimit\b|\breset\b"
         r")"
     )
-    # Mode: error_fatal (require [ERROR] etc)
-    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE)\]", re.I)
-    
+
     i = 0
     while i < len(lines):
         line = lines[i]
-        if ERROR_PATTERN.search(line) and LEVEL_PATTERN.search(line):
-            start = max(0, i - 2)
-            end = i + 1
-            while end < len(lines) and (end - i) < 30:
-                # Mirroring ai_log_fetcher.py: Break if a new independent error is found
-                next_line_raw = lines[end]
-                next_line_scan = re.sub(r"https?://[^\s]+", " ", next_line_raw, flags=re.I)
-                if ERROR_PATTERN.search(next_line_scan) and LEVEL_PATTERN.search(next_line_raw):
-                    break
 
-                if lines[end].startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
-                    end += 1
-                else: break
-            if end == i + 1: end = min(len(lines), i + 4)
-            ctx = "\n".join(lines[start:end])
-            
-            # Mask timestamps for better deduplication
-            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx)
-            fingerprint = fingerprint_text[:200]
-            
-            if fingerprint not in seen:
-                seen.add(fingerprint)
-                error_contexts.append(ctx)
-            i = end
-        else:
+        # Skip pure INFO/DEBUG/TRACE lines unless they carry a strong signal
+        # (401, 403, 5xx, exception, stacktrace, OOM, panic) — BigID sometimes
+        # logs real problems at INFO level.
+        if re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I):
+            STRONG = re.compile(
+                r"(?i)(?:\bexception\b|\bstacktrace\b|\bnull.?pointer\b|"
+                r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+                r"\b(?:40[0-9]|5[0-9]{2})\b|\bunauthorized\b|\bforbidden\b|\bauthentication.?fail)"
+            )
+            if not STRONG.search(line):
+                i += 1
+                continue
+
+        has_level_tag = bool(LEVEL_PATTERN.search(line))
+        scan_line     = re.sub(r"https?://[^\s]+", " ", line, flags=re.I)
+        has_keyword   = bool(KEYWORD_PATTERN.search(scan_line)) if not has_level_tag else False
+
+        is_trigger = has_level_tag or has_keyword
+
+        if not is_trigger:
             i += 1
+            continue
+
+        start = max(0, i - 2)
+        end = i + 1
+        while end < len(lines) and (end - i) < 30:
+            next_line_raw  = lines[end]
+            next_has_level = bool(LEVEL_PATTERN.search(next_line_raw))
+            next_scan      = re.sub(r"https?://[^\s]+", " ", next_line_raw, flags=re.I)
+            next_has_kw    = bool(KEYWORD_PATTERN.search(next_scan)) if not next_has_level else False
+            if next_has_level or next_has_kw:
+                break
+            if lines[end].startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
+                end += 1
+            else:
+                break
+
+        if end == i + 1:
+            end = min(len(lines), i + 4)
+
+        ctx = "\n".join(lines[start:end])
+
+        fingerprint_text = re.sub(
+            r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx
+        )
+        fingerprint = fingerprint_text[:200]
+
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            error_contexts.append(ctx)
+        i = end
+
     return error_contexts
 
 def _extract_ids_from_log_ctx(ctx: str):
+    """
+    Best-effort subscan ID extraction from log context.
+    Parent scan linking is done via time-window, not ID parsing.
+    """
     sid = None
     ssid = None
-    m1 = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
+    m1 = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
     if not m1: m1 = re.search(r'sdk-object-scan-([a-f0-9]{24})', ctx)
     if m1: sid = m1.group(1)
     m2 = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
@@ -16535,19 +16586,23 @@ def page_scan_progress():
                 has_extra_cols_local = _db_has_column("scan_log_errors", "log_source")
                 cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols_local else "log_timestamp, error_context, ai_analysis, is_resolved"
                 
-                # Fetch only relevant errors for this scan/environment since it started
+                # Fetch errors for this environment within the scan's time window.
+                # We intentionally do NOT filter by scan_id here because log lines may carry
+                # UUID-format IDs (scanner_file logs) that differ from the MongoDB scan_id
+                # used as the display key. Time-window filtering is the reliable gate.
                 q_params = {"eid": env_id}
                 q_filters = ["environment_id = :eid"]
-                if scan_id:
-                    # Match this scan_id or system-wide logs (often logged with no scan ID context)
-                    q_filters.append("(scan_id = :sid OR scan_id IS NULL OR scan_id = '' OR scan_id = 'None')")
-                    q_params["sid"] = str(scan_id)
-                
+
                 if db_started_at:
-                    # Ensure we don't show logs from BEFORE the scan started
+                    # Only show errors from scan start time onward
                     q_filters.append("log_timestamp >= :started")
                     q_params["started"] = db_started_at
-                
+
+                if db_completed_at and db_completed_at.strip() and db_completed_at.strip() not in ("", "None", "nan"):
+                    # For completed scans, cap at completed_at + 5 min buffer for late-arriving logs
+                    q_filters.append("log_timestamp <= DATE_ADD(:completed, INTERVAL 5 MINUTE)")
+                    q_params["completed"] = db_completed_at
+
                 q_where = " AND ".join(q_filters)
                 query_str = f"SELECT {cols} FROM scan_log_errors WHERE {q_where} ORDER BY id DESC LIMIT 20"
                 e_df = pd.read_sql(text(query_str), engine, params=q_params)
@@ -16573,63 +16628,117 @@ def page_scan_progress():
                                     st.error("Cannot resolve environment URL to fetch logs.")
                                 else:
                                     token = Get_auth_token(env_row["base_url"], env_row)
-                                    # Use ALL configured log sources - not a hardcoded list
                                     try:
-                                        from ai_log_fetcher import load_enabled_log_sources as _load_sources
+                                        from ai_log_fetcher import (
+                                            load_enabled_log_sources as _load_sources,
+                                            _estimate_fetch_lines as _est_lines,
+                                            _filter_lines_to_scan_window as _filter_window,
+                                            call_llm_log_scanner as _llm_scan,
+                                        )
                                         sources = _load_sources(engine)
                                     except Exception:
                                         sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "aci"]
-                                    
-                                    import hashlib as _hashlib
-                                    new_found = 0
-                                    scan_start_gate = db_started_at  # Only keep logs >= scan start
-                                    for src in sources:
-                                        url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len=3000"
-                                        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=30)
-                                        if resp.status_code == 200:
-                                            log_text = resp.json().get("data") if isinstance(resp.json(), dict) else resp.text
-                                            if log_text:
-                                                found_errors = _detect_log_errors_structural(str(log_text))
-                                                for ctx in found_errors:
-                                                    # GATE: Extract real log timestamp and skip pre-scan-start logs
-                                                    import re as _re
-                                                    ts_match = _re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(ctx))
-                                                    if ts_match and scan_start_gate:
-                                                        try:
-                                                            from datetime import datetime as _dt
-                                                            log_ts_str = ts_match.group(1).replace('T', ' ')
-                                                            log_ts = _dt.strptime(log_ts_str[:19], '%Y-%m-%d %H:%M:%S')
-                                                            scan_start_dt = _dt.strptime(str(scan_start_gate)[:19], '%Y-%m-%d %H:%M:%S')
-                                                            if log_ts < scan_start_dt:
-                                                                continue  # Skip stale log
-                                                            actual_ts = log_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                                        except Exception:
-                                                            actual_ts = None
-                                                    else:
-                                                        actual_ts = None
+                                        _est_lines = lambda s, e: 3000
+                                        _filter_window = lambda t, s, e: t
+                                        _llm_scan = lambda *a, **k: []
 
-                                                    # Hash-based dedup (match background fetcher behavior)
-                                                    fp_text = _re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', str(ctx))
-                                                    err_hash = _hashlib.md5(fp_text[:300].encode('utf-8')).hexdigest()
-                                                    with engine.connect() as conn:
-                                                        exist = conn.execute(text(
-                                                            "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:hash AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
-                                                        ), {"eid": env_id, "hash": err_hash}).fetchone()
-                                                        if exist: continue
-                                                        
-                                                        psid, pssid = _extract_ids_from_log_ctx(ctx)
-                                                        ai_ans = _call_ollama_for_error(ctx, src)
-                                                        conn.execute(text("""
-                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
-                                                            VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
-                                                        """), {
-                                                            "eid": env_id,
-                                                            "ts": actual_ts or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                                                            "ctx": ctx, "ai": ai_ans, "src": src,
-                                                            "sid": psid or scan_id, "ssid": pssid, "hash": err_hash
-                                                        })
-                                                        conn.commit()
+                                    import hashlib as _hashlib
+                                    from datetime import datetime as _dt
+
+                                    # Parse scan window boundaries once
+                                    _scan_start_dt = None
+                                    _scan_end_dt   = None
+                                    try:
+                                        if db_started_at and str(db_started_at).strip() not in ("", "None", "nan"):
+                                            _scan_start_dt = _dt.strptime(str(db_started_at)[:19], '%Y-%m-%d %H:%M:%S')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if db_completed_at and str(db_completed_at).strip() not in ("", "None", "nan"):
+                                            _scan_end_dt = _dt.strptime(str(db_completed_at)[:19], '%Y-%m-%d %H:%M:%S')
+                                    except Exception:
+                                        pass
+
+                                    new_found = 0
+
+                                    for src in sources:
+                                        try:
+                                            # Smart fetch: size based on scan duration
+                                            fetch_n = _est_lines(_scan_start_dt, _scan_end_dt)
+                                            url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len={fetch_n}"
+                                            resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=60)
+                                            if resp.status_code != 200:
+                                                continue
+                                            raw = resp.json().get("data") if isinstance(resp.json(), dict) else resp.text
+                                            if not raw:
+                                                continue
+
+                                            # Filter to scan window ONCE — used for both passes
+                                            filtered = _filter_window(str(raw), _scan_start_dt, _scan_end_dt)
+                                            if not filtered.strip():
+                                                continue
+
+                                            # Per-source line dedup set (masks timestamps)
+                                            _seen_lh = set()
+                                            def _lhash(t):
+                                                m = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', t)
+                                                return _hashlib.md5(m[:300].encode()).hexdigest()
+
+                                            def _insert_if_new(ctx_t, ts_str, ai_t):
+                                                fp = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_t)
+                                                eh = _hashlib.md5(fp[:300].encode()).hexdigest()
+                                                with engine.connect() as _c:
+                                                    if _c.execute(text(
+                                                        "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:h AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                                                    ), {"eid": env_id, "h": eh}).fetchone():
+                                                        return False
+                                                    _, pssid = _extract_ids_from_log_ctx(ctx_t)
+                                                    _c.execute(text("""
+                                                        INSERT INTO scan_log_errors
+                                                            (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
+                                                        VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
+                                                    """), {
+                                                        "eid": env_id, "ts": ts_str or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                                                        "ctx": ctx_t, "ai": ai_t, "src": src,
+                                                        "sid": str(scan_id), "ssid": pssid, "hash": eh
+                                                    })
+                                                    _c.commit()
+                                                return True
+
+                                            # ── Pass 1: regex ──────────────────────────────
+                                            for err in _detect_log_errors_structural(filtered):
+                                                ts_m = re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(err))
+                                                actual_ts = None
+                                                try:
+                                                    if ts_m:
+                                                        actual_ts = _dt.strptime(ts_m.group(1).replace('T', ' ')[:19], '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M:%S')
+                                                except Exception:
+                                                    pass
+                                                for ln in err.splitlines():
+                                                    if ln.strip():
+                                                        _seen_lh.add(_lhash(ln))
+                                                ai_ans = _call_ollama_for_error(err, src)
+                                                if _insert_if_new(err, actual_ts, ai_ans):
+                                                    new_found += 1
+
+                                            # ── Pass 2: LLM on deduplicated remainder ──────
+                                            llm_lines = [ln for ln in filtered.splitlines()
+                                                         if ln.strip() and _lhash(ln) not in _seen_lh]
+                                            if llm_lines:
+                                                for hit in _llm_scan("\n".join(llm_lines), src,
+                                                                      scan_start=str(_scan_start_dt) if _scan_start_dt else None,
+                                                                      scan_end=str(_scan_end_dt) if _scan_end_dt else None):
+                                                    ctx_t = (
+                                                        f"[LLM-DETECTED | {hit['severity']} | {hit['category']}]\n"
+                                                        f"{hit['text']}\n\nAI Summary: {hit['summary']}"
+                                                    )
+                                                    ai_t = f"[LLM Scanner: {hit['summary']}]\n\n{_call_ollama_for_error(hit['text'], src)}"
+                                                    if _insert_if_new(ctx_t, None, ai_t):
                                                         new_found += 1
+
+                                        except Exception as _src_err:
+                                            pass  # best-effort per source
+
                                     st.success(f"Log fetch complete. Found/Analyzed {new_found} new error signatures.")
                                     st.rerun()
                             except Exception as e:
