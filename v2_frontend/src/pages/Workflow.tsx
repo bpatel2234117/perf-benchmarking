@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import PaginationBar from '../components/Pagination';
 import { Loader2, GitBranch, ChevronDown, ChevronRight } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
@@ -74,6 +76,8 @@ interface EnvironmentRow {
   is_active: boolean;
   is_busy: boolean;
   is_default?: boolean;
+  auth_module_path?: string | null;
+  auth_function_name?: string | null;
 }
 
 interface StepCatalogRow {
@@ -238,10 +242,13 @@ function canAction(status: string | null | undefined, action: string): boolean {
   }
 }
 
+const WF_PAGE_SIZE = 25;
+
 const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const authConfig = { headers: { Authorization: `Bearer ${token}` } };
   const queryClient = useQueryClient();
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [runPage, setRunPage] = useState(0);
   const [createName, setCreateName] = useState('');
   const [createCooldown, setCreateCooldown] = useState(15);
   const [createEnv1, setCreateEnv1] = useState<string>('');
@@ -271,14 +278,24 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
 
   const enabledStepCount = useMemo(() => stepEnabled.filter(Boolean).length, [stepEnabled]);
 
-  const { data: runs = [], isLoading: runsLoading, error: runsError } = useQuery({
-    queryKey: ['workflowRuns', token],
+  const { data: runsPayload, isLoading: runsLoading, error: runsError } = useQuery({
+    queryKey: ['workflowRuns', token, runPage],
     queryFn: async () => {
-      const res = await axios.get(`${API_BASE}/api/workflow/runs`, { ...authConfig, params: { limit: 10000 } });
-      return res.data as WorkflowRun[];
+      const res = await axios.get<{ runs: WorkflowRun[]; total: number }>(`${API_BASE}/api/workflow/runs`, {
+        ...authConfig,
+        params: { limit: WF_PAGE_SIZE, offset: runPage * WF_PAGE_SIZE },
+      });
+      return res.data;
     },
     refetchInterval: 8000,
   });
+
+  const runs = runsPayload?.runs ?? [];
+  const runsTotal = runsPayload?.total ?? 0;
+
+  useEffect(() => {
+    setExpandedId(null);
+  }, [runPage]);
 
   const runIdsCsv = useMemo(() => runs.map((r) => r.id).join(','), [runs]);
 
@@ -387,6 +404,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
       queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
+      setRunPage(0);
       if (data?.id) setExpandedId(data.id);
       setCreateName('');
     },
@@ -400,6 +418,17 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
       queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
       queryClient.invalidateQueries({ queryKey: ['workflowEnvStatus', token] });
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: async (runId: number) => {
+      await axios.delete(`${API_BASE}/api/workflow/runs/${runId}`, authConfig);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
+      queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
+      setExpandedId(null);
     },
   });
 
@@ -744,215 +773,258 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
               No workflow runs.
             </div>
           ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <table className="workflow-automation-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.88rem' }}>
-                <thead>
-                  <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Run</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Name</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Status</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Started</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Finished</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Last Error</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map((run) => {
-                    const isOpen = expandedId === run.id;
-                    const rawSteps = stepsByRun[String(run.id)] ?? stepsByRun[run.id] ?? [];
-                    const runStatus = run.status;
-                    const metrics = computeStepMetrics(rawSteps as unknown as Record<string, unknown>[], rawSteps.length);
-                    return (
-                      <React.Fragment key={run.id}>
-                        <tr
-                          className="wf-main-row"
-                          onClick={() => toggleExpand(run.id)}
-                          style={{
-                            cursor: 'pointer',
-                            background: isOpen ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
-                            borderBottom: '1px solid var(--surface-border)',
-                          }}
-                        >
-                          <td style={{ padding: '10px 12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                              {isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                              #{run.id}
-                            </span>
-                          </td>
-                          <td style={{ padding: '10px 12px', maxWidth: 220 }}>{fmtCell(run.name)}</td>
-                          <td style={{ padding: '10px 12px' }}>{statusBadge(run.status)}</td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.started_at)}</td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.finished_at)}</td>
-                          <td style={{ padding: '10px 12px', maxWidth: 200, color: 'var(--danger-color)', fontSize: '0.82rem' }}>
-                            {fmtCell(run.last_error)}
-                          </td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
-                            <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                              {(
-                                [
-                                  ['start', '▶️'],
-                                  ['pause', '⏸'],
-                                  ['resume', '↩️'],
-                                  ['stop', '⏹'],
-                                ] as const
-                              ).map(([act, emoji]) => {
-                                const enabled = canAction(run.status, act);
-                                return (
-                                  <button
-                                    key={act}
-                                    type="button"
-                                    title={act}
-                                    disabled={!enabled || controlMutation.isPending}
-                                    onClick={() => controlMutation.mutate({ runId: run.id, action: act })}
-                                    style={{
-                                      background: 'transparent',
-                                      border: 'none',
-                                      cursor: enabled ? 'pointer' : 'default',
-                                      fontSize: '1.05rem',
-                                      opacity: enabled ? 1 : 0.28,
-                                      padding: '0 2px',
-                                      lineHeight: 1,
-                                    }}
-                                  >
-                                    {emoji}
-                                  </button>
-                                );
-                              })}
-                            </span>
-                          </td>
-                        </tr>
-                        {isOpen && (
-                          <tr>
-                            <td colSpan={7} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
-                              <div
-                                style={{
-                                  borderLeft: '4px solid var(--primary-color, #6366f1)',
-                                  margin: '0 0 0 12px',
-                                  padding: '12px 16px',
-                                }}
-                              >
-                                <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary-color)', marginBottom: 8 }}>
-                                  Step Progress — Run {run.id}
-                                </div>
-                                {stepsLoading && !rawSteps.length ? (
-                                  <Loader2 className="lucide-spin" size={22} />
-                                ) : (
-                                  <>
-                                    <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
-                                      {(
-                                        [
-                                          ['Pending', metrics.pending, '#6b7280'],
-                                          ['In Progress', metrics.in_prog, '#ca8a04'],
-                                          ['Completed', metrics.completed, '#16a34a'],
-                                          ['Disabled', metrics.disabled, '#6b7280'],
-                                          ['Errors', metrics.errors, '#dc2626'],
-                                        ] as const
-                                      ).map(([label, val, color]) => (
-                                        <div key={label}>
-                                          <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
-                                          <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
-                                        </div>
-                                      ))}
-                                    </div>
-                                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-                                      <thead>
-                                        <tr style={{ background: '#e8e3f5' }}>
-                                          <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {rawSteps
-                                          .filter((st) => {
-                                            const cs = workflowNormStepStatus(st.status);
-                                            return cs !== 'disabled' && st.is_enabled;
-                                          })
-                                          .map((st) => {
-                                            const rd = st as unknown as Record<string, unknown>;
-                                            const cStatus = workflowNormStepStatus(st.status);
-                                            let displayErr = String(st.last_error ?? '').trim();
-                                            if (
-                                              ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
-                                              workflowIsTransientStepMessage(displayErr)
-                                            ) {
-                                              displayErr = '';
-                                            }
-                                            if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
-
-                                            const name = String(st.environment_name ?? '').trim();
-                                            const busy = workflowStepImpliesEnvBusy(rd, runStatus);
-                                            const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
-
-                                            return (
-                                              <tr key={st.id} style={{ background: st.seq % 2 === 0 ? '#f9f8ff' : '#ffffff' }}>
-                                                <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
-                                                <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
-                                                <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
-                                                  {computeProgressEmoji(rd)}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
-                                                  {fmtCell(st.scan_id)}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                  {st.scan_id ? (
-                                                    <a href={`/scan-progress?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
-                                                      View Progress
-                                                    </a>
-                                                  ) : '—'}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                  {st.scan_id ? (
-                                                    <a href={`/benchmark/new?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
-                                                      Open
-                                                    </a>
-                                                  ) : '—'}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
-                                                  {fmtCell(st.notes)}
-                                                </td>
-                                                <td
-                                                  style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
-                                                  title={st.last_error ?? ''}
-                                                >
-                                                  {displayErr ? displayErr.slice(0, 200) : ''}
-                                                </td>
-                                              </tr>
-                                            );
-                                          })}
-                                      </tbody>
-                                    </table>
-                                    {rawSteps.length === 0 && !stepsLoading && (
-                                      <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
-                                    )}
-                                  </>
-                                )}
-                              </div>
+            <>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="workflow-automation-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.88rem' }}>
+                  <thead>
+                    <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Run</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Name</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Status</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Started</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Finished</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Last Error</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {runs.map((run) => {
+                      const isOpen = expandedId === run.id;
+                      const rawSteps = stepsByRun[String(run.id)] ?? stepsByRun[run.id] ?? [];
+                      const runStatus = run.status;
+                      const metrics = computeStepMetrics(rawSteps as unknown as Record<string, unknown>[], rawSteps.length);
+                      return (
+                        <React.Fragment key={run.id}>
+                          <tr
+                            className="wf-main-row"
+                            onClick={() => toggleExpand(run.id)}
+                            style={{
+                              cursor: 'pointer',
+                              background: isOpen ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
+                              borderBottom: '1px solid var(--surface-border)',
+                            }}
+                          >
+                            <td style={{ padding: '10px 12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                {isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                                #{run.id}
+                              </span>
+                            </td>
+                            <td style={{ padding: '10px 12px', maxWidth: 220 }}>{fmtCell(run.name)}</td>
+                            <td style={{ padding: '10px 12px' }}>{statusBadge(run.status)}</td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.started_at)}</td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.finished_at)}</td>
+                            <td style={{ padding: '10px 12px', maxWidth: 200, color: 'var(--danger-color)', fontSize: '0.82rem' }}>
+                              {fmtCell(run.last_error)}
+                            </td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
+                              <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                                {(
+                                  [
+                                    ['start', '▶️'],
+                                    ['pause', '⏸'],
+                                    ['resume', '↩️'],
+                                    ['stop', '⏹'],
+                                  ] as const
+                                ).map(([act, emoji]) => {
+                                  const enabled = canAction(run.status, act);
+                                  return (
+                                    <button
+                                      key={act}
+                                      type="button"
+                                      title={act}
+                                      disabled={!enabled || controlMutation.isPending}
+                                      onClick={() => controlMutation.mutate({ runId: run.id, action: act })}
+                                      style={{
+                                        background: 'transparent',
+                                        border: 'none',
+                                        cursor: enabled ? 'pointer' : 'default',
+                                        fontSize: '1.05rem',
+                                        opacity: enabled ? 1 : 0.28,
+                                        padding: '0 2px',
+                                        lineHeight: 1,
+                                      }}
+                                    >
+                                      {emoji}
+                                    </button>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  title="Delete run"
+                                  disabled={!canAction(run.status, 'delete') || deleteMutation.isPending}
+                                  onClick={() => {
+                                    if (window.confirm(`Delete workflow run #${run.id}?`)) {
+                                      deleteMutation.mutate(run.id);
+                                    }
+                                  }}
+                                  style={{
+                                    background: 'transparent',
+                                    border: 'none',
+                                    cursor: canAction(run.status, 'delete') ? 'pointer' : 'default',
+                                    fontSize: '1.05rem',
+                                    opacity: canAction(run.status, 'delete') ? 1 : 0.28,
+                                    padding: '0 2px',
+                                    lineHeight: 1,
+                                  }}
+                                >
+                                  🗑️
+                                </button>
+                              </span>
                             </td>
                           </tr>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                          {isOpen && (
+                            <tr>
+                              <td colSpan={7} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
+                                <div
+                                  style={{
+                                    borderLeft: '4px solid var(--primary-color, #6366f1)',
+                                    margin: '0 0 0 12px',
+                                    padding: '12px 16px',
+                                  }}
+                                >
+                                  <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary-color)', marginBottom: 8 }}>
+                                    Step Progress — Run {run.id}
+                                  </div>
+                                  {stepsLoading && !rawSteps.length ? (
+                                    <Loader2 className="lucide-spin" size={22} />
+                                  ) : (
+                                    <>
+                                      <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
+                                        {(
+                                          [
+                                            ['Pending', metrics.pending, '#6b7280'],
+                                            ['In Progress', metrics.in_prog, '#ca8a04'],
+                                            ['Completed', metrics.completed, '#16a34a'],
+                                            ['Disabled', metrics.disabled, '#6b7280'],
+                                            ['Errors', metrics.errors, '#dc2626'],
+                                          ] as const
+                                        ).map(([label, val, color]) => (
+                                          <div key={label}>
+                                            <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
+                                            <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
+                                          </div>
+                                        ))}
+                                      </div>
+                                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                                        <thead>
+                                          <tr style={{ background: '#e8e3f5' }}>
+                                            <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
+                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
+                                          </tr>
+                                        </thead>
+                                        <tbody>
+                                          {rawSteps
+                                            .filter((st) => {
+                                              const cs = workflowNormStepStatus(st.status);
+                                              return cs !== 'disabled' && st.is_enabled;
+                                            })
+                                            .map((st) => {
+                                              const rd = st as unknown as Record<string, unknown>;
+                                              const cStatus = workflowNormStepStatus(st.status);
+                                              let displayErr = String(st.last_error ?? '').trim();
+                                              if (
+                                                ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
+                                                workflowIsTransientStepMessage(displayErr)
+                                              ) {
+                                                displayErr = '';
+                                              }
+                                              if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
+
+                                              const name = String(st.environment_name ?? '').trim();
+                                              const busy = workflowStepImpliesEnvBusy(rd, runStatus);
+                                              const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
+                                              return (
+                                                <tr key={st.id} style={{ background: st.seq % 2 === 0 ? '#f9f8ff' : '#ffffff' }}>
+                                                  <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
+                                                  <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
+                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
+                                                  <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
+                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
+                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
+                                                  <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
+                                                  <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
+                                                    {computeProgressEmoji(rd)}
+                                                  </td>
+                                                  <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
+                                                    {fmtCell(st.scan_id)}
+                                                  </td>
+                                                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                    {st.scan_id ? (
+                                                      <Link
+                                                        to={`/tools/scan-status?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                        style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                      >
+                                                        View Progress
+                                                      </Link>
+                                                    ) : (
+                                                      '—'
+                                                    )}
+                                                  </td>
+                                                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                    {st.scan_id ? (
+                                                      <Link
+                                                        to={`/tools/add-benchmark?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                        style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                      >
+                                                        Open
+                                                      </Link>
+                                                    ) : (
+                                                      '—'
+                                                    )}
+                                                  </td>
+                                                  <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
+                                                    {fmtCell(st.notes)}
+                                                  </td>
+                                                  <td
+                                                    style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
+                                                    title={st.last_error ?? ''}
+                                                  >
+                                                    {displayErr ? displayErr.slice(0, 200) : ''}
+                                                  </td>
+                                                </tr>
+                                              );
+                                            })}
+                                        </tbody>
+                                      </table>
+                                      {rawSteps.length === 0 && !stepsLoading && (
+                                        <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {runsTotal > WF_PAGE_SIZE && (
+                <div style={{ padding: '0.65rem 1rem 1rem' }}>
+                  <PaginationBar
+                    page={runPage}
+                    pageSize={WF_PAGE_SIZE}
+                    totalItems={runsTotal}
+                    onPageChange={setRunPage}
+                    ariaLabel="Workflow runs pages"
+                  />
+                </div>
+              )}
+            </>
           )}
         </div>
 

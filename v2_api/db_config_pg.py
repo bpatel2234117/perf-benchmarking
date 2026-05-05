@@ -26,7 +26,9 @@ DDL_STATEMENTS = {
     'builds': """
         CREATE TABLE IF NOT EXISTS builds (
             id SERIAL PRIMARY KEY,
-            version VARCHAR(50) UNIQUE NOT NULL
+            version VARCHAR(50) UNIQUE NOT NULL,
+            release_milestone INT NULL,
+            quarter_label VARCHAR(50) NULL
         );
     """,
     'classifiers': """
@@ -145,6 +147,7 @@ DDL_STATEMENTS = {
             throughput_scanner_files_hr REAL,
             throughput_thread_files_hr REAL,
             is_active BOOLEAN DEFAULT TRUE,
+            is_release BOOLEAN DEFAULT FALSE,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             scan_id VARCHAR(128) NULL
         );
@@ -179,6 +182,7 @@ DDL_STATEMENTS = {
             log_source VARCHAR(50) DEFAULT 'scanner',
             scan_id VARCHAR(50),
             subscan_id VARCHAR(50),
+            error_hash VARCHAR(32),
             is_resolved BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -281,5 +285,65 @@ DDL_STATEMENTS = {
             payload_json TEXT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """
+    """,
+    # Tracker / Streamlit parity (MySQL→Postgres sync); explicit ids preserved for upserts.
+    'scan_parents': """
+        CREATE TABLE IF NOT EXISTS scan_parents (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL UNIQUE,
+            environment_id INT NULL REFERENCES test_environments(id),
+            scan_name VARCHAR(1000) NULL,
+            scan_type VARCHAR(120) NULL,
+            started_at VARCHAR(80) NULL,
+            completed_at VARCHAR(80) NULL,
+            template_name VARCHAR(255) NULL,
+            scan_status VARCHAR(120) NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP NULL,
+            updated_at TIMESTAMP NULL,
+            last_seen_at TIMESTAMP NULL
+        );
+    """,
+    'scan_progress': """
+        CREATE TABLE IF NOT EXISTS scan_progress (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL,
+            scan_name VARCHAR(1000) NULL,
+            environment_id INT NULL REFERENCES test_environments(id),
+            "timestamp" TIMESTAMP NULL,
+            captured_at_utc TIMESTAMP NULL,
+            scan_state VARCHAR(64) NULL,
+            completed_sub_scans BIGINT DEFAULT 0,
+            failed_sub_scans BIGINT DEFAULT 0,
+            total_sub_scans BIGINT DEFAULT 0,
+            completed_parts BIGINT DEFAULT 0,
+            failed_parts BIGINT DEFAULT 0,
+            total_parts_scanned BIGINT DEFAULT 0,
+            total_classifications BIGINT DEFAULT 0,
+            newly_added_classifications BIGINT DEFAULT 0,
+            false_removed_classifications BIGINT DEFAULT 0,
+            objects_scanned BIGINT DEFAULT 0,
+            objects_failed BIGINT DEFAULT 0,
+            objects_with_pi BIGINT DEFAULT 0
+        );
+    """,
+    # Populated by Scan Status "Sync" (BigID insights API) / tracker parity.
+    'scan_insights': """
+        CREATE TABLE IF NOT EXISTS scan_insights (
+            scan_id VARCHAR(128) PRIMARY KEY,
+            distinct_classification_attributes BIGINT NULL,
+            classifier_attribute_names TEXT NULL,
+            data_source_names TEXT NULL,
+            objects_with_pi BIGINT NULL,
+            objects_scanned BIGINT NULL,
+            objects_enumerated BIGINT NULL,
+            total_classification BIGINT NULL,
+            new_attributes_count BIGINT NULL,
+            removed_attributes_count BIGINT NULL,
+            total_size_gb REAL NULL,
+            insight_payload TEXT NULL,
+            attributes_payload TEXT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """,
 }
