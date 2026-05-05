@@ -482,8 +482,10 @@ def load_data(include_inactive=False):
     # Ensure optional columns exist (non-breaking for existing DBs)
     try:
         with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE benchmarks ADD COLUMN scenario_type VARCHAR(100)"))
-            # Classification metrics (manual benchmark meaning):
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN scenario_type VARCHAR(100)"))
+            except Exception:
+                pass
             # - total_catalog_items is used as "New Attributes count" in your table
             # Add missing fields so Trend chart can be complete.
             try:
@@ -492,6 +494,10 @@ def load_data(include_inactive=False):
                 pass
             try:
                 conn.execute(text("ALTER TABLE benchmarks ADD COLUMN removed_attributes BIGINT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN is_release BOOLEAN DEFAULT FALSE"))
             except Exception:
                 pass
             conn.commit()
@@ -560,9 +566,10 @@ def load_data(include_inactive=False):
             b.total_scan_hours,
             b.avg_file_size,
             b.is_active,
+            CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
-            COALESCE(si.objects_scanned, 0) as objects_scanned
+            COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
@@ -601,9 +608,10 @@ def load_data(include_inactive=False):
             b.total_scan_hours,
             b.avg_file_size,
             b.is_active,
+            CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
-            COALESCE(si.objects_scanned, 0) as objects_scanned
+            COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
@@ -623,6 +631,8 @@ def load_data(include_inactive=False):
                 df["Release_Milestone"] = ""
             if "Quarter_Label" not in df.columns:
                 df["Quarter_Label"] = ""
+            if "is_release" not in df.columns:
+                df["is_release"] = False
 
         if "Comparable_Version" in df.columns and "Build_Version" in df.columns:
             try:
@@ -730,6 +740,7 @@ def page_overview(df):
     show_acl = st.sidebar.checkbox("Show ACL Scans Only", False)
     show_ocr = st.sidebar.checkbox("Show OCR Scans Only", False)
     show_ff = st.sidebar.checkbox("Show Structured Discovery FF Only", False)
+    show_release = st.sidebar.checkbox("Show Release Builds Only", False)
 
     # Filter Logic
     mask = (df[ver_col].astype(str).isin(selected_versions)) & \
@@ -738,6 +749,7 @@ def page_overview(df):
     if show_acl: mask = mask & (df['is_acl'] == 1)
     if show_ocr: mask = mask & (df['is_ocr'] == 1)
     if show_ff: mask = mask & (df['is_feature_flags'] == 1)
+    if show_release: mask = mask & (df['is_release'] == 1)
 
     filtered_df = df[mask]
 
@@ -3787,11 +3799,12 @@ def ensure_auto_scan_benchmarks_table():
                     objects_scanned BIGINT NULL,
                     objects_enumerated BIGINT NULL,
                     total_classification BIGINT NULL,
-                    new_attributes BIGINT NULL,
-                    removed_attributes BIGINT NULL,
+                    new_attributes INT,
+                    removed_attributes INT,
                     classifier_attribute_names LONGTEXT NULL,
                     scan_name VARCHAR(1000) NULL,
                     is_active BOOLEAN DEFAULT TRUE,
+                    is_release BOOLEAN DEFAULT FALSE,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
                 )
@@ -5628,151 +5641,9 @@ def _strip_mb_to_int(val_str):
     except (ValueError, TypeError):
         return 0
 
-def get_scanner_group_performance(base_url, token):
-    if not base_url or not token: return []
-    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
-    try:
-        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            groups = []
-            for item in data.get("data", []):
-                for sg in item.get("scannerGroups", []):
-                    groups.append({
-                        "name": sg.get("name"),
-                        "runningScanners": sg.get("runningScanners", 0),
-                        "runningThreads": sg.get("runningThreads", 0),
-                        "maxThreads": sg.get("maxThreads", 0),
-                        "scannerThreads": sg.get("scannerThreads", 0),
-                        "avgScanSpeed": sg.get("avgScanSpeed", 0),
-                        "physicalMemory": sg.get("physicalMemory"),
-                        "freeMemory": sg.get("freeMemory"),
-                        "updateDate": sg.get("updateDate")
-                    })
-            return groups
-    except Exception:
-        pass
-    return []
-
-def get_individual_scanner_performance(base_url, token):
-    if not base_url or not token: return []
-    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
-    try:
-        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            scanners = []
-            for item in data:
-                if item.get("type") == "scanner":
-                    scanners.append({
-                        "id": item.get("id"),
-                        "name": item.get("name"),
-                        "status": item.get("status"),
-                        "group": item.get("groupName"),
-                        "runningThreads": item.get("runningThreads", 0),
-                        "totalNumOfThreads": item.get("totalNumOfThreads", 0),
-                        "systemLoadAverage": item.get("systemLoadAverage", 0),
-                        "physicalMemory": item.get("physicalMemory"),
-                        "freeMemory": item.get("freeMemory"),
-                        "scannerThreads": item.get("scannerThreads", 0),
-                        "updateDate": item.get("updateDate")
-                    })
-            return scanners
-    except Exception:
-        pass
-    return []
-
-def _now_utc_naive():
-    return datetime.utcnow()
-
-def _strip_mb_to_int(v):
-    try:
-        if not v: return 0
-        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
-        return int(float(s))
-    except Exception:
-        return 0
-
-def upsert_scanner_performance(engine, env_id, group_metrics, individual_metrics, captured_at=None):
-    if not engine or env_id is None: return
-    now = captured_at if captured_at else _now_utc_naive()
-    now = now.replace(microsecond=0)
-    try:
-        with engine.connect() as conn:
-            for g in group_metrics:
-                update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
-                conn.execute(text("""
-                    INSERT IGNORE INTO scanner_group_performance (
-                        environment_id, captured_at_utc, group_name,
-                        running_scanners, running_threads, max_threads, scanner_threads,
-                        physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
-                    ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
-                """), {
-                    "eid": env_id, "cau": now, "gn": str(g.get("name") or ""),
-                    "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
-                    "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
-                    "pm": _strip_mb_to_int(g.get("physicalMemory")), "fm": _strip_mb_to_int(g.get("freeMemory")),
-                    "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
-                })
-            for i in individual_metrics:
-                update_date = _parse_iso_dt(str(i.get("updateDate") or ""))
-                sid = str(i.get("id") or "")
-                s_name = str(i.get("name") or "")
-                # If multiple scanners have the same name, we suffix with ID to separate lines in charts
-                display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
-
-                conn.execute(text("""
-                    INSERT IGNORE INTO scanner_individual_performance (
-                        environment_id, captured_at_utc, scanner_id, name, status, group_name,
-                        running_threads, total_num_of_threads, system_load_average,
-                        physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
-                    ) VALUES (
-                        :eid, :cau, :sid, :name, :status, :gn,
-                        :rt, :tt, :la, :pm, :fm, :st, :ud
-                    )
-                """), {
-                    "eid": env_id, "cau": now, "sid": sid,
-                    "name": display_name, "status": str(i.get("status") or ""),
-                    "gn": str(i.get("group") or ""),
-                    "rt": int(i.get("runningThreads") or 0),
-                    "tt": int(i.get("totalNumOfThreads") or 0),
-                    "la": float(i.get("systemLoadAverage") or 0),
-                    "pm": _strip_mb_to_int(i.get("physicalMemory")), 
-                    "fm": _strip_mb_to_int(i.get("freeMemory")),
-                    "st": int(i.get("scannerThreads") or 0), "ud": update_date
-                })
-            conn.commit()
-    except Exception:
-        pass
-
-def _parse_iso_dt(val):
-    if not val: return None
-    try:
-        clean = str(val).replace("Z", "+00:00")
-        return datetime.fromisoformat(clean).replace(tzinfo=None)
-    except Exception:
-        return None
-
-def capture_scanner_performance_for_env(env_row, captured_at=None):
-    if not env_row or not engine: return {"ok": False}
-    eid = env_row.get("id")
-    base_url = env_row.get("base_url")
-    token = None
-    try:
-        from bigid_auth import Get_auth_token
-        token = Get_auth_token(env_row)
-    except Exception:
-        pass
-    if not token: return {"ok": False}
-    try:
-        g = get_scanner_group_performance(base_url, token)
-        i = get_individual_scanner_performance(base_url, token)
-        if g or i:
-            upsert_scanner_performance(engine, eid, g, i, captured_at=captured_at)
-            return {"ok": True, "groups": len(g), "individuals": len(i)}
-    except Exception:
-        pass
-    return {"ok": False}
+# Scanner performance fetch/write functions are provided by scanner_performance.py (imported above).
+# capture_scanner_performance_for_env, upsert_scanner_performance, get_scanner_group_performance,
+# and get_individual_scanner_performance all live there — do not redefine them here.
 
 
 def _resolve_env_row_for_scan_progress(scan_id):
@@ -8351,7 +8222,7 @@ def page_add_benchmark():
     
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
-    c3, c4, c5, c6 = st.columns(4)
+    c3, c4, c5, c6, c7 = st.columns(5)
     scan_count = c3.number_input("Scanner Count", min_value=1, value=DEFAULT_SCANNER_COUNT)
     thread_count = c4.number_input(
         "Total threads (all scanners)",
@@ -8825,13 +8696,14 @@ def page_add_benchmark():
                         "scan_start_time", "scan_end_time", "enum_start_time", "enum_end_time",
                         "total_scan_hours", "enumeration_hours",
                         "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
-                        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr"
+                        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+                        "is_release"
                     ]
                     vals_placeholders = [
                         ":bid", ":cid", ":clid", ":clist", ":dt", ":scn", ":st", ":dst", ":dtype", ":fstype",
                         ":tf", ":tfo", ":tgb", ":tci", ":asz",
                         ":ss", ":se", ":es", ":ee", ":tsh", ":eh",
-                        ":tpcgb", ":tpsgb", ":tptgb", ":tpcf", ":tpsf", ":tptf"
+                        ":tpcgb", ":tpsgb", ":tptgb", ":tpcf", ":tpsf", ":tptf", ":is_rel"
                     ]
                     params_dict = {
                         'bid': b_id, 'cid': conf_id, 'clid': c_id,
@@ -8842,7 +8714,8 @@ def page_add_benchmark():
                         'es': enum_start, 'ee': enum_end,
                         'tsh': scan_duration, 'eh': enum_duration,
                         'tpcgb': tp_cluster_gb, 'tpsgb': tp_scanner_gb, 'tptgb': tp_thread_gb,
-                        'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files
+                        'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files,
+                        'is_rel': is_release
                     }
 
                     # If scan_id is provided, pull classification metrics from scan_insights into benchmarks (manual trend table)
@@ -10885,7 +10758,11 @@ def page_build_analysis(df):
             scan_type = str(row.get("Scan_Type") or "").strip().lower()
             is_acl = bool(row.get("is_acl"))
             is_ff  = bool(row.get("is_feature_flags"))
-            if "ols" in scan_type:
+            has_ols = "ols" in scan_type
+            # OLS + Structured FF must be checked before plain OLS
+            if has_ols and is_ff:
+                return "OLS + Structured FF"
+            if has_ols:
                 return "OLS Scan"
             if is_acl and is_ff:
                 return "ACL + Structured FF"
@@ -10907,7 +10784,53 @@ def page_build_analysis(df):
             .reset_index(drop=True)
         )
 
-        SCENARIO_ORDER = ["Base (Full Scan)", "ACL On", "OLS Scan", "Structured FF", "ACL + Structured FF"]
+        SCENARIO_ORDER = [
+            "Base (Full Scan)",
+            "ACL On",
+            "OLS Scan",
+            "OLS + Structured FF",
+            "Structured FF",
+            "ACL + Structured FF",
+        ]
+
+        # ── Major-version comparison lookup ──────────────────────────────────
+        # Version format is MAJOR.MINOR (e.g. "251.1", "251.99", "252.15").
+        # Major = first component only (e.g. "251", "252").
+        def _major_ver(v: str) -> str:
+            return str(v).split(".")[0]
+
+        current_major = _major_ver(selected_build)
+
+        # Find the previous major version (highest major < current_major).
+        all_majors_sorted = sorted(
+            {_major_ver(v) for v in all_versions},
+            key=lambda m: int(m) if m.isdigit() else 0,
+            reverse=True,
+        )
+        prev_major = next(
+            (m for m in all_majors_sorted if m != current_major),
+            None,
+        )
+
+        # Build lookup: (scenario, ds_type, file_set_type) → best throughput_cluster_gb_hr
+        # across ALL builds of the previous major version.
+        prev_major_best: dict = {}
+        if prev_major:
+            prev_major_builds = [v for v in all_versions if _major_ver(v) == prev_major]
+            prev_major_df = df[df["Build_Version"].astype(str).isin(prev_major_builds)].copy()
+            if not prev_major_df.empty:
+                prev_major_df["_scenario"] = prev_major_df.apply(_classify_scenario, axis=1)
+                for _, pmr in prev_major_df.iterrows():
+                    tp_pm = pmr.get("throughput_cluster_gb_hr")
+                    if tp_pm and pd.notna(tp_pm) and float(tp_pm) > 0:
+                        key = (
+                            pmr.get("_scenario", ""),
+                            str(pmr.get("Data_Source_Type") or ""),
+                            str(pmr.get("file_set_type") or ""),
+                        )
+                        prev_major_best[key] = max(
+                            prev_major_best.get(key, 0.0), float(tp_pm)
+                        )
 
         groups = sm_best.groupby(["Data_Source_Type", "file_set_type"])
         if groups.ngroups == 0:
@@ -10917,7 +10840,6 @@ def page_build_analysis(df):
                 with st.expander(f"**{ds_type}** — {file_set}  ({len(grp)} scenario(s))", expanded=True):
                     # Build pivot table
                     rows_out = []
-                    base_tp = None
                     for scen in SCENARIO_ORDER:
                         sr = grp[grp["Scenario"] == scen]
                         if sr.empty:
@@ -10928,13 +10850,19 @@ def page_build_analysis(df):
                         hrs  = r.get("total_scan_hours")
                         objs = r.get("objects_scanned")
 
-                        delta_str = ""
-                        if base_tp is None and scen == "Base (Full Scan)":
-                            base_tp = tp
-                        elif base_tp and tp and base_tp > 0:
-                            pct = (tp - base_tp) / base_tp * 100
+                        # vs Prev Major: compare this scenario's best throughput in the
+                        # current major version against the best throughput for the same
+                        # scenario in the previous major version.
+                        pm_key = (scen, str(ds_type), str(file_set))
+                        pm_tp  = prev_major_best.get(pm_key)
+                        if pm_tp and tp and pd.notna(tp) and float(tp) > 0 and pm_tp > 0:
+                            pct = (float(tp) - pm_tp) / pm_tp * 100
                             arrow = "▲" if pct >= 0 else "▼"
                             delta_str = f"{arrow}{abs(pct):.1f}%"
+                        elif prev_major:
+                            delta_str = "N/A"   # prev major exists but no matching row
+                        else:
+                            delta_str = "—"     # no previous major version at all
 
                         rows_out.append({
                             "Scenario": scen,
@@ -10942,14 +10870,17 @@ def page_build_analysis(df):
                             "Files/hr": f"{ftp:,.0f}" if pd.notna(ftp) else "—",
                             "Scan Hrs": f"{hrs:.2f}" if pd.notna(hrs) else "—",
                             "Objects": f"{int(objs):,}" if pd.notna(objs) and objs else "—",
-                            "vs Base": delta_str,
+                            f"vs {prev_major or 'Prev Major'}": delta_str,
                         })
 
                     if rows_out:
                         disp = pd.DataFrame(rows_out)
+                        # The delta column name is dynamic (e.g. "vs 24.5" or "vs Prev Major")
+                        delta_col = [c for c in disp.columns if c.startswith("vs ")]
+                        delta_col = delta_col[0] if delta_col else None
 
                         def _color_delta(val):
-                            if not val or val == "":
+                            if not val or val in ("", "—", "N/A"):
                                 return ""
                             if "▲" in str(val):
                                 return "color: green; font-weight: bold;"
@@ -10957,8 +10888,11 @@ def page_build_analysis(df):
                                 return "color: red; font-weight: bold;"
                             return ""
 
+                        styled = disp.style
+                        if delta_col:
+                            styled = styled.applymap(_color_delta, subset=[delta_col])
                         st.dataframe(
-                            disp.style.applymap(_color_delta, subset=["vs Base"]),
+                            styled,
                             hide_index=True,
                             width='stretch',
                         )
@@ -11815,6 +11749,11 @@ def page_data_source_trend_comparison(df):
     selected_scan_type = st.selectbox("Scan Type", ["(All)"] + scan_type_options)
 
     scan_type_filter = None if selected_scan_type == "(All)" else selected_scan_type
+    
+    show_release_only = st.checkbox("Show Release Builds Only", value=False, key="ds_trend_release_only")
+    if show_release_only and "is_release" in df.columns:
+        df = df[df["is_release"] == 1]
+
     render_trend_analysis(
         df,
         title=f"Data Source Trend Comparison ({selected_fs})",
@@ -12876,10 +12815,12 @@ def load_auto_trend_dataset():
                     ab.new_attributes,
                     ab.removed_attributes,
                     ab.updated_at,
-                    ab.is_active
+                    ab.is_active,
+                    CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release
                 FROM auto_scan_benchmarks ab
                 LEFT JOIN test_environments te ON te.id = ab.environment_id
                 LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                LEFT JOIN builds bu ON bu.version = ab.build_version
                 WHERE LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
                   AND LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'
@@ -12891,7 +12832,7 @@ def load_auto_trend_dataset():
             "scan_type", "data_source_type", "data_type", "file_set_type", "scan_name",
             "scan_start_time", "scan_end_time", "total_scan_hours",
             "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", 
-            "new_attributes", "removed_attributes", "updated_at", "is_active"
+            "new_attributes", "removed_attributes", "updated_at", "is_active", "is_release"
         ]
         df = pd.DataFrame(rows, columns=cols)
         if df.empty:
@@ -12945,6 +12886,7 @@ def load_auto_trend_as_manual_like_df():
     out["Data_Type"] = out["data_type"].astype(str)
     out["scan_name"] = out.get("scan_name", "").astype(str)
     out["is_active"] = out.get("is_active", 1)
+    out["is_release"] = out.get("is_release", 0)
 
     # Re-infer core fields from scan_name when the auto table fields are missing/garbage.
     try:
@@ -13466,28 +13408,18 @@ def page_edit_benchmark(df):
                                 total_catalog_items = :tci, avg_file_size = :avg,
                                 throughput_cluster_gb_hr = :tpcg, throughput_scanner_gb_hr = :tpsg, throughput_thread_gb_hr = :tptg,
                                 throughput_cluster_files_hr = :tpcf, throughput_scanner_files_hr = :tpsf, throughput_thread_files_hr = :tptf,
-                                is_active = :act
+                                is_active = :act, is_release = :rel
                             WHERE id = :bid
                         """)
                         conn.execute(upd_bench, {
-                            'rd': run_date_str,
-                            'scn': clean_value(row.get('Scenario_Type')),
-                            'st': clean_value(row.get('Scan_Type')),
-                            'dst': clean_value(row.get('Data_Source_Type')),
-                            'dtype': clean_value(row.get('Data_Type')),
-                            'fst': clean_value(row.get('file_set_type')),
-                            'tf': clean_value(row.get('Total_Files')),
-                            'tfo': clean_value(row.get('Total_Folders')),
-                            'tgb': clean_value(row.get('Total_Size_GB')),
-                            'tci': clean_value(row.get('New_Attributes')),
-                            'avg': clean_value(row.get('avg_file_size')),
-                            'tpcg': clean_value(row.get('throughput_cluster_gb_hr')),
-                            'tpsg': clean_value(row.get('throughput_scanner_gb_hr')),
-                            'tptg': clean_value(row.get('throughput_thread_gb_hr')),
-                            'tpcf': clean_value(row.get('throughput_cluster_files_hr')),
-                            'tpsf': clean_value(row.get('throughput_scanner_files_hr')),
-                            'tptf': clean_value(row.get('throughput_thread_files_hr')),
+                            'rd': run_date_str, 'scn': clean_value(row.get('Scenario_Type')), 'st': clean_value(row.get('Scan_Type')),
+                            'dst': clean_value(row.get('Data_Source_Type')), 'dtype': clean_value(row.get('Data_Type')), 'fst': clean_value(row.get('file_set_type')),
+                            'tf': clean_value(row.get('Total_Files')), 'tfo': clean_value(row.get('Total_Folders')), 'tgb': clean_value(row.get('Total_Size_GB')),
+                            'tci': clean_value(row.get('New_Attributes')), 'avg': clean_value(row.get('avg_file_size')),
+                            'tpcg': clean_value(row.get('throughput_cluster_gb_hr')), 'tpsg': clean_value(row.get('throughput_scanner_gb_hr')), 'tptg': clean_value(row.get('throughput_thread_gb_hr')),
+                            'tpcf': clean_value(row.get('throughput_cluster_files_hr')), 'tpsf': clean_value(row.get('throughput_scanner_files_hr')), 'tptf': clean_value(row.get('throughput_thread_files_hr')),
                             'act': 1 if bool(row.get('is_active')) else 0,
+                            'rel': 1 if bool(row.get('is_release')) else 0,
                             'bid': row_id
                         })
                 conn.commit()
@@ -14164,9 +14096,9 @@ def page_scan_progress():
                     try:
                         _cau_scan = write_res.get("captured_at_utc") if isinstance(write_res, dict) else None
                         if _cau_scan is not None and hasattr(_cau_scan, "replace"):
-                            _cap_at = _cau_scan.replace(microsecond=0)
+                            _cap_at = _cau_scan.replace(second=0, microsecond=0)
                         else:
-                            _cap_at = datetime.utcnow().replace(microsecond=0)
+                            _cap_at = datetime.utcnow().replace(second=0, microsecond=0)
                         p_res = capture_scanner_performance_for_env(
                             engine,
                             sync_env_row,

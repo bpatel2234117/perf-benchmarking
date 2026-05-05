@@ -4,6 +4,7 @@ import time
 import requests
 import json
 import re
+import hashlib
 from datetime import date as date_cls
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -554,8 +555,6 @@ def _line_passes_error_level_gate(line: str) -> bool:
     # error_fatal (default)
     return bool(re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I))
 
-
-import hashlib
 
 def _parse_log_timestamp(line: str) -> Optional[datetime]:
     """
