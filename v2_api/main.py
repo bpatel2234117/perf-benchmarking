@@ -2171,6 +2171,661 @@ async def get_build_analysis_data(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Benchmarks: list with filters, update, delete ────────────────────────────
+
+@app.get("/api/benchmarks/list")
+async def list_benchmarks(
+    token: str = Depends(oauth2_scheme),
+    search: Optional[str] = Query(None),
+    limit: int = Query(500, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+):
+    """Paginated benchmark list for Edit Records page."""
+    try:
+        where = "WHERE COALESCE(b.is_active, TRUE) = TRUE"
+        params: dict = {"limit": limit, "offset": offset}
+        if search and search.strip():
+            where += """ AND (
+                bv.version ILIKE :s OR b.scan_type ILIKE :s OR dst.name ILIKE :s OR b.id::text = :sid
+            )"""
+            params["s"] = f"%{search.strip()}%"
+            params["sid"] = search.strip()
+        with engine.connect() as conn:
+            total = conn.execute(text(f"""
+                SELECT COUNT(*) FROM benchmarks b
+                JOIN builds bv ON bv.id = b.build_id
+                LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
+                {where}
+            """), params).scalar() or 0
+            rows = conn.execute(text(f"""
+                SELECT b.id, bv.version AS build_version, b.run_date, b.scenario_type, b.scan_type,
+                       dst.name AS data_source_type, fst.name AS file_set_type,
+                       b.total_scan_hours, b.throughput_cluster_gb_hr, b.throughput_scanner_gb_hr,
+                       b.throughput_thread_gb_hr, b.throughput_cluster_files_hr,
+                       b.throughput_scanner_files_hr, b.throughput_thread_files_hr,
+                       cfg.scanner_count, cfg.thread_count, cfg.is_acl, cfg.is_ocr,
+                       cfg.is_feature_flags, cfg.feature_flags, cfg.comment,
+                       b.total_catalog_items, b.is_active, b.is_release, b.scan_id,
+                       b.config_id, b.build_id
+                FROM benchmarks b
+                JOIN builds bv ON bv.id = b.build_id
+                LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
+                LEFT JOIN file_set_types fst ON fst.id = b.file_set_type_id
+                LEFT JOIN configurations cfg ON cfg.id = b.config_id
+                {where}
+                ORDER BY b.id DESC
+                LIMIT :limit OFFSET :offset
+            """), params).fetchall()
+        cols = ["id","build_version","run_date","scenario_type","scan_type","data_source_type",
+                "file_set_type","total_scan_hours","throughput_cluster_gb_hr","throughput_scanner_gb_hr",
+                "throughput_thread_gb_hr","throughput_cluster_files_hr","throughput_scanner_files_hr",
+                "throughput_thread_files_hr","scanner_count","thread_count","is_acl","is_ocr",
+                "is_feature_flags","feature_flags","comment","total_catalog_items","is_active",
+                "is_release","scan_id","config_id","build_id"]
+        return {"items": [dict(zip(cols, r)) for r in rows], "total": int(total)}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BenchmarkUpdate(BaseModel):
+    run_date: Optional[str] = None
+    scenario_type: Optional[str] = None
+    scan_type: Optional[str] = None
+    total_scan_hours: Optional[float] = None
+    throughput_cluster_gb_hr: Optional[float] = None
+    throughput_scanner_gb_hr: Optional[float] = None
+    throughput_thread_gb_hr: Optional[float] = None
+    throughput_cluster_files_hr: Optional[float] = None
+    throughput_scanner_files_hr: Optional[float] = None
+    throughput_thread_files_hr: Optional[float] = None
+    total_catalog_items: Optional[int] = None
+    is_active: Optional[bool] = None
+    is_release: Optional[bool] = None
+
+
+@app.put("/api/benchmarks/{benchmark_id}")
+async def update_benchmark(benchmark_id: int, payload: BenchmarkUpdate, token: str = Depends(oauth2_scheme)):
+    sets, params = [], {"bid": benchmark_id}
+    for field, val in payload.model_dump(exclude_none=True).items():
+        sets.append(f"{field} = :{field}")
+        params[field] = val
+    if not sets:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    sets.append("updated_at = CURRENT_TIMESTAMP")
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(text(f"UPDATE benchmarks SET {', '.join(sets)} WHERE id = :bid RETURNING id"), params)
+            if r.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Benchmark not found")
+        return {"ok": True, "id": benchmark_id}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/benchmarks/{benchmark_id}")
+async def delete_benchmark(benchmark_id: int, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM benchmark_findings WHERE benchmark_id = :id"), {"id": benchmark_id})
+            r = conn.execute(text("DELETE FROM benchmarks WHERE id = :id RETURNING id"), {"id": benchmark_id})
+            if r.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Benchmark not found")
+        return {"ok": True}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BulkDeletePayload(BaseModel):
+    ids: List[int]
+
+
+@app.post("/api/benchmarks/bulk-delete")
+async def bulk_delete_benchmarks(payload: BulkDeletePayload, token: str = Depends(oauth2_scheme)):
+    if not payload.ids:
+        return {"ok": True, "deleted": 0}
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("DELETE FROM benchmark_findings WHERE benchmark_id = ANY(:ids)"),
+                {"ids": payload.ids},
+            )
+            r = conn.execute(
+                text("DELETE FROM benchmarks WHERE id = ANY(:ids)"),
+                {"ids": payload.ids},
+            )
+        return {"ok": True, "deleted": r.rowcount}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Builds: list, update release tags ────────────────────────────────────────
+
+@app.get("/api/builds")
+async def list_builds(token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT id, version, release_milestone, quarter_label
+                FROM builds
+                ORDER BY
+                  COALESCE(NULLIF(SUBSTRING(version FROM '^([0-9]+)'), '')::INTEGER, 0) DESC,
+                  COALESCE(NULLIF(SUBSTRING(version FROM '^[0-9]+[.\\-]([0-9]+)'), '')::INTEGER, 0) DESC,
+                  id DESC
+            """)).fetchall()
+        return [{"id": r[0], "version": r[1], "release_milestone": r[2], "quarter_label": r[3]} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class BuildTagUpdate(BaseModel):
+    release_milestone: Optional[str] = None
+    quarter_label: Optional[str] = None
+
+
+@app.put("/api/builds/{build_id}/tag")
+async def update_build_tag(build_id: int, payload: BuildTagUpdate, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(
+                text("UPDATE builds SET release_milestone = :m, quarter_label = :q WHERE id = :id RETURNING id"),
+                {"m": payload.release_milestone, "q": payload.quarter_label, "id": build_id},
+            )
+            if r.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Build not found")
+        return {"ok": True}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Classifier comparison ─────────────────────────────────────────────────────
+
+@app.get("/api/classifiers/build-mappings")
+async def get_classifier_build_mappings(
+    token: str = Depends(oauth2_scheme),
+    environment_id: Optional[int] = Query(None),
+):
+    """Return {build_version: [classifier_name, ...]} for classifier comparison page."""
+    try:
+        with engine.connect() as conn:
+            if environment_id is not None:
+                rows = conn.execute(text("""
+                    SELECT bv.version, c.name
+                    FROM build_classifier_mappings bcm
+                    JOIN builds bv ON bv.id = bcm.build_id
+                    JOIN classifiers c ON c.id = bcm.classifier_id
+                    WHERE bcm.environment_id = :eid
+                    ORDER BY bv.version, c.name
+                """), {"eid": environment_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT bv.version, c.name
+                    FROM build_classifier_mappings bcm
+                    JOIN builds bv ON bv.id = bcm.build_id
+                    JOIN classifiers c ON c.id = bcm.classifier_id
+                    ORDER BY bv.version, c.name
+                """)).fetchall()
+        build_map: dict = {}
+        for ver, name in rows:
+            v, n = str(ver or "").strip(), str(name or "").strip()
+            if v and n:
+                build_map.setdefault(v, []).append(n)
+        return {"build_map": build_map, "builds": sorted(build_map.keys())}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/classifiers/build-stats")
+async def get_classifier_build_stats(
+    token: str = Depends(oauth2_scheme),
+    environment_id: Optional[int] = Query(None),
+):
+    """Classifier count per build per environment for Version Comparison trend chart."""
+    try:
+        with engine.connect() as conn:
+            if environment_id is not None:
+                rows = conn.execute(text("""
+                    SELECT bv.version, te.env_name, COUNT(DISTINCT bcm.classifier_id) AS cnt,
+                           MAX(bcm.last_synced_at) AS last_synced_at
+                    FROM build_classifier_mappings bcm
+                    JOIN builds bv ON bv.id = bcm.build_id
+                    LEFT JOIN test_environments te ON te.id = bcm.environment_id
+                    WHERE bcm.environment_id = :eid
+                    GROUP BY bv.version, te.env_name
+                    ORDER BY bv.version, te.env_name
+                """), {"eid": environment_id}).fetchall()
+            else:
+                rows = conn.execute(text("""
+                    SELECT bv.version, COALESCE(te.env_name, 'All') AS env_name,
+                           COUNT(DISTINCT bcm.classifier_id) AS cnt,
+                           MAX(bcm.last_synced_at) AS last_synced_at
+                    FROM build_classifier_mappings bcm
+                    JOIN builds bv ON bv.id = bcm.build_id
+                    LEFT JOIN test_environments te ON te.id = bcm.environment_id
+                    GROUP BY bv.version, te.env_name
+                    ORDER BY bv.version, te.env_name
+                """)).fetchall()
+        return [{"build_version": r[0], "env_name": r[1], "classifier_count": int(r[2]),
+                 "last_synced_at": str(r[3]) if r[3] else None} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/classifiers/snapshot-summary")
+async def get_classifier_snapshot_summary(
+    token: str = Depends(oauth2_scheme),
+    environment_id: Optional[int] = Query(None)
+):
+    """List build versions that have metadata snapshots for the selected environment."""
+    try:
+        where = ""
+        params = {}
+        if environment_id is not None:
+            where = "WHERE cds.environment_id = :eid"
+            params["eid"] = environment_id
+            
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT b.version, COUNT(*) as snapshot_count, MAX(cds.created_at) as last_captured
+                FROM classifier_details_snapshots cds
+                JOIN builds b ON b.id = cds.build_id
+                {where}
+                GROUP BY b.version
+                ORDER BY b.version DESC
+            """), params).fetchall()
+            
+        return [
+            {
+                "build_version": r[0],
+                "snapshot_count": r[1],
+                "last_captured": str(r[2]) if r[2] else None
+            }
+            for r in rows
+        ]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/classifiers/snapshots")
+async def get_classifier_snapshots(
+    build_version: str,
+    environment_id: Optional[int] = Query(None),
+    token: str = Depends(oauth2_scheme)
+):
+    """Return all classifier snapshots for a build version + environment."""
+    try:
+        with engine.connect() as conn:
+            # Resolve build_id
+            b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
+            if not b_row:
+                return {"snapshots": []}
+            bid = int(b_row[0])
+            
+            where = "WHERE build_id = :bid"
+            params = {"bid": bid}
+            if environment_id is not None:
+                where += " AND environment_id = :eid"
+                params["eid"] = environment_id
+                
+            rows = conn.execute(text(f"""
+                SELECT classifier_name, bigid_classifier_id, snapshot_json
+                FROM classifier_details_snapshots
+                {where}
+            """), params).fetchall()
+            
+        import json
+        out = []
+        for r in rows:
+            try:
+                snap = json.loads(r[2]) if isinstance(r[2], str) else r[2]
+            except Exception:
+                snap = {}
+            out.append({
+                "classifier_name": r[0],
+                "bigid_classifier_id": r[1],
+                "snapshot": snap
+            })
+        return {"snapshots": out}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/classifiers/refresh-snapshots")
+async def refresh_classifier_snapshots(
+    environment_id: int,
+    token: str = Depends(oauth2_scheme)
+):
+    """Trigger manual refresh of classifier snapshots for an environment."""
+    try:
+        from v2_api.tracker import sync_classifier_details_for_env_build, fetch_about, _extract_build_version_from_about_payload
+        from bigid_auth import Get_auth_token
+        
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT id, env_name, base_url, auth_module_path, auth_function_name, version FROM test_environments WHERE id = :eid"), {"eid": environment_id}).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Environment not found")
+            env_row = dict(row._mapping)
+            
+        base_url = str(env_row.get("base_url") or "").strip()
+        if not base_url:
+             raise HTTPException(status_code=400, detail="Environment base_url is missing")
+             
+        env_token = Get_auth_token(base_url, env_row)
+        if not env_token:
+            raise HTTPException(status_code=401, detail="Failed to get BigID auth token for environment")
+            
+        about = fetch_about(base_url, env_token)
+        if not about:
+             raise HTTPException(status_code=502, detail="Failed to fetch /about from BigID")
+             
+        build_version = _extract_build_version_from_about_payload(about)
+        if not build_version:
+            build_version = env_row.get("version")
+            
+        if not build_version:
+             raise HTTPException(status_code=400, detail="Could not determine build version for snapshot capture")
+             
+        ok = sync_classifier_details_for_env_build(engine, env_row, env_token, build_version, force=True)
+        return {"ok": ok, "build_version": build_version}
+    except HTTPException:
+        raise
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Scanner Infrastructure ────────────────────────────────────────────────────
+
+@app.get("/api/scanner-performance/individual")
+async def get_scanner_individual_perf(
+    token: str = Depends(oauth2_scheme),
+    environment_id: int = Query(...),
+    days_back: int = Query(7, ge=1, le=30),
+):
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        end_dt = _dt.utcnow()
+        start_dt = end_dt - _td(days=days_back)
+        has_cpu = _db_has_column(engine, "scanner_individual_performance", "cpu_pct")
+        has_mem = _db_has_column(engine, "scanner_individual_performance", "memory_usage_pct")
+        has_disp = _db_has_column(engine, "scanner_individual_performance", "display_name")
+        cpu_col = "cpu_pct" if has_cpu else "system_load_average AS cpu_pct"
+        mem_col = "memory_usage_pct" if has_mem else "NULL::float AS memory_usage_pct"
+        name_col = "display_name" if has_disp else "name AS display_name"
+        with engine.connect() as conn:
+            rows = conn.execute(text(f"""
+                SELECT captured_at_utc, scanner_id, {name_col}, status,
+                       {cpu_col}, {mem_col}, running_threads
+                FROM scanner_individual_performance
+                WHERE environment_id = :eid
+                  AND captured_at_utc BETWEEN :start AND :end
+                ORDER BY captured_at_utc ASC
+            """), {"eid": environment_id, "start": start_dt, "end": end_dt}).fetchall()
+        return [{"captured_at_utc": str(r[0]), "scanner_id": r[1], "display_name": r[2],
+                 "status": r[3], "cpu_pct": r[4], "memory_usage_pct": r[5],
+                 "running_threads": r[6]} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/scanner-performance/group")
+async def get_scanner_group_perf(
+    token: str = Depends(oauth2_scheme),
+    environment_id: int = Query(...),
+    days_back: int = Query(7, ge=1, le=30),
+):
+    try:
+        from datetime import datetime as _dt, timedelta as _td
+        end_dt = _dt.utcnow()
+        start_dt = end_dt - _td(days=days_back)
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT captured_at_utc, group_name, running_scanners, running_threads,
+                       avg_scan_speed, physical_memory_mb, free_memory_mb,
+                       COALESCE(group_scanner_ids_json, '[]') AS scanner_ids_json
+                FROM scanner_group_performance
+                WHERE environment_id = :eid
+                  AND captured_at_utc BETWEEN :start AND :end
+                ORDER BY captured_at_utc ASC
+            """), {"eid": environment_id, "start": start_dt, "end": end_dt}).fetchall()
+        return [{"captured_at_utc": str(r[0]), "group_name": r[1], "running_scanners": r[2],
+                 "running_threads": r[3], "avg_scan_speed": r[4], "physical_memory_mb": r[5],
+                 "free_memory_mb": r[6], "scanner_ids_json": r[7]} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── RBAC management ───────────────────────────────────────────────────────────
+
+@app.get("/api/rbac/users")
+async def list_users(token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT u.id, u.username, r.role_name, u.role_id, u.created_at
+                FROM app_users u JOIN app_roles r ON u.role_id = r.id
+                ORDER BY u.username
+            """)).fetchall()
+        return [{"id": r[0], "username": r[1], "role_name": r[2], "role_id": r[3],
+                 "created_at": str(r[4]) if r[4] else None} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3)
+    role_id: int
+
+
+class UserRoleUpdate(BaseModel):
+    role_id: int
+
+
+@app.post("/api/rbac/users")
+async def create_user(payload: UserCreate, token: str = Depends(oauth2_scheme)):
+    email = payload.username.strip().lower()
+    if "@bigid.com" not in email:
+        raise HTTPException(status_code=400, detail="Only @bigid.com emails allowed")
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(
+                text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, 'PASSWORDLESS', :r) RETURNING id"),
+                {"u": email, "r": payload.role_id},
+            ).fetchone()
+        return {"ok": True, "id": r[0]}
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="User already exists")
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/rbac/users/{user_id}/role")
+async def update_user_role(user_id: int, payload: UserRoleUpdate, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(
+                text("UPDATE app_users SET role_id = :rid WHERE id = :uid RETURNING id"),
+                {"rid": payload.role_id, "uid": user_id},
+            )
+            if r.rowcount == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+        return {"ok": True}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/rbac/users/{user_id}")
+async def delete_user(user_id: int, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(text("DELETE FROM app_users WHERE id = :id RETURNING id"), {"id": user_id})
+            if r.rowcount == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+        return {"ok": True}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rbac/roles")
+async def list_roles(token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT id, role_name FROM app_roles ORDER BY role_name")).fetchall()
+        return [{"id": r[0], "role_name": r[1]} for r in rows]
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class RoleCreate(BaseModel):
+    role_name: str = Field(..., min_length=1)
+
+
+@app.post("/api/rbac/roles")
+async def create_role(payload: RoleCreate, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            r = conn.execute(
+                text("INSERT INTO app_roles (role_name) VALUES (:n) RETURNING id"),
+                {"n": payload.role_name.strip()},
+            ).fetchone()
+        return {"ok": True, "id": r[0]}
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="Role already exists")
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rbac/roles/{role_id}/permissions")
+async def get_role_permissions(role_id: int, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT page_name FROM app_role_pages WHERE role_id = :rid ORDER BY page_name"),
+                {"rid": role_id},
+            ).fetchall()
+        return {"role_id": role_id, "pages": [r[0] for r in rows]}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class PermissionsUpdate(BaseModel):
+    pages: List[str]
+
+
+@app.put("/api/rbac/roles/{role_id}/permissions")
+async def update_role_permissions(role_id: int, payload: PermissionsUpdate, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id})
+            for page in payload.pages:
+                conn.execute(
+                    text("INSERT INTO app_role_pages (role_id, page_name) VALUES (:rid, :p)"),
+                    {"rid": role_id, "p": page},
+                )
+        return {"ok": True, "pages": len(payload.pages)}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Workflow templates (Create Data Source config) ────────────────────────────
+
+@app.get("/api/workflow-templates")
+async def get_workflow_templates(token: str = Depends(oauth2_scheme), key: Optional[str] = Query(None)):
+    try:
+        with engine.connect() as conn:
+            if key:
+                row = conn.execute(
+                    text("SELECT k, template_kind, payload_json FROM workflow_templates WHERE k = :k"),
+                    {"k": key},
+                ).fetchone()
+                if not row:
+                    return {"items": []}
+                return {"items": [{"key": row[0], "kind": row[1], "payload": row[2]}]}
+            rows = conn.execute(
+                text("SELECT k, template_kind, payload_json FROM workflow_templates ORDER BY k")
+            ).fetchall()
+        return {"items": [{"key": r[0], "kind": r[1], "payload": r[2]} for r in rows]}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class WorkflowTemplateUpsert(BaseModel):
+    key: str = Field(..., min_length=1)
+    kind: str = "config"
+    payload: str = ""
+
+
+@app.post("/api/workflow-templates")
+async def upsert_workflow_template(payload: WorkflowTemplateUpsert, token: str = Depends(oauth2_scheme)):
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_templates (k, template_kind, payload_json)
+                    VALUES (:k, :kind, :p)
+                    ON CONFLICT (k) DO UPDATE SET template_kind = EXCLUDED.template_kind,
+                                                   payload_json = EXCLUDED.payload_json,
+                                                   updated_at = CURRENT_TIMESTAMP
+                """),
+                {"k": payload.key, "kind": payload.kind, "p": payload.payload},
+            )
+        return {"ok": True}
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Environment build-info proxy (Create Data Source) ────────────────────────
+
+@app.get("/api/environments/{environment_id}/build-info")
+async def get_environment_build_info(environment_id: int, token: str = Depends(oauth2_scheme)):
+    """Fetch build version from BigID /about API for the given environment."""
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT base_url, auth_module_path, auth_function_name, version FROM test_environments WHERE id = :eid"),
+                {"eid": environment_id},
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Environment not found")
+        base_url, auth_path, auth_fn, stored_version = row
+    except SQLAlchemyError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    try:
+        from bigid_auth import Get_auth_token as _get_token
+        env_row = {"base_url": base_url, "auth_module_path": auth_path, "auth_function_name": auth_fn}
+        tok = _get_token(env_row)
+    except Exception:
+        tok = ""
+
+    build_version = ""
+    try:
+        import requests as _req
+        about_url = f"{str(base_url or '').rstrip('/')}/api/v1/about"
+        resp = _req.get(about_url, headers={"authorization": tok}, timeout=10, verify=False)
+        if resp.status_code == 200:
+            data = resp.json()
+            for key in ["releaseVersion", "coreVersion", "version", "buildVersion"]:
+                v = (data.get(key) or (data.get("data") or {}).get(key) or "")
+                if v:
+                    import re as _re
+                    m = _re.search(r"\b(\d{3})[\.\-](\d{1,3})\b", str(v))
+                    if m:
+                        build_version = f"{m.group(1)}.{m.group(2)}"
+                        break
+    except Exception:
+        pass
+
+    if build_version:
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE test_environments SET version = :v WHERE id = :eid"),
+                    {"v": build_version, "eid": environment_id},
+                )
+        except Exception:
+            pass
+
+    return {"build_version": build_version or stored_version or "", "environment_id": environment_id}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("v2_api.main:app", host="0.0.0.0", port=8000, reload=True)

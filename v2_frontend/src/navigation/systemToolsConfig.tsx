@@ -22,7 +22,8 @@ export type AppNavPath =
   | '/environments'
   | '/logs'
   | '/tools/scan-status'
-  | '/tools/build-analysis';
+  | '/tools/build-analysis'
+  | '/tools/classifier-comparison';
 
 export type SystemToolEntry =
   | { kind: 'app'; path: AppNavPath; label: string; icon: LucideIcon }
@@ -32,7 +33,7 @@ export type SystemToolEntry =
 export const SYSTEM_TOOLS_ENTRIES: readonly SystemToolEntry[] = [
   { kind: 'app', path: '/tools/build-analysis', label: 'Build Analysis', icon: BarChart2 },
   { kind: 'legacy', slug: 'run-comparison', label: 'Run Comparison Tool', icon: GitCompare },
-  { kind: 'legacy', slug: 'classifier-comparison', label: 'Classifier Comparison', icon: Layers },
+  { kind: 'app', path: '/tools/classifier-comparison', label: 'Classifier Comparison', icon: Layers },
   { kind: 'legacy', slug: 'data-record-add', label: 'Add New Data Record', icon: PlusSquare },
   { kind: 'legacy', slug: 'records-edit', label: 'Edit Existing Records', icon: Wrench },
   { kind: 'app', path: '/environments', label: 'Manage Test Environments', icon: Globe },
