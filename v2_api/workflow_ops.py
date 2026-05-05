@@ -21,6 +21,7 @@ def insert_workflow_run_with_steps(
     env1_id: Any,
     env2_id: Any,
     steps_override: Optional[List[Dict[str, Any]]] = None,
+    created_by: Optional[int] = None,
 ) -> int:
     nm = (name or "").strip() or f"workflow {_utc_name()}"
     try:
@@ -59,12 +60,12 @@ def insert_workflow_run_with_steps(
         row = conn.execute(
             text(
                 """
-                INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes)
-                VALUES (:n, 'created', :e1, :e2, :cd)
+                INSERT INTO workflow_runs (name, status, env1_id, env2_id, cooldown_minutes, created_by)
+                VALUES (:n, 'created', :e1, :e2, :cd, :cb)
                 RETURNING id
                 """
             ),
-            {"n": nm, "e1": env1_id, "e2": env2_id, "cd": cd},
+            {"n": nm, "e1": env1_id, "e2": env2_id, "cd": cd, "cb": created_by},
         ).fetchone()
         if not row:
             raise RuntimeError("INSERT workflow_runs returned no id")

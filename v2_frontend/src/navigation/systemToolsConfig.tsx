@@ -23,7 +23,11 @@ export type AppNavPath =
   | '/logs'
   | '/tools/scan-status'
   | '/tools/build-analysis'
-  | '/tools/classifier-comparison';
+  | '/tools/classifier-comparison'
+  | '/tools/records-edit'
+  | '/tools/manage-rbac'
+  | '/tools/scanner-infra'
+  | '/tools/data-source-create';
 
 export type SystemToolEntry =
   | { kind: 'app'; path: AppNavPath; label: string; icon: LucideIcon }
@@ -35,13 +39,13 @@ export const SYSTEM_TOOLS_ENTRIES: readonly SystemToolEntry[] = [
   { kind: 'legacy', slug: 'run-comparison', label: 'Run Comparison Tool', icon: GitCompare },
   { kind: 'app', path: '/tools/classifier-comparison', label: 'Classifier Comparison', icon: Layers },
   { kind: 'legacy', slug: 'data-record-add', label: 'Add New Data Record', icon: PlusSquare },
-  { kind: 'legacy', slug: 'records-edit', label: 'Edit Existing Records', icon: Wrench },
+  { kind: 'app', path: '/tools/records-edit', label: 'Edit Existing Records', icon: Wrench },
   { kind: 'app', path: '/environments', label: 'Manage Test Environments', icon: Globe },
   { kind: 'legacy', slug: 'version-comparison', label: 'Version Comparison', icon: GitBranch },
-  { kind: 'legacy', slug: 'data-source-create', label: 'Create Data Source', icon: Puzzle },
+  { kind: 'app', path: '/tools/data-source-create', label: 'Create Data Source', icon: Puzzle },
   { kind: 'app', path: '/tools/scan-status', label: 'Scan Status', icon: Satellite },
-  { kind: 'legacy', slug: 'scanner-infra', label: 'Scanner Infrastructure', icon: Monitor },
-  { kind: 'legacy', slug: 'manage-rbac', label: 'Manage RBAC', icon: ShieldCheck },
+  { kind: 'app', path: '/tools/scanner-infra', label: 'Scanner Infrastructure', icon: Monitor },
+  { kind: 'app', path: '/tools/manage-rbac', label: 'Manage RBAC', icon: ShieldCheck },
   { kind: 'app', path: '/logs', label: 'AI Logs', icon: TerminalSquare },
 ];
 

@@ -53,7 +53,7 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, children }) => {
     <div className="app-shell">
       <aside ref={sidebarRef} className="app-sidebar-purple" aria-label="Main navigation">
         <Link to="/" className="app-sidebar-brand-white">
-          <Activity size={22} aria-hidden />
+          <img src="/logo.png" alt="BigID" style={{ width: 24, height: 24, borderRadius: 6, objectFit: 'cover' }} />
           <span className="app-sidebar-title">BigID Benchmarks</span>
         </Link>
 

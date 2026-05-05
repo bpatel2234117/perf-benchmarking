@@ -146,10 +146,52 @@ DDL_STATEMENTS = {
             throughput_cluster_files_hr REAL,
             throughput_scanner_files_hr REAL,
             throughput_thread_files_hr REAL,
+            total_files BIGINT NULL,
+            total_folders BIGINT NULL,
+            total_size_gb REAL NULL,
+            data_type VARCHAR(50) NULL,
+            total_classification BIGINT NULL,
+            removed_attributes BIGINT NULL,
+            classifier_list TEXT NULL,
             is_active BOOLEAN DEFAULT TRUE,
             is_release BOOLEAN DEFAULT FALSE,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            scan_id VARCHAR(128) NULL
+            scan_id VARCHAR(128) NULL,
+            created_by INT NULL REFERENCES app_users(id)
+        );
+    """,
+    'auto_scan_benchmarks': """
+        CREATE TABLE IF NOT EXISTS auto_scan_benchmarks (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL UNIQUE,
+            environment_id INT REFERENCES test_environments(id),
+            build_version VARCHAR(100),
+            run_date DATE,
+            scenario_type VARCHAR(100),
+            scan_type VARCHAR(100),
+            data_source_type VARCHAR(100),
+            data_type VARCHAR(50),
+            file_set_type VARCHAR(150),
+            scan_start_time TIMESTAMP,
+            scan_end_time TIMESTAMP,
+            total_scan_hours REAL,
+            objects_with_pi BIGINT,
+            objects_scanned BIGINT,
+            objects_enumerated BIGINT,
+            total_classification BIGINT,
+            new_attributes INT,
+            removed_attributes INT,
+            classifier_attribute_names TEXT,
+            scan_name VARCHAR(1000),
+            total_size_gb REAL,
+            total_files BIGINT,
+            total_folders BIGINT,
+            throughput_cluster_gb_hr REAL,
+            throughput_cluster_files_hr REAL,
+            is_active BOOLEAN DEFAULT TRUE,
+            is_release BOOLEAN DEFAULT FALSE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by INT NULL REFERENCES app_users(id)
         );
     """,
     'benchmark_findings': """
@@ -242,7 +284,8 @@ DDL_STATEMENTS = {
             finished_at TIMESTAMP NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            scan_template_id VARCHAR(128) NULL
+            scan_template_id VARCHAR(128) NULL,
+            created_by INT NULL REFERENCES app_users(id)
         );
     """,
     'workflow_steps': """

@@ -132,12 +132,34 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
     return hash_password(plain_password) == hashed_password
 
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    email = token.replace("fake-jwt-token-for-", "")
+    try:
+        with engine.connect() as conn:
+            res = conn.execute(text("""
+                SELECT u.id, u.username, r.role_name, u.role_id
+                FROM app_users u
+                JOIN app_roles r ON u.role_id = r.id
+                WHERE u.username = :u
+            """), {"u": email}).fetchone()
+            if not res:
+                # Fallback for dev/first run if user doesn't exist yet but token is valid
+                if email == "bpatel@bigid.com":
+                    return {"id": 1, "username": email, "role": "Admin", "role_id": 1}
+                raise HTTPException(status_code=401, detail="Invalid user session")
+            return {"id": res[0], "username": res[1], "role": res[2], "role_id": res[3]}
+    except SQLAlchemyError:
+        if email == "bpatel@bigid.com":
+            return {"id": 1, "username": email, "role": "Admin", "role_id": 1}
+        raise HTTPException(status_code=503, detail="Auth DB error")
+
 # Models
 class Token(BaseModel):
     access_token: str
     token_type: str
 
 class UserProfile(BaseModel):
+    id: int
     username: str
     role: str
     role_id: int
@@ -311,24 +333,8 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.get("/api/users/me", response_model=UserProfile)
-async def read_users_me(token: str = Depends(oauth2_scheme)):
-    email = token.replace("fake-jwt-token-for-", "")
-    try:
-        with engine.connect() as conn:
-            res = conn.execute(text("""
-                SELECT u.username, r.role_name, u.role_id
-                FROM app_users u
-                JOIN app_roles r ON u.role_id = r.id
-                WHERE u.username = :u
-            """), {"u": email}).fetchone()
-            if not res:
-                raise HTTPException(status_code=401, detail="Invalid token")
-            return UserProfile(username=res[0], role=res[1], role_id=res[2])
-    except SQLAlchemyError:
-        # Mock profile if DB down but token is valid (for local dev)
-        if email == "bpatel@bigid.com":
-            return UserProfile(username=email, role="Admin", role_id=1)
-        raise HTTPException(status_code=503, detail="Database connection failed")
+async def read_users_me(u=Depends(get_current_user)):
+    return UserProfile(id=u["id"], username=u["username"], role=u["role"], role_id=u["role_id"])
 
 @app.get("/api/environments", response_model=List[Environment])
 async def get_environments(token: str = Depends(oauth2_scheme)):
@@ -1744,7 +1750,7 @@ _WORKFLOW_STEP_SELECT = """
 
 @app.get("/api/workflow/runs")
 async def get_workflow_runs(
-    token: str = Depends(oauth2_scheme),
+    u=Depends(get_current_user),
     limit: int = Query(25, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -1752,19 +1758,27 @@ async def get_workflow_runs(
     try:
         wf = get_workflow_sql_engine()
         with wf.connect() as conn:
-            total_row = conn.execute(text("SELECT COUNT(*) FROM workflow_runs")).scalar()
+            # RBAC: Filter by user unless Admin
+            user_filter = ""
+            params = {"limit": limit, "offset": offset}
+            if u["role"] != "Admin":
+                user_filter = "WHERE created_by = :uid"
+                params["uid"] = u["id"]
+
+            total_row = conn.execute(text(f"SELECT COUNT(*) FROM workflow_runs {user_filter}"), params).scalar()
             total = int(total_row or 0)
             res = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, name, status, env1_id, env2_id, cooldown_minutes, last_error,
                            next_eligible_at, scan_template_id, started_at, finished_at
                     FROM workflow_runs
+                    {user_filter}
                     ORDER BY id DESC
                     LIMIT :limit OFFSET :offset
                     """
                 ),
-                {"limit": limit, "offset": offset},
+                params,
             ).fetchall()
         runs = [
             {
@@ -1852,7 +1866,7 @@ async def get_workflow_env_status(token: str = Depends(oauth2_scheme)):
 
 
 @app.post("/api/workflow/runs")
-async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, token: str = Depends(oauth2_scheme)):
+async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, u=Depends(get_current_user)):
     """Create workflow run + step matrix (default from catalog or client-selected steps)."""
     try:
         from v2_api.workflow_ops import insert_workflow_run_with_steps  # noqa: PLC0415
@@ -1868,6 +1882,7 @@ async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, token: st
             payload.env1_id,
             payload.env2_id,
             steps_override=steps_kw,
+            created_by=u["id"]
         )
         return {"id": rid, "message": "created"}
     except ValueError as e:
@@ -1974,7 +1989,7 @@ def _get_or_create_config(conn, scanner_count: int, thread_count: int, is_acl: b
 
 
 @app.post("/api/benchmarks/save")
-async def save_benchmark(payload: BenchmarkSavePayload, token: str = Depends(oauth2_scheme)):
+async def save_benchmark(payload: BenchmarkSavePayload, u=Depends(get_current_user)):
     """
     Full benchmark save — equivalent to Streamlit 'Save Benchmark Run'.
     Creates/reuses lookup rows (builds, data_source_types, file_set_types, configurations)
@@ -2043,14 +2058,14 @@ async def save_benchmark(payload: BenchmarkSavePayload, token: str = Depends(oau
                         scan_start_time, scan_end_time, total_scan_hours,
                         throughput_cluster_gb_hr, throughput_scanner_gb_hr, throughput_thread_gb_hr,
                         throughput_cluster_files_hr, throughput_scanner_files_hr, throughput_thread_files_hr,
-                        total_catalog_items, scan_id, is_active, is_release, updated_at
+                        total_catalog_items, scan_id, is_active, is_release, updated_at, created_by
                     ) VALUES (
                         :bid, :cid, :rd, :st, :sct,
                         :dst, :fst,
                         :ss, :se, :tsh,
                         :tcg, :tsg2, :ttg,
                         :tcf, :tsf, :ttf,
-                        :tci, :sid, TRUE, :isr, CURRENT_TIMESTAMP
+                        :tci, :sid, TRUE, :isr, CURRENT_TIMESTAMP, :cb
                     ) RETURNING id
                 """),
                 {
@@ -2066,6 +2081,7 @@ async def save_benchmark(payload: BenchmarkSavePayload, token: str = Depends(oau
                     "tci": payload.total_catalog_items,
                     "sid": payload.scan_id or None,
                     "isr": payload.is_release,
+                    "cb": u["id"]
                 },
             ).fetchone()
             new_id = int(row[0])
@@ -2175,54 +2191,148 @@ async def get_build_analysis_data(
 
 @app.get("/api/benchmarks/list")
 async def list_benchmarks(
-    token: str = Depends(oauth2_scheme),
+    u=Depends(get_current_user),
     search: Optional[str] = Query(None),
+    mode: Literal["manual", "auto"] = Query("manual"),
+    include_inactive: bool = Query(False),
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
 ):
-    """Paginated benchmark list for Edit Records page."""
+    """Paginated benchmark list for Edit Records page (supports Manual and Auto modes)."""
     try:
-        where = "WHERE COALESCE(b.is_active, TRUE) = TRUE"
-        params: dict = {"limit": limit, "offset": offset}
-        if search and search.strip():
-            where += """ AND (
-                bv.version ILIKE :s OR b.scan_type ILIKE :s OR dst.name ILIKE :s OR b.id::text = :sid
-            )"""
-            params["s"] = f"%{search.strip()}%"
-            params["sid"] = search.strip()
-        with engine.connect() as conn:
-            total = conn.execute(text(f"""
-                SELECT COUNT(*) FROM benchmarks b
-                JOIN builds bv ON bv.id = b.build_id
-                LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
-                {where}
-            """), params).scalar() or 0
-            rows = conn.execute(text(f"""
-                SELECT b.id, bv.version AS build_version, b.run_date, b.scenario_type, b.scan_type,
-                       dst.name AS data_source_type, fst.name AS file_set_type,
-                       b.total_scan_hours, b.throughput_cluster_gb_hr, b.throughput_scanner_gb_hr,
-                       b.throughput_thread_gb_hr, b.throughput_cluster_files_hr,
-                       b.throughput_scanner_files_hr, b.throughput_thread_files_hr,
-                       cfg.scanner_count, cfg.thread_count, cfg.is_acl, cfg.is_ocr,
-                       cfg.is_feature_flags, cfg.feature_flags, cfg.comment,
-                       b.total_catalog_items, b.is_active, b.is_release, b.scan_id,
-                       b.config_id, b.build_id
-                FROM benchmarks b
-                JOIN builds bv ON bv.id = b.build_id
-                LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
-                LEFT JOIN file_set_types fst ON fst.id = b.file_set_type_id
-                LEFT JOIN configurations cfg ON cfg.id = b.config_id
-                {where}
-                ORDER BY b.id DESC
-                LIMIT :limit OFFSET :offset
-            """), params).fetchall()
-        cols = ["id","build_version","run_date","scenario_type","scan_type","data_source_type",
-                "file_set_type","total_scan_hours","throughput_cluster_gb_hr","throughput_scanner_gb_hr",
-                "throughput_thread_gb_hr","throughput_cluster_files_hr","throughput_scanner_files_hr",
-                "throughput_thread_files_hr","scanner_count","thread_count","is_acl","is_ocr",
-                "is_feature_flags","feature_flags","comment","total_catalog_items","is_active",
-                "is_release","scan_id","config_id","build_id"]
-        return {"items": [dict(zip(cols, r)) for r in rows], "total": int(total)}
+        if mode == "auto":
+            where_clauses = []
+            params: dict = {"limit": limit, "offset": offset}
+            
+            if not include_inactive:
+                where_clauses.append("COALESCE(ab.is_active, 1) = 1")
+            
+            # Exclude noise like in Streamlit load_auto_trend_dataset
+            where_clauses.append("LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')")
+            where_clauses.append("LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'")
+            where_clauses.append("LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'")
+            
+            if search and search.strip():
+                where_clauses.append("(ab.scan_id ILIKE :s OR ab.build_version ILIKE :s OR ab.scan_type ILIKE :s OR ab.scan_name ILIKE :s)")
+                params["s"] = f"%{search.strip()}%"
+            
+            # RBAC: Filter by user unless Admin
+            if u["role"] != "Admin":
+                where_clauses.append("ab.created_by = :uid")
+                params["uid"] = u["id"]
+            
+            where = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+            
+            with engine.connect() as conn:
+                total = conn.execute(text(f"""
+                    SELECT COUNT(*) 
+                    FROM auto_scan_benchmarks ab
+                    LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                    {where}
+                """), params).scalar() or 0
+                
+                rows = conn.execute(text(f"""
+                    SELECT ab.scan_id AS id, ab.build_version, ab.run_date, ab.scenario_type, ab.scan_type,
+                           ab.data_source_type, ab.file_set_type, ab.total_scan_hours, 
+                           NULL::float AS throughput_cluster_gb_hr, NULL::float AS throughput_scanner_gb_hr,
+                           NULL::float AS throughput_thread_gb_hr, NULL::float AS throughput_cluster_files_hr,
+                           NULL::float AS throughput_scanner_files_hr, NULL::float AS throughput_thread_files_hr,
+                           5 AS scanner_count, 50 AS thread_count, FALSE AS is_acl, FALSE AS is_ocr,
+                           FALSE AS is_feature_flags, NULL AS feature_flags, '' AS comment,
+                           ab.objects_scanned AS total_catalog_items, ab.is_active, 
+                           CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN TRUE ELSE FALSE END as is_release,
+                           ab.scan_id, NULL AS config_id, bu.id AS build_id,
+                           ab.total_files, ab.total_folders, ab.total_size_gb, ab.data_type
+                    FROM auto_scan_benchmarks ab
+                    LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                    LEFT JOIN test_environments te ON te.id = ab.environment_id
+                    LEFT JOIN builds bu ON bu.version = ab.build_version
+                    {where}
+                    ORDER BY ab.run_date DESC, ab.updated_at DESC
+                    LIMIT :limit OFFSET :offset
+                """), params).fetchall()
+            
+            cols = ["id","build_version","run_date","scenario_type","scan_type","data_source_type",
+                    "file_set_type","total_scan_hours","throughput_cluster_gb_hr","throughput_scanner_gb_hr",
+                    "throughput_thread_gb_hr","throughput_cluster_files_hr","throughput_scanner_files_hr",
+                    "throughput_thread_files_hr","scanner_count","thread_count","is_acl","is_ocr",
+                    "is_feature_flags","feature_flags","comment","total_catalog_items","is_active",
+                    "is_release","scan_id","config_id","build_id",
+                    "total_files", "total_folders", "total_size_gb", "data_type"]
+            
+            items = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["is_active"] = bool(d["is_active"]) if d["is_active"] is not None else True
+                items.append(d)
+                
+            return {"items": items, "total": int(total)}
+            
+        else: # Manual mode
+            where_clauses = []
+            params: dict = {"limit": limit, "offset": offset}
+            
+            if not include_inactive:
+                where_clauses.append("COALESCE(b.is_active, TRUE) = TRUE")
+            
+            if search and search.strip():
+                where_clauses.append("(bv.version ILIKE :s OR b.scan_type ILIKE :s OR dst.name ILIKE :s OR b.id::text = :sid)")
+                params["s"] = f"%{search.strip()}%"
+                params["sid"] = search.strip()
+            
+            # RBAC: Filter by user unless Admin
+            if u["role"] != "Admin":
+                where_clauses.append("b.created_by = :uid")
+                params["uid"] = u["id"]
+
+            where = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+            
+            with engine.connect() as conn:
+                total = conn.execute(text(f"""
+                    SELECT COUNT(*) FROM benchmarks b
+                    JOIN builds bv ON bv.id = b.build_id
+                    LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
+                    {where}
+                """), params).scalar() or 0
+                
+                rows = conn.execute(text(f"""
+                    SELECT b.id, bv.version AS build_version, b.run_date, b.scenario_type, b.scan_type,
+                           dst.name AS data_source_type, fst.name AS file_set_type,
+                           b.total_scan_hours, b.throughput_cluster_gb_hr, b.throughput_scanner_gb_hr,
+                           b.throughput_thread_gb_hr, b.throughput_cluster_files_hr,
+                           b.throughput_scanner_files_hr, b.throughput_thread_files_hr,
+                           cfg.scanner_count, cfg.thread_count, cfg.is_acl, cfg.is_ocr,
+                           cfg.is_feature_flags, cfg.feature_flags, cfg.comment,
+                           b.total_catalog_items, b.is_active, b.is_release, b.scan_id,
+                           b.config_id, b.build_id,
+                           b.total_files, b.total_folders, b.total_size_gb, b.data_type
+                    FROM benchmarks b
+                    JOIN builds bv ON bv.id = b.build_id
+                    LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
+                    LEFT JOIN file_set_types fst ON fst.id = b.file_set_type_id
+                    LEFT JOIN configurations cfg ON cfg.id = b.config_id
+                    {where}
+                    ORDER BY b.id DESC
+                    LIMIT :limit OFFSET :offset
+                """), params).fetchall()
+            
+            cols = ["id","build_version","run_date","scenario_type","scan_type","data_source_type",
+                    "file_set_type","total_scan_hours","throughput_cluster_gb_hr","throughput_scanner_gb_hr",
+                    "throughput_thread_gb_hr","throughput_cluster_files_hr","throughput_scanner_files_hr",
+                    "throughput_thread_files_hr","scanner_count","thread_count","is_acl","is_ocr",
+                    "is_feature_flags","feature_flags","comment","total_catalog_items","is_active",
+                    "is_release","scan_id","config_id","build_id",
+                    "total_files", "total_folders", "total_size_gb", "data_type"]
+            
+            items = []
+            for r in rows:
+                d = dict(zip(cols, r))
+                d["is_active"] = bool(d["is_active"]) if d["is_active"] is not None else True
+                d["is_release"] = bool(d["is_release"]) if d["is_release"] is not None else False
+                items.append(d)
+                
+            return {"items": items, "total": int(total)}
+            
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2231,6 +2341,12 @@ class BenchmarkUpdate(BaseModel):
     run_date: Optional[str] = None
     scenario_type: Optional[str] = None
     scan_type: Optional[str] = None
+    data_source_type: Optional[str] = None
+    data_type: Optional[str] = None
+    file_set_type: Optional[str] = None
+    total_files: Optional[int] = None
+    total_folders: Optional[int] = None
+    total_size_gb: Optional[float] = None
     total_scan_hours: Optional[float] = None
     throughput_cluster_gb_hr: Optional[float] = None
     throughput_scanner_gb_hr: Optional[float] = None
@@ -2239,62 +2355,143 @@ class BenchmarkUpdate(BaseModel):
     throughput_scanner_files_hr: Optional[float] = None
     throughput_thread_files_hr: Optional[float] = None
     total_catalog_items: Optional[int] = None
+    avg_file_size: Optional[float] = None
     is_active: Optional[bool] = None
     is_release: Optional[bool] = None
 
 
 @app.put("/api/benchmarks/{benchmark_id}")
-async def update_benchmark(benchmark_id: int, payload: BenchmarkUpdate, token: str = Depends(oauth2_scheme)):
-    sets, params = [], {"bid": benchmark_id}
-    for field, val in payload.model_dump(exclude_none=True).items():
-        sets.append(f"{field} = :{field}")
-        params[field] = val
-    if not sets:
+async def update_benchmark(
+    benchmark_id: str, 
+    payload: BenchmarkUpdate, 
+    mode: Literal["manual", "auto"] = Query("manual"),
+    token: str = Depends(oauth2_scheme)
+):
+    """Update a benchmark record. Handles Manual and Auto tables."""
+    data = payload.model_dump(exclude_none=True)
+    if not data:
         raise HTTPException(status_code=400, detail="No fields to update")
-    sets.append("updated_at = CURRENT_TIMESTAMP")
+
     try:
         with engine.begin() as conn:
-            r = conn.execute(text(f"UPDATE benchmarks SET {', '.join(sets)} WHERE id = :bid RETURNING id"), params)
-            if r.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Benchmark not found")
+            if mode == "auto":
+                sets = []
+                params = {"sid": benchmark_id}
+                
+                # Map payload fields to auto_scan_benchmarks columns
+                field_map = {
+                    "scenario_type": "scenario_type",
+                    "scan_type": "scan_type",
+                    "data_source_type": "data_source_type",
+                    "data_type": "data_type",
+                    "file_set_type": "file_set_type",
+                    "total_files": "total_files",
+                    "total_folders": "total_folders",
+                    "total_size_gb": "total_size_gb",
+                    "total_catalog_items": "total_classification",
+                    "is_active": "is_active"
+                }
+                
+                for field, col in field_map.items():
+                    if field in data:
+                        sets.append(f"{col} = :{field}")
+                        val = data[field]
+                        if field == "is_active": val = 1 if val else 0
+                        params[field] = val
+                
+                if not sets:
+                    return {"ok": True, "message": "No auto-scan fields changed"}
+                
+                sets.append("updated_at = CURRENT_TIMESTAMP")
+                r = conn.execute(text(f"UPDATE auto_scan_benchmarks SET {', '.join(sets)} WHERE scan_id = :sid"), params)
+                if r.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Auto-scan benchmark not found")
+            else:
+                sets = []
+                params = {"bid": int(benchmark_id)}
+                # Fields that map 1:1 to benchmarks table
+                manual_fields = [
+                    "run_date", "scenario_type", "scan_type", "total_scan_hours",
+                    "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
+                    "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+                    "total_catalog_items", "avg_file_size", "is_active", "is_release",
+                    "total_files", "total_folders", "total_size_gb", "data_type"
+                ]
+                for field in manual_fields:
+                    if field in data:
+                        sets.append(f"{field} = :{field}")
+                        params[field] = data[field]
+                
+                if not sets:
+                    return {"ok": True, "message": "No manual benchmark fields changed"}
+
+                sets.append("updated_at = CURRENT_TIMESTAMP")
+                r = conn.execute(text(f"UPDATE benchmarks SET {', '.join(sets)} WHERE id = :bid"), params)
+                if r.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Benchmark not found")
+            
         return {"ok": True, "id": benchmark_id}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid benchmark ID format")
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/api/benchmarks/{benchmark_id}")
-async def delete_benchmark(benchmark_id: int, token: str = Depends(oauth2_scheme)):
+async def delete_benchmark(
+    benchmark_id: str, 
+    mode: Literal["manual", "auto"] = Query("manual"),
+    token: str = Depends(oauth2_scheme)
+):
+    """Delete a benchmark record from Manual or Auto tables."""
     try:
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM benchmark_findings WHERE benchmark_id = :id"), {"id": benchmark_id})
-            r = conn.execute(text("DELETE FROM benchmarks WHERE id = :id RETURNING id"), {"id": benchmark_id})
+            if mode == "auto":
+                r = conn.execute(text("DELETE FROM auto_scan_benchmarks WHERE scan_id = :id"), {"id": benchmark_id})
+            else:
+                bid = int(benchmark_id)
+                conn.execute(text("DELETE FROM benchmark_findings WHERE benchmark_id = :id"), {"id": bid})
+                r = conn.execute(text("DELETE FROM benchmarks WHERE id = :id"), {"id": bid})
+            
             if r.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Benchmark not found")
+                raise HTTPException(status_code=404, detail="Record not found")
         return {"ok": True}
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid benchmark ID format")
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 class BulkDeletePayload(BaseModel):
-    ids: List[int]
-
+    ids: List[str]
 
 @app.post("/api/benchmarks/bulk-delete")
-async def bulk_delete_benchmarks(payload: BulkDeletePayload, token: str = Depends(oauth2_scheme)):
+async def bulk_delete_benchmarks(
+    payload: BulkDeletePayload, 
+    mode: Literal["manual", "auto"] = Query("manual"),
+    token: str = Depends(oauth2_scheme)
+):
     if not payload.ids:
         return {"ok": True, "deleted": 0}
     try:
         with engine.begin() as conn:
-            conn.execute(
-                text("DELETE FROM benchmark_findings WHERE benchmark_id = ANY(:ids)"),
-                {"ids": payload.ids},
-            )
-            r = conn.execute(
-                text("DELETE FROM benchmarks WHERE id = ANY(:ids)"),
-                {"ids": payload.ids},
-            )
+            if mode == "auto":
+                r = conn.execute(
+                    text("DELETE FROM auto_scan_benchmarks WHERE scan_id = ANY(:ids)"),
+                    {"ids": payload.ids},
+                )
+            else:
+                int_ids = [int(i) for i in payload.ids]
+                conn.execute(
+                    text("DELETE FROM benchmark_findings WHERE benchmark_id = ANY(:ids)"),
+                    {"ids": int_ids},
+                )
+                r = conn.execute(
+                    text("DELETE FROM benchmarks WHERE id = ANY(:ids)"),
+                    {"ids": int_ids},
+                )
         return {"ok": True, "deleted": r.rowcount}
-    except SQLAlchemyError as e:
+    except (ValueError, SQLAlchemyError) as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -2825,6 +3022,215 @@ async def get_environment_build_info(environment_id: int, token: str = Depends(o
 
     return {"build_version": build_version or stored_version or "", "environment_id": environment_id}
 
+
+# ------------------------------------------------------------------------------
+# RBAC MANAGEMENT
+# ------------------------------------------------------------------------------
+
+@app.get("/api/rbac/users")
+async def list_users(u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    with engine.connect() as conn:
+        users = conn.execute(text("""
+            SELECT u.id, u.username, r.role_name, u.role_id, u.created_at
+            FROM app_users u
+            JOIN app_roles r ON u.role_id = r.id
+            ORDER BY u.id ASC
+        """)).fetchall()
+        return [dict(r._mapping) for r in users]
+
+@app.post("/api/rbac/users")
+async def create_user(data: dict, u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    username = data.get("username", "").strip().lower()
+    role_id = data.get("role_id")
+    if not username or "@bigid.com" not in username:
+        raise HTTPException(status_code=400, detail="Valid @bigid.com email required")
+    if not role_id:
+        raise HTTPException(status_code=400, detail="Role required")
+    
+    with engine.connect() as conn:
+        conn.execute(text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, 'PASSWORDLESS', :r)"),
+                     {"u": username, "r": role_id})
+        conn.commit()
+    return {"status": "ok"}
+
+@app.put("/api/rbac/users/{user_id}")
+async def update_user(user_id: int, data: dict, u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    role_id = data.get("role_id")
+    if not role_id:
+        raise HTTPException(status_code=400, detail="Role required")
+    
+    with engine.connect() as conn:
+        conn.execute(text("UPDATE app_users SET role_id = :r WHERE id = :id"),
+                     {"r": role_id, "id": user_id})
+        conn.commit()
+    return {"status": "ok"}
+
+@app.get("/api/rbac/roles")
+async def list_roles(u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    with engine.connect() as conn:
+        roles = conn.execute(text("SELECT id, role_name FROM app_roles ORDER BY id ASC")).fetchall()
+        return [dict(r._mapping) for r in roles]
+
+@app.post("/api/rbac/roles")
+async def create_role(data: dict, u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    role_name = data.get("role_name", "").strip()
+    if not role_name:
+        raise HTTPException(status_code=400, detail="Role name required")
+    
+    with engine.connect() as conn:
+        conn.execute(text("INSERT INTO app_roles (role_name) VALUES (:r)"), {"r": role_name})
+        conn.commit()
+    return {"status": "ok"}
+
+@app.get("/api/rbac/roles/{role_id}/permissions")
+async def get_role_permissions(role_id: int, u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    with engine.connect() as conn:
+        perms = conn.execute(text("SELECT page_name FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id}).fetchall()
+        return [r[0] for r in perms]
+
+@app.put("/api/rbac/roles/{role_id}/permissions")
+async def update_role_permissions(role_id: int, pages: list[str], u=Depends(get_current_user)):
+    if u["role"] != "Admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    with engine.connect() as conn:
+        conn.execute(text("DELETE FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id})
+        for p in pages:
+            conn.execute(text("INSERT INTO app_role_pages (role_id, page_name) VALUES (:rid, :p)"),
+                         {"rid": role_id, "p": p})
+        conn.commit()
+    return {"status": "ok"}
+
+# ------------------------------------------------------------------------------
+# SCANNER INFRASTRUCTURE
+# ------------------------------------------------------------------------------
+
+@app.get("/api/scanner-metrics/performance")
+async def get_scanner_performance(
+    environment_id: int, 
+    days: int = 7, 
+    u=Depends(get_current_user)
+):
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=days)
+    
+    with engine.connect() as conn:
+        # Group Performance (to find effective running scanners if possible)
+        group_rows = conn.execute(text("""
+            SELECT captured_at_utc, group_name, running_scanners, running_threads, 
+                   max_threads, scanner_threads, physical_memory_mb, free_memory_mb,
+                   avg_scan_speed, group_scanner_ids_json
+            FROM scanner_group_performance
+            WHERE environment_id = :eid AND captured_at_utc BETWEEN :start AND :end
+            ORDER BY captured_at_utc ASC
+        """), {"eid": environment_id, "start": start_dt, "end": end_dt}).fetchall()
+        
+        # Individual Performance
+        indiv_rows = conn.execute(text("""
+            SELECT id, captured_at_utc, scanner_id, name, status, group_name, 
+                   running_threads, total_num_of_threads, system_load_average, 
+                   available_processors, cpu_pct, physical_memory_mb, free_memory_mb
+            FROM scanner_individual_performance
+            WHERE environment_id = :eid AND captured_at_utc BETWEEN :start AND :end
+            ORDER BY captured_at_utc ASC
+        """), {"eid": environment_id, "start": start_dt, "end": end_dt}).fetchall()
+        
+    # Process Individual Rows
+    processed_indiv = []
+    for r in indiv_rows:
+        row = dict(r._mapping)
+        # Display Name Logic
+        base = str(row["name"] or "Unknown")
+        sid = str(row["scanner_id"] or "")
+        display_name = f"{base} [{sid[:4]}]" if sid and f"[{sid[:4]}]" not in base else base
+        
+        # Memory Logic
+        def clean_mem(v):
+            if isinstance(v, str):
+                v = v.upper().replace("MB", "").replace(" ", "").strip()
+                try: return float(v)
+                except: return 0.0
+            return float(v or 0.0)
+            
+        phys = clean_mem(row["physical_memory_mb"])
+        free = clean_mem(row["free_memory_mb"])
+        used = phys - free
+        mem_pct = (used / phys * 100) if phys > 0 else 0.0
+        
+        row["display_name"] = display_name
+        row["memory_usage_pct"] = mem_pct
+        row["cpu_pct"] = float(row["cpu_pct"] or 0.0)
+        processed_indiv.append(row)
+        
+    return {
+        "individual": processed_indiv,
+        "groups": [dict(r._mapping) for r in group_rows]
+    }
+
+# ------------------------------------------------------------------------------
+# DATA SOURCE CREATION
+# ------------------------------------------------------------------------------
+
+@app.get("/api/data-sources/scanner-groups")
+async def get_ds_scanner_groups(environment_id: int, u=Depends(get_current_user)):
+    with engine.connect() as conn:
+        env = conn.execute(text("SELECT * FROM test_environments WHERE id = :id"), {"id": environment_id}).fetchone()
+        if not env: raise HTTPException(status_code=404, detail="Environment not found")
+        env_dict = dict(env._mapping)
+        
+    try:
+        # Reusing existing logic from dashboard.py style (internal helpers)
+        # Note: In a real migration we'd move these helpers to a shared lib.
+        # For now, we'll implement the call here.
+        base_url = env_dict.get("base_url")
+        auth_module = env_dict.get("auth_module_path")
+        auth_func = env_dict.get("auth_function_name")
+        
+        # We'll use a simplified version of fetch_scanner_groups_with_auth_retry
+        from dashboard import fetch_scanner_groups_with_auth_retry
+        items, total, url = fetch_scanner_groups_with_auth_retry(env_dict)
+        return {"items": items, "total": total}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/data-sources")
+async def create_update_ds(environment_id: int, ds_name: str, payload: dict, u=Depends(get_current_user)):
+    with engine.connect() as conn:
+        env = conn.execute(text("SELECT * FROM test_environments WHERE id = :id"), {"id": environment_id}).fetchone()
+        if not env: raise HTTPException(status_code=404, detail="Environment not found")
+        env_dict = dict(env._mapping)
+        
+    try:
+        from dashboard import put_ds_connection_with_auth_retry
+        out, url = put_ds_connection_with_auth_retry(env_dict, ds_name, payload)
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/data-sources/test-connection")
+async def test_ds_connection(environment_id: int, broadcast_event: str, payload: dict, u=Depends(get_current_user)):
+    with engine.connect() as conn:
+        env = conn.execute(text("SELECT * FROM test_environments WHERE id = :id"), {"id": environment_id}).fetchone()
+        if not env: raise HTTPException(status_code=404, detail="Environment not found")
+        env_dict = dict(env._mapping)
+        
+    try:
+        from dashboard import post_ds_connection_test_with_auth_retry
+        out, url = post_ds_connection_test_with_auth_retry(env_dict, broadcast_event, payload)
+        return out
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

@@ -11,6 +11,10 @@ import ScanProgressRedirect from './pages/ScanProgressPage';
 import AddBenchmarkFromScanPage from './pages/AddBenchmarkFromScanPage';
 import BuildAnalysisPage from './pages/BuildAnalysisPage';
 import ClassifierComparisonPage from './pages/ClassifierComparisonPage';
+import EditRecordsPage from './pages/EditRecordsPage';
+import ManageRBACPage from './pages/ManageRBACPage';
+import ScannerInfraPage from './pages/ScannerInfraPage';
+import CreateDataSourcePage from './pages/CreateDataSourcePage';
 import Navbar from './components/Navbar';
 
 const App = () => {
@@ -37,6 +41,10 @@ const App = () => {
       <Route path="/tools/add-benchmark" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/build-analysis" element={token ? <BuildAnalysisPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/classifier-comparison" element={token ? <ClassifierComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/records-edit" element={token ? <EditRecordsPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/manage-rbac" element={token ? <ManageRBACPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/scanner-infra" element={token ? <ScannerInfraPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/data-source-create" element={token ? <CreateDataSourcePage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/:slug" element={token ? <LegacyToolPage /> : <Navigate to="/login" />} />
     </Routes>
   );
