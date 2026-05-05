@@ -20,6 +20,16 @@ from typing import Optional, Tuple
 from sqlalchemy import text
 
 
+def _win_background_python() -> str:
+    """On Windows detached spawns prefer pythonw.exe to avoid a black console window."""
+    exe = sys.executable
+    if sys.platform == "win32" and exe.lower().endswith("python.exe"):
+        cand = exe[:-10] + "pythonw.exe"
+        if os.path.isfile(cand):
+            return cand
+    return exe
+
+
 def _pid_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -101,7 +111,7 @@ def ensure_workflow_runner_running(engine) -> Tuple[bool, str]:
     if not runner_path.exists():
         return False, "workflow_runner.py not found"
 
-    cmd = [sys.executable, str(runner_path), "--quiet"]
+    cmd = [_win_background_python(), str(runner_path), "--quiet"]
     env = os.environ.copy()
 
     try:

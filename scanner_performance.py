@@ -330,7 +330,8 @@ def upsert_scanner_performance(
     if not db_engine or env_id is None:
         return
     now = captured_at if captured_at else datetime.utcnow()
-    now = now.replace(microsecond=0)
+    # Truncate to the minute — deduplicates multiple calls within the same minute
+    now = now.replace(second=0, microsecond=0)
     try:
         with db_engine.connect() as conn:
             for g in group_metrics:

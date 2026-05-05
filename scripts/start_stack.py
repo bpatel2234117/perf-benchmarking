@@ -7,7 +7,7 @@ Usage:
   python3 scripts/start_stack.py --all-bg     # all three detached (prints PIDs and log paths)
   python3 scripts/start_stack.py --no-ui      # only tracker + workflow_runner + ai_log_fetcher
   python3 scripts/start_stack.py --status     # show PIDs / whether processes respond to signal 0
-  python3 scripts/start_stack.py --stop       # stop services started by this script
+  python3 scripts/start_stack.py --stop       # stop services (Windows: orphan python* cleanup for repo)
 
 Environment (optional):
   STREAMLIT_SERVER_PORT   — passed through to Streamlit (default 8501)
@@ -418,6 +418,42 @@ def stop_one(label: str, pidfile: Path) -> str:
     return f"{label}: sent SIGTERM to pid={pid}"
 
 
+def _win_stop_stray_repo_processes() -> list[str]:
+    if os.name != "nt":
+        return []
+    root = str(repo_root().resolve())
+    safe = root.replace("'", "''")
+    ps = f"""
+$root = '{safe}'
+$rx = [regex]'(tracker\\.py|workflow_runner\\.py|ai_log_fetcher\\.py|streamlit|dashboard\\.py)'
+$out = New-Object System.Collections.Generic.List[string]
+Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'python.exe' -or $_.Name -eq 'pythonw.exe' }} | ForEach-Object {{
+  $cl = $_.CommandLine
+  if (-not $cl) {{ return }}
+  if ($cl.IndexOf($root, [StringComparison]::OrdinalIgnoreCase) -lt 0) {{ return }}
+  if (-not $rx.IsMatch($cl)) {{ return }}
+  try {{
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+    $null = $out.Add("stray-killed: pid=" + $_.ProcessId)
+  }} catch {{}}
+}}
+$out
+"""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=90,
+            creationflags=0x08000000,
+        )
+        if r.returncode != 0 and (r.stderr or "").strip():
+            return [f"stray-scan: exit={r.returncode} {r.stderr.strip()[:200]}"]
+        return [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    except Exception as ex:
+        return [f"stray-scan-failed: {ex}"]
+
+
 def cmd_stop() -> int:
     msgs = [
         stop_one("dashboard", dashboard_pidfile()),
@@ -426,6 +462,11 @@ def cmd_stop() -> int:
         stop_one("tracker", tracker_pidfile()),
     ]
     print("\n".join(msgs))
+    if os.name == "nt":
+        extra = _win_stop_stray_repo_processes()
+        if extra:
+            print("--- orphan cleanup (this repo) ---")
+            print("\n".join(extra))
     return 0
 
 

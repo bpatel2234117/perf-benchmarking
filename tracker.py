@@ -32,9 +32,16 @@ import requests
 from sqlalchemy import create_engine, text
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from db_config import DB_CONNECTION_STRING
+from benchmark_db import is_postgresql_engine, resolve_benchmark_database_url
+from tracker_pg_schema import dedupe_scan_progress_postgresql, ensure_postgresql_classifier_tables, ensure_postgresql_tracker_schema
 from bigid_auth import Get_auth_token
-from scanner_performance import capture_scanner_performance_for_env, ensure_scanner_performance_tables
+from scanner_performance import (
+    capture_scanner_performance_for_env,
+    ensure_scanner_performance_tables,
+    get_scanner_group_performance,
+    get_individual_scanner_performance,
+    upsert_scanner_performance,
+)
 
 
 ENV_FILE_PATH = Path(__file__).parent / ".env"
@@ -232,6 +239,9 @@ def resolve_scan_status_value(scan: Dict[str, Any]) -> str:
 
 
 def ensure_scan_tracking_tables(engine) -> None:
+    if is_postgresql_engine(engine):
+        ensure_postgresql_tracker_schema(engine)
+        return
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS tracker_heartbeat (
@@ -504,24 +514,46 @@ def _hb_update(engine, status: str, message: str = "", started: Optional[datetim
     """
     try:
         with engine.connect() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
-                    VALUES (:n, :s, :f, :st, :m)
-                    ON DUPLICATE KEY UPDATE
-                        last_started_at_utc = COALESCE(VALUES(last_started_at_utc), last_started_at_utc),
-                        last_finished_at_utc = COALESCE(VALUES(last_finished_at_utc), last_finished_at_utc),
-                        last_status = VALUES(last_status),
-                        last_message = VALUES(last_message)
-                """),
-                {
-                    "n": TRACKER_NAME[:64],
-                    "s": started,
-                    "f": finished,
-                    "st": str(status or "")[:16] or None,
-                    "m": str(message or "")[:2000] or None,
-                },
-            )
+            if is_postgresql_engine(engine):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :s, :f, :st, :m)
+                        ON CONFLICT (name) DO UPDATE SET
+                            last_started_at_utc = COALESCE(EXCLUDED.last_started_at_utc, tracker_heartbeat.last_started_at_utc),
+                            last_finished_at_utc = COALESCE(EXCLUDED.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
+                            last_status = EXCLUDED.last_status,
+                            last_message = EXCLUDED.last_message
+                        """
+                    ),
+                    {
+                        "n": TRACKER_NAME[:64],
+                        "s": started,
+                        "f": finished,
+                        "st": str(status or "")[:16] or None,
+                        "m": str(message or "")[:2000] or None,
+                    },
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :s, :f, :st, :m)
+                        ON DUPLICATE KEY UPDATE
+                            last_started_at_utc = COALESCE(VALUES(last_started_at_utc), last_started_at_utc),
+                            last_finished_at_utc = COALESCE(VALUES(last_finished_at_utc), last_finished_at_utc),
+                            last_status = VALUES(last_status),
+                            last_message = VALUES(last_message)
+                    """),
+                    {
+                        "n": TRACKER_NAME[:64],
+                        "s": started,
+                        "f": finished,
+                        "st": str(status or "")[:16] or None,
+                        "m": str(message or "")[:2000] or None,
+                    },
+                )
             conn.commit()
     except Exception:
         pass
@@ -539,22 +571,40 @@ def _kv_get(engine, key: str) -> str:
 def _kv_set(engine, key: str, value: str) -> None:
     try:
         with engine.connect() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO tracker_kv (k, v)
-                    VALUES (:k, :v)
-                    ON DUPLICATE KEY UPDATE
-                        v = VALUES(v),
-                        updated_at = CURRENT_TIMESTAMP
-                """),
-                {"k": str(key), "v": str(value)},
-            )
+            if is_postgresql_engine(engine):
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO tracker_kv (k, v)
+                        VALUES (:k, :v)
+                        ON CONFLICT (k) DO UPDATE SET
+                            v = EXCLUDED.v,
+                            updated_at = CURRENT_TIMESTAMP
+                        """
+                    ),
+                    {"k": str(key), "v": str(value)},
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_kv (k, v)
+                        VALUES (:k, :v)
+                        ON DUPLICATE KEY UPDATE
+                            v = VALUES(v),
+                            updated_at = CURRENT_TIMESTAMP
+                    """),
+                    {"k": str(key), "v": str(value)},
+                )
             conn.commit()
     except Exception:
         pass
 
 
 def ensure_scan_progress_table(engine) -> None:
+    if is_postgresql_engine(engine):
+        ensure_postgresql_tracker_schema(engine)
+        dedupe_scan_progress_postgresql(engine)
+        return
     with engine.connect() as conn:
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS scan_progress (
@@ -1143,6 +1193,9 @@ def ensure_classifier_mapping_tables(engine) -> None:
     """
     Tables used to store per-build classifier sets (template classifier count).
     """
+    if is_postgresql_engine(engine):
+        ensure_postgresql_classifier_tables(engine)
+        return
     try:
         with engine.connect() as conn:
             conn.execute(text("""
@@ -1306,8 +1359,16 @@ def sync_classifier_details_for_env_build(
     if not items:
         return False
 
+    pg = is_postgresql_engine(engine)
+
     with engine.connect() as conn:
-        conn.execute(text("INSERT IGNORE INTO builds (version) VALUES (:v)"), {"v": build_version})
+        if pg:
+            conn.execute(
+                text("INSERT INTO builds (version) VALUES (:v) ON CONFLICT (version) DO NOTHING"),
+                {"v": build_version},
+            )
+        else:
+            conn.execute(text("INSERT IGNORE INTO builds (version) VALUES (:v)"), {"v": build_version})
         bid_row = conn.execute(text("SELECT id FROM builds WHERE version = :v"), {"v": build_version}).fetchone()
         if not bid_row:
             return False
@@ -1332,20 +1393,42 @@ def sync_classifier_details_for_env_build(
             snapshot_json = json.dumps(snapshot, default=str)
 
             with engine.connect() as conn:
-                conn.execute(text("""
-                    INSERT INTO classifier_details_snapshots (environment_id, build_id, bigid_classifier_id, classifier_name, snapshot_json)
-                    VALUES (:eid, :bid, :cid, :cname, :json)
-                    ON DUPLICATE KEY UPDATE
-                        classifier_name = VALUES(classifier_name),
-                        snapshot_json = VALUES(snapshot_json),
-                        created_at = CURRENT_TIMESTAMP
-                """), {
-                    "eid": int(env_id),
-                    "bid": build_id,
-                    "cid": str(cid)[:64],
-                    "cname": str(name)[:500],
-                    "json": snapshot_json
-                })
+                if pg:
+                    conn.execute(
+                        text("""
+                            INSERT INTO classifier_details_snapshots (environment_id, build_id, bigid_classifier_id, classifier_name, snapshot_json)
+                            VALUES (:eid, :bid, :cid, :cname, :json)
+                            ON CONFLICT (environment_id, build_id, bigid_classifier_id) DO UPDATE SET
+                                classifier_name = EXCLUDED.classifier_name,
+                                snapshot_json = EXCLUDED.snapshot_json,
+                                created_at = CURRENT_TIMESTAMP
+                        """),
+                        {
+                            "eid": int(env_id),
+                            "bid": build_id,
+                            "cid": str(cid)[:64],
+                            "cname": str(name)[:500],
+                            "json": snapshot_json,
+                        },
+                    )
+                else:
+                    conn.execute(
+                        text("""
+                            INSERT INTO classifier_details_snapshots (environment_id, build_id, bigid_classifier_id, classifier_name, snapshot_json)
+                            VALUES (:eid, :bid, :cid, :cname, :json)
+                            ON DUPLICATE KEY UPDATE
+                                classifier_name = VALUES(classifier_name),
+                                snapshot_json = VALUES(snapshot_json),
+                                created_at = CURRENT_TIMESTAMP
+                        """),
+                        {
+                            "eid": int(env_id),
+                            "bid": build_id,
+                            "cid": str(cid)[:64],
+                            "cname": str(name)[:500],
+                            "json": snapshot_json,
+                        },
+                    )
                 conn.commit()
         except Exception as ex:
             print(f"  [!] Failed detail for {name}: {ex}")
@@ -1387,8 +1470,16 @@ def upsert_build_classifier_set(engine, build_version: str, template_name: str, 
         return
     ensure_classifier_mapping_tables(engine)
 
+    pg = is_postgresql_engine(engine)
+
     with engine.connect() as conn:
-        conn.execute(text("INSERT IGNORE INTO builds (version) VALUES (:v)"), {"v": build_version})
+        if pg:
+            conn.execute(
+                text("INSERT INTO builds (version) VALUES (:v) ON CONFLICT (version) DO NOTHING"),
+                {"v": build_version},
+            )
+        else:
+            conn.execute(text("INSERT IGNORE INTO builds (version) VALUES (:v)"), {"v": build_version})
         b_row = conn.execute(text("SELECT id FROM builds WHERE version = :v LIMIT 1"), {"v": build_version}).fetchone()
         if not b_row:
             conn.commit()
@@ -1397,33 +1488,62 @@ def upsert_build_classifier_set(engine, build_version: str, template_name: str, 
 
         # Save template row (comma-separated names)
         classifier_set_text = ", ".join([str(x).strip() for x in classifier_names if str(x).strip()])
-        conn.execute(
-            text("""
-                INSERT INTO build_templates (build_id, template_name, classifier_set)
-                VALUES (:b, :t, :s)
-                ON DUPLICATE KEY UPDATE
-                    classifier_set = VALUES(classifier_set)
-            """),
-            {"b": build_id, "t": template_name[:100], "s": classifier_set_text},
-        )
+        tpl_params = {"b": build_id, "t": template_name[:100], "s": classifier_set_text}
+        if pg:
+            conn.execute(
+                text("""
+                    INSERT INTO build_templates (build_id, template_name, classifier_set)
+                    VALUES (:b, :t, :s)
+                    ON CONFLICT (build_id, template_name) DO UPDATE SET
+                        classifier_set = EXCLUDED.classifier_set
+                """),
+                tpl_params,
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO build_templates (build_id, template_name, classifier_set)
+                    VALUES (:b, :t, :s)
+                    ON DUPLICATE KEY UPDATE
+                        classifier_set = VALUES(classifier_set)
+                """),
+                tpl_params,
+            )
 
         # Upsert classifier names + mappings
         for name in classifier_names:
             n = str(name or "").strip()
             if not n:
                 continue
-            conn.execute(text("INSERT IGNORE INTO classifiers (name) VALUES (:n)"), {"n": n})
+            if pg:
+                conn.execute(
+                    text("INSERT INTO classifiers (name) VALUES (:n) ON CONFLICT (name) DO NOTHING"),
+                    {"n": n},
+                )
+            else:
+                conn.execute(text("INSERT IGNORE INTO classifiers (name) VALUES (:n)"), {"n": n})
             c_row = conn.execute(text("SELECT id FROM classifiers WHERE name = :n LIMIT 1"), {"n": n}).fetchone()
             if not c_row:
                 continue
             cid = int(c_row[0])
-            conn.execute(
-                text("""
-                    INSERT IGNORE INTO build_classifier_mappings (build_id, classifier_id, environment_id)
-                    VALUES (:b, :c, :e)
-                """),
-                {"b": build_id, "c": cid, "e": int(environment_id) if environment_id is not None else None},
-            )
+            map_params = {"b": build_id, "c": cid, "e": int(environment_id) if environment_id is not None else None}
+            if pg:
+                conn.execute(
+                    text("""
+                        INSERT INTO build_classifier_mappings (build_id, classifier_id, environment_id)
+                        VALUES (:b, :c, :e)
+                        ON CONFLICT (build_id, classifier_id, environment_id) DO NOTHING
+                    """),
+                    map_params,
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT IGNORE INTO build_classifier_mappings (build_id, classifier_id, environment_id)
+                        VALUES (:b, :c, :e)
+                    """),
+                    map_params,
+                )
         conn.commit()
 
 def fetch_scan_classifier_attributes(
@@ -1498,32 +1618,61 @@ def upsert_scan_parent_record(engine, env_id: Any, scan: Dict[str, Any], status:
         env_id_int = None
 
     with engine.connect() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO scan_parents (
-                    scan_id, environment_id, scan_name, scan_type, started_at, completed_at, template_name, scan_status, is_active
-                ) VALUES (:sid, :eid, :sn, :st, :sa, :ca, :tn, :ss, TRUE)
-                ON DUPLICATE KEY UPDATE
-                    environment_id = VALUES(environment_id),
-                    scan_name = VALUES(scan_name),
-                    scan_type = VALUES(scan_type),
-                    started_at = VALUES(started_at),
-                    completed_at = VALUES(completed_at),
-                    template_name = VALUES(template_name),
-                    scan_status = VALUES(scan_status),
-                    last_seen_at = CURRENT_TIMESTAMP
-            """),
-            {
-                "sid": scan_id,
-                "eid": env_id_int,
-                "sn": name,
-                "st": scan_type,
-                "sa": started_at,
-                "ca": completed_at,
-                "tn": template_name,
-                "ss": status_val,
-            },
-        )
+        if is_postgresql_engine(engine):
+            conn.execute(
+                text("""
+                    INSERT INTO scan_parents (
+                        scan_id, environment_id, scan_name, scan_type, started_at, completed_at, template_name, scan_status, is_active
+                    ) VALUES (:sid, :eid, :sn, :st, :sa, :ca, :tn, :ss, TRUE)
+                    ON CONFLICT (scan_id) DO UPDATE SET
+                        environment_id = EXCLUDED.environment_id,
+                        scan_name = EXCLUDED.scan_name,
+                        scan_type = EXCLUDED.scan_type,
+                        started_at = EXCLUDED.started_at,
+                        completed_at = EXCLUDED.completed_at,
+                        template_name = EXCLUDED.template_name,
+                        scan_status = EXCLUDED.scan_status,
+                        last_seen_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                {
+                    "sid": scan_id,
+                    "eid": env_id_int,
+                    "sn": name,
+                    "st": scan_type,
+                    "sa": started_at,
+                    "ca": completed_at,
+                    "tn": template_name,
+                    "ss": status_val,
+                },
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_parents (
+                        scan_id, environment_id, scan_name, scan_type, started_at, completed_at, template_name, scan_status, is_active
+                    ) VALUES (:sid, :eid, :sn, :st, :sa, :ca, :tn, :ss, TRUE)
+                    ON DUPLICATE KEY UPDATE
+                        environment_id = VALUES(environment_id),
+                        scan_name = VALUES(scan_name),
+                        scan_type = VALUES(scan_type),
+                        started_at = VALUES(started_at),
+                        completed_at = VALUES(completed_at),
+                        template_name = VALUES(template_name),
+                        scan_status = VALUES(scan_status),
+                        last_seen_at = CURRENT_TIMESTAMP
+                """),
+                {
+                    "sid": scan_id,
+                    "eid": env_id_int,
+                    "sn": name,
+                    "st": scan_type,
+                    "sa": started_at,
+                    "ca": completed_at,
+                    "tn": template_name,
+                    "ss": status_val,
+                },
+            )
         conn.commit()
 
 
@@ -1587,6 +1736,7 @@ def upsert_scan_progress_record(
         env_id_int = None
 
     with engine.connect() as conn:
+        pg = is_postgresql_engine(engine)
         # start-marker row (scan start time): write the real BigID startedAt as the first DB row for this scan
         try:
             sp0 = si.get('scanProfile') if isinstance(si.get('scanProfile'), dict) else {}
@@ -1596,97 +1746,175 @@ def upsert_scan_progress_record(
                 row = conn.execute(text('SELECT 1 FROM scan_progress WHERE scan_id=:sid LIMIT 1'), {'sid': str(scan_id)}).fetchone()
                 if not row:
                     cau = started_dt.replace(microsecond=0)
-                    slot_m = int(_slot_minutes())
+                    slot_m2 = int(_slot_minutes())
                     # Avoid colliding with slot-aligned snapshots (seconds=0 at slot boundaries)
-                    if (cau.second == 0) and (cau.minute % slot_m == 0):
+                    if (cau.second == 0) and (cau.minute % slot_m2 == 0):
                         cau = cau + timedelta(seconds=1)
                     ts0 = started_dt.replace(microsecond=0)
-                    conn.execute(text("""
-                        INSERT IGNORE INTO scan_progress (
-                            captured_at_utc, `timestamp`,
-                            scan_id, scan_name, environment_id,
-                            scan_state,
-                            completed_sub_scans, failed_sub_scans, total_sub_scans,
-                            completed_parts, failed_parts, total_parts_scanned,
-                            total_classifications, newly_added_classifications, false_removed_classifications,
-                            objects_scanned, objects_failed, objects_with_pi
-                        ) VALUES (
-                            :cau, :ts,
-                            :sid, :sname, :eid,
-                            :sst,
-                            0,0,0,
-                            0,0,0,
-                            0,0,0,
-                            0,0,0
+                    if pg:
+                        conn.execute(
+                            text("""
+                                INSERT INTO scan_progress (
+                                    captured_at_utc, "timestamp",
+                                    scan_id, scan_name, environment_id,
+                                    scan_state,
+                                    completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                    completed_parts, failed_parts, total_parts_scanned,
+                                    total_classifications, newly_added_classifications, false_removed_classifications,
+                                    objects_scanned, objects_failed, objects_with_pi
+                                ) VALUES (
+                                    :cau, :ts,
+                                    :sid, :sname, :eid,
+                                    :sst,
+                                    0,0,0,
+                                    0,0,0,
+                                    0,0,0,
+                                    0,0,0
+                                )
+                                ON CONFLICT (scan_id, captured_at_utc) DO NOTHING
+                            """),
+                            {
+                                'cau': cau,
+                                'ts': ts0,
+                                'sid': str(scan_id),
+                                'sname': str(scan_name or ''),
+                                'eid': env_id_int,
+                                'sst': 'Started',
+                            },
                         )
-                    """), {
-                        'cau': cau,
-                        'ts': ts0,
-                        'sid': str(scan_id),
-                        'sname': str(scan_name or ''),
-                        'eid': env_id_int,
-                        'sst': 'Started',
-                    })
+                    else:
+                        conn.execute(
+                            text("""
+                                INSERT IGNORE INTO scan_progress (
+                                    captured_at_utc, `timestamp`,
+                                    scan_id, scan_name, environment_id,
+                                    scan_state,
+                                    completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                    completed_parts, failed_parts, total_parts_scanned,
+                                    total_classifications, newly_added_classifications, false_removed_classifications,
+                                    objects_scanned, objects_failed, objects_with_pi
+                                ) VALUES (
+                                    :cau, :ts,
+                                    :sid, :sname, :eid,
+                                    :sst,
+                                    0,0,0,
+                                    0,0,0,
+                                    0,0,0,
+                                    0,0,0
+                                )
+                            """),
+                            {
+                                'cau': cau,
+                                'ts': ts0,
+                                'sid': str(scan_id),
+                                'sname': str(scan_name or ''),
+                                'eid': env_id_int,
+                                'sst': 'Started',
+                            },
+                        )
         except Exception:
             pass
 
-        conn.execute(
-            text("""
-                INSERT INTO scan_progress (
-                    captured_at_utc,
-                    scan_id, scan_name, environment_id,
-                    scan_state,
-                    completed_sub_scans, failed_sub_scans, total_sub_scans,
-                    completed_parts, failed_parts, total_parts_scanned,
-                    total_classifications, newly_added_classifications, false_removed_classifications,
-                    objects_scanned, objects_failed, objects_with_pi
-                ) VALUES (
-                    :cau,
-                    :sid, :sname, :eid,
-                    :sst,
-                    :cs, :fs, :tsc,
-                    :cp, :fp, :tp,
-                    :tc, :nc, :fr,
-                    :os, :of, :owp
-                )
-                ON DUPLICATE KEY UPDATE
-                    scan_name = VALUES(scan_name),
-                    environment_id = VALUES(environment_id),
-                    scan_state = VALUES(scan_state),
-                    completed_sub_scans = VALUES(completed_sub_scans),
-                    failed_sub_scans = VALUES(failed_sub_scans),
-                    total_sub_scans = VALUES(total_sub_scans),
-                    completed_parts = VALUES(completed_parts),
-                    failed_parts = VALUES(failed_parts),
-                    total_parts_scanned = VALUES(total_parts_scanned),
-                    total_classifications = VALUES(total_classifications),
-                    newly_added_classifications = VALUES(newly_added_classifications),
-                    false_removed_classifications = VALUES(false_removed_classifications),
-                    objects_scanned = VALUES(objects_scanned),
-                    objects_failed = VALUES(objects_failed),
-                    objects_with_pi = VALUES(objects_with_pi),
-                    `timestamp` = CURRENT_TIMESTAMP
-            """),
-            {
-                "cau": captured_at_utc,
-                "sid": scan_id,
-                "sname": str(scan_name or "")[:1000] or None,
-                "eid": env_id_int,
-                "sst": scan_state,
-                "cs": completed_sub,
-                "fs": failed_sub,
-                "tsc": total_sub,
-                "cp": completed_parts,
-                "fp": failed_parts,
-                "tp": total_parts,
-                "tc": total_class,
-                "nc": new_class,
-                "fr": false_removed,
-                "os": objects_scanned,
-                "of": objects_failed,
-                "owp": objects_with_pi,
-            },
-        )
+        params_slot = {
+            "cau": captured_at_utc,
+            "sid": scan_id,
+            "sname": str(scan_name or "")[:1000] or None,
+            "eid": env_id_int,
+            "sst": scan_state,
+            "cs": completed_sub,
+            "fs": failed_sub,
+            "tsc": total_sub,
+            "cp": completed_parts,
+            "fp": failed_parts,
+            "tp": total_parts,
+            "tc": total_class,
+            "nc": new_class,
+            "fr": false_removed,
+            "os": objects_scanned,
+            "of": objects_failed,
+            "owp": objects_with_pi,
+        }
+
+        if pg:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_progress (
+                        captured_at_utc,
+                        scan_id, scan_name, environment_id,
+                        scan_state,
+                        completed_sub_scans, failed_sub_scans, total_sub_scans,
+                        completed_parts, failed_parts, total_parts_scanned,
+                        total_classifications, newly_added_classifications, false_removed_classifications,
+                        objects_scanned, objects_failed, objects_with_pi
+                    ) VALUES (
+                        :cau,
+                        :sid, :sname, :eid,
+                        :sst,
+                        :cs, :fs, :tsc,
+                        :cp, :fp, :tp,
+                        :tc, :nc, :fr,
+                        :os, :of, :owp
+                    )
+                    ON CONFLICT (scan_id, captured_at_utc) DO UPDATE SET
+                        scan_name = EXCLUDED.scan_name,
+                        environment_id = EXCLUDED.environment_id,
+                        scan_state = EXCLUDED.scan_state,
+                        completed_sub_scans = EXCLUDED.completed_sub_scans,
+                        failed_sub_scans = EXCLUDED.failed_sub_scans,
+                        total_sub_scans = EXCLUDED.total_sub_scans,
+                        completed_parts = EXCLUDED.completed_parts,
+                        failed_parts = EXCLUDED.failed_parts,
+                        total_parts_scanned = EXCLUDED.total_parts_scanned,
+                        total_classifications = EXCLUDED.total_classifications,
+                        newly_added_classifications = EXCLUDED.newly_added_classifications,
+                        false_removed_classifications = EXCLUDED.false_removed_classifications,
+                        objects_scanned = EXCLUDED.objects_scanned,
+                        objects_failed = EXCLUDED.objects_failed,
+                        objects_with_pi = EXCLUDED.objects_with_pi,
+                        "timestamp" = CURRENT_TIMESTAMP
+                """),
+                params_slot,
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_progress (
+                        captured_at_utc,
+                        scan_id, scan_name, environment_id,
+                        scan_state,
+                        completed_sub_scans, failed_sub_scans, total_sub_scans,
+                        completed_parts, failed_parts, total_parts_scanned,
+                        total_classifications, newly_added_classifications, false_removed_classifications,
+                        objects_scanned, objects_failed, objects_with_pi
+                    ) VALUES (
+                        :cau,
+                        :sid, :sname, :eid,
+                        :sst,
+                        :cs, :fs, :tsc,
+                        :cp, :fp, :tp,
+                        :tc, :nc, :fr,
+                        :os, :of, :owp
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        scan_name = VALUES(scan_name),
+                        environment_id = VALUES(environment_id),
+                        scan_state = VALUES(scan_state),
+                        completed_sub_scans = VALUES(completed_sub_scans),
+                        failed_sub_scans = VALUES(failed_sub_scans),
+                        total_sub_scans = VALUES(total_sub_scans),
+                        completed_parts = VALUES(completed_parts),
+                        failed_parts = VALUES(failed_parts),
+                        total_parts_scanned = VALUES(total_parts_scanned),
+                        total_classifications = VALUES(total_classifications),
+                        newly_added_classifications = VALUES(newly_added_classifications),
+                        false_removed_classifications = VALUES(false_removed_classifications),
+                        objects_scanned = VALUES(objects_scanned),
+                        objects_failed = VALUES(objects_failed),
+                        objects_with_pi = VALUES(objects_with_pi),
+                        `timestamp` = CURRENT_TIMESTAMP
+                """),
+                params_slot,
+            )
         
         # FINAL/TERMINAL row: If scan is terminal, insert a row with the ACTUAL completedAt as captured_at_utc
         if scan_state and _is_terminal_state(scan_state):
@@ -1700,36 +1928,91 @@ def upsert_scan_progress_record(
                     if (cau_end.second == 0) and (cau_end.minute % slot_m == 0):
                         cau_end = cau_end + timedelta(seconds=1)
                         
-                    conn.execute(text("""
-                        INSERT IGNORE INTO scan_progress (
-                            captured_at_utc, `timestamp`,
-                            scan_id, scan_name, environment_id,
-                            scan_state,
-                            completed_sub_scans, failed_sub_scans, total_sub_scans,
-                            completed_parts, failed_parts, total_parts_scanned,
-                            total_classifications, newly_added_classifications, false_removed_classifications,
-                            objects_scanned, objects_failed, objects_with_pi
-                        ) VALUES (
-                            :cau, :ts,
-                            :sid, :sname, :eid,
-                            :sst,
-                            :cs, :fs, :tsc,
-                            :cp, :fp, :tp,
-                            :tc, :nc, :fr,
-                            :os, :of, :owp
+                    if pg:
+                        conn.execute(
+                            text("""
+                                INSERT INTO scan_progress (
+                                    captured_at_utc, "timestamp",
+                                    scan_id, scan_name, environment_id,
+                                    scan_state,
+                                    completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                    completed_parts, failed_parts, total_parts_scanned,
+                                    total_classifications, newly_added_classifications, false_removed_classifications,
+                                    objects_scanned, objects_failed, objects_with_pi
+                                ) VALUES (
+                                    :cau, :ts,
+                                    :sid, :sname, :eid,
+                                    :sst,
+                                    :cs, :fs, :tsc,
+                                    :cp, :fp, :tp,
+                                    :tc, :nc, :fr,
+                                    :os, :of, :owp
+                                )
+                                ON CONFLICT (scan_id, captured_at_utc) DO NOTHING
+                            """),
+                            {
+                                'cau': cau_end,
+                                'ts': cau_end,
+                                'sid': str(scan_id),
+                                'sname': str(scan_name or ''),
+                                'eid': env_id_int,
+                                'sst': scan_state,
+                                'cs': completed_sub,
+                                'fs': failed_sub,
+                                'tsc': total_sub,
+                                'cp': completed_parts,
+                                'fp': failed_parts,
+                                'tp': total_parts,
+                                'tc': total_class,
+                                'nc': new_class,
+                                'fr': false_removed,
+                                'os': objects_scanned,
+                                'of': objects_failed,
+                                'owp': objects_with_pi,
+                            },
                         )
-                    """), {
-                        'cau': cau_end,
-                        'ts': cau_end,
-                        'sid': str(scan_id),
-                        'sname': str(scan_name or ''),
-                        'eid': env_id_int,
-                        'sst': scan_state,
-                        'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
-                        'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
-                        'tc': total_class, 'nc': new_class, 'fr': false_removed,
-                        'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
-                    })
+                    else:
+                        conn.execute(
+                            text("""
+                                INSERT IGNORE INTO scan_progress (
+                                    captured_at_utc, `timestamp`,
+                                    scan_id, scan_name, environment_id,
+                                    scan_state,
+                                    completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                    completed_parts, failed_parts, total_parts_scanned,
+                                    total_classifications, newly_added_classifications, false_removed_classifications,
+                                    objects_scanned, objects_failed, objects_with_pi
+                                ) VALUES (
+                                    :cau, :ts,
+                                    :sid, :sname, :eid,
+                                    :sst,
+                                    :cs, :fs, :tsc,
+                                    :cp, :fp, :tp,
+                                    :tc, :nc, :fr,
+                                    :os, :of, :owp
+                                )
+                            """),
+                            {
+                                'cau': cau_end,
+                                'ts': cau_end,
+                                'sid': str(scan_id),
+                                'sname': str(scan_name or ''),
+                                'eid': env_id_int,
+                                'sst': scan_state,
+                                'cs': completed_sub,
+                                'fs': failed_sub,
+                                'tsc': total_sub,
+                                'cp': completed_parts,
+                                'fp': failed_parts,
+                                'tp': total_parts,
+                                'tc': total_class,
+                                'nc': new_class,
+                                'fr': false_removed,
+                                'os': objects_scanned,
+                                'of': objects_failed,
+                                'owp': objects_with_pi,
+                            },
+                        )
             except Exception:
                 pass
         conn.commit()
@@ -1755,94 +2038,6 @@ def upsert_scan_insights_record(engine, scan_id: str, insight_payload: Dict[str,
         except Exception:
             return None
 
-def _strip_mb_to_int(v: Any) -> int:
-    try:
-        if not v: return 0
-        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
-        return int(float(s))
-    except Exception:
-        return 0
-
-def get_scanner_group_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
-    """Fetch scanner group metrics from /api/v1/scanner-groups"""
-    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
-    try:
-        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
-        if resp.status_code == 200:
-            data = resp.json()
-            # Expecting data: { "status": "success", "data": [ { "scannerGroups": [...] } ] }
-            groups_outer = data.get("data", [])
-            if groups_outer and isinstance(groups_outer, list):
-                return groups_outer[0].get("scannerGroups", [])
-    except Exception:
-        pass
-    return []
-
-def get_individual_scanner_performance(base_url: str, token: str) -> List[Dict[str, Any]]:
-    """Fetch individual scanner metrics from /api/v1/health-checks/services-status"""
-    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
-    try:
-        resp = requests.get(url, headers={"Authorization": token}, timeout=20, verify=False)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list):
-                return [x for x in data if x.get("type") == "scanner"]
-    except Exception:
-        pass
-    return []
-
-def upsert_scanner_performance(engine, env_id: int, group_data: List[Dict[str, Any]], individual_data: List[Dict[str, Any]], captured_at=None) -> None:
-    now_utc = captured_at if captured_at else _now_utc_naive()
-    # If no captured_at was passed, we might still want to align to 20-min marks for the periodic loop.
-    # However, I'll move the alignment logic TO THE CALLER (the main loop) so manual calls aren't forced into buckets.
-    captured_at_utc = now_utc.replace(second=0, microsecond=0)
-    
-    with engine.connect() as conn:
-        # Save group stats
-        for g in group_data:
-            update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
-            conn.execute(text("""
-                INSERT IGNORE INTO scanner_group_performance (
-                    environment_id, captured_at_utc, group_name,
-                    running_scanners, running_threads, max_threads, scanner_threads,
-                    physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
-                ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
-            """), {
-                "eid": env_id, "cau": captured_at_utc, "gn": str(g.get("name") or ""),
-                "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
-                "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
-                "pm": int(g.get("physicalMemory") or 0), "fm": int(g.get("freeMemory") or 0),
-                "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
-            })
-            
-        # Save individual stats
-        for s in individual_data:
-            update_date = _parse_iso_dt(str(s.get("updateDate") or ""))
-            sid = str(s.get("id") or "")
-            s_name = str(s.get("name") or "")
-            # If multiple scanners have the same name, we suffix with ID to separate lines in charts
-            display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
-            
-            conn.execute(text("""
-                INSERT IGNORE INTO scanner_individual_performance (
-                    environment_id, captured_at_utc, scanner_id, name, status, group_name,
-                    running_threads, total_num_of_threads, system_load_average,
-                    physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
-                ) VALUES (
-                    :eid, :cau, :sid, :name, :status, :gn,
-                    :rt, :tt, :la, :pm, :fm, :st, :ud
-                )
-            """), {
-                "eid": env_id, "cau": captured_at_utc, "sid": sid,
-                "name": display_name, "status": str(s.get("status") or ""),
-                "gn": str(s.get("group") or ""),
-                "rt": int(s.get("runningThreads") or 0), "tt": int(s.get("totalNumOfThreads") or 0),
-                "la": float(s.get("systemLoadAverage") or 0),
-                "pm": _strip_mb_to_int(s.get("physicalMemory")), "fm": _strip_mb_to_int(s.get("freeMemory")),
-                "st": int(s.get("scannerThreads") or 0), "ud": update_date
-            })
-        conn.commit()
-
     ds_names = data_sources.get("dataSourceNames")
     if isinstance(ds_names, list):
         data_source_names_text = ", ".join(sorted({str(x).strip() for x in ds_names if str(x).strip()}))
@@ -1863,49 +2058,87 @@ def upsert_scanner_performance(engine, env_id: int, group_data: List[Dict[str, A
     objects_enumerated = _to_int(data_sources.get("objectsEnumerated"))
     total_classification = _to_int(classifications.get("total"))
 
+    params = {
+        "sid": scan_id,
+        "dca": distinct_attrs,
+        "can": classifier_attribute_names_text or None,
+        "dsn": data_source_names_text or None,
+        "owp": objects_with_pi,
+        "osc": objects_scanned,
+        "oen": objects_enumerated,
+        "tcl": total_classification,
+        "nac": None,
+        "rac": None,
+    }
+
     with engine.connect() as conn:
-        conn.execute(
-            text("""
-                INSERT INTO scan_insights (
-                    scan_id,
-                    distinct_classification_attributes,
-                    classifier_attribute_names,
-                    data_source_names,
-                    objects_with_pi,
-                    objects_scanned,
-                    objects_enumerated,
-                    total_classification,
-                    new_attributes_count,
-                    removed_attributes_count
-                ) VALUES (
-                    :sid, :dca, :can, :dsn, :owp, :osc, :oen, :tcl, :nac, :rac
-                )
-                ON DUPLICATE KEY UPDATE
-                    distinct_classification_attributes = VALUES(distinct_classification_attributes),
-                    classifier_attribute_names = VALUES(classifier_attribute_names),
-                    data_source_names = VALUES(data_source_names),
-                    objects_with_pi = VALUES(objects_with_pi),
-                    objects_scanned = VALUES(objects_scanned),
-                    objects_enumerated = VALUES(objects_enumerated),
-                    total_classification = VALUES(total_classification),
-                    new_attributes_count = COALESCE(VALUES(new_attributes_count), new_attributes_count),
-                    removed_attributes_count = COALESCE(VALUES(removed_attributes_count), removed_attributes_count),
-                    updated_at = CURRENT_TIMESTAMP
-            """),
-            {
-                "sid": scan_id,
-                "dca": distinct_attrs,
-                "can": classifier_attribute_names_text or None,
-                "dsn": data_source_names_text or None,
-                "owp": objects_with_pi,
-                "osc": objects_scanned,
-                "oen": objects_enumerated,
-                "tcl": total_classification,
-                "nac": None,
-                "rac": None,
-            },
-        )
+        if is_postgresql_engine(engine):
+            conn.execute(
+                text("""
+                    INSERT INTO scan_insights (
+                        scan_id,
+                        distinct_classification_attributes,
+                        classifier_attribute_names,
+                        data_source_names,
+                        objects_with_pi,
+                        objects_scanned,
+                        objects_enumerated,
+                        total_classification,
+                        new_attributes_count,
+                        removed_attributes_count
+                    ) VALUES (
+                        :sid, :dca, :can, :dsn, :owp, :osc, :oen, :tcl, :nac, :rac
+                    )
+                    ON CONFLICT (scan_id) DO UPDATE SET
+                        distinct_classification_attributes = EXCLUDED.distinct_classification_attributes,
+                        classifier_attribute_names = EXCLUDED.classifier_attribute_names,
+                        data_source_names = EXCLUDED.data_source_names,
+                        objects_with_pi = EXCLUDED.objects_with_pi,
+                        objects_scanned = EXCLUDED.objects_scanned,
+                        objects_enumerated = EXCLUDED.objects_enumerated,
+                        total_classification = EXCLUDED.total_classification,
+                        new_attributes_count = COALESCE(EXCLUDED.new_attributes_count, scan_insights.new_attributes_count),
+                        removed_attributes_count = COALESCE(EXCLUDED.removed_attributes_count, scan_insights.removed_attributes_count),
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                params,
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_insights (
+                        scan_id,
+                        distinct_classification_attributes,
+                        classifier_attribute_names,
+                        data_source_names,
+                        objects_with_pi,
+                        objects_scanned,
+                        objects_enumerated,
+                        total_classification,
+                        new_attributes_count,
+                        removed_attributes_count
+                    ) VALUES (
+                        :sid, :dca, :can, :dsn, :owp, :osc, :oen, :tcl, :nac, :rac
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        distinct_classification_attributes = VALUES(distinct_classification_attributes),
+                        classifier_attribute_names = VALUES(classifier_attribute_names),
+                        data_source_names = VALUES(data_source_names),
+                        objects_with_pi = VALUES(objects_with_pi),
+                        objects_scanned = VALUES(objects_scanned),
+                        objects_enumerated = VALUES(objects_enumerated),
+                        total_classification = VALUES(total_classification),
+                        new_attributes_count = COALESCE(VALUES(new_attributes_count), new_attributes_count),
+                        removed_attributes_count = COALESCE(VALUES(removed_attributes_count), removed_attributes_count),
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                params,
+            )
         conn.commit()
+
+
+# get_scanner_group_performance, get_individual_scanner_performance, upsert_scanner_performance
+# are all provided by scanner_performance.py (imported above).
 
 
 def upsert_scan_attribute_deltas(engine, scan_id: str, attribute_items: List[Dict[str, Any]]) -> None:
@@ -2007,6 +2240,8 @@ def upsert_scan_attribute_deltas(engine, scan_id: str, attribute_items: List[Dic
     if not attr_map:
         return
 
+    pg = is_postgresql_engine(engine)
+
     # Summary metrics we want available for trend analysis / scan status.
     # IMPORTANT: "New/Removed" here refers to the *counts* shown in BigID's attributes table,
     # not the number of attributes.
@@ -2018,22 +2253,17 @@ def upsert_scan_attribute_deltas(engine, scan_id: str, attribute_items: List[Dic
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM scan_insight_attribute_delta_map WHERE scan_id = :sid"), {"sid": str(scan_id)})
         for attr_name, flags in attr_map.items():
-            conn.execute(text("INSERT IGNORE INTO scan_classifier_attributes (name) VALUES (:n)"), {"n": attr_name})
+            if pg:
+                conn.execute(
+                    text("INSERT INTO scan_classifier_attributes (name) VALUES (:n) ON CONFLICT (name) DO NOTHING"),
+                    {"n": attr_name},
+                )
+            else:
+                conn.execute(text("INSERT IGNORE INTO scan_classifier_attributes (name) VALUES (:n)"), {"n": attr_name})
             row = conn.execute(text("SELECT id FROM scan_classifier_attributes WHERE name = :n LIMIT 1"), {"n": attr_name}).fetchone()
             if not row:
                 continue
-            conn.execute(text("""
-                INSERT INTO scan_insight_attribute_delta_map
-                (scan_id, attribute_id, is_new, is_removed, finding_count, attribute_value, new_count_value, removed_count_value)
-                VALUES (:sid, :aid, :is_new, :is_removed, :fc, :av, :ncv, :rcv)
-                ON DUPLICATE KEY UPDATE
-                    is_new = VALUES(is_new),
-                    is_removed = VALUES(is_removed),
-                    finding_count = VALUES(finding_count),
-                    attribute_value = VALUES(attribute_value),
-                    new_count_value = VALUES(new_count_value),
-                    removed_count_value = VALUES(removed_count_value)
-            """), {
+            fld = {
                 "sid": str(scan_id),
                 "aid": int(row[0]),
                 "is_new": bool(flags.get("is_new")),
@@ -2042,31 +2272,81 @@ def upsert_scan_attribute_deltas(engine, scan_id: str, attribute_items: List[Dic
                 "av": str(flags.get("attribute_value") or "") or None,
                 "ncv": int(flags.get("new_count_value") or 0),
                 "rcv": int(flags.get("removed_count_value") or 0),
-            })
+            }
+            if pg:
+                conn.execute(
+                    text("""
+                        INSERT INTO scan_insight_attribute_delta_map
+                        (scan_id, attribute_id, is_new, is_removed, finding_count, attribute_value, new_count_value, removed_count_value)
+                        VALUES (:sid, :aid, :is_new, :is_removed, :fc, :av, :ncv, :rcv)
+                        ON CONFLICT (scan_id, attribute_id) DO UPDATE SET
+                            is_new = EXCLUDED.is_new,
+                            is_removed = EXCLUDED.is_removed,
+                            finding_count = EXCLUDED.finding_count,
+                            attribute_value = EXCLUDED.attribute_value,
+                            new_count_value = EXCLUDED.new_count_value,
+                            removed_count_value = EXCLUDED.removed_count_value
+                    """),
+                    fld,
+                )
+            else:
+                conn.execute(
+                    text("""
+                        INSERT INTO scan_insight_attribute_delta_map
+                        (scan_id, attribute_id, is_new, is_removed, finding_count, attribute_value, new_count_value, removed_count_value)
+                        VALUES (:sid, :aid, :is_new, :is_removed, :fc, :av, :ncv, :rcv)
+                        ON DUPLICATE KEY UPDATE
+                            is_new = VALUES(is_new),
+                            is_removed = VALUES(is_removed),
+                            finding_count = VALUES(finding_count),
+                            attribute_value = VALUES(attribute_value),
+                            new_count_value = VALUES(new_count_value),
+                            removed_count_value = VALUES(removed_count_value)
+                    """),
+                    fld,
+                )
 
         # Also update scan_insights so the dashboard can plot build-by-build trends.
         # We intentionally only set these when we have attribute delta data available.
-        conn.execute(
-            text("""
-                INSERT INTO scan_insights
-                    (scan_id, distinct_classification_attributes, classifier_attribute_names, new_attributes_count, removed_attributes_count)
-                VALUES
-                    (:sid, :dca, :can, :nac, :rac)
-                ON DUPLICATE KEY UPDATE
-                    distinct_classification_attributes = COALESCE(VALUES(distinct_classification_attributes), distinct_classification_attributes),
-                    classifier_attribute_names = COALESCE(VALUES(classifier_attribute_names), classifier_attribute_names),
-                    new_attributes_count = COALESCE(VALUES(new_attributes_count), new_attributes_count),
-                    removed_attributes_count = COALESCE(VALUES(removed_attributes_count), removed_attributes_count),
-                    updated_at = CURRENT_TIMESTAMP
-            """),
-            {
-                "sid": str(scan_id),
-                "dca": int(distinct_attrs) if distinct_attrs else None,
-                "can": classifier_attribute_names_text or None,
-                "nac": int(new_attributes_count) if new_attributes_count is not None else None,
-                "rac": int(removed_attributes_count) if removed_attributes_count is not None else None,
-            },
-        )
+        si_partial = {
+            "sid": str(scan_id),
+            "dca": int(distinct_attrs) if distinct_attrs else None,
+            "can": classifier_attribute_names_text or None,
+            "nac": int(new_attributes_count) if new_attributes_count is not None else None,
+            "rac": int(removed_attributes_count) if removed_attributes_count is not None else None,
+        }
+        if pg:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_insights
+                        (scan_id, distinct_classification_attributes, classifier_attribute_names, new_attributes_count, removed_attributes_count)
+                    VALUES
+                        (:sid, :dca, :can, :nac, :rac)
+                    ON CONFLICT (scan_id) DO UPDATE SET
+                        distinct_classification_attributes = COALESCE(EXCLUDED.distinct_classification_attributes, scan_insights.distinct_classification_attributes),
+                        classifier_attribute_names = COALESCE(EXCLUDED.classifier_attribute_names, scan_insights.classifier_attribute_names),
+                        new_attributes_count = COALESCE(EXCLUDED.new_attributes_count, scan_insights.new_attributes_count),
+                        removed_attributes_count = COALESCE(EXCLUDED.removed_attributes_count, scan_insights.removed_attributes_count),
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                si_partial,
+            )
+        else:
+            conn.execute(
+                text("""
+                    INSERT INTO scan_insights
+                        (scan_id, distinct_classification_attributes, classifier_attribute_names, new_attributes_count, removed_attributes_count)
+                    VALUES
+                        (:sid, :dca, :can, :nac, :rac)
+                    ON DUPLICATE KEY UPDATE
+                        distinct_classification_attributes = COALESCE(VALUES(distinct_classification_attributes), distinct_classification_attributes),
+                        classifier_attribute_names = COALESCE(VALUES(classifier_attribute_names), classifier_attribute_names),
+                        new_attributes_count = COALESCE(VALUES(new_attributes_count), new_attributes_count),
+                        removed_attributes_count = COALESCE(VALUES(removed_attributes_count), removed_attributes_count),
+                        updated_at = CURRENT_TIMESTAMP
+                """),
+                si_partial,
+            )
         conn.commit()
 
 
@@ -2927,7 +3207,7 @@ def main() -> int:
     ap.add_argument("--quiet", action="store_true", help="Less logging")
     args = ap.parse_args()
 
-    engine = create_engine(DB_CONNECTION_STRING)
+    engine = create_engine(resolve_benchmark_database_url())
     ensure_scan_tracking_tables(engine)
     ensure_scan_progress_table(engine)
 

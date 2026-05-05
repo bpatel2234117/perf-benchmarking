@@ -482,8 +482,10 @@ def load_data(include_inactive=False):
     # Ensure optional columns exist (non-breaking for existing DBs)
     try:
         with engine.connect() as conn:
-            conn.execute(text("ALTER TABLE benchmarks ADD COLUMN scenario_type VARCHAR(100)"))
-            # Classification metrics (manual benchmark meaning):
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN scenario_type VARCHAR(100)"))
+            except Exception:
+                pass
             # - total_catalog_items is used as "New Attributes count" in your table
             # Add missing fields so Trend chart can be complete.
             try:
@@ -492,6 +494,10 @@ def load_data(include_inactive=False):
                 pass
             try:
                 conn.execute(text("ALTER TABLE benchmarks ADD COLUMN removed_attributes BIGINT NULL"))
+            except Exception:
+                pass
+            try:
+                conn.execute(text("ALTER TABLE benchmarks ADD COLUMN is_release BOOLEAN DEFAULT FALSE"))
             except Exception:
                 pass
             conn.commit()
@@ -560,9 +566,10 @@ def load_data(include_inactive=False):
             b.total_scan_hours,
             b.avg_file_size,
             b.is_active,
+            CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
-            COALESCE(si.objects_scanned, 0) as objects_scanned
+            COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
@@ -601,9 +608,10 @@ def load_data(include_inactive=False):
             b.total_scan_hours,
             b.avg_file_size,
             b.is_active,
+            CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
-            COALESCE(si.objects_scanned, 0) as objects_scanned
+            COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
         JOIN builds bu ON b.build_id = bu.id
         JOIN configurations conf ON b.config_id = conf.id
@@ -623,6 +631,8 @@ def load_data(include_inactive=False):
                 df["Release_Milestone"] = ""
             if "Quarter_Label" not in df.columns:
                 df["Quarter_Label"] = ""
+            if "is_release" not in df.columns:
+                df["is_release"] = False
 
         if "Comparable_Version" in df.columns and "Build_Version" in df.columns:
             try:
@@ -730,6 +740,7 @@ def page_overview(df):
     show_acl = st.sidebar.checkbox("Show ACL Scans Only", False)
     show_ocr = st.sidebar.checkbox("Show OCR Scans Only", False)
     show_ff = st.sidebar.checkbox("Show Structured Discovery FF Only", False)
+    show_release = st.sidebar.checkbox("Show Release Builds Only", False)
 
     # Filter Logic
     mask = (df[ver_col].astype(str).isin(selected_versions)) & \
@@ -738,6 +749,7 @@ def page_overview(df):
     if show_acl: mask = mask & (df['is_acl'] == 1)
     if show_ocr: mask = mask & (df['is_ocr'] == 1)
     if show_ff: mask = mask & (df['is_feature_flags'] == 1)
+    if show_release: mask = mask & (df['is_release'] == 1)
 
     filtered_df = df[mask]
 
@@ -1158,6 +1170,17 @@ def ensure_app_settings_table(_eng):
         pass
 
 
+@st.cache_resource
+def initialize_app_tables(_eng):
+    """Run expensive DDL checks only once per application instance."""
+    ensure_rbac_tables(_eng)
+    ensure_test_environments_table(_eng)
+    ensure_app_settings_table(_eng)
+    # Other table checks will run if they don't exist during first loader hit,
+    # but these core ones are ensured at startup.
+    return True
+
+
 def load_log_fetch_service_settings():
     ensure_app_settings_table(engine)
     default_enabled = _ordered_unique_log_sources(DEFAULT_LOG_FETCH_SOURCES)
@@ -1504,16 +1527,6 @@ def _workflow_ds_json_dialog(step: Dict[str, Any]) -> None:
         st.rerun()
 
 if engine:
-    @st.cache_resource
-    def initialize_app_tables(_eng):
-        """Run expensive DDL checks only once per application instance."""
-        ensure_rbac_tables(_eng)
-        ensure_test_environments_table(_eng)
-        ensure_app_settings_table(_eng)
-        # Other table checks will run if they don't exist during first loader hit,
-        # but these core ones are ensured at startup.
-        return True
-    
     initialize_app_tables(engine)
 
 
@@ -3786,11 +3799,12 @@ def ensure_auto_scan_benchmarks_table():
                     objects_scanned BIGINT NULL,
                     objects_enumerated BIGINT NULL,
                     total_classification BIGINT NULL,
-                    new_attributes BIGINT NULL,
-                    removed_attributes BIGINT NULL,
+                    new_attributes INT,
+                    removed_attributes INT,
                     classifier_attribute_names LONGTEXT NULL,
                     scan_name VARCHAR(1000) NULL,
                     is_active BOOLEAN DEFAULT TRUE,
+                    is_release BOOLEAN DEFAULT FALSE,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
                 )
@@ -5627,151 +5641,9 @@ def _strip_mb_to_int(val_str):
     except (ValueError, TypeError):
         return 0
 
-def get_scanner_group_performance(base_url, token):
-    if not base_url or not token: return []
-    url = f"{base_url.rstrip('/')}/api/v1/scanner-groups"
-    try:
-        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            groups = []
-            for item in data.get("data", []):
-                for sg in item.get("scannerGroups", []):
-                    groups.append({
-                        "name": sg.get("name"),
-                        "runningScanners": sg.get("runningScanners", 0),
-                        "runningThreads": sg.get("runningThreads", 0),
-                        "maxThreads": sg.get("maxThreads", 0),
-                        "scannerThreads": sg.get("scannerThreads", 0),
-                        "avgScanSpeed": sg.get("avgScanSpeed", 0),
-                        "physicalMemory": sg.get("physicalMemory"),
-                        "freeMemory": sg.get("freeMemory"),
-                        "updateDate": sg.get("updateDate")
-                    })
-            return groups
-    except Exception:
-        pass
-    return []
-
-def get_individual_scanner_performance(base_url, token):
-    if not base_url or not token: return []
-    url = f"{base_url.rstrip('/')}/api/v1/health-checks/services-status"
-    try:
-        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            scanners = []
-            for item in data:
-                if item.get("type") == "scanner":
-                    scanners.append({
-                        "id": item.get("id"),
-                        "name": item.get("name"),
-                        "status": item.get("status"),
-                        "group": item.get("groupName"),
-                        "runningThreads": item.get("runningThreads", 0),
-                        "totalNumOfThreads": item.get("totalNumOfThreads", 0),
-                        "systemLoadAverage": item.get("systemLoadAverage", 0),
-                        "physicalMemory": item.get("physicalMemory"),
-                        "freeMemory": item.get("freeMemory"),
-                        "scannerThreads": item.get("scannerThreads", 0),
-                        "updateDate": item.get("updateDate")
-                    })
-            return scanners
-    except Exception:
-        pass
-    return []
-
-def _now_utc_naive():
-    return datetime.utcnow()
-
-def _strip_mb_to_int(v):
-    try:
-        if not v: return 0
-        s = str(v).upper().replace("MB", "").replace(" ", "").strip()
-        return int(float(s))
-    except Exception:
-        return 0
-
-def upsert_scanner_performance(engine, env_id, group_metrics, individual_metrics, captured_at=None):
-    if not engine or env_id is None: return
-    now = captured_at if captured_at else _now_utc_naive()
-    now = now.replace(microsecond=0)
-    try:
-        with engine.connect() as conn:
-            for g in group_metrics:
-                update_date = _parse_iso_dt(str(g.get("updateDate") or ""))
-                conn.execute(text("""
-                    INSERT IGNORE INTO scanner_group_performance (
-                        environment_id, captured_at_utc, group_name,
-                        running_scanners, running_threads, max_threads, scanner_threads,
-                        physical_memory_mb, free_memory_mb, avg_scan_speed, update_date_bigid
-                    ) VALUES (:eid, :cau, :gn, :rs, :rt, :mt, :st, :pm, :fm, :as, :ud)
-                """), {
-                    "eid": env_id, "cau": now, "gn": str(g.get("name") or ""),
-                    "rs": int(g.get("runningScanners") or 0), "rt": int(g.get("runningThreads") or 0),
-                    "mt": int(g.get("maxThreads") or 0), "st": int(g.get("scannerThreads") or 0),
-                    "pm": _strip_mb_to_int(g.get("physicalMemory")), "fm": _strip_mb_to_int(g.get("freeMemory")),
-                    "as": float(g.get("avgScanSpeed") or 0), "ud": update_date
-                })
-            for i in individual_metrics:
-                update_date = _parse_iso_dt(str(i.get("updateDate") or ""))
-                sid = str(i.get("id") or "")
-                s_name = str(i.get("name") or "")
-                # If multiple scanners have the same name, we suffix with ID to separate lines in charts
-                display_name = f"{s_name} [{sid[:4]}]" if sid else s_name
-
-                conn.execute(text("""
-                    INSERT IGNORE INTO scanner_individual_performance (
-                        environment_id, captured_at_utc, scanner_id, name, status, group_name,
-                        running_threads, total_num_of_threads, system_load_average,
-                        physical_memory_mb, free_memory_mb, scanner_threads, update_date_bigid
-                    ) VALUES (
-                        :eid, :cau, :sid, :name, :status, :gn,
-                        :rt, :tt, :la, :pm, :fm, :st, :ud
-                    )
-                """), {
-                    "eid": env_id, "cau": now, "sid": sid,
-                    "name": display_name, "status": str(i.get("status") or ""),
-                    "gn": str(i.get("group") or ""),
-                    "rt": int(i.get("runningThreads") or 0),
-                    "tt": int(i.get("totalNumOfThreads") or 0),
-                    "la": float(i.get("systemLoadAverage") or 0),
-                    "pm": _strip_mb_to_int(i.get("physicalMemory")), 
-                    "fm": _strip_mb_to_int(i.get("freeMemory")),
-                    "st": int(i.get("scannerThreads") or 0), "ud": update_date
-                })
-            conn.commit()
-    except Exception:
-        pass
-
-def _parse_iso_dt(val):
-    if not val: return None
-    try:
-        clean = str(val).replace("Z", "+00:00")
-        return datetime.fromisoformat(clean).replace(tzinfo=None)
-    except Exception:
-        return None
-
-def capture_scanner_performance_for_env(env_row, captured_at=None):
-    if not env_row or not engine: return {"ok": False}
-    eid = env_row.get("id")
-    base_url = env_row.get("base_url")
-    token = None
-    try:
-        from bigid_auth import Get_auth_token
-        token = Get_auth_token(env_row)
-    except Exception:
-        pass
-    if not token: return {"ok": False}
-    try:
-        g = get_scanner_group_performance(base_url, token)
-        i = get_individual_scanner_performance(base_url, token)
-        if g or i:
-            upsert_scanner_performance(engine, eid, g, i, captured_at=captured_at)
-            return {"ok": True, "groups": len(g), "individuals": len(i)}
-    except Exception:
-        pass
-    return {"ok": False}
+# Scanner performance fetch/write functions are provided by scanner_performance.py (imported above).
+# capture_scanner_performance_for_env, upsert_scanner_performance, get_scanner_group_performance,
+# and get_individual_scanner_performance all live there — do not redefine them here.
 
 
 def _resolve_env_row_for_scan_progress(scan_id):
@@ -6735,55 +6607,106 @@ Provide a comprehensive, executive-level technical summary in Markdown.
 # --- AI Log Analysis Helpers (Synced with ai_log_fetcher.py) ---
 
 def _detect_log_errors_structural(log_text: str) -> List[str]:
-    """ estructural-aware log analysis mirroring ai_log_fetcher.py """
+    """
+    Structural-aware log analysis mirroring ai_log_fetcher.detect_errors_in_logs.
+
+    Two independent capture paths — either is sufficient:
+      A) Line has [ERROR], [FATAL], [SEVERE], [WARN], [WARNING] tag → always captured.
+      B) Line has no severity tag but contains a known error keyword → captured
+         (exception, timeout, refused, 4xx/5xx status, etc.)
+
+    Previously both conditions were required (AND), which silently dropped lines like:
+        [2026-04-29 08:52:34.712Z] [ERROR] scanner_file - <message with no keyword>
+    """
     lines = log_text.splitlines()
     error_contexts = []
     seen = set()
-    ERROR_PATTERN = re.compile(
+
+    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", re.I)
+    KEYWORD_PATTERN = re.compile(
         r"(?i)(?:"
-        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|"
-        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
-        r"\babort(?:ed|ing)?\b|\bexhausted\b|\bthrottl(?:ing|ed)\b"
+        r"\berror\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bsevere\b|\bexception\b|\baxioserror\b|"
+        r"\bstatus\s+[45]\d{2}\b|\bhttp\s+[45]\d{2}\b|"
+        r"\b(?:400|401|403|404|408|409|429|500|502|503|504)\b|"
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail|\baccess.?denied\b|"
+        r"\btoken.?(?:expired|invalid|fail)\b|\bcredential\b|"
+        r"\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\bconnection.?(?:reset|closed|lost|drop)\b|"
+        r"\bsocket\b|\beof\b|\bbroken.?pipe\b|"
+        r"\bdenied\b|\bexhausted\b|\bout.?of.?memory\b|\boom\b|"
+        r"\bnull.?pointer\b|\bnullpointer\b|\bstack.?(?:trace|overflow)\b|\bstacktrace\b|"
+        r"\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        r"\babort(?:ed|ing)?\b|\bthrottl(?:ing|ed)?\b|\blimitreached\b|"
+        r"\bcircuit.?breaker\b|\bretry.?(?:limit|exhaust)\b|"
+        r"\bgraphservice\b|\bactivitylimit\b|\breset\b"
         r")"
     )
-    # Mode: error_fatal (require [ERROR] etc)
-    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE)\]", re.I)
-    
+
     i = 0
     while i < len(lines):
         line = lines[i]
-        if ERROR_PATTERN.search(line) and LEVEL_PATTERN.search(line):
-            start = max(0, i - 2)
-            end = i + 1
-            while end < len(lines) and (end - i) < 30:
-                # Mirroring ai_log_fetcher.py: Break if a new independent error is found
-                next_line_raw = lines[end]
-                next_line_scan = re.sub(r"https?://[^\s]+", " ", next_line_raw, flags=re.I)
-                if ERROR_PATTERN.search(next_line_scan) and LEVEL_PATTERN.search(next_line_raw):
-                    break
 
-                if lines[end].startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
-                    end += 1
-                else: break
-            if end == i + 1: end = min(len(lines), i + 4)
-            ctx = "\n".join(lines[start:end])
-            
-            # Mask timestamps for better deduplication
-            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx)
-            fingerprint = fingerprint_text[:200]
-            
-            if fingerprint not in seen:
-                seen.add(fingerprint)
-                error_contexts.append(ctx)
-            i = end
-        else:
+        # Skip pure INFO/DEBUG/TRACE lines unless they carry a strong signal
+        # (401, 403, 5xx, exception, stacktrace, OOM, panic) — BigID sometimes
+        # logs real problems at INFO level.
+        if re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I):
+            STRONG = re.compile(
+                r"(?i)(?:\bexception\b|\bstacktrace\b|\bnull.?pointer\b|"
+                r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+                r"\b(?:40[0-9]|5[0-9]{2})\b|\bunauthorized\b|\bforbidden\b|\bauthentication.?fail)"
+            )
+            if not STRONG.search(line):
+                i += 1
+                continue
+
+        has_level_tag = bool(LEVEL_PATTERN.search(line))
+        scan_line     = re.sub(r"https?://[^\s]+", " ", line, flags=re.I)
+        has_keyword   = bool(KEYWORD_PATTERN.search(scan_line)) if not has_level_tag else False
+
+        is_trigger = has_level_tag or has_keyword
+
+        if not is_trigger:
             i += 1
+            continue
+
+        start = max(0, i - 2)
+        end = i + 1
+        while end < len(lines) and (end - i) < 30:
+            next_line_raw  = lines[end]
+            next_has_level = bool(LEVEL_PATTERN.search(next_line_raw))
+            next_scan      = re.sub(r"https?://[^\s]+", " ", next_line_raw, flags=re.I)
+            next_has_kw    = bool(KEYWORD_PATTERN.search(next_scan)) if not next_has_level else False
+            if next_has_level or next_has_kw:
+                break
+            if lines[end].startswith((" ", "\t", "at ", "Caused by:", "---", "}", "]")):
+                end += 1
+            else:
+                break
+
+        if end == i + 1:
+            end = min(len(lines), i + 4)
+
+        ctx = "\n".join(lines[start:end])
+
+        fingerprint_text = re.sub(
+            r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx
+        )
+        fingerprint = fingerprint_text[:200]
+
+        if fingerprint not in seen:
+            seen.add(fingerprint)
+            error_contexts.append(ctx)
+        i = end
+
     return error_contexts
 
 def _extract_ids_from_log_ctx(ctx: str):
+    """
+    Best-effort subscan ID extraction from log context.
+    Parent scan linking is done via time-window, not ID parsing.
+    """
     sid = None
     ssid = None
-    m1 = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
+    m1 = re.search(r'(?i)(?:scan[_-]?id|scan[_-]?profile[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
     if not m1: m1 = re.search(r'sdk-object-scan-([a-f0-9]{24})', ctx)
     if m1: sid = m1.group(1)
     m2 = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', ctx)
@@ -8299,7 +8222,7 @@ def page_add_benchmark():
     
     # 3. Configuration & Flags
     st.subheader("3. Configuration & Flags")
-    c3, c4, c5, c6 = st.columns(4)
+    c3, c4, c5, c6, c7 = st.columns(5)
     scan_count = c3.number_input("Scanner Count", min_value=1, value=DEFAULT_SCANNER_COUNT)
     thread_count = c4.number_input(
         "Total threads (all scanners)",
@@ -8773,13 +8696,14 @@ def page_add_benchmark():
                         "scan_start_time", "scan_end_time", "enum_start_time", "enum_end_time",
                         "total_scan_hours", "enumeration_hours",
                         "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
-                        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr"
+                        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+                        "is_release"
                     ]
                     vals_placeholders = [
                         ":bid", ":cid", ":clid", ":clist", ":dt", ":scn", ":st", ":dst", ":dtype", ":fstype",
                         ":tf", ":tfo", ":tgb", ":tci", ":asz",
                         ":ss", ":se", ":es", ":ee", ":tsh", ":eh",
-                        ":tpcgb", ":tpsgb", ":tptgb", ":tpcf", ":tpsf", ":tptf"
+                        ":tpcgb", ":tpsgb", ":tptgb", ":tpcf", ":tpsf", ":tptf", ":is_rel"
                     ]
                     params_dict = {
                         'bid': b_id, 'cid': conf_id, 'clid': c_id,
@@ -8790,7 +8714,8 @@ def page_add_benchmark():
                         'es': enum_start, 'ee': enum_end,
                         'tsh': scan_duration, 'eh': enum_duration,
                         'tpcgb': tp_cluster_gb, 'tpsgb': tp_scanner_gb, 'tptgb': tp_thread_gb,
-                        'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files
+                        'tpcf': tp_cluster_files, 'tpsf': tp_scanner_files, 'tptf': tp_thread_files,
+                        'is_rel': is_release
                     }
 
                     # If scan_id is provided, pull classification metrics from scan_insights into benchmarks (manual trend table)
@@ -10833,7 +10758,11 @@ def page_build_analysis(df):
             scan_type = str(row.get("Scan_Type") or "").strip().lower()
             is_acl = bool(row.get("is_acl"))
             is_ff  = bool(row.get("is_feature_flags"))
-            if "ols" in scan_type:
+            has_ols = "ols" in scan_type
+            # OLS + Structured FF must be checked before plain OLS
+            if has_ols and is_ff:
+                return "OLS + Structured FF"
+            if has_ols:
                 return "OLS Scan"
             if is_acl and is_ff:
                 return "ACL + Structured FF"
@@ -10855,7 +10784,53 @@ def page_build_analysis(df):
             .reset_index(drop=True)
         )
 
-        SCENARIO_ORDER = ["Base (Full Scan)", "ACL On", "OLS Scan", "Structured FF", "ACL + Structured FF"]
+        SCENARIO_ORDER = [
+            "Base (Full Scan)",
+            "ACL On",
+            "OLS Scan",
+            "OLS + Structured FF",
+            "Structured FF",
+            "ACL + Structured FF",
+        ]
+
+        # ── Major-version comparison lookup ──────────────────────────────────
+        # Version format is MAJOR.MINOR (e.g. "251.1", "251.99", "252.15").
+        # Major = first component only (e.g. "251", "252").
+        def _major_ver(v: str) -> str:
+            return str(v).split(".")[0]
+
+        current_major = _major_ver(selected_build)
+
+        # Find the previous major version (highest major < current_major).
+        all_majors_sorted = sorted(
+            {_major_ver(v) for v in all_versions},
+            key=lambda m: int(m) if m.isdigit() else 0,
+            reverse=True,
+        )
+        prev_major = next(
+            (m for m in all_majors_sorted if m != current_major),
+            None,
+        )
+
+        # Build lookup: (scenario, ds_type, file_set_type) → best throughput_cluster_gb_hr
+        # across ALL builds of the previous major version.
+        prev_major_best: dict = {}
+        if prev_major:
+            prev_major_builds = [v for v in all_versions if _major_ver(v) == prev_major]
+            prev_major_df = df[df["Build_Version"].astype(str).isin(prev_major_builds)].copy()
+            if not prev_major_df.empty:
+                prev_major_df["_scenario"] = prev_major_df.apply(_classify_scenario, axis=1)
+                for _, pmr in prev_major_df.iterrows():
+                    tp_pm = pmr.get("throughput_cluster_gb_hr")
+                    if tp_pm and pd.notna(tp_pm) and float(tp_pm) > 0:
+                        key = (
+                            pmr.get("_scenario", ""),
+                            str(pmr.get("Data_Source_Type") or ""),
+                            str(pmr.get("file_set_type") or ""),
+                        )
+                        prev_major_best[key] = max(
+                            prev_major_best.get(key, 0.0), float(tp_pm)
+                        )
 
         groups = sm_best.groupby(["Data_Source_Type", "file_set_type"])
         if groups.ngroups == 0:
@@ -10865,7 +10840,6 @@ def page_build_analysis(df):
                 with st.expander(f"**{ds_type}** — {file_set}  ({len(grp)} scenario(s))", expanded=True):
                     # Build pivot table
                     rows_out = []
-                    base_tp = None
                     for scen in SCENARIO_ORDER:
                         sr = grp[grp["Scenario"] == scen]
                         if sr.empty:
@@ -10876,13 +10850,19 @@ def page_build_analysis(df):
                         hrs  = r.get("total_scan_hours")
                         objs = r.get("objects_scanned")
 
-                        delta_str = ""
-                        if base_tp is None and scen == "Base (Full Scan)":
-                            base_tp = tp
-                        elif base_tp and tp and base_tp > 0:
-                            pct = (tp - base_tp) / base_tp * 100
+                        # vs Prev Major: compare this scenario's best throughput in the
+                        # current major version against the best throughput for the same
+                        # scenario in the previous major version.
+                        pm_key = (scen, str(ds_type), str(file_set))
+                        pm_tp  = prev_major_best.get(pm_key)
+                        if pm_tp and tp and pd.notna(tp) and float(tp) > 0 and pm_tp > 0:
+                            pct = (float(tp) - pm_tp) / pm_tp * 100
                             arrow = "▲" if pct >= 0 else "▼"
                             delta_str = f"{arrow}{abs(pct):.1f}%"
+                        elif prev_major:
+                            delta_str = "N/A"   # prev major exists but no matching row
+                        else:
+                            delta_str = "—"     # no previous major version at all
 
                         rows_out.append({
                             "Scenario": scen,
@@ -10890,14 +10870,17 @@ def page_build_analysis(df):
                             "Files/hr": f"{ftp:,.0f}" if pd.notna(ftp) else "—",
                             "Scan Hrs": f"{hrs:.2f}" if pd.notna(hrs) else "—",
                             "Objects": f"{int(objs):,}" if pd.notna(objs) and objs else "—",
-                            "vs Base": delta_str,
+                            f"vs {prev_major or 'Prev Major'}": delta_str,
                         })
 
                     if rows_out:
                         disp = pd.DataFrame(rows_out)
+                        # The delta column name is dynamic (e.g. "vs 24.5" or "vs Prev Major")
+                        delta_col = [c for c in disp.columns if c.startswith("vs ")]
+                        delta_col = delta_col[0] if delta_col else None
 
                         def _color_delta(val):
-                            if not val or val == "":
+                            if not val or val in ("", "—", "N/A"):
                                 return ""
                             if "▲" in str(val):
                                 return "color: green; font-weight: bold;"
@@ -10905,8 +10888,11 @@ def page_build_analysis(df):
                                 return "color: red; font-weight: bold;"
                             return ""
 
+                        styled = disp.style
+                        if delta_col:
+                            styled = styled.applymap(_color_delta, subset=[delta_col])
                         st.dataframe(
-                            disp.style.applymap(_color_delta, subset=["vs Base"]),
+                            styled,
                             hide_index=True,
                             width='stretch',
                         )
@@ -11763,6 +11749,11 @@ def page_data_source_trend_comparison(df):
     selected_scan_type = st.selectbox("Scan Type", ["(All)"] + scan_type_options)
 
     scan_type_filter = None if selected_scan_type == "(All)" else selected_scan_type
+    
+    show_release_only = st.checkbox("Show Release Builds Only", value=False, key="ds_trend_release_only")
+    if show_release_only and "is_release" in df.columns:
+        df = df[df["is_release"] == 1]
+
     render_trend_analysis(
         df,
         title=f"Data Source Trend Comparison ({selected_fs})",
@@ -12824,10 +12815,12 @@ def load_auto_trend_dataset():
                     ab.new_attributes,
                     ab.removed_attributes,
                     ab.updated_at,
-                    ab.is_active
+                    ab.is_active,
+                    CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release
                 FROM auto_scan_benchmarks ab
                 LEFT JOIN test_environments te ON te.id = ab.environment_id
                 LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
+                LEFT JOIN builds bu ON bu.version = ab.build_version
                 WHERE LOWER(COALESCE(sp.scan_status, '')) NOT IN ('stopped', 'aborted')
                   AND LOWER(COALESCE(sp.scan_name, '')) NOT LIKE 'instant scan data%'
                   AND LOWER(COALESCE(ab.scan_name, '')) NOT LIKE 'instant scan data%'
@@ -12839,7 +12832,7 @@ def load_auto_trend_dataset():
             "scan_type", "data_source_type", "data_type", "file_set_type", "scan_name",
             "scan_start_time", "scan_end_time", "total_scan_hours",
             "total_size_gb_table", "total_files_table", "objects_scanned", "total_classification", 
-            "new_attributes", "removed_attributes", "updated_at", "is_active"
+            "new_attributes", "removed_attributes", "updated_at", "is_active", "is_release"
         ]
         df = pd.DataFrame(rows, columns=cols)
         if df.empty:
@@ -12893,6 +12886,7 @@ def load_auto_trend_as_manual_like_df():
     out["Data_Type"] = out["data_type"].astype(str)
     out["scan_name"] = out.get("scan_name", "").astype(str)
     out["is_active"] = out.get("is_active", 1)
+    out["is_release"] = out.get("is_release", 0)
 
     # Re-infer core fields from scan_name when the auto table fields are missing/garbage.
     try:
@@ -13414,28 +13408,18 @@ def page_edit_benchmark(df):
                                 total_catalog_items = :tci, avg_file_size = :avg,
                                 throughput_cluster_gb_hr = :tpcg, throughput_scanner_gb_hr = :tpsg, throughput_thread_gb_hr = :tptg,
                                 throughput_cluster_files_hr = :tpcf, throughput_scanner_files_hr = :tpsf, throughput_thread_files_hr = :tptf,
-                                is_active = :act
+                                is_active = :act, is_release = :rel
                             WHERE id = :bid
                         """)
                         conn.execute(upd_bench, {
-                            'rd': run_date_str,
-                            'scn': clean_value(row.get('Scenario_Type')),
-                            'st': clean_value(row.get('Scan_Type')),
-                            'dst': clean_value(row.get('Data_Source_Type')),
-                            'dtype': clean_value(row.get('Data_Type')),
-                            'fst': clean_value(row.get('file_set_type')),
-                            'tf': clean_value(row.get('Total_Files')),
-                            'tfo': clean_value(row.get('Total_Folders')),
-                            'tgb': clean_value(row.get('Total_Size_GB')),
-                            'tci': clean_value(row.get('New_Attributes')),
-                            'avg': clean_value(row.get('avg_file_size')),
-                            'tpcg': clean_value(row.get('throughput_cluster_gb_hr')),
-                            'tpsg': clean_value(row.get('throughput_scanner_gb_hr')),
-                            'tptg': clean_value(row.get('throughput_thread_gb_hr')),
-                            'tpcf': clean_value(row.get('throughput_cluster_files_hr')),
-                            'tpsf': clean_value(row.get('throughput_scanner_files_hr')),
-                            'tptf': clean_value(row.get('throughput_thread_files_hr')),
+                            'rd': run_date_str, 'scn': clean_value(row.get('Scenario_Type')), 'st': clean_value(row.get('Scan_Type')),
+                            'dst': clean_value(row.get('Data_Source_Type')), 'dtype': clean_value(row.get('Data_Type')), 'fst': clean_value(row.get('file_set_type')),
+                            'tf': clean_value(row.get('Total_Files')), 'tfo': clean_value(row.get('Total_Folders')), 'tgb': clean_value(row.get('Total_Size_GB')),
+                            'tci': clean_value(row.get('New_Attributes')), 'avg': clean_value(row.get('avg_file_size')),
+                            'tpcg': clean_value(row.get('throughput_cluster_gb_hr')), 'tpsg': clean_value(row.get('throughput_scanner_gb_hr')), 'tptg': clean_value(row.get('throughput_thread_gb_hr')),
+                            'tpcf': clean_value(row.get('throughput_cluster_files_hr')), 'tpsf': clean_value(row.get('throughput_scanner_files_hr')), 'tptf': clean_value(row.get('throughput_thread_files_hr')),
                             'act': 1 if bool(row.get('is_active')) else 0,
+                            'rel': 1 if bool(row.get('is_release')) else 0,
                             'bid': row_id
                         })
                 conn.commit()
@@ -13599,8 +13583,9 @@ def load_scanner_group_performance(env_id, start_dt, end_dt):
 
 def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
     """
-    Fallback when `group_scanner_ids_json` was not stored yet: pods whose **latest** row is
-    not failed/inactive and has **running_threads > 0** (typical BigID "busy" running set).
+    Fallback when `group_scanner_ids_json` was not stored yet: active pods from the
+    latest services-status rows. A scanner with 0 running threads still counts as an
+    active scanner in the BigID scanners table.
     """
     if df_i is None or df_i.empty or "scanner_id" not in df_i.columns:
         return set()
@@ -13614,9 +13599,7 @@ def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
                 continue
             if _scanner_status_inactive(r.get("status")):
                 continue
-            rt = int(pd.to_numeric(r.get("running_threads"), errors="coerce") or 0)
-            if rt > 0:
-                out.add(sid)
+            out.add(sid)
         return out
     except Exception:
         return set()
@@ -13625,14 +13608,14 @@ def spm_infer_running_scanner_ids_from_individual(df_i: pd.DataFrame) -> set:
 def spm_effective_running_scanner_id_set(df_g: pd.DataFrame, df_i: pd.DataFrame) -> Tuple[set, str]:
     """
     Prefer scanner-groups `scannersIDs` (matches BigID runningScanners count).
-    Else infer from services-status latest rows (threads > 0, non-failed).
+    Else infer active scanner IDs from services-status latest rows.
     """
     ids = spm_latest_group_scanner_id_set(df_g)
     if ids:
         return ids, "scanner-groups `scannersIDs`"
     ids2 = spm_infer_running_scanner_ids_from_individual(df_i)
     if ids2:
-        return ids2, "inferred (latest non-failed + running_threads > 0)"
+        return ids2, "inferred (latest active services-status scanners)"
     return set(), ""
 
 
@@ -14113,9 +14096,9 @@ def page_scan_progress():
                     try:
                         _cau_scan = write_res.get("captured_at_utc") if isinstance(write_res, dict) else None
                         if _cau_scan is not None and hasattr(_cau_scan, "replace"):
-                            _cap_at = _cau_scan.replace(microsecond=0)
+                            _cap_at = _cau_scan.replace(second=0, microsecond=0)
                         else:
-                            _cap_at = datetime.utcnow().replace(microsecond=0)
+                            _cap_at = datetime.utcnow().replace(second=0, microsecond=0)
                         p_res = capture_scanner_performance_for_env(
                             engine,
                             sync_env_row,
@@ -16087,6 +16070,26 @@ def page_scan_progress():
                                     g_sum["avg_scan_speed_kib_s"] = pd.to_numeric(
                                         g_sum["avg_scan_speed"], errors="coerce"
                                     ).fillna(0.0) / 1024.0
+                                    st.markdown("**Total running threads over time**")
+                                    fig_threads_total = go.Figure()
+                                    fig_threads_total.add_trace(
+                                        go.Scatter(
+                                            x=g_sum["captured_at_utc"],
+                                            y=g_sum["running_threads"],
+                                            mode="lines+markers",
+                                            name="Total running threads",
+                                            line=dict(color="#7C3AED", width=2),
+                                        )
+                                    )
+                                    fig_threads_total.update_layout(
+                                        **_spm_layout_merge(
+                                            _spm_m,
+                                            yaxis=dict(title="Threads", rangemode="tozero"),
+                                            height=360,
+                                        ),
+                                    )
+                                    spm_apply_plotly_ticks(fig_threads_total, g_sum["captured_at_utc"])
+                                    st.plotly_chart(fig_threads_total, width="stretch")
                                     # Pod CPU → group-level trend: mean CPU % per scanner group per slot, then mean across groups (matches BigID group × pods).
                                     _cpu_t = pd.DataFrame()
                                     try:
@@ -16515,19 +16518,23 @@ def page_scan_progress():
                 has_extra_cols_local = _db_has_column("scan_log_errors", "log_source")
                 cols = "log_timestamp, error_context, ai_analysis, is_resolved, log_source, scan_id, subscan_id" if has_extra_cols_local else "log_timestamp, error_context, ai_analysis, is_resolved"
                 
-                # Fetch only relevant errors for this scan/environment since it started
+                # Fetch errors for this environment within the scan's time window.
+                # We intentionally do NOT filter by scan_id here because log lines may carry
+                # UUID-format IDs (scanner_file logs) that differ from the MongoDB scan_id
+                # used as the display key. Time-window filtering is the reliable gate.
                 q_params = {"eid": env_id}
                 q_filters = ["environment_id = :eid"]
-                if scan_id:
-                    # Match this scan_id or system-wide logs (often logged with no scan ID context)
-                    q_filters.append("(scan_id = :sid OR scan_id IS NULL OR scan_id = '' OR scan_id = 'None')")
-                    q_params["sid"] = str(scan_id)
-                
+
                 if db_started_at:
-                    # Ensure we don't show logs from BEFORE the scan started
+                    # Only show errors from scan start time onward
                     q_filters.append("log_timestamp >= :started")
                     q_params["started"] = db_started_at
-                
+
+                if db_completed_at and db_completed_at.strip() and db_completed_at.strip() not in ("", "None", "nan"):
+                    # For completed scans, cap at completed_at + 5 min buffer for late-arriving logs
+                    q_filters.append("log_timestamp <= DATE_ADD(:completed, INTERVAL 5 MINUTE)")
+                    q_params["completed"] = db_completed_at
+
                 q_where = " AND ".join(q_filters)
                 query_str = f"SELECT {cols} FROM scan_log_errors WHERE {q_where} ORDER BY id DESC LIMIT 20"
                 e_df = pd.read_sql(text(query_str), engine, params=q_params)
@@ -16553,63 +16560,117 @@ def page_scan_progress():
                                     st.error("Cannot resolve environment URL to fetch logs.")
                                 else:
                                     token = Get_auth_token(env_row["base_url"], env_row)
-                                    # Use ALL configured log sources - not a hardcoded list
                                     try:
-                                        from ai_log_fetcher import load_enabled_log_sources as _load_sources
+                                        from ai_log_fetcher import (
+                                            load_enabled_log_sources as _load_sources,
+                                            _estimate_fetch_lines as _est_lines,
+                                            _filter_lines_to_scan_window as _filter_window,
+                                            call_llm_log_scanner as _llm_scan,
+                                        )
                                         sources = _load_sources(engine)
                                     except Exception:
                                         sources = ["scanner", "orch", "orch2", "data-manager", "api-gateway", "aci"]
-                                    
-                                    import hashlib as _hashlib
-                                    new_found = 0
-                                    scan_start_gate = db_started_at  # Only keep logs >= scan start
-                                    for src in sources:
-                                        url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len=3000"
-                                        resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=30)
-                                        if resp.status_code == 200:
-                                            log_text = resp.json().get("data") if isinstance(resp.json(), dict) else resp.text
-                                            if log_text:
-                                                found_errors = _detect_log_errors_structural(str(log_text))
-                                                for ctx in found_errors:
-                                                    # GATE: Extract real log timestamp and skip pre-scan-start logs
-                                                    import re as _re
-                                                    ts_match = _re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(ctx))
-                                                    if ts_match and scan_start_gate:
-                                                        try:
-                                                            from datetime import datetime as _dt
-                                                            log_ts_str = ts_match.group(1).replace('T', ' ')
-                                                            log_ts = _dt.strptime(log_ts_str[:19], '%Y-%m-%d %H:%M:%S')
-                                                            scan_start_dt = _dt.strptime(str(scan_start_gate)[:19], '%Y-%m-%d %H:%M:%S')
-                                                            if log_ts < scan_start_dt:
-                                                                continue  # Skip stale log
-                                                            actual_ts = log_ts.strftime('%Y-%m-%d %H:%M:%S')
-                                                        except Exception:
-                                                            actual_ts = None
-                                                    else:
-                                                        actual_ts = None
+                                        _est_lines = lambda s, e: 3000
+                                        _filter_window = lambda t, s, e: t
+                                        _llm_scan = lambda *a, **k: []
 
-                                                    # Hash-based dedup (match background fetcher behavior)
-                                                    fp_text = _re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', str(ctx))
-                                                    err_hash = _hashlib.md5(fp_text[:300].encode('utf-8')).hexdigest()
-                                                    with engine.connect() as conn:
-                                                        exist = conn.execute(text(
-                                                            "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:hash AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
-                                                        ), {"eid": env_id, "hash": err_hash}).fetchone()
-                                                        if exist: continue
-                                                        
-                                                        psid, pssid = _extract_ids_from_log_ctx(ctx)
-                                                        ai_ans = _call_ollama_for_error(ctx, src)
-                                                        conn.execute(text("""
-                                                            INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
-                                                            VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
-                                                        """), {
-                                                            "eid": env_id,
-                                                            "ts": actual_ts or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
-                                                            "ctx": ctx, "ai": ai_ans, "src": src,
-                                                            "sid": psid or scan_id, "ssid": pssid, "hash": err_hash
-                                                        })
-                                                        conn.commit()
+                                    import hashlib as _hashlib
+                                    from datetime import datetime as _dt
+
+                                    # Parse scan window boundaries once
+                                    _scan_start_dt = None
+                                    _scan_end_dt   = None
+                                    try:
+                                        if db_started_at and str(db_started_at).strip() not in ("", "None", "nan"):
+                                            _scan_start_dt = _dt.strptime(str(db_started_at)[:19], '%Y-%m-%d %H:%M:%S')
+                                    except Exception:
+                                        pass
+                                    try:
+                                        if db_completed_at and str(db_completed_at).strip() not in ("", "None", "nan"):
+                                            _scan_end_dt = _dt.strptime(str(db_completed_at)[:19], '%Y-%m-%d %H:%M:%S')
+                                    except Exception:
+                                        pass
+
+                                    new_found = 0
+
+                                    for src in sources:
+                                        try:
+                                            # Smart fetch: size based on scan duration
+                                            fetch_n = _est_lines(_scan_start_dt, _scan_end_dt)
+                                            url = f"{env_row['base_url'].rstrip('/')}/api/v1/logs/{src}?len={fetch_n}"
+                                            resp = requests.get(url, headers={"authorization": token}, verify=False, timeout=60)
+                                            if resp.status_code != 200:
+                                                continue
+                                            raw = resp.json().get("data") if isinstance(resp.json(), dict) else resp.text
+                                            if not raw:
+                                                continue
+
+                                            # Filter to scan window ONCE — used for both passes
+                                            filtered = _filter_window(str(raw), _scan_start_dt, _scan_end_dt)
+                                            if not filtered.strip():
+                                                continue
+
+                                            # Per-source line dedup set (masks timestamps)
+                                            _seen_lh = set()
+                                            def _lhash(t):
+                                                m = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', t)
+                                                return _hashlib.md5(m[:300].encode()).hexdigest()
+
+                                            def _insert_if_new(ctx_t, ts_str, ai_t):
+                                                fp = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_t)
+                                                eh = _hashlib.md5(fp[:300].encode()).hexdigest()
+                                                with engine.connect() as _c:
+                                                    if _c.execute(text(
+                                                        "SELECT id FROM scan_log_errors WHERE environment_id=:eid AND error_hash=:h AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)"
+                                                    ), {"eid": env_id, "h": eh}).fetchone():
+                                                        return False
+                                                    _, pssid = _extract_ids_from_log_ctx(ctx_t)
+                                                    _c.execute(text("""
+                                                        INSERT INTO scan_log_errors
+                                                            (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
+                                                        VALUES (:eid, :ts, :ctx, :ai, :src, :sid, :ssid, :hash)
+                                                    """), {
+                                                        "eid": env_id, "ts": ts_str or _dt.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                                                        "ctx": ctx_t, "ai": ai_t, "src": src,
+                                                        "sid": str(scan_id), "ssid": pssid, "hash": eh
+                                                    })
+                                                    _c.commit()
+                                                return True
+
+                                            # ── Pass 1: regex ──────────────────────────────
+                                            for err in _detect_log_errors_structural(filtered):
+                                                ts_m = re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', str(err))
+                                                actual_ts = None
+                                                try:
+                                                    if ts_m:
+                                                        actual_ts = _dt.strptime(ts_m.group(1).replace('T', ' ')[:19], '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d %H:%M:%S')
+                                                except Exception:
+                                                    pass
+                                                for ln in err.splitlines():
+                                                    if ln.strip():
+                                                        _seen_lh.add(_lhash(ln))
+                                                ai_ans = _call_ollama_for_error(err, src)
+                                                if _insert_if_new(err, actual_ts, ai_ans):
+                                                    new_found += 1
+
+                                            # ── Pass 2: LLM on deduplicated remainder ──────
+                                            llm_lines = [ln for ln in filtered.splitlines()
+                                                         if ln.strip() and _lhash(ln) not in _seen_lh]
+                                            if llm_lines:
+                                                for hit in _llm_scan("\n".join(llm_lines), src,
+                                                                      scan_start=str(_scan_start_dt) if _scan_start_dt else None,
+                                                                      scan_end=str(_scan_end_dt) if _scan_end_dt else None):
+                                                    ctx_t = (
+                                                        f"[LLM-DETECTED | {hit['severity']} | {hit['category']}]\n"
+                                                        f"{hit['text']}\n\nAI Summary: {hit['summary']}"
+                                                    )
+                                                    ai_t = f"[LLM Scanner: {hit['summary']}]\n\n{_call_ollama_for_error(hit['text'], src)}"
+                                                    if _insert_if_new(ctx_t, None, ai_t):
                                                         new_found += 1
+
+                                        except Exception as _src_err:
+                                            pass  # best-effort per source
+
                                     st.success(f"Log fetch complete. Found/Analyzed {new_found} new error signatures.")
                                     st.rerun()
                             except Exception as e:
@@ -16865,39 +16926,25 @@ def render_workflow_creation_section(wf_pool_df, in_use_env_ids):
                     "status",
                 ]
                 show_cols = [c for c in show_cols if c in prev_df.columns]
-                def _on_editor_change():
-                    # Captures the very first click on a checkbox
-                    ed_state = st.session_state.get("wf_preview_steps_editor_new_expander")
-                    if ed_state and "edited_rows" in ed_state:
-                        ps = list(st.session_state["wf_preview_step_rows"])
-                        for idx_str, changes in ed_state["edited_rows"].items():
-                            idx = int(idx_str)
-                            if idx < len(ps) and "is_enabled" in changes:
-                                ps[idx]["is_enabled"] = bool(changes["is_enabled"])
-                        st.session_state["wf_preview_step_rows"] = ps
-
                 editable_df = st.data_editor(
                     prev_df[show_cols],
                     width="stretch",
                     hide_index=True,
                     key="wf_preview_steps_editor_new_expander",
-                    on_change=_on_editor_change,
                     column_config={
                         "is_enabled": st.column_config.CheckboxColumn("Execute", default=True),
                     },
                     disabled=[c for c in show_cols if c != "is_enabled"],
                 )
                 try:
-                    # Sync editor changes back to session state immediately
-                    if "wf_preview_steps_editor_new_expander" in st.session_state:
-                        ed_state = st.session_state["wf_preview_steps_editor_new_expander"]
-                        if ed_state and "edited_rows" in ed_state:
-                            ps = list(st.session_state["wf_preview_step_rows"])
-                            for idx_str, changes in ed_state["edited_rows"].items():
-                                idx = int(idx_str)
-                                if idx < len(ps) and "is_enabled" in changes:
-                                    ps[idx]["is_enabled"] = bool(changes["is_enabled"])
-                            st.session_state["wf_preview_step_rows"] = ps
+                    if editable_df is not None and len(editable_df) and "is_enabled" in getattr(
+                        editable_df, "columns", []
+                    ):
+                        ps = list(st.session_state["wf_preview_step_rows"])
+                        n = min(len(ps), len(editable_df))
+                        for i in range(n):
+                            ps[i]["is_enabled"] = bool(editable_df["is_enabled"].iloc[i])
+                        st.session_state["wf_preview_step_rows"] = ps
                 except Exception:
                     pass
                 preview_steps = st.session_state.get("wf_preview_step_rows") or preview_steps
@@ -17158,7 +17205,15 @@ def page_workflow_automation():
     render_workflow_creation_section(wf_pool_df, in_use_env_ids)
 
     # --- Load runs ---
-    st.markdown("### Workflow Runs")
+    wf_runs_title_col, wf_runs_refresh_col = st.columns([4, 1])
+    wf_runs_title_col.markdown("### Workflow Runs")
+    if wf_runs_refresh_col.button("Refresh Workflow Runs", key="wf_runs_refresh_top", use_container_width=True):
+        try:
+            load_workflow_runs.clear()
+            load_test_environments.clear()
+        except Exception:
+            pass
+        st.rerun()
     st.caption(
         "Click a run id to expand details. Row **🔁** = quick reconcile from DB. **Reset** options live under "
         "**Controls — Run …** below the table (scroll down). **Delete** (🗑️) purges local DB rows for that run’s "
@@ -17322,7 +17377,7 @@ def page_workflow_automation():
                         errors += 1
                     elif c_status == "completed":
                         completed += 1
-                    elif c_status in {"", "pending"}:
+                    elif c_status in {"", "pending", "stopped", "aborted", "cancelled", "canceled"}:
                         pass  # included in metrics.pending below (residual)
                     else:
                         in_prog += 1
@@ -17467,7 +17522,7 @@ def page_workflow_automation():
                         err_val = ""
                     _err_full = str(sr.get("last_error") or "")
                     err_cell = (
-                        f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(_err_full)}">{html.escape(err_val[:40])}</span>'
+                        f'<span style="color:#dc2626;font-size:0.78rem;" title="{html.escape(_err_full)}">{html.escape(err_val[:200])}</span>'
                         if err_val
                         else ""
                     )
