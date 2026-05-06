@@ -443,7 +443,7 @@ def fetch_about(base_url: str, token: str) -> Dict[str, Any]:
 
 # Global cache for build version checks to avoid BigID API spam (env_id -> (timestamp, version))
 _BUILD_VERSION_CACHE: Dict[int, Tuple[datetime, str]] = {}
-_BUILD_VERSION_CACHE_TTL_MINUTES = 15
+_BUILD_VERSION_CACHE_TTL_MINUTES = 10
 
 def resolve_env_build_version(env_row: Dict[str, Any], token: str) -> str:
     """
@@ -506,7 +506,7 @@ def ensure_workflow_tables(engine) -> None:
                     status TEXT NULL,
                     env1_id INTEGER NULL,
                     env2_id INTEGER NULL,
-                    cooldown_minutes INTEGER DEFAULT 15,
+                    cooldown_minutes INTEGER DEFAULT 10,
                     next_eligible_at TEXT NULL,
                     last_error TEXT NULL,
                     started_at TEXT NULL,
@@ -585,7 +585,7 @@ def ensure_workflow_tables(engine) -> None:
                 status VARCHAR(32) NULL,
                 env1_id INT NULL,
                 env2_id INT NULL,
-                cooldown_minutes INT DEFAULT 15,
+                cooldown_minutes INT DEFAULT 10,
                 next_eligible_at DATETIME NULL,
                 last_error TEXT NULL,
                 started_at DATETIME NULL,
@@ -3619,6 +3619,26 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             return True
 
     # --- Pre-step action (feature flags on/off etc) ---
+    # Execute pre-OLS action if this step has is_ols=True
+    if bool(step_dict.get("is_ols")):
+        try:
+            action_keys = _action_pre_ols_key(env_id)
+            action_tpl = None
+            for ak in action_keys:
+                action_tpl = get_template(engine, ak)
+                if action_tpl:
+                    break
+            
+            if action_tpl:
+                try:
+                    action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
+                    action_payload = json.loads(action_raw)
+                    run_action_template(base_url, token, action_payload)
+                except Exception as ex:
+                    # Don't fail the step, just log the warning
+                    pass
+        except Exception:
+            pass
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):
@@ -4056,4 +4076,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
