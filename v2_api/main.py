@@ -109,7 +109,6 @@ _WORKFLOW_ENV_STATUS_SQL = text(
           AND COALESCE(ws.is_enabled, TRUE) = TRUE
           AND LOWER(TRIM(COALESCE(ws.status, ''))) IN (
               'running',
-              'pre_action_done',
               'ds_created',
               'ds_test_ok',
               'scan_created',
@@ -1914,7 +1913,8 @@ async def get_workflow_env_status(u=Depends(get_current_user)):
     """
     Env 🟢/🔴 strip: active envs marked busy when `test_environments.is_busy`
     OR a running workflow references the env in an active step-state
-    (running, pre_action_done, ds_created, ds_test_ok, scan_created, scan_running, scan_waiting).
+    (running, ds_created, ds_test_ok, scan_created, scan_running, scan_waiting).
+    Excludes pending/pre_action_done to avoid false positives.
     """
     try:
         with get_workflow_sql_engine().connect() as conn:

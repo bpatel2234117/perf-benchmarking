@@ -250,7 +250,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [runPage, setRunPage] = useState(0);
   const [createName, setCreateName] = useState('');
-  const [createCooldown, setCreateCooldown] = useState(15);
+  const [createCooldown, setCreateCooldown] = useState(10);
   const [createEnv1, setCreateEnv1] = useState<string>('');
   const [createEnv2, setCreateEnv2] = useState<string>('');
   const [stepEnabled, setStepEnabled] = useState<boolean[]>([]);
@@ -411,8 +411,17 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   });
 
   const controlMutation = useMutation({
-    mutationFn: async (vars: { runId: number; action: 'start' | 'pause' | 'resume' | 'stop' }) => {
-      await axios.post(`${API_BASE}/api/workflow/runs/${vars.runId}/control`, { action: vars.action }, authConfig);
+    mutationFn: async (vars: {
+      runId: number;
+      action: 'start' | 'pause' | 'resume' | 'stop';
+      env1Id?: number | null;
+      env2Id?: number | null;
+    }) => {
+      await axios.post(`${API_BASE}/api/workflow/runs/${vars.runId}/control`, {
+        action: vars.action,
+        env1_id: vars.env1Id,
+        env2_id: vars.env2Id
+      }, authConfig);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
@@ -470,7 +479,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                 min={1}
                 max={180}
                 value={createCooldown}
-                onChange={(e) => setCreateCooldown(Number(e.target.value) || 15)}
+                onChange={(e) => setCreateCooldown(Number(e.target.value) || 10)}
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
               />
             </div>
@@ -615,7 +624,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                   const actionBlock = findConsecutiveActionBlock(catalog);
                   const gridStyle: React.CSSProperties = {
                     display: 'grid',
-                    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
+                    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
                     gap: '10px 14px',
                   };
 
@@ -834,7 +843,12 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                       type="button"
                                       title={act}
                                       disabled={!enabled || controlMutation.isPending}
-                                      onClick={() => controlMutation.mutate({ runId: run.id, action: act })}
+                                      onClick={() => controlMutation.mutate({
+                                        runId: run.id,
+                                        action: act,
+                                        env1Id: run.env1_id,
+                                        env2Id: run.env2_id
+                                      })}
                                       style={{
                                         background: 'transparent',
                                         border: 'none',
