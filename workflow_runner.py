@@ -3754,10 +3754,50 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             
             if not action_tpl:
                 raise RuntimeError(f"Missing action template for key: {action_key}")
+            
+            # If environment_id is NULL, run action on ALL active environments in the workflow
+            if env_id is None:
+                # Get all active environments from the workflow
+                with engine.connect() as conn:
+                    env_rows = conn.execute(text("""
+                        SELECT DISTINCT te.id, te.base_url
+                        FROM workflow_steps ws
+                        INNER JOIN test_environments te ON ws.environment_id = te.id
+                        WHERE ws.run_id = :rid
+                          AND ws.environment_id IS NOT NULL
+                          AND COALESCE(te.is_active, TRUE) = TRUE
+                        ORDER BY te.id
+                    """), {"rid": run_id}).fetchall()
                 
-            action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
-            action_payload = json.loads(action_raw)
-            run_action_template(base_url, token, action_payload)
+                if not env_rows:
+                    raise RuntimeError("No active environments found in workflow for action step")
+                
+                # Execute action on each environment
+                for env_row_item in env_rows:
+                    env_id_item = int(env_row_item[0])
+                    base_url_item = str(env_row_item[1] or "").strip()
+                    if not base_url_item:
+                        continue
+                    
+                    # Get auth token for this environment
+                    token_item = get_auth_token_for_env(env_id_item)
+                    if not token_item:
+                        logger.warning(f"Skipping action for env {env_id_item}: no auth token")
+                        continue
+                    
+                    try:
+                        action_raw = _render_template(action_tpl, {"BASE_URL": base_url_item, "TOKEN": token_item})
+                        action_payload = json.loads(action_raw)
+                        run_action_template(base_url_item, token_item, action_payload)
+                        logger.info(f"Action '{action_key}' completed on env {env_id_item}")
+                    except Exception as ex:
+                        logger.warning(f"Action '{action_key}' failed on env {env_id_item}: {ex}")
+                        # Continue with other environments even if one fails
+            else:
+                # Single environment - execute action
+                action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
+                action_payload = json.loads(action_raw)
+                run_action_template(base_url, token, action_payload)
             
             # Action completed successfully, mark step as completed
             set_step_status(engine, step_id, "completed", finished_at=_now_utc())
@@ -3770,30 +3810,6 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             _set_env_busy(engine, env_id, run_id, False) # RELEASE
             set_run_next_eligible(engine, run_id, _now_utc())
             return True
-
-    # --- Pre-step action (feature flags on/off etc) ---
-    # Execute pre-OLS action if this step has is_ols=True
-    if bool(step_dict.get("is_ols")):
-        try:
-            action_keys = _action_pre_ols_key(env_id)
-            action_tpl = None
-            for ak in action_keys:
-                action_tpl = get_template(engine, ak)
-                if action_tpl:
-                    break
-            
-            if action_tpl:
-                try:
-                    logger.info(f"Executing pre-OLS action for step {seq} on env {env_id}")
-                    action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
-                    action_payload = json.loads(action_raw)
-                    run_action_template(base_url, token, action_payload)
-                    logger.info(f"Pre-OLS action completed successfully for step {seq}")
-                except Exception as ex:
-                    logger.warning(f"Pre-OLS action failed for step {seq}: {ex}")
-                    # Don't fail the step, just log the warning
-        except Exception as ex:
-            logger.warning(f"Error checking pre-OLS action for step {seq}: {ex}")
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):
