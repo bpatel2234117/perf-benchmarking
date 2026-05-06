@@ -3602,36 +3602,43 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             if not action_tpl:
                 raise RuntimeError(f"Missing action template for key: {action_key}")
             
-            # If environment_id is NULL, run action on ALL active environments in the workflow
+            # If environment_id is NULL, run action on workflow's assigned environments (env1_id, env2_id)
             if env_id is None:
-                # Get all active environments from the workflow
+                # Get env1_id and env2_id from workflow_runs
                 with engine.connect() as conn:
-                    env_rows = conn.execute(text("""
-                        SELECT DISTINCT te.id, te.base_url
-                        FROM workflow_steps ws
-                        INNER JOIN test_environments te ON ws.environment_id = te.id
-                        WHERE ws.run_id = :rid
-                          AND ws.environment_id IS NOT NULL
-                          AND COALESCE(te.is_active, TRUE) = TRUE
-                        ORDER BY te.id
-                    """), {"rid": run_id}).fetchall()
+                    run_row = conn.execute(text("SELECT env1_id, env2_id FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)}).fetchone()
                 
-                if not env_rows:
-                    raise RuntimeError("No active environments found in workflow for action step")
+                if not run_row:
+                    raise RuntimeError("Workflow run not found")
                 
-                # Execute action on each environment
-                for env_row_item in env_rows:
-                    env_id_item = int(env_row_item[0])
-                    base_url_item = str(env_row_item[1] or "").strip()
-                    if not base_url_item:
-                        continue
-                    
-                    # Get auth token for this environment
-                    token_item = get_auth_token_for_env(env_id_item)
-                    if not token_item:
-                        continue
-                    
+                env_ids = [run_row[0], run_row[1]]
+                env_ids = [eid for eid in env_ids if eid is not None]
+                
+                if not env_ids:
+                    raise RuntimeError("No environments assigned to workflow")
+                
+                # Execute action on each assigned environment
+                for env_id_item in env_ids:
                     try:
+                        with engine.connect() as conn:
+                            env_row_item = conn.execute(text("""
+                                SELECT base_url, is_active
+                                FROM test_environments
+                                WHERE id = :eid
+                            """), {"eid": int(env_id_item)}).fetchone()
+                        
+                        if not env_row_item or not bool(env_row_item[1]):
+                            continue
+                        
+                        base_url_item = str(env_row_item[0] or "").strip()
+                        if not base_url_item:
+                            continue
+                        
+                        # Get auth token for this environment
+                        token_item = get_auth_token_for_env(env_id_item)
+                        if not token_item:
+                            continue
+                        
                         action_raw = _render_template(action_tpl, {"BASE_URL": base_url_item, "TOKEN": token_item})
                         action_payload = json.loads(action_raw)
                         run_action_template(base_url_item, token_item, action_payload)
