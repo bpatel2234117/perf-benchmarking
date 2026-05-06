@@ -15,6 +15,8 @@ import EditRecordsPage from './pages/EditRecordsPage';
 import ManageRBACPage from './pages/ManageRBACPage';
 import ScannerInfraPage from './pages/ScannerInfraPage';
 import CreateDataSourcePage from './pages/CreateDataSourcePage';
+import RunComparisonPage from './pages/RunComparisonPage';
+import VersionComparisonPage from './pages/VersionComparisonPage';
 import Navbar from './components/Navbar';
 
 const App = () => {
@@ -45,6 +47,10 @@ const App = () => {
       <Route path="/tools/manage-rbac" element={token ? <ManageRBACPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/scanner-infra" element={token ? <ScannerInfraPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/data-source-create" element={token ? <CreateDataSourcePage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/run-comparison" element={token ? <RunComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/version-comparison" element={token ? <VersionComparisonPage token={token} /> : <Navigate to="/login" />} />
+      {/* data-record-add → AddBenchmarkFromScanPage (same functionality) */}
+      <Route path="/tools/data-record-add" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/:slug" element={token ? <LegacyToolPage /> : <Navigate to="/login" />} />
     </Routes>
   );
@@ -52,7 +58,7 @@ const App = () => {
   return (
     <Router>
       {token ? (
-        <Navbar onLogout={() => handleSetToken(null)}>{routesInner}</Navbar>
+        <Navbar onLogout={() => handleSetToken(null)} token={token}>{routesInner}</Navbar>
       ) : (
         <div className="main-content main-content-login">{routesInner}</div>
       )}

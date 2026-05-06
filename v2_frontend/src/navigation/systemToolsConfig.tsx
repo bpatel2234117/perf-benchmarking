@@ -9,7 +9,6 @@ import {
   Layers,
   Monitor,
   Puzzle,
-  PlusSquare,
   Satellite,
   ShieldCheck,
   TerminalSquare,
@@ -27,7 +26,9 @@ export type AppNavPath =
   | '/tools/records-edit'
   | '/tools/manage-rbac'
   | '/tools/scanner-infra'
-  | '/tools/data-source-create';
+  | '/tools/data-source-create'
+  | '/tools/run-comparison'
+  | '/tools/version-comparison';
 
 export type SystemToolEntry =
   | { kind: 'app'; path: AppNavPath; label: string; icon: LucideIcon }
@@ -36,12 +37,11 @@ export type SystemToolEntry =
 /** System Tools flyout (Workflow lives as a top-level sidebar item, not here). */
 export const SYSTEM_TOOLS_ENTRIES: readonly SystemToolEntry[] = [
   { kind: 'app', path: '/tools/build-analysis', label: 'Build Analysis', icon: BarChart2 },
-  { kind: 'legacy', slug: 'run-comparison', label: 'Run Comparison Tool', icon: GitCompare },
+  { kind: 'app', path: '/tools/run-comparison', label: 'Run Comparison Tool', icon: GitCompare },
   { kind: 'app', path: '/tools/classifier-comparison', label: 'Classifier Comparison', icon: Layers },
-  { kind: 'legacy', slug: 'data-record-add', label: 'Add New Data Record', icon: PlusSquare },
   { kind: 'app', path: '/tools/records-edit', label: 'Edit Existing Records', icon: Wrench },
   { kind: 'app', path: '/environments', label: 'Manage Test Environments', icon: Globe },
-  { kind: 'legacy', slug: 'version-comparison', label: 'Version Comparison', icon: GitBranch },
+  { kind: 'app', path: '/tools/version-comparison', label: 'Version Comparison', icon: GitBranch },
   { kind: 'app', path: '/tools/data-source-create', label: 'Create Data Source', icon: Puzzle },
   { kind: 'app', path: '/tools/scan-status', label: 'Scan Status', icon: Satellite },
   { kind: 'app', path: '/tools/scanner-infra', label: 'Scanner Infrastructure', icon: Monitor },

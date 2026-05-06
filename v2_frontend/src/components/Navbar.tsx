@@ -1,17 +1,21 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Activity,
   ChevronDown,
   FlaskConical,
   LogOut,
   RefreshCw,
   Wrench,
+  Loader2,
 } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
+import { useQuery } from '@tanstack/react-query';
+import axios from 'axios';
 import { SYSTEM_TOOLS_ENTRIES } from '../navigation/systemToolsConfig';
+import { API_BASE } from '../apiConfig';
 
 interface NavbarProps {
   onLogout: () => void;
+  token: string;
   children: React.ReactNode;
 }
 
@@ -22,12 +26,30 @@ function pathMatches(entry: typeof SYSTEM_TOOLS_ENTRIES[number], pathname: strin
   return pathname === `/tools/${entry.slug}` || pathname.startsWith(`/tools/${entry.slug}/`);
 }
 
-const Navbar: React.FC<NavbarProps> = ({ onLogout, children }) => {
+const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
   const location = useLocation();
   const [toolsOpen, setToolsOpen] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
 
-  const systemToolsCurrent = SYSTEM_TOOLS_ENTRIES.some((e) => pathMatches(e, location.pathname));
+  const { data: userProfile } = useQuery({
+    queryKey: ['me'],
+    queryFn: async () => {
+      const res = await axios.get(`${API_BASE}/api/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      return res.data;
+    }
+  });
+
+  const userRole = userProfile?.role || 'Viewer';
+  const isAdminOrDev = ['Admin', 'Developer'].includes(userRole);
+
+  const filteredTools = SYSTEM_TOOLS_ENTRIES.filter(entry => {
+    if (entry.kind === 'app' && entry.path === '/tools/manage-rbac') return isAdminOrDev;
+    return true;
+  });
+
+  const systemToolsCurrent = filteredTools.some((e) => pathMatches(e, location.pathname));
 
   useEffect(() => {
     function onDoc(e: MouseEvent) {
@@ -84,7 +106,7 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, children }) => {
           {toolsOpen && (
             <div id="system-tools-panel" className="system-tools-flyout" role="menu">
               <ul className="system-tools-menu">
-                {SYSTEM_TOOLS_ENTRIES.map((entry) => {
+                {filteredTools.map((entry) => {
                   const Icon = entry.icon;
                   const selected = pathMatches(entry, location.pathname);
                   const to = entry.kind === 'app' ? entry.path : `/tools/${entry.slug}`;
@@ -107,6 +129,16 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, children }) => {
         </div>
 
         <nav className="app-sidebar-purple-footer">
+          <div style={{ padding: '0 1rem 1rem', fontSize: '0.75rem', color: 'rgba(255,255,255,0.6)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            {userProfile ? (
+              <>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#10b981' }} />
+                <span>{userRole}</span>
+              </>
+            ) : (
+              <Loader2 size={12} className="lucide-spin" />
+            )}
+          </div>
           <button type="button" className="app-sidebar-refresh-btn" onClick={() => window.location.reload()}>
             <RefreshCw size={17} aria-hidden /> Refresh
           </button>
@@ -117,10 +149,13 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, children }) => {
       </aside>
 
       <div className="app-main-area">
-        <main className="main-content app-main-body">{children}</main>
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+          <main className="main-content app-main-body">{children}</main>
+        </div>
       </div>
     </div>
   );
 };
 
 export default Navbar;
+

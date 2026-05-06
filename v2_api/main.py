@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Body, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import bindparam, create_engine, text
@@ -106,6 +106,16 @@ _WORKFLOW_ENV_STATUS_SQL = text(
         INNER JOIN workflow_runs wr ON wr.id = ws.run_id
         WHERE LOWER(COALESCE(wr.status, '')) = 'running'
           AND ws.environment_id IS NOT NULL
+          AND COALESCE(ws.is_enabled, TRUE) = TRUE
+          AND LOWER(TRIM(COALESCE(ws.status, ''))) IN (
+              'running',
+              'pre_action_done',
+              'ds_created',
+              'ds_test_ok',
+              'scan_created',
+              'scan_running',
+              'scan_waiting'
+          )
         UNION
         SELECT id AS eid FROM test_environments WHERE COALESCE(is_busy, FALSE) = TRUE
     )
@@ -153,6 +163,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
             return {"id": 1, "username": email, "role": "Admin", "role_id": 1}
         raise HTTPException(status_code=503, detail="Auth DB error")
 
+
+
+
 # Models
 class Token(BaseModel):
     access_token: str
@@ -164,6 +177,10 @@ class UserProfile(BaseModel):
     role: str
     role_id: int
 
+@app.get("/api/me", response_model=UserProfile)
+async def get_me(u=Depends(get_current_user)):
+    return u
+
 class Environment(BaseModel):
     id: int
     env_name: str
@@ -171,6 +188,8 @@ class Environment(BaseModel):
     is_active: bool
     is_busy: bool
     auth_module_path: Optional[str] = None
+    auth_function_name: Optional[str] = None
+    created_by: Optional[int] = None
     auth_function_name: Optional[str] = None
 
 
@@ -323,6 +342,7 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
                 conn.execute(text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, 'PASSWORDLESS', :r)"),
                              {"u": email, "r": v_role_id})
                 conn.commit()
+        return {"access_token": f"fake-jwt-token-for-{email}", "token_type": "bearer"}
     except SQLAlchemyError as e:
         # Fallback fake login for testing UI if Postgres is down
         if email == "bpatel@bigid.com" and form_data.password == "bigid123":
@@ -337,23 +357,29 @@ async def read_users_me(u=Depends(get_current_user)):
     return UserProfile(id=u["id"], username=u["username"], role=u["role"], role_id=u["role_id"])
 
 @app.get("/api/environments", response_model=List[Environment])
-async def get_environments(token: str = Depends(oauth2_scheme)):
+async def get_environments(u=Depends(get_current_user)):
     try:
         with engine.connect() as conn:
+            where_clause = ""
+            params = {}
+            if u["role"] not in ["Admin", "Developer"]:
+                where_clause = " WHERE created_by = :uid "
+                params["uid"] = u["id"]
+            
             res = conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT id, env_name, base_url, is_active, is_busy,
                            NULLIF(TRIM(COALESCE(auth_module_path, '')), ''),
-                           NULLIF(TRIM(COALESCE(auth_function_name, '')), '')
-                    FROM test_environments ORDER BY env_name
+                           NULLIF(TRIM(COALESCE(auth_function_name, '')), ''),
+                           created_by
+                    FROM test_environments {where_clause} ORDER BY env_name
                     """
-                )
+                ),
+                params
             ).fetchall()
             out = []
             for r in res:
-                auth_path = r[5] if len(r) > 5 else None
-                auth_fn = r[6] if len(r) > 6 else None
                 out.append(
                     {
                         "id": r[0],
@@ -361,8 +387,9 @@ async def get_environments(token: str = Depends(oauth2_scheme)):
                         "base_url": str(r[2] or ""),
                         "is_active": bool(r[3]) if r[3] is not None else True,
                         "is_busy": bool(r[4]) if r[4] is not None else False,
-                        "auth_module_path": auth_path,
-                        "auth_function_name": auth_fn or None,
+                        "auth_module_path": r[5],
+                        "auth_function_name": r[6],
+                        "created_by": r[7],
                     }
                 )
             return out
@@ -371,7 +398,7 @@ async def get_environments(token: str = Depends(oauth2_scheme)):
 
 
 @app.post("/api/environments", response_model=Environment)
-async def create_environment(payload: EnvironmentCreate, token: str = Depends(oauth2_scheme)):
+async def create_environment(payload: EnvironmentCreate, u=Depends(get_current_user)):
     auth_fn = (payload.auth_function_name or "").strip() or "Get_auth_token"
     auth_path = (payload.auth_module_path or "").strip() or None
     try:
@@ -379,9 +406,9 @@ async def create_environment(payload: EnvironmentCreate, token: str = Depends(oa
             row = conn.execute(
                 text(
                     """
-                    INSERT INTO test_environments (env_name, base_url, auth_module_path, auth_function_name, is_active)
-                    VALUES (:name, :url, :apath, :afn, :active)
-                    RETURNING id, env_name, base_url, is_active, is_busy
+                    INSERT INTO test_environments (env_name, base_url, auth_module_path, auth_function_name, is_active, created_by)
+                    VALUES (:name, :url, :apath, :afn, :active, :uid)
+                    RETURNING id, env_name, base_url, is_active, is_busy, created_by
                     """
                 ),
                 {
@@ -390,6 +417,7 @@ async def create_environment(payload: EnvironmentCreate, token: str = Depends(oa
                     "apath": auth_path,
                     "afn": auth_fn,
                     "active": payload.is_active,
+                    "uid": u["id"],
                 },
             ).fetchone()
             if not row:
@@ -402,6 +430,7 @@ async def create_environment(payload: EnvironmentCreate, token: str = Depends(oa
                 "is_busy": bool(row[4]) if row[4] is not None else False,
                 "auth_module_path": auth_path,
                 "auth_function_name": auth_fn,
+                "created_by": row[5],
             }
     except IntegrityError as ex:
         raise HTTPException(status_code=409, detail="Environment name already exists or constraint violation.") from ex
@@ -410,8 +439,16 @@ async def create_environment(payload: EnvironmentCreate, token: str = Depends(oa
 
 
 @app.put("/api/environments/{environment_id}", response_model=Environment)
-async def update_environment(environment_id: int, payload: EnvironmentUpdate, token: str = Depends(oauth2_scheme)):
+async def update_environment(environment_id: int, payload: EnvironmentUpdate, u=Depends(get_current_user)):
     eid = int(environment_id)
+    
+    # Ownership check
+    if u["role"] not in ["Admin", "Developer"]:
+        with engine.connect() as conn:
+            owner = conn.execute(text("SELECT created_by FROM test_environments WHERE id = :eid"), {"eid": eid}).scalar()
+            if owner != u["id"]:
+                raise HTTPException(status_code=403, detail="You do not own this environment")
+
     sets: List[str] = []
     params: dict = {"eid": eid}
     if payload.env_name is not None:
@@ -447,7 +484,8 @@ async def update_environment(environment_id: int, payload: EnvironmentUpdate, to
                     """
                     SELECT id, env_name, base_url, is_active, is_busy,
                            NULLIF(TRIM(COALESCE(auth_module_path, '')), ''),
-                           NULLIF(TRIM(COALESCE(auth_function_name, '')), '')
+                           NULLIF(TRIM(COALESCE(auth_function_name, '')), ''),
+                           created_by
                     FROM test_environments WHERE id = :eid
                     """
                 ),
@@ -463,6 +501,7 @@ async def update_environment(environment_id: int, payload: EnvironmentUpdate, to
                 "is_busy": bool(row[4]) if row[4] is not None else False,
                 "auth_module_path": row[5],
                 "auth_function_name": row[6],
+                "created_by": row[7],
             }
     except IntegrityError as ex:
         raise HTTPException(status_code=409, detail="Duplicate name or constraint violation.") from ex
@@ -471,8 +510,16 @@ async def update_environment(environment_id: int, payload: EnvironmentUpdate, to
 
 
 @app.delete("/api/environments/{environment_id}")
-async def delete_environment(environment_id: int, token: str = Depends(oauth2_scheme)):
+async def delete_environment(environment_id: int, u=Depends(get_current_user)):
     eid = int(environment_id)
+    
+    # Ownership check
+    if u["role"] not in ["Admin", "Developer"]:
+        with engine.connect() as conn:
+            owner = conn.execute(text("SELECT created_by FROM test_environments WHERE id = :eid"), {"eid": eid}).scalar()
+            if owner != u["id"]:
+                raise HTTPException(status_code=403, detail="You do not own this environment")
+
     try:
         with engine.begin() as conn:
             r = conn.execute(text("DELETE FROM test_environments WHERE id = :eid RETURNING id"), {"eid": eid})
@@ -1758,10 +1805,10 @@ async def get_workflow_runs(
     try:
         wf = get_workflow_sql_engine()
         with wf.connect() as conn:
-            # RBAC: Filter by user unless Admin
+            # RBAC: Filter by user unless Admin or Developer
             user_filter = ""
             params = {"limit": limit, "offset": offset}
-            if u["role"] != "Admin":
+            if u["role"] not in ["Admin", "Developer"]:
                 user_filter = "WHERE created_by = :uid"
                 params["uid"] = u["id"]
 
@@ -1838,24 +1885,36 @@ async def get_workflow_steps_batch(
 
 
 @app.get("/api/workflow/steps/{run_id}")
-async def get_workflow_steps(run_id: int, token: str = Depends(oauth2_scheme)):
+async def get_workflow_steps(run_id: int, u=Depends(get_current_user)):
     """Steps for a workflow run — joined with env names/busy flags (Streamlit parity)."""
     try:
-        with get_workflow_sql_engine().connect() as conn:
+        wf_engine = get_workflow_sql_engine()
+        
+        # Ownership check
+        if u["role"] not in ["Admin", "Developer"]:
+            with wf_engine.connect() as conn:
+                owner = conn.execute(text("SELECT created_by FROM workflow_runs WHERE id = :rid"), {"rid": run_id}).scalar()
+                if owner != u["id"]:
+                    raise HTTPException(status_code=403, detail="You do not own this workflow")
+
+        with wf_engine.connect() as conn:
             res = conn.execute(
                 text(_WORKFLOW_STEP_SELECT + " WHERE ws.run_id = :r ORDER BY ws.seq"),
                 {"r": run_id},
             ).fetchall()
         return [_workflow_step_row_dict(r) for r in res]
+    except HTTPException:
+        raise
     except SQLAlchemyError:
         return []
 
 
 @app.get("/api/workflow/env-status")
-async def get_workflow_env_status(token: str = Depends(oauth2_scheme)):
+async def get_workflow_env_status(u=Depends(get_current_user)):
     """
     Env 🟢/🔴 strip: active envs marked busy when `test_environments.is_busy`
-    OR a running workflow references the env (mirrors Streamlit union, without per-step pandas derivations).
+    OR a running workflow references the env in an active step-state
+    (running, pre_action_done, ds_created, ds_test_ok, scan_created, scan_running, scan_waiting).
     """
     try:
         with get_workflow_sql_engine().connect() as conn:
@@ -1897,14 +1956,22 @@ async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, u=Depends
 async def workflow_run_control_endpoint(
     run_id: int,
     payload: WorkflowControlPayload,
-    token: str = Depends(oauth2_scheme),
+    u=Depends(get_current_user),
 ):
     """Start / pause / resume / stop — updates DB like Streamlit query actions (no Streamlit required)."""
     try:
         from v2_api.workflow_ops import workflow_control  # noqa: PLC0415
+        wf_engine = get_workflow_sql_engine()
+
+        # Ownership check
+        if u["role"] not in ["Admin", "Developer"]:
+            with wf_engine.connect() as conn:
+                owner = conn.execute(text("SELECT created_by FROM workflow_runs WHERE id = :rid"), {"rid": run_id}).scalar()
+                if owner != u["id"]:
+                    raise HTTPException(status_code=403, detail="You do not own this workflow")
 
         return workflow_control(
-            get_workflow_sql_engine(),
+            wf_engine,
             run_id,
             payload.action,
             payload.env1_id,
@@ -1917,10 +1984,17 @@ async def workflow_run_control_endpoint(
 
 
 @app.delete("/api/workflow/runs/{run_id}")
-async def delete_workflow_run(run_id: int, token: str = Depends(oauth2_scheme)):
+async def delete_workflow_run(run_id: int, u=Depends(get_current_user)):
     """Delete a workflow run and its steps (only when not running)."""
     wf_engine = get_workflow_sql_engine()
     try:
+        # Ownership check
+        if u["role"] not in ["Admin", "Developer"]:
+            with wf_engine.connect() as conn:
+                owner = conn.execute(text("SELECT created_by FROM workflow_runs WHERE id = :rid"), {"rid": run_id}).scalar()
+                if owner != u["id"]:
+                    raise HTTPException(status_code=403, detail="You do not own this workflow")
+
         with wf_engine.connect() as conn:
             row = conn.execute(
                 text("SELECT status FROM workflow_runs WHERE id = :rid"),
@@ -2789,154 +2863,40 @@ async def get_scanner_group_perf(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── RBAC management ───────────────────────────────────────────────────────────
+# Consolidated RBAC section moved to bottom of file.
 
-@app.get("/api/rbac/users")
-async def list_users(token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("""
-                SELECT u.id, u.username, r.role_name, u.role_id, u.created_at
-                FROM app_users u JOIN app_roles r ON u.role_id = r.id
-                ORDER BY u.username
-            """)).fetchall()
-        return [{"id": r[0], "username": r[1], "role_name": r[2], "role_id": r[3],
-                 "created_at": str(r[4]) if r[4] else None} for r in rows]
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class UserCreate(BaseModel):
-    username: str = Field(..., min_length=3)
-    role_id: int
-
-
-class UserRoleUpdate(BaseModel):
-    role_id: int
-
-
-@app.post("/api/rbac/users")
-async def create_user(payload: UserCreate, token: str = Depends(oauth2_scheme)):
-    email = payload.username.strip().lower()
-    if "@bigid.com" not in email:
-        raise HTTPException(status_code=400, detail="Only @bigid.com emails allowed")
-    try:
-        with engine.begin() as conn:
-            r = conn.execute(
-                text("INSERT INTO app_users (username, password_hash, role_id) VALUES (:u, 'PASSWORDLESS', :r) RETURNING id"),
-                {"u": email, "r": payload.role_id},
-            ).fetchone()
-        return {"ok": True, "id": r[0]}
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail="User already exists")
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.put("/api/rbac/users/{user_id}/role")
-async def update_user_role(user_id: int, payload: UserRoleUpdate, token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.begin() as conn:
-            r = conn.execute(
-                text("UPDATE app_users SET role_id = :rid WHERE id = :uid RETURNING id"),
-                {"rid": payload.role_id, "uid": user_id},
-            )
-            if r.rowcount == 0:
-                raise HTTPException(status_code=404, detail="User not found")
-        return {"ok": True}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.delete("/api/rbac/users/{user_id}")
-async def delete_user(user_id: int, token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.begin() as conn:
-            r = conn.execute(text("DELETE FROM app_users WHERE id = :id RETURNING id"), {"id": user_id})
-            if r.rowcount == 0:
-                raise HTTPException(status_code=404, detail="User not found")
-        return {"ok": True}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/rbac/roles")
-async def list_roles(token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(text("SELECT id, role_name FROM app_roles ORDER BY role_name")).fetchall()
-        return [{"id": r[0], "role_name": r[1]} for r in rows]
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class RoleCreate(BaseModel):
-    role_name: str = Field(..., min_length=1)
-
-
-@app.post("/api/rbac/roles")
-async def create_role(payload: RoleCreate, token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.begin() as conn:
-            r = conn.execute(
-                text("INSERT INTO app_roles (role_name) VALUES (:n) RETURNING id"),
-                {"n": payload.role_name.strip()},
-            ).fetchone()
-        return {"ok": True, "id": r[0]}
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail="Role already exists")
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/rbac/roles/{role_id}/permissions")
-async def get_role_permissions(role_id: int, token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text("SELECT page_name FROM app_role_pages WHERE role_id = :rid ORDER BY page_name"),
-                {"rid": role_id},
-            ).fetchall()
-        return {"role_id": role_id, "pages": [r[0] for r in rows]}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-class PermissionsUpdate(BaseModel):
-    pages: List[str]
-
-
-@app.put("/api/rbac/roles/{role_id}/permissions")
-async def update_role_permissions(role_id: int, payload: PermissionsUpdate, token: str = Depends(oauth2_scheme)):
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id})
-            for page in payload.pages:
-                conn.execute(
-                    text("INSERT INTO app_role_pages (role_id, page_name) VALUES (:rid, :p)"),
-                    {"rid": role_id, "p": page},
-                )
-        return {"ok": True, "pages": len(payload.pages)}
-    except SQLAlchemyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Workflow templates (Create Data Source config) ────────────────────────────
 
 @app.get("/api/workflow-templates")
-async def get_workflow_templates(token: str = Depends(oauth2_scheme), key: Optional[str] = Query(None)):
+async def get_workflow_templates(u=Depends(get_current_user), key: Optional[str] = Query(None)):
     try:
         with engine.connect() as conn:
+            user_filter = ""
+            params = {}
+            if u["role"] not in ["Admin", "Developer"]:
+                user_filter = " AND created_by = :uid "
+                params["uid"] = u["id"]
+
             if key:
+                params["k"] = key
                 row = conn.execute(
-                    text("SELECT k, template_kind, payload_json FROM workflow_templates WHERE k = :k"),
-                    {"k": key},
+                    text(f"SELECT k, template_kind, payload_json FROM workflow_templates WHERE k = :k {user_filter}"),
+                    params,
                 ).fetchone()
                 if not row:
                     return {"items": []}
                 return {"items": [{"key": row[0], "kind": row[1], "payload": row[2]}]}
+            
+            # List all
+            base_where = ""
+            if user_filter:
+                base_where = " WHERE 1=1 " + user_filter
+
             rows = conn.execute(
-                text("SELECT k, template_kind, payload_json FROM workflow_templates ORDER BY k")
+                text(f"SELECT k, template_kind, payload_json FROM workflow_templates {base_where} ORDER BY k"),
+                params
             ).fetchall()
         return {"items": [{"key": r[0], "kind": r[1], "payload": r[2]} for r in rows]}
     except SQLAlchemyError as e:
@@ -2950,20 +2910,31 @@ class WorkflowTemplateUpsert(BaseModel):
 
 
 @app.post("/api/workflow-templates")
-async def upsert_workflow_template(payload: WorkflowTemplateUpsert, token: str = Depends(oauth2_scheme)):
+async def upsert_workflow_template(payload: WorkflowTemplateUpsert, u=Depends(get_current_user)):
     try:
         with engine.begin() as conn:
+            # Check ownership on conflict
+            if u["role"] not in ["Admin", "Developer"]:
+                existing = conn.execute(
+                    text("SELECT created_by FROM workflow_templates WHERE k = :k"),
+                    {"k": payload.key}
+                ).fetchone()
+                if existing and existing[0] != u["id"]:
+                    raise HTTPException(status_code=403, detail="Template key owned by another user")
+
             conn.execute(
                 text("""
-                    INSERT INTO workflow_templates (k, template_kind, payload_json)
-                    VALUES (:k, :kind, :p)
+                    INSERT INTO workflow_templates (k, template_kind, payload_json, created_by)
+                    VALUES (:k, :kind, :p, :cb)
                     ON CONFLICT (k) DO UPDATE SET template_kind = EXCLUDED.template_kind,
                                                    payload_json = EXCLUDED.payload_json,
                                                    updated_at = CURRENT_TIMESTAMP
                 """),
-                {"k": payload.key, "kind": payload.kind, "p": payload.payload},
+                {"k": payload.key, "kind": payload.kind, "p": payload.payload, "cb": u["id"]},
             )
         return {"ok": True}
+    except HTTPException:
+        raise
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -3029,8 +3000,8 @@ async def get_environment_build_info(environment_id: int, token: str = Depends(o
 
 @app.get("/api/rbac/users")
 async def list_users(u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     with engine.connect() as conn:
         users = conn.execute(text("""
             SELECT u.id, u.username, r.role_name, u.role_id, u.created_at
@@ -3042,8 +3013,8 @@ async def list_users(u=Depends(get_current_user)):
 
 @app.post("/api/rbac/users")
 async def create_user(data: dict, u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     username = data.get("username", "").strip().lower()
     role_id = data.get("role_id")
     if not username or "@bigid.com" not in username:
@@ -3059,8 +3030,8 @@ async def create_user(data: dict, u=Depends(get_current_user)):
 
 @app.put("/api/rbac/users/{user_id}")
 async def update_user(user_id: int, data: dict, u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     role_id = data.get("role_id")
     if not role_id:
         raise HTTPException(status_code=400, detail="Role required")
@@ -3073,16 +3044,16 @@ async def update_user(user_id: int, data: dict, u=Depends(get_current_user)):
 
 @app.get("/api/rbac/roles")
 async def list_roles(u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     with engine.connect() as conn:
         roles = conn.execute(text("SELECT id, role_name FROM app_roles ORDER BY id ASC")).fetchall()
         return [dict(r._mapping) for r in roles]
 
 @app.post("/api/rbac/roles")
 async def create_role(data: dict, u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     role_name = data.get("role_name", "").strip()
     if not role_name:
         raise HTTPException(status_code=400, detail="Role name required")
@@ -3094,16 +3065,16 @@ async def create_role(data: dict, u=Depends(get_current_user)):
 
 @app.get("/api/rbac/roles/{role_id}/permissions")
 async def get_role_permissions(role_id: int, u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     with engine.connect() as conn:
         perms = conn.execute(text("SELECT page_name FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id}).fetchall()
         return [r[0] for r in perms]
 
 @app.put("/api/rbac/roles/{role_id}/permissions")
-async def update_role_permissions(role_id: int, pages: list[str], u=Depends(get_current_user)):
-    if u["role"] != "Admin":
-        raise HTTPException(status_code=403, detail="Admin access required")
+async def update_role_permissions(role_id: int, pages: list[str] = Body(...), u=Depends(get_current_user)):
+    if u["role"] not in ["Admin", "Developer"]:
+        raise HTTPException(status_code=403, detail="Admin or Developer access required")
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM app_role_pages WHERE role_id = :rid"), {"rid": role_id})
         for p in pages:
