@@ -287,7 +287,14 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       });
       return res.data;
     },
-    refetchInterval: 8000,
+    refetchInterval: (query) => {
+      // Only poll if there are running workflows on current page
+      const data = query.state.data;
+      const hasRunning = data?.runs?.some((r: WorkflowRun) =>
+        String(r.status || '').trim().toLowerCase() === 'running'
+      );
+      return hasRunning ? 10000 : false; // Poll every 10s if running, otherwise stop
+    },
   });
 
   const runs = runsPayload?.runs ?? [];
@@ -297,20 +304,26 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     setExpandedId(null);
   }, [runPage]);
 
-  const runIdsCsv = useMemo(() => runs.map((r) => r.id).join(','), [runs]);
+  // Check if any workflows are running
+  const hasRunningWorkflows = useMemo(() => {
+    return runs.some((r) => String(r.status || '').trim().toLowerCase() === 'running');
+  }, [runs]);
+
+  // Fetch steps for ALL runs on initial load (to show completed workflows)
+  const allRunIdsCsv = useMemo(() => runs.map((r) => r.id).join(','), [runs]);
 
   const { data: stepsByRun = {}, isLoading: stepsLoading } = useQuery({
-    queryKey: ['workflowStepsBatch', token, runIdsCsv],
+    queryKey: ['workflowStepsBatch', token, allRunIdsCsv],
     queryFn: async () => {
-      if (!runIdsCsv) return {};
+      if (!allRunIdsCsv) return {};
       const res = await axios.get(`${API_BASE}/api/workflow/steps/batch`, {
         ...authConfig,
-        params: { run_ids: runIdsCsv },
+        params: { run_ids: allRunIdsCsv },
       });
       return res.data as Record<string, WorkflowStepRow[]>;
     },
-    enabled: runIdsCsv.length > 0,
-    refetchInterval: 5000,
+    enabled: allRunIdsCsv.length > 0,
+    refetchInterval: hasRunningWorkflows ? 8000 : false, // Poll every 8s if any running, otherwise stop
   });
 
   const { data: envChips = [] } = useQuery({
@@ -319,7 +332,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       const res = await axios.get(`${API_BASE}/api/workflow/env-status`, authConfig);
       return res.data as EnvChip[];
     },
-    refetchInterval: 8000,
+    refetchInterval: hasRunningWorkflows ? 12000 : false, // Poll every 12s if any running, otherwise stop
   });
 
   const { data: environments = [] } = useQuery({
