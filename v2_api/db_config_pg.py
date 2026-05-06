@@ -277,7 +277,7 @@ DDL_STATEMENTS = {
             status VARCHAR(32) NULL,
             env1_id INT NULL,
             env2_id INT NULL,
-            cooldown_minutes INT DEFAULT 15,
+            cooldown_minutes INT DEFAULT 10,
             next_eligible_at TIMESTAMP NULL,
             last_error TEXT NULL,
             started_at TIMESTAMP NULL,
@@ -285,7 +285,8 @@ DDL_STATEMENTS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             scan_template_id VARCHAR(128) NULL,
-            created_by INT NULL REFERENCES app_users(id)
+            created_by INT NULL REFERENCES app_users(id),
+            ols_enabled BOOLEAN DEFAULT FALSE
         );
     """,
     'workflow_steps': """

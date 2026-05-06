@@ -3562,6 +3562,19 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     # We do NOT rely on timestamps for uniqueness. We use build prefix + scenario + wf run/seq.
     existing_ds_name = str(step_dict.get("ds_name") or "").strip()
     base_ds_name = existing_ds_name or _standard_ds_base_name(step_dict)
+    
+    # Check if OLS is enabled for this workflow and auto-add OLS to name if not present
+    try:
+        if not bool(step_dict.get("is_ols")):  # Only if step doesn't already have is_ols=True
+            with engine.connect() as conn:
+                ols_row = conn.execute(text("SELECT COALESCE(ols_enabled, FALSE) FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
+            if ols_row and bool(ols_row[0]):
+                # OLS is enabled for workflow, add to name if not present
+                if "OLS" not in base_ds_name.upper():
+                    base_ds_name = f"{base_ds_name} OLS".strip()
+    except Exception:
+        pass
+    
     # Always apply build prefix (if we have it).
     base_with_prefix = _apply_build_prefix(base_ds_name, build_prefix) if build_prefix else base_ds_name
     # Ensure uniqueness per workflow run/step without timestamps.
@@ -3653,6 +3666,19 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             
             # Action completed successfully, mark step as completed
             set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+            
+            # If this was an OLS enable action, mark the workflow as OLS-enabled
+            if "OLS" in action_key.upper():
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            UPDATE workflow_runs 
+                            SET ols_enabled = TRUE 
+                            WHERE id = :rid
+                        """), {"rid": int(run_id)})
+                except Exception:
+                    pass
+            
             _set_env_busy(engine, env_id, run_id, False) # RELEASE
             set_run_next_eligible(engine, run_id, _now_utc())
             return True
