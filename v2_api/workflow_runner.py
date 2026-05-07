@@ -32,6 +32,18 @@ def _workflow_env_occupying_sql_in() -> str:
     return ",".join(f"'{s}'" for s in WORKFLOW_ENV_OCCUPYING_STATUSES)
 
 
+def _sql_bool_true(engine) -> str:
+    """Return SQL for boolean TRUE value based on dialect (TRUE for Postgres, 1 for MySQL)."""
+    dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    return "TRUE" if "postgres" in dialect else "1"
+
+
+def _sql_bool_false(engine) -> str:
+    """Return SQL for boolean FALSE value based on dialect (FALSE for Postgres, 0 for MySQL)."""
+    dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+    return "FALSE" if "postgres" in dialect else "0"
+
+
 import argparse
 import json
 import os
@@ -574,6 +586,13 @@ def ensure_workflow_tables(engine) -> None:
                     conn.execute(text(stmt))
                 except Exception:
                     pass
+            conn.commit()
+            return
+
+        if "postgres" in dialect:
+            # PostgreSQL - tables already created by db_config_pg.py DDL_STATEMENTS
+            # Just ensure they exist (they should already be there from v2_api/main.py startup)
+            # No-op: tables are managed by db_config_pg.py schema
             conn.commit()
             return
 
@@ -2577,6 +2596,7 @@ def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
     If a run was marked failed while enabled steps are still non-terminal, flip back to running.
     Otherwise the runner never loads it (WHERE status='running') and parallelism / DS pipeline stall forever.
     """
+    bool_true = _sql_bool_true(engine)
     try:
         with engine.connect() as conn:
             st_row = conn.execute(
@@ -2588,7 +2608,7 @@ def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
         with engine.connect() as conn:
             act = conn.execute(
                 text(
-                    "SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,1)=1 "
+                    f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,{bool_true})={bool_true} "
                     "AND LOWER(TRIM(COALESCE(status,''))) NOT IN ('completed','error','disabled') LIMIT 1"
                 ),
                 {"rid": int(run_id)},
@@ -2765,17 +2785,18 @@ def run_once(engine, *, quiet: bool = False) -> bool:
         max_scans = env_count if env_count > 0 else 2
 
     # --- PASS 1: RECONCILIATION FOR ALL RUNS ---
+    bool_true = _sql_bool_true(engine)
     for run_row in run_rows:
         run_id = int(run_row[0])
         try:
             with engine.connect() as conn:
                 inflight_rows = conn.execute(
-                    text("""
+                    text(f"""
                         SELECT ws.id, ws.seq, ws.environment_id, ws.scan_id, ws.status, sp.scan_status, ws.updated_at
                         FROM workflow_steps ws
                         LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
                         WHERE ws.run_id=:rid
-                          AND COALESCE(ws.is_enabled,1)=1
+                          AND COALESCE(ws.is_enabled,{bool_true})={bool_true}
                           AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
                           AND (
                             (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
@@ -2915,6 +2936,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
     # Any env with a step in DS/profile/scan phase counts toward concurrency (not only scan_running).
     try:
+        bool_true = _sql_bool_true(engine)
         with engine.connect() as conn:
             occ_rows = conn.execute(
                 text(
@@ -2923,7 +2945,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     FROM workflow_steps ws
                     INNER JOIN workflow_runs wr ON wr.id = ws.run_id
                     WHERE wr.status = 'running'
-                      AND COALESCE(ws.is_enabled, 1) = 1
+                      AND COALESCE(ws.is_enabled, {bool_true}) = {bool_true}
                       AND ws.environment_id IS NOT NULL
                       AND LOWER(TRIM(COALESCE(ws.status, ''))) IN ({_workflow_env_occupying_sql_in()})
                     """
@@ -2975,11 +2997,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
         # Strategy for status filter
         retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        bool_true = _sql_bool_true(engine)
         if not retry_errors:
             # Include scan_created so a step can resume (e.g. trigger scan after profile) if the runner tick ended mid-pipeline.
-            where_status = "AND COALESCE(status, 'pending') NOT IN ('completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
+            where_status = f"AND COALESCE(status, 'pending') NOT IN ('completed', 'error', 'disabled') AND COALESCE(is_enabled, {bool_true}) = {bool_true}"
         else:
-            where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
+            where_status = f"AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, {bool_true}) = {bool_true}"
 
         with engine.connect() as conn:
             candidates = conn.execute(
@@ -3002,10 +3025,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if not any_left:
                         with engine.connect() as conn:
                             # Re-verify one last time before closing
-                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, 1) = 1 LIMIT 1"), {"rid": run_id}).fetchone()
+                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, {bool_true}) = {bool_true} LIMIT 1"), {"rid": run_id}).fetchone()
                             if not any_active:
                                 # Mark as failed if ANY enabled step hit an error, otherwise completed
-                                has_err = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,1)=1 LIMIT 1"), {"rid": run_id}).fetchone()
+                                has_err = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,{bool_true})={bool_true} LIMIT 1"), {"rid": run_id}).fetchone()
                                 final_s = 'failed' if has_err else 'completed'
                                 conn.execute(text("UPDATE workflow_runs SET status=:s, finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id, "s": final_s})
                                 conn.commit()
@@ -3332,24 +3355,25 @@ def _maybe_mark_run_completed(engine, run_id: int) -> None:
     mark the workflow run as 'completed'. Called after auth failure so
     runs don't stay stuck in 'running' forever when all work is done.
     """
+    bool_true = _sql_bool_true(engine)
     try:
         with engine.connect() as conn:
             any_active = conn.execute(
                 text(
-                    "SELECT 1 FROM workflow_steps "
-                    "WHERE run_id=:rid "
-                    "AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') "
-                    "AND COALESCE(is_enabled,1)=1 "
-                    "LIMIT 1"
+                    f"SELECT 1 FROM workflow_steps "
+                    f"WHERE run_id=:rid "
+                    f"AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') "
+                    f"AND COALESCE(is_enabled,{bool_true})={bool_true} "
+                    f"LIMIT 1"
                 ),
                 {"rid": int(run_id)},
             ).fetchone()
             any_error = conn.execute(
                 text(
-                    "SELECT 1 FROM workflow_steps "
-                    "WHERE run_id=:rid "
-                    "AND COALESCE(status,'')='error' "
-                    "AND COALESCE(is_enabled,1)=1 "
+                    f"SELECT 1 FROM workflow_steps "
+                    f"WHERE run_id=:rid "
+                    f"AND COALESCE(status,'')='error' "
+                    f"AND COALESCE(is_enabled,{bool_true})={bool_true} "
                     "LIMIT 1"
                 ),
                 {"rid": int(run_id)},
