@@ -33,6 +33,14 @@ from sqlalchemy import create_engine, text
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from v2_api.db_config_pg import DB_CONNECTION_STRING
+from v2_api.pg_compat import (
+    is_postgresql,
+    sql_auto_increment,
+    sql_datetime,
+    sql_longtext,
+    sql_on_update_current_timestamp,
+    sql_upsert_heartbeat,
+)
 from bigid_auth import Get_auth_token
 from scanner_performance import capture_scanner_performance_for_env, ensure_scanner_performance_tables
 
@@ -232,26 +240,31 @@ def resolve_scan_status_value(scan: Dict[str, Any]) -> str:
 
 
 def ensure_scan_tracking_tables(engine) -> None:
+    dt = sql_datetime(engine)
+    ai = sql_auto_increment(engine)
+    lt = sql_longtext(engine)
+    ou = sql_on_update_current_timestamp(engine)
+    
     with engine.connect() as conn:
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS tracker_heartbeat (
                 name VARCHAR(64) PRIMARY KEY,
-                last_started_at_utc DATETIME NULL,
-                last_finished_at_utc DATETIME NULL,
+                last_started_at_utc {dt} NULL,
+                last_finished_at_utc {dt} NULL,
                 last_status VARCHAR(16) NULL,
                 last_message VARCHAR(2000) NULL
             )
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS tracker_kv (
                 k VARCHAR(200) PRIMARY KEY,
                 v VARCHAR(2000) NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou}
             )
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scan_parents (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 scan_id VARCHAR(128) NOT NULL UNIQUE,
                 environment_id INT NULL,
                 scan_name VARCHAR(1000) NULL,
@@ -262,17 +275,17 @@ def ensure_scan_tracking_tables(engine) -> None:
                 scan_status VARCHAR(120) NULL,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou},
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou}
             )
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scan_insights (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 scan_id VARCHAR(128) NOT NULL UNIQUE,
                 distinct_classification_attributes BIGINT NULL,
-                classifier_attribute_names LONGTEXT NULL,
-                data_source_names LONGTEXT NULL,
+                classifier_attribute_names {lt} NULL,
+                data_source_names {lt} NULL,
                 objects_with_pi BIGINT NULL,
                 objects_scanned BIGINT NULL,
                 objects_enumerated BIGINT NULL,
@@ -280,9 +293,9 @@ def ensure_scan_tracking_tables(engine) -> None:
                 new_attributes_count BIGINT NULL,
                 removed_attributes_count BIGINT NULL,
                 total_size_gb FLOAT NULL,
-                insight_payload LONGTEXT NULL,
-                attributes_payload LONGTEXT NULL,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                insight_payload {lt} NULL,
+                attributes_payload {lt} NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou}
             )
         """))
         # Non-breaking schema upgrades (in case table existed with fewer columns)
@@ -290,8 +303,8 @@ def ensure_scan_tracking_tables(engine) -> None:
             "ALTER TABLE scan_insights ADD COLUMN new_attributes_count BIGINT NULL",
             "ALTER TABLE scan_insights ADD COLUMN removed_attributes_count BIGINT NULL",
             "ALTER TABLE scan_insights ADD COLUMN total_size_gb FLOAT NULL",
-            "ALTER TABLE scan_insights ADD COLUMN insight_payload LONGTEXT NULL",
-            "ALTER TABLE scan_insights ADD COLUMN attributes_payload LONGTEXT NULL",
+            f"ALTER TABLE scan_insights ADD COLUMN insight_payload {lt} NULL",
+            f"ALTER TABLE scan_insights ADD COLUMN attributes_payload {lt} NULL",
         ]:
             try:
                 conn.execute(text(stmt))
@@ -300,13 +313,13 @@ def ensure_scan_tracking_tables(engine) -> None:
                 pass
 
         # Tables used by Add New Benchmark "Findings Files" prefill
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scan_classifier_attributes (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 name VARCHAR(500) NOT NULL UNIQUE
             )
         """))
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scan_insight_attribute_delta_map (
                 scan_id VARCHAR(128) NOT NULL,
                 attribute_id INT NOT NULL,
@@ -337,9 +350,9 @@ def ensure_scan_tracking_tables(engine) -> None:
         # Tracker does NOT create rows here (dashboard does today), but we may update
         # completed scans with computed throughputs (best-effort).
         try:
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS auto_scan_benchmarks (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id {ai} PRIMARY KEY,
                     scan_id VARCHAR(128) NOT NULL UNIQUE,
                     environment_id INT NULL,
                     build_version VARCHAR(100) NULL,
@@ -349,8 +362,8 @@ def ensure_scan_tracking_tables(engine) -> None:
                     data_source_type VARCHAR(100) NULL,
                     data_type VARCHAR(50) NULL,
                     file_set_type VARCHAR(150) NULL,
-                    scan_start_time DATETIME NULL,
-                    scan_end_time DATETIME NULL,
+                    scan_start_time {dt} NULL,
+                    scan_end_time {dt} NULL,
                     total_scan_hours FLOAT NULL,
                     total_size_gb FLOAT NULL,
                     total_files BIGINT NULL,
@@ -361,12 +374,12 @@ def ensure_scan_tracking_tables(engine) -> None:
                     total_classification BIGINT NULL,
                     new_attributes BIGINT NULL,
                     removed_attributes BIGINT NULL,
-                    classifier_attribute_names LONGTEXT NULL,
+                    classifier_attribute_names {lt} NULL,
                     scan_name VARCHAR(1000) NULL,
                     throughput_cluster_gb_hr FLOAT NULL,
                     throughput_cluster_files_hr FLOAT NULL,
                     is_active BOOLEAN DEFAULT TRUE,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou}
                 )
             """))
             conn.commit()
@@ -505,15 +518,7 @@ def _hb_update(engine, status: str, message: str = "", started: Optional[datetim
     try:
         with engine.connect() as conn:
             conn.execute(
-                text("""
-                    INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
-                    VALUES (:n, :s, :f, :st, :m)
-                    ON DUPLICATE KEY UPDATE
-                        last_started_at_utc = COALESCE(VALUES(last_started_at_utc), last_started_at_utc),
-                        last_finished_at_utc = COALESCE(VALUES(last_finished_at_utc), last_finished_at_utc),
-                        last_status = VALUES(last_status),
-                        last_message = VALUES(last_message)
-                """),
+                text(sql_upsert_heartbeat(engine)),
                 {
                     "n": TRACKER_NAME[:64],
                     "s": started,
@@ -555,15 +560,18 @@ def _kv_set(engine, key: str, value: str) -> None:
 
 
 def ensure_scan_progress_table(engine) -> None:
+    dt = sql_datetime(engine)
+    ai = sql_auto_increment(engine)
+    
     with engine.connect() as conn:
-        conn.execute(text("""
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scan_progress (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 scan_id VARCHAR(128) NOT NULL,
                 scan_name VARCHAR(1000) NULL,
                 environment_id INT NULL,
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                captured_at_utc DATETIME NULL,
+                captured_at_utc {dt} NULL,
                 scan_state VARCHAR(64) NULL,
                 completed_sub_scans BIGINT DEFAULT 0,
                 failed_sub_scans BIGINT DEFAULT 0,
@@ -576,18 +584,26 @@ def ensure_scan_progress_table(engine) -> None:
                 false_removed_classifications BIGINT DEFAULT 0,
                 objects_scanned BIGINT DEFAULT 0,
                 objects_failed BIGINT DEFAULT 0,
-                objects_with_pi BIGINT DEFAULT 0,
-                INDEX idx_scan_id (scan_id),
-                INDEX idx_timestamp (timestamp),
-                INDEX idx_captured_at_utc (captured_at_utc),
-                INDEX idx_state (scan_state)
+                objects_with_pi BIGINT DEFAULT 0
             )
         """))
-        conn.execute(text("""
+        # Create indexes separately for Postgres compatibility
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_scan_id ON scan_progress(scan_id)",
+            "CREATE INDEX IF NOT EXISTS idx_timestamp ON scan_progress(timestamp)",
+            "CREATE INDEX IF NOT EXISTS idx_captured_at_utc ON scan_progress(captured_at_utc)",
+            "CREATE INDEX IF NOT EXISTS idx_state ON scan_progress(scan_state)",
+        ]:
+            try:
+                conn.execute(text(idx_sql))
+            except Exception:
+                pass
+                
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scanner_group_performance (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 environment_id INT NOT NULL,
-                captured_at_utc DATETIME NOT NULL,
+                captured_at_utc {dt} NOT NULL,
                 group_name VARCHAR(255) NULL,
                 running_scanners INT DEFAULT 0,
                 running_threads INT DEFAULT 0,
@@ -596,15 +612,19 @@ def ensure_scan_progress_table(engine) -> None:
                 physical_memory_mb BIGINT DEFAULT 0,
                 free_memory_mb BIGINT DEFAULT 0,
                 avg_scan_speed FLOAT DEFAULT 0,
-                update_date_bigid DATETIME NULL,
-                INDEX idx_env_time_group (environment_id, captured_at_utc)
+                update_date_bigid {dt} NULL
             )
         """))
-        conn.execute(text("""
+        try:
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_env_time_group ON scanner_group_performance(environment_id, captured_at_utc)"))
+        except Exception:
+            pass
+            
+        conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS scanner_individual_performance (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id {ai} PRIMARY KEY,
                 environment_id INT NOT NULL,
-                captured_at_utc DATETIME NOT NULL,
+                captured_at_utc {dt} NOT NULL,
                 scanner_id VARCHAR(255) NULL,
                 name VARCHAR(255) NULL,
                 status VARCHAR(64) NULL,
