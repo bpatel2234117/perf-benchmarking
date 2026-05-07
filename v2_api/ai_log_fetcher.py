@@ -10,6 +10,13 @@ from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
 
+from v2_api.pg_compat import (
+    sql_auto_increment,
+    sql_datetime,
+    sql_longtext,
+    sql_on_update_current_timestamp,
+)
+
 # Force unbuffered output for cleaner logs
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -96,13 +103,15 @@ def _ordered_unique_log_sources(values):
 
 
 def ensure_app_settings_table(engine):
+    lt = sql_longtext(engine)
+    ou = sql_on_update_current_timestamp(engine)
     try:
         with engine.connect() as conn:
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS app_settings (
                     setting_key VARCHAR(100) PRIMARY KEY,
-                    setting_value LONGTEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                    setting_value {lt},
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP {ou}
                 )
             """))
             conn.commit()
@@ -149,6 +158,10 @@ def check_ollama_ready():
 def setup_db_engine():
     engine = create_engine(get_db_connection_string(), echo=False)
     ensure_app_settings_table(engine)
+    
+    dt = sql_datetime(engine)
+    ai = sql_auto_increment(engine)
+    
     try:
         with engine.connect() as conn:
             # Automatic Migration for error_hash
@@ -161,20 +174,20 @@ def setup_db_engine():
                 pass
             
             # Tracker and Log Fetcher heartbeat table
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS tracker_heartbeat (
                     name VARCHAR(50) PRIMARY KEY,
-                    last_started_at_utc DATETIME,
-                    last_finished_at_utc DATETIME,
+                    last_started_at_utc {dt},
+                    last_finished_at_utc {dt},
                     last_status VARCHAR(20),
                     last_message TEXT
                 )
             """))
             conn.commit()
             
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS scan_log_errors (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id {ai} PRIMARY KEY,
                     environment_id INT NOT NULL,
                     log_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     error_context TEXT,
@@ -207,11 +220,12 @@ def setup_db_engine():
     except Exception:
         pass
         
+    ai = sql_auto_increment(engine)
     try:
         with engine.connect() as conn:
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS scan_log_correlations (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id {ai} PRIMARY KEY,
                     environment_id INT NOT NULL,
                     scan_id VARCHAR(50),
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -224,11 +238,12 @@ def setup_db_engine():
     except Exception:
         pass
     
+    ai = sql_auto_increment(engine)
     try:
         with engine.connect() as conn:
-            conn.execute(text("""
+            conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS scan_system_health (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    id {ai} PRIMARY KEY,
                     environment_id INT NOT NULL,
                     captured_at_utc TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     health_summary TEXT,

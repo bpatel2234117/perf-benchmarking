@@ -254,6 +254,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const [createEnv1, setCreateEnv1] = useState<string>('');
   const [createEnv2, setCreateEnv2] = useState<string>('');
   const [stepEnabled, setStepEnabled] = useState<boolean[]>([]);
+  const [stepsExpanded, setStepsExpanded] = useState(false);
 
   const {
     data: stepCatalogResp,
@@ -272,7 +273,8 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     if (!steps?.length) return;
     setStepEnabled((prev) => {
       if (prev.length === steps.length) return prev;
-      return steps.map((s) => s.is_enabled !== false);
+      // Default: all steps disabled (none selected)
+      return steps.map(() => false);
     });
   }, [stepCatalogResp]);
 
@@ -309,20 +311,26 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     return runs.some((r) => String(r.status || '').trim().toLowerCase() === 'running');
   }, [runs]);
 
-  // Fetch steps for ALL runs on initial load (to show completed workflows)
-  const allRunIdsCsv = useMemo(() => runs.map((r) => r.id).join(','), [runs]);
+  // Fetch steps ONLY for running workflows (to reduce API load)
+  // For completed workflows, steps are fetched on-demand when expanded
+  const runningRunIdsCsv = useMemo(() => {
+    return runs
+      .filter((r) => String(r.status || '').trim().toLowerCase() === 'running')
+      .map((r) => r.id)
+      .join(',');
+  }, [runs]);
 
   const { data: stepsByRun = {}, isLoading: stepsLoading } = useQuery({
-    queryKey: ['workflowStepsBatch', token, allRunIdsCsv],
+    queryKey: ['workflowStepsBatch', token, runningRunIdsCsv],
     queryFn: async () => {
-      if (!allRunIdsCsv) return {};
+      if (!runningRunIdsCsv) return {};
       const res = await axios.get(`${API_BASE}/api/workflow/steps/batch`, {
         ...authConfig,
-        params: { run_ids: allRunIdsCsv },
+        params: { run_ids: runningRunIdsCsv },
       });
       return res.data as Record<string, WorkflowStepRow[]>;
     },
-    enabled: allRunIdsCsv.length > 0,
+    enabled: runningRunIdsCsv.length > 0,
     refetchInterval: hasRunningWorkflows ? 8000 : false, // Poll every 8s if any running, otherwise stop
   });
 
@@ -458,6 +466,29 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     setExpandedId((cur) => (cur === id ? null : id));
   };
 
+  // Fetch steps for expanded workflow if not already loaded (on-demand for completed workflows)
+  const { data: expandedSteps } = useQuery({
+    queryKey: ['workflowSteps', token, expandedId],
+    queryFn: async () => {
+      if (!expandedId) return [];
+      const res = await axios.get(`${API_BASE}/api/workflow/steps`, {
+        ...authConfig,
+        params: { run_id: expandedId },
+      });
+      return res.data as WorkflowStepRow[];
+    },
+    enabled: expandedId !== null && !stepsByRun[expandedId],
+  });
+
+  // Merge batch-loaded steps with on-demand expanded steps
+  const allStepsByRun = useMemo(() => {
+    const merged = { ...stepsByRun };
+    if (expandedId && expandedSteps && !merged[expandedId]) {
+      merged[expandedId] = expandedSteps;
+    }
+    return merged;
+  }, [stepsByRun, expandedId, expandedSteps]);
+
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
       <section>
@@ -557,9 +588,25 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           {stepCatalogResp?.steps?.length ? (
             <div style={{ marginTop: '0.85rem' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '0.45rem' }}>
-                <span style={{ fontWeight: 600, fontSize: '0.88rem', color: 'var(--text-primary)' }}>
+                <button
+                  type="button"
+                  style={{
+                    fontWeight: 600,
+                    fontSize: '0.88rem',
+                    color: 'var(--text-primary)',
+                    background: 'transparent',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                  }}
+                  onClick={() => setStepsExpanded(!stepsExpanded)}
+                >
+                  <span style={{ fontSize: '1rem' }}>{stepsExpanded ? '▼' : '▶'}</span>
                   Steps to include ({enabledStepCount}/{stepCatalogResp.steps.length})
-                </span>
+                </button>
                 <button
                   type="button"
                   style={{
@@ -595,167 +642,171 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                   Disable all
                 </button>
               </div>
-              <div
-                style={{
-                  marginTop: '0.55rem',
-                  marginBottom: '0.45rem',
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  alignItems: 'center',
-                  gap: '6px 8px',
-                  rowGap: '8px',
-                }}
-              >
-                <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', width: '100%', flexBasis: '100%' }}>
-                  Toggle groups (all checked in family → clears; otherwise selects all matching steps):
-                </span>
-                {PRESET_GROUPS.map(({ preset, label, hint }) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    style={PRESET_BTN_STYLE}
-                    title={hint}
-                    onClick={() => togglePresetGroup(preset)}
+              {stepsExpanded && (
+                <>
+                  <div
+                    style={{
+                      marginTop: '0.55rem',
+                      marginBottom: '0.45rem',
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      gap: '6px 8px',
+                      rowGap: '8px',
+                    }}
                   >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <div
-                style={{
-                  maxHeight: 300,
-                  overflowY: 'auto',
-                  border: '1px solid var(--surface-border)',
-                  borderRadius: 8,
-                  padding: '10px 10px',
-                  fontSize: '0.82rem',
-                  background: 'rgba(0,0,0,0.02)',
-                }}
-              >
-                {(() => {
-                  const catalog = stepCatalogResp.steps!;
-                  const actionBlock = findConsecutiveActionBlock(catalog);
-                  const gridStyle: React.CSSProperties = {
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
-                    gap: '10px 14px',
-                  };
+                    <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', width: '100%', flexBasis: '100%' }}>
+                      Toggle groups (all checked in family → clears; otherwise selects all matching steps):
+                    </span>
+                    {PRESET_GROUPS.map(({ preset, label, hint }) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        style={PRESET_BTN_STYLE}
+                        title={hint}
+                        onClick={() => togglePresetGroup(preset)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      maxHeight: 300,
+                      overflowY: 'auto',
+                      border: '1px solid var(--surface-border)',
+                      borderRadius: 8,
+                      padding: '10px 10px',
+                      fontSize: '0.82rem',
+                      background: 'rgba(0,0,0,0.02)',
+                    }}
+                  >
+                    {(() => {
+                      const catalog = stepCatalogResp.steps!;
+                      const actionBlock = findConsecutiveActionBlock(catalog);
+                      const gridStyle: React.CSSProperties = {
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                        gap: '10px 14px',
+                      };
 
-                  const renderStep = (row: StepCatalogRow, idx: number) => {
-                    const prev = idx > 0 ? catalog[idx - 1] : null;
-                    const isActionStep =
-                      String(row.ds_kind || '')
-                        .trim()
-                        .toLowerCase() === 'action';
-                    const olsBlockStarts = !!row.is_ols && (!prev || !prev.is_ols);
+                      const renderStep = (row: StepCatalogRow, idx: number) => {
+                        const prev = idx > 0 ? catalog[idx - 1] : null;
+                        const isActionStep =
+                          String(row.ds_kind || '')
+                            .trim()
+                            .toLowerCase() === 'action';
+                        const olsBlockStarts = !!row.is_ols && (!prev || !prev.is_ols);
 
-                    return (
-                      <React.Fragment key={row.seq}>
-                        {olsBlockStarts ? (
+                        return (
+                          <React.Fragment key={row.seq}>
+                            {olsBlockStarts ? (
+                              <div
+                                style={{
+                                  gridColumn: '1 / -1',
+                                  borderTop: '1px solid var(--surface-border)',
+                                  opacity: 0.65,
+                                  marginTop: idx > 0 ? 4 : 0,
+                                  marginBottom: 2,
+                                  height: 0,
+                                }}
+                                aria-hidden
+                              />
+                            ) : null}
+                            <label
+                              style={{
+                                display: 'flex',
+                                alignItems: 'flex-start',
+                                gap: '8px',
+                                padding: '8px 10px',
+                                cursor: 'pointer',
+                                borderRadius: 8,
+                                opacity: stepEnabled[idx] === false ? 0.55 : 1,
+                                background: isActionStep ? 'rgba(251, 191, 36, 0.22)' : 'transparent',
+                                border: isActionStep
+                                  ? '1px solid rgba(217, 119, 6, 0.45)'
+                                  : '1px solid transparent',
+                                boxShadow: isActionStep ? 'inset 0 0 0 1px rgba(255,255,255,0.12)' : undefined,
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={stepEnabled[idx] !== false}
+                                disabled={stepEnabled.length !== catalog.length}
+                                onChange={(e) => {
+                                  const on = e.target.checked;
+                                  setStepEnabled((prevEnabled) => {
+                                    const next = [...prevEnabled];
+                                    next[idx] = on;
+                                    return next;
+                                  });
+                                }}
+                                style={{ marginTop: 3 }}
+                              />
+                              <span style={{ lineHeight: 1.45 }}>
+                                <strong style={{ color: 'var(--text-primary)' }}>
+                                  {row.seq}. {row.ds_kind}
+                                </strong>
+                                {row.ds_name ? (
+                                  <span style={{ color: 'var(--text-secondary)' }}>{' — '}{row.ds_name}</span>
+                                ) : null}
+                                {row.notes ? (
+                                  <span style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.78rem' }}>
+                                    {row.notes}
+                                  </span>
+                                ) : null}
+                              </span>
+                            </label>
+                          </React.Fragment>
+                        );
+                      };
+
+                      if (!actionBlock) {
+                        return <div style={gridStyle}>{catalog.map((row, idx) => renderStep(row, idx))}</div>;
+                      }
+
+                      const before = catalog.slice(0, actionBlock.start);
+                      const middle = catalog.slice(actionBlock.start, actionBlock.end + 1);
+                      const after = catalog.slice(actionBlock.end + 1);
+
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                          {before.length > 0 ? (
+                            <div style={gridStyle}>{before.map((row, j) => renderStep(row, j))}</div>
+                          ) : null}
                           <div
                             style={{
-                              gridColumn: '1 / -1',
-                              borderTop: '1px solid var(--surface-border)',
-                              opacity: 0.65,
-                              marginTop: idx > 0 ? 4 : 0,
-                              marginBottom: 2,
-                              height: 0,
+                              display: 'flex',
+                              justifyContent: 'center',
+                              alignItems: 'stretch',
+                              width: '100%',
+                              padding: '4px 0 8px',
                             }}
-                            aria-hidden
-                          />
-                        ) : null}
-                        <label
-                          style={{
-                            display: 'flex',
-                            alignItems: 'flex-start',
-                            gap: '8px',
-                            padding: '8px 10px',
-                            cursor: 'pointer',
-                            borderRadius: 8,
-                            opacity: stepEnabled[idx] === false ? 0.55 : 1,
-                            background: isActionStep ? 'rgba(251, 191, 36, 0.22)' : 'transparent',
-                            border: isActionStep
-                              ? '1px solid rgba(217, 119, 6, 0.45)'
-                              : '1px solid transparent',
-                            boxShadow: isActionStep ? 'inset 0 0 0 1px rgba(255,255,255,0.12)' : undefined,
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={stepEnabled[idx] !== false}
-                            disabled={stepEnabled.length !== catalog.length}
-                            onChange={(e) => {
-                              const on = e.target.checked;
-                              setStepEnabled((prevEnabled) => {
-                                const next = [...prevEnabled];
-                                next[idx] = on;
-                                return next;
-                              });
-                            }}
-                            style={{ marginTop: 3 }}
-                          />
-                          <span style={{ lineHeight: 1.45 }}>
-                            <strong style={{ color: 'var(--text-primary)' }}>
-                              {row.seq}. {row.ds_kind}
-                            </strong>
-                            {row.ds_name ? (
-                              <span style={{ color: 'var(--text-secondary)' }}>{' — '}{row.ds_name}</span>
-                            ) : null}
-                            {row.notes ? (
-                              <span style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.78rem' }}>
-                                {row.notes}
-                              </span>
-                            ) : null}
-                          </span>
-                        </label>
-                      </React.Fragment>
-                    );
-                  };
-
-                  if (!actionBlock) {
-                    return <div style={gridStyle}>{catalog.map((row, idx) => renderStep(row, idx))}</div>;
-                  }
-
-                  const before = catalog.slice(0, actionBlock.start);
-                  const middle = catalog.slice(actionBlock.start, actionBlock.end + 1);
-                  const after = catalog.slice(actionBlock.end + 1);
-
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                      {before.length > 0 ? (
-                        <div style={gridStyle}>{before.map((row, j) => renderStep(row, j))}</div>
-                      ) : null}
-                      <div
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'center',
-                          alignItems: 'stretch',
-                          width: '100%',
-                          padding: '4px 0 8px',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: '100%',
-                            maxWidth: 'min(440px, 96%)',
-                            boxSizing: 'border-box',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: 10,
-                          }}
-                        >
-                          {middle.map((row, k) => renderStep(row, actionBlock.start + k))}
+                          >
+                            <div
+                              style={{
+                                width: '100%',
+                                maxWidth: 'min(440px, 96%)',
+                                boxSizing: 'border-box',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: 10,
+                              }}
+                            >
+                              {middle.map((row, k) => renderStep(row, actionBlock.start + k))}
+                            </div>
+                          </div>
+                          {after.length > 0 ? (
+                            <div style={gridStyle}>
+                              {after.map((row, j) => renderStep(row, actionBlock.end + 1 + j))}
+                            </div>
+                          ) : null}
                         </div>
-                      </div>
-                      {after.length > 0 ? (
-                        <div style={gridStyle}>
-                          {after.map((row, j) => renderStep(row, actionBlock.end + 1 + j))}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })()}
-              </div>
+                      );
+                    })()}
+                  </div>
+                </>
+              )}
               {createBlockedBySteps && (
                 <p style={{ fontSize: '0.76rem', color: 'var(--danger-color)', marginTop: '0.45rem', marginBottom: 0 }}>
                   Select at least one step.
@@ -812,7 +863,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                   <tbody>
                     {runs.map((run) => {
                       const isOpen = expandedId === run.id;
-                      const rawSteps = stepsByRun[String(run.id)] ?? stepsByRun[run.id] ?? [];
+                      const rawSteps = allStepsByRun[String(run.id)] ?? allStepsByRun[run.id] ?? [];
                       const runStatus = run.status;
                       const metrics = computeStepMetrics(rawSteps as unknown as Record<string, unknown>[], rawSteps.length);
                       return (

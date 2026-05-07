@@ -27,7 +27,7 @@ def insert_workflow_run_with_steps(
     try:
         cd = max(1, min(180, int(cooldown_minutes)))
     except Exception:
-        cd = 15
+        cd = 10
 
     if steps_override is not None:
         if len(steps_override) < 1:
@@ -151,8 +151,8 @@ def workflow_control(
 
     with engine.begin() as conn:
         if act == "start":
-            if env1_id is not None and env2_id is not None:
-                apply_run_env_mapping(conn, rid, int(env1_id), int(env2_id))
+            if env1_id is not None or env2_id is not None:
+                apply_run_env_mapping(conn, rid, env1_id, env2_id)
             conn.execute(
                 text(
                     """
@@ -170,8 +170,8 @@ def workflow_control(
             return {"ok": True, "action": act}
 
         if act == "resume":
-            if env1_id is not None and env2_id is not None:
-                apply_run_env_mapping(conn, rid, int(env1_id), int(env2_id))
+            if env1_id is not None or env2_id is not None:
+                apply_run_env_mapping(conn, rid, env1_id, env2_id)
             conn.execute(
                 text(
                     """
