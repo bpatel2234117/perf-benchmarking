@@ -44,6 +44,21 @@ def _sql_bool_false(engine) -> str:
     return "FALSE" if "postgres" in dialect else "0"
 
 
+def is_postgresql_engine(engine) -> bool:
+    """Check if engine is PostgreSQL."""
+    try:
+        return engine.dialect.name == "postgresql"
+    except Exception:
+        return False
+
+
+def _sql_truthy(engine, column_sql: str) -> str:
+    """Return SQL for truthy check based on dialect."""
+    if is_postgresql_engine(engine):
+        return f"COALESCE({column_sql}, TRUE) = TRUE"
+    return f"COALESCE({column_sql}, 1) = 1"
+
+
 import argparse
 import json
 import os
@@ -1487,17 +1502,29 @@ def ensure_runner_heartbeat_table(engine) -> None:
     Ensure tracker_heartbeat exists so the runner can report liveness + last action.
     (Table is also used by tracker.py; we create it here for standalone runner usage.)
     """
+    dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
     try:
         with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS tracker_heartbeat (
-                    name VARCHAR(64) PRIMARY KEY,
-                    last_started_at_utc DATETIME NULL,
-                    last_finished_at_utc DATETIME NULL,
-                    last_status VARCHAR(16) NULL,
-                    last_message VARCHAR(2000) NULL
-                )
-            """))
+            if "postgres" in dialect:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                        name VARCHAR(64) PRIMARY KEY,
+                        last_started_at_utc TIMESTAMP NULL,
+                        last_finished_at_utc TIMESTAMP NULL,
+                        last_status VARCHAR(16) NULL,
+                        last_message VARCHAR(2000) NULL
+                    )
+                """))
+            else:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                        name VARCHAR(64) PRIMARY KEY,
+                        last_started_at_utc DATETIME NULL,
+                        last_finished_at_utc DATETIME NULL,
+                        last_status VARCHAR(16) NULL,
+                        last_message VARCHAR(2000) NULL
+                    )
+                """))
             conn.commit()
     except Exception:
         pass
@@ -1532,6 +1559,19 @@ def set_runner_heartbeat(engine, *, status: str, message: str = "", started: boo
                             last_finished_at_utc=COALESCE(excluded.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
                             last_status=COALESCE(excluded.last_status, tracker_heartbeat.last_status),
                             last_message=COALESCE(excluded.last_message, tracker_heartbeat.last_message)
+                    """),
+                    {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
+                )
+            elif "postgres" in dialect:
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :sa, :fa, :s, :m)
+                        ON CONFLICT(name) DO UPDATE SET
+                            last_started_at_utc=COALESCE(EXCLUDED.last_started_at_utc, tracker_heartbeat.last_started_at_utc),
+                            last_finished_at_utc=COALESCE(EXCLUDED.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
+                            last_status=COALESCE(EXCLUDED.last_status, tracker_heartbeat.last_status),
+                            last_message=COALESCE(EXCLUDED.last_message, tracker_heartbeat.last_message)
                     """),
                     {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
                 )
