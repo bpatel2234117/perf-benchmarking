@@ -1,0 +1,38 @@
+Not fully “step running” yet, but the main blockers are identified and the bad side effects are cleaned up.
+
+I found two issues:
+
+
+React env red/green mismatch:
+
+The React env strip was marking an env busy just because a running workflow had a pending step assigned to that env. The row dot used stricter step-state logic. I tightened v2_api/main.py so env status only counts real active workflow phases like running, ds_created, scan_waiting, etc., plus DB is_busy.
+
+
+
+Runner not progressing:
+
+Run 64 is in Postgres, but root runner was defaulting to MySQL unless TRACKER_USE_POSTGRES=1 is set. I fixed root workflow_runner.py for Postgres boolean SQL and DDL/upsert compatibility, and updated scripts/start_stack.py so heartbeat checks use the same DB resolver.
+
+
+
+Current DB state for run 64 after cleanup:
+
+run = running, last_error = NULL, step 1 is scan_waiting on env 3 with transient message No free env this tick; will retry next tick., and stale workflow_runner_lock is cleared.
+
+Important: my local auth test to e2e-cor-rel fails because this machine cannot resolve the ELB hostname, so I did not force it further. Start the Postgres runner from an environment that can resolve/reach BigID:
+
+bash
+
+
+
+TRACKER_USE_POSTGRES=1 python3 scripts/start_stack.py --no-ui --force
+
+
+
+Validation passed:
+
+bash
+
+
+
+python3 -m py_compile workflow_runner.py tracker.py scripts/start_stack.py v2_api/main.py

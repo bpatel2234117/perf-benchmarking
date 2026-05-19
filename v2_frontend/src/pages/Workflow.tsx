@@ -1,4 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
+import PaginationBar from '../components/Pagination';
 import { Loader2, GitBranch, ChevronDown, ChevronRight } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
@@ -74,6 +76,8 @@ interface EnvironmentRow {
   is_active: boolean;
   is_busy: boolean;
   is_default?: boolean;
+  auth_module_path?: string | null;
+  auth_function_name?: string | null;
 }
 
 interface StepCatalogRow {
@@ -184,6 +188,18 @@ function utcLabel(): string {
   return `Workflow ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
+/** Returns a human-readable cooldown label like "⏸ 2m 14s" or "⏸ Starting…". */
+function cooldownLabel(nextEligibleAt: string | null | undefined): string {
+  if (!nextEligibleAt) return '⏸ Cooldown';
+  const diff = new Date(nextEligibleAt).getTime() - Date.now();
+  if (diff <= 0) return '⏸ Starting…';
+  const mins = Math.floor(diff / 60000);
+  const secs = Math.floor((diff % 60000) / 1000);
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  const utcTime = new Date(nextEligibleAt).toISOString().slice(11, 16);
+  return `⏸ Cooldown ${timeStr} (→${utcTime}Z)`;
+}
+
 function statusBadge(status: string | null | undefined): React.ReactElement {
   const s = String(status ?? '').trim().toLowerCase();
   const styles: Record<string, { bg: string; fg: string }> = {
@@ -238,15 +254,19 @@ function canAction(status: string | null | undefined, action: string): boolean {
   }
 }
 
+const WF_PAGE_SIZE = 25;
+
 const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const authConfig = { headers: { Authorization: `Bearer ${token}` } };
   const queryClient = useQueryClient();
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const [runPage, setRunPage] = useState(0);
   const [createName, setCreateName] = useState('');
-  const [createCooldown, setCreateCooldown] = useState(15);
+  const [createCooldown, setCreateCooldown] = useState(10);
   const [createEnv1, setCreateEnv1] = useState<string>('');
   const [createEnv2, setCreateEnv2] = useState<string>('');
   const [stepEnabled, setStepEnabled] = useState<boolean[]>([]);
+  const [stepsExpanded, setStepsExpanded] = useState(false);
 
   const {
     data: stepCatalogResp,
@@ -265,35 +285,65 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     if (!steps?.length) return;
     setStepEnabled((prev) => {
       if (prev.length === steps.length) return prev;
-      return steps.map((s) => s.is_enabled !== false);
+      // Default: all steps disabled (none selected)
+      return steps.map(() => false);
     });
   }, [stepCatalogResp]);
 
   const enabledStepCount = useMemo(() => stepEnabled.filter(Boolean).length, [stepEnabled]);
 
-  const { data: runs = [], isLoading: runsLoading, error: runsError } = useQuery({
-    queryKey: ['workflowRuns', token],
+  const { data: runsPayload, isLoading: runsLoading, error: runsError } = useQuery({
+    queryKey: ['workflowRuns', token, runPage],
     queryFn: async () => {
-      const res = await axios.get(`${API_BASE}/api/workflow/runs`, { ...authConfig, params: { limit: 10000 } });
-      return res.data as WorkflowRun[];
+      const res = await axios.get<{ runs: WorkflowRun[]; total: number }>(`${API_BASE}/api/workflow/runs`, {
+        ...authConfig,
+        params: { limit: WF_PAGE_SIZE, offset: runPage * WF_PAGE_SIZE },
+      });
+      return res.data;
     },
-    refetchInterval: 8000,
+    refetchInterval: (query) => {
+      // Only poll if there are running workflows on current page
+      const data = query.state.data;
+      const hasRunning = data?.runs?.some((r: WorkflowRun) =>
+        String(r.status || '').trim().toLowerCase() === 'running'
+      );
+      return hasRunning ? 10000 : false; // Poll every 10s if running, otherwise stop
+    },
   });
 
-  const runIdsCsv = useMemo(() => runs.map((r) => r.id).join(','), [runs]);
+  const runs = runsPayload?.runs ?? [];
+  const runsTotal = runsPayload?.total ?? 0;
+
+  useEffect(() => {
+    setExpandedId(null);
+  }, [runPage]);
+
+  // Check if any workflows are running
+  const hasRunningWorkflows = useMemo(() => {
+    return runs.some((r) => String(r.status || '').trim().toLowerCase() === 'running');
+  }, [runs]);
+
+  // Fetch steps ONLY for running workflows (to reduce API load)
+  // For completed workflows, steps are fetched on-demand when expanded
+  const runningRunIdsCsv = useMemo(() => {
+    return runs
+      .filter((r) => String(r.status || '').trim().toLowerCase() === 'running')
+      .map((r) => r.id)
+      .join(',');
+  }, [runs]);
 
   const { data: stepsByRun = {}, isLoading: stepsLoading } = useQuery({
-    queryKey: ['workflowStepsBatch', token, runIdsCsv],
+    queryKey: ['workflowStepsBatch', token, runningRunIdsCsv],
     queryFn: async () => {
-      if (!runIdsCsv) return {};
+      if (!runningRunIdsCsv) return {};
       const res = await axios.get(`${API_BASE}/api/workflow/steps/batch`, {
         ...authConfig,
-        params: { run_ids: runIdsCsv },
+        params: { run_ids: runningRunIdsCsv },
       });
       return res.data as Record<string, WorkflowStepRow[]>;
     },
-    enabled: runIdsCsv.length > 0,
-    refetchInterval: 5000,
+    enabled: runningRunIdsCsv.length > 0,
+    refetchInterval: hasRunningWorkflows ? 8000 : false, // Poll every 8s if any running, otherwise stop
   });
 
   const { data: envChips = [] } = useQuery({
@@ -302,7 +352,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       const res = await axios.get(`${API_BASE}/api/workflow/env-status`, authConfig);
       return res.data as EnvChip[];
     },
-    refetchInterval: 8000,
+    refetchInterval: hasRunningWorkflows ? 12000 : false, // Poll every 12s if any running, otherwise stop
   });
 
   const { data: environments = [] } = useQuery({
@@ -380,6 +430,10 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           feature_flags: row.feature_flags ?? null,
           notes: row.notes ?? null,
         }));
+        const enabledCount = (body.steps as any[]).filter(s => s.is_enabled).length;
+        console.log(`Creating workflow with ${(body.steps as any[]).length} steps (${enabledCount} enabled)`);
+      } else {
+        console.log('Creating workflow without steps array (will use server defaults)');
       }
       const res = await axios.post(`${API_BASE}/api/workflow/runs`, body, authConfig);
       return res.data as { id: number };
@@ -387,14 +441,24 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
       queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
+      setRunPage(0);
       if (data?.id) setExpandedId(data.id);
       setCreateName('');
     },
   });
 
   const controlMutation = useMutation({
-    mutationFn: async (vars: { runId: number; action: 'start' | 'pause' | 'resume' | 'stop' }) => {
-      await axios.post(`${API_BASE}/api/workflow/runs/${vars.runId}/control`, { action: vars.action }, authConfig);
+    mutationFn: async (vars: {
+      runId: number;
+      action: 'start' | 'pause' | 'resume' | 'stop';
+      env1Id?: number | null;
+      env2Id?: number | null;
+    }) => {
+      await axios.post(`${API_BASE}/api/workflow/runs/${vars.runId}/control`, {
+        action: vars.action,
+        env1_id: vars.env1Id,
+        env2_id: vars.env2Id
+      }, authConfig);
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
@@ -403,9 +467,40 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: async (runId: number) => {
+      await axios.delete(`${API_BASE}/api/workflow/runs/${runId}`, authConfig);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
+      queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
+      setExpandedId(null);
+    },
+  });
+
   const toggleExpand = (id: number) => {
     setExpandedId((cur) => (cur === id ? null : id));
   };
+
+  // Fetch steps for expanded workflow if not already loaded (on-demand for completed workflows)
+  const { data: expandedSteps } = useQuery({
+    queryKey: ['workflowSteps', token, expandedId],
+    queryFn: async () => {
+      if (!expandedId) return [];
+      const res = await axios.get(`${API_BASE}/api/workflow/steps/${expandedId}`, authConfig);
+      return res.data as WorkflowStepRow[];
+    },
+    enabled: expandedId !== null && !stepsByRun[expandedId],
+  });
+
+  // Merge batch-loaded steps with on-demand expanded steps
+  const allStepsByRun = useMemo(() => {
+    const merged = { ...stepsByRun };
+    if (expandedId && expandedSteps && !merged[expandedId]) {
+      merged[expandedId] = expandedSteps;
+    }
+    return merged;
+  }, [stepsByRun, expandedId, expandedSteps]);
 
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -441,7 +536,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                 min={1}
                 max={180}
                 value={createCooldown}
-                onChange={(e) => setCreateCooldown(Number(e.target.value) || 15)}
+                onChange={(e) => setCreateCooldown(Number(e.target.value) || 10)}
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
               />
             </div>
@@ -506,9 +601,25 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           {stepCatalogResp?.steps?.length ? (
             <div style={{ marginTop: '0.85rem' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap', marginBottom: '0.45rem' }}>
-                <span style={{ fontWeight: 600, fontSize: '0.88rem', color: 'var(--text-primary)' }}>
+                <button
+                  type="button"
+                  style={{
+                    fontWeight: 600,
+                    fontSize: '0.88rem',
+                    color: 'var(--text-primary)',
+                    background: 'transparent',
+                    border: 'none',
+                    cursor: 'pointer',
+                    padding: 0,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.5rem',
+                  }}
+                  onClick={() => setStepsExpanded(!stepsExpanded)}
+                >
+                  <span style={{ fontSize: '1rem' }}>{stepsExpanded ? '▼' : '▶'}</span>
                   Steps to include ({enabledStepCount}/{stepCatalogResp.steps.length})
-                </span>
+                </button>
                 <button
                   type="button"
                   style={{
@@ -544,170 +655,179 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                   Disable all
                 </button>
               </div>
-              <div
-                style={{
-                  marginTop: '0.55rem',
-                  marginBottom: '0.45rem',
-                  display: 'flex',
-                  flexWrap: 'wrap',
-                  alignItems: 'center',
-                  gap: '6px 8px',
-                  rowGap: '8px',
-                }}
-              >
-                <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', width: '100%', flexBasis: '100%' }}>
-                  Toggle groups (all checked in family → clears; otherwise selects all matching steps):
-                </span>
-                {PRESET_GROUPS.map(({ preset, label, hint }) => (
-                  <button
-                    key={preset}
-                    type="button"
-                    style={PRESET_BTN_STYLE}
-                    title={hint}
-                    onClick={() => togglePresetGroup(preset)}
+              {stepsExpanded && (
+                <>
+                  <div
+                    style={{
+                      marginTop: '0.55rem',
+                      marginBottom: '0.45rem',
+                      display: 'flex',
+                      flexWrap: 'wrap',
+                      alignItems: 'center',
+                      gap: '6px 8px',
+                      rowGap: '8px',
+                    }}
                   >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <div
-                style={{
-                  maxHeight: 300,
-                  overflowY: 'auto',
-                  border: '1px solid var(--surface-border)',
-                  borderRadius: 8,
-                  padding: '10px 10px',
-                  fontSize: '0.82rem',
-                  background: 'rgba(0,0,0,0.02)',
-                }}
-              >
-                {(() => {
-                  const catalog = stepCatalogResp.steps!;
-                  const actionBlock = findConsecutiveActionBlock(catalog);
-                  const gridStyle: React.CSSProperties = {
-                    display: 'grid',
-                    gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)',
-                    gap: '10px 14px',
-                  };
+                    <span style={{ fontSize: '0.76rem', color: 'var(--text-secondary)', width: '100%', flexBasis: '100%' }}>
+                      Toggle groups (all checked in family → clears; otherwise selects all matching steps):
+                    </span>
+                    {PRESET_GROUPS.map(({ preset, label, hint }) => (
+                      <button
+                        key={preset}
+                        type="button"
+                        style={PRESET_BTN_STYLE}
+                        title={hint}
+                        onClick={() => togglePresetGroup(preset)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  <div
+                    style={{
+                      maxHeight: 300,
+                      overflowY: 'auto',
+                      border: '1px solid var(--surface-border)',
+                      borderRadius: 8,
+                      padding: '10px 10px',
+                      fontSize: '0.82rem',
+                      background: 'rgba(0,0,0,0.02)',
+                    }}
+                  >
+                    {(() => {
+                      const catalog = stepCatalogResp.steps!;
+                      const actionBlock = findConsecutiveActionBlock(catalog);
+                      const gridStyle: React.CSSProperties = {
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                        gap: '10px 14px',
+                      };
 
-                  const renderStep = (row: StepCatalogRow, idx: number) => {
-                    const prev = idx > 0 ? catalog[idx - 1] : null;
-                    const isActionStep =
-                      String(row.ds_kind || '')
-                        .trim()
-                        .toLowerCase() === 'action';
-                    const olsBlockStarts = !!row.is_ols && (!prev || !prev.is_ols);
+                      const renderStep = (row: StepCatalogRow, idx: number) => {
+                        const prev = idx > 0 ? catalog[idx - 1] : null;
+                        const isActionStep =
+                          String(row.ds_kind || '')
+                            .trim()
+                            .toLowerCase() === 'action';
+                        const olsBlockStarts = !!row.is_ols && (!prev || !prev.is_ols);
 
-                    return (
-                      <React.Fragment key={row.seq}>
-                        {olsBlockStarts ? (
+                        return (
+                          <React.Fragment key={row.seq}>
+                            {olsBlockStarts ? (
+                              <div
+                                style={{
+                                  gridColumn: '1 / -1',
+                                  borderTop: '1px solid var(--surface-border)',
+                                  opacity: 0.65,
+                                  marginTop: idx > 0 ? 4 : 0,
+                                  marginBottom: 2,
+                                  height: 0,
+                                }}
+                                aria-hidden
+                              />
+                            ) : null}
+                            <label
+                              style={{
+                                display: 'flex',
+                                alignItems: 'flex-start',
+                                gap: '8px',
+                                padding: '8px 10px',
+                                cursor: 'pointer',
+                                borderRadius: 8,
+                                opacity: stepEnabled[idx] === false ? 0.55 : 1,
+                                background: isActionStep ? 'rgba(251, 191, 36, 0.22)' : 'transparent',
+                                border: isActionStep
+                                  ? '1px solid rgba(217, 119, 6, 0.45)'
+                                  : '1px solid transparent',
+                                boxShadow: isActionStep ? 'inset 0 0 0 1px rgba(255,255,255,0.12)' : undefined,
+                              }}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={stepEnabled[idx] !== false}
+                                disabled={stepEnabled.length !== catalog.length}
+                                onChange={(e) => {
+                                  const on = e.target.checked;
+                                  setStepEnabled((prevEnabled) => {
+                                    const next = [...prevEnabled];
+                                    next[idx] = on;
+                                    return next;
+                                  });
+                                }}
+                                style={{ marginTop: 3 }}
+                              />
+                              <span style={{ lineHeight: 1.45 }}>
+                                <strong style={{ color: 'var(--text-primary)' }}>
+                                  {row.seq}. {row.ds_kind}
+                                </strong>
+                                {row.ds_name ? (
+                                  <span style={{ color: 'var(--text-secondary)' }}>{' — '}{row.ds_name}</span>
+                                ) : null}
+                                {row.notes ? (
+                                  <span style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.78rem' }}>
+                                    {row.notes}
+                                  </span>
+                                ) : null}
+                              </span>
+                            </label>
+                          </React.Fragment>
+                        );
+                      };
+
+                      if (!actionBlock) {
+                        return <div style={gridStyle}>{catalog.map((row, idx) => renderStep(row, idx))}</div>;
+                      }
+
+                      const before = catalog.slice(0, actionBlock.start);
+                      const middle = catalog.slice(actionBlock.start, actionBlock.end + 1);
+                      const after = catalog.slice(actionBlock.end + 1);
+
+                      return (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                          {before.length > 0 ? (
+                            <div style={gridStyle}>{before.map((row, j) => renderStep(row, j))}</div>
+                          ) : null}
                           <div
                             style={{
-                              gridColumn: '1 / -1',
-                              borderTop: '1px solid var(--surface-border)',
-                              opacity: 0.65,
-                              marginTop: idx > 0 ? 4 : 0,
-                              marginBottom: 2,
-                              height: 0,
+                              display: 'flex',
+                              justifyContent: 'center',
+                              alignItems: 'stretch',
+                              width: '100%',
+                              padding: '4px 0 8px',
                             }}
-                            aria-hidden
-                          />
-                        ) : null}
-                        <label
-                          style={{
-                            display: 'flex',
-                            alignItems: 'flex-start',
-                            gap: '8px',
-                            padding: '8px 10px',
-                            cursor: 'pointer',
-                            borderRadius: 8,
-                            opacity: stepEnabled[idx] === false ? 0.55 : 1,
-                            background: isActionStep ? 'rgba(251, 191, 36, 0.22)' : 'transparent',
-                            border: isActionStep
-                              ? '1px solid rgba(217, 119, 6, 0.45)'
-                              : '1px solid transparent',
-                            boxShadow: isActionStep ? 'inset 0 0 0 1px rgba(255,255,255,0.12)' : undefined,
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={stepEnabled[idx] !== false}
-                            disabled={stepEnabled.length !== catalog.length}
-                            onChange={(e) => {
-                              const on = e.target.checked;
-                              setStepEnabled((prevEnabled) => {
-                                const next = [...prevEnabled];
-                                next[idx] = on;
-                                return next;
-                              });
-                            }}
-                            style={{ marginTop: 3 }}
-                          />
-                          <span style={{ lineHeight: 1.45 }}>
-                            <strong style={{ color: 'var(--text-primary)' }}>
-                              {row.seq}. {row.ds_kind}
-                            </strong>
-                            {row.ds_name ? (
-                              <span style={{ color: 'var(--text-secondary)' }}>{' — '}{row.ds_name}</span>
-                            ) : null}
-                            {row.notes ? (
-                              <span style={{ display: 'block', color: 'var(--text-secondary)', fontSize: '0.78rem' }}>
-                                {row.notes}
-                              </span>
-                            ) : null}
-                          </span>
-                        </label>
-                      </React.Fragment>
-                    );
-                  };
-
-                  if (!actionBlock) {
-                    return <div style={gridStyle}>{catalog.map((row, idx) => renderStep(row, idx))}</div>;
-                  }
-
-                  const before = catalog.slice(0, actionBlock.start);
-                  const middle = catalog.slice(actionBlock.start, actionBlock.end + 1);
-                  const after = catalog.slice(actionBlock.end + 1);
-
-                  return (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                      {before.length > 0 ? (
-                        <div style={gridStyle}>{before.map((row, j) => renderStep(row, j))}</div>
-                      ) : null}
-                      <div
-                        style={{
-                          display: 'flex',
-                          justifyContent: 'center',
-                          alignItems: 'stretch',
-                          width: '100%',
-                          padding: '4px 0 8px',
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: '100%',
-                            maxWidth: 'min(440px, 96%)',
-                            boxSizing: 'border-box',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: 10,
-                          }}
-                        >
-                          {middle.map((row, k) => renderStep(row, actionBlock.start + k))}
+                          >
+                            <div
+                              style={{
+                                width: '100%',
+                                maxWidth: 'min(440px, 96%)',
+                                boxSizing: 'border-box',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: 10,
+                              }}
+                            >
+                              {middle.map((row, k) => renderStep(row, actionBlock.start + k))}
+                            </div>
+                          </div>
+                          {after.length > 0 ? (
+                            <div style={gridStyle}>
+                              {after.map((row, j) => renderStep(row, actionBlock.end + 1 + j))}
+                            </div>
+                          ) : null}
                         </div>
-                      </div>
-                      {after.length > 0 ? (
-                        <div style={gridStyle}>
-                          {after.map((row, j) => renderStep(row, actionBlock.end + 1 + j))}
-                        </div>
-                      ) : null}
-                    </div>
-                  );
-                })()}
-              </div>
+                      );
+                    })()}
+                  </div>
+                </>
+              )}
               {createBlockedBySteps && (
                 <p style={{ fontSize: '0.76rem', color: 'var(--danger-color)', marginTop: '0.45rem', marginBottom: 0 }}>
                   Select at least one step.
+                </p>
+              )}
+              {createMutation.isError && (
+                <p style={{ fontSize: '0.76rem', color: 'var(--danger-color)', marginTop: '0.45rem', marginBottom: 0 }}>
+                  Error creating workflow: {(createMutation.error as any)?.response?.data?.detail || (createMutation.error as Error)?.message || 'Unknown error'}
                 </p>
               )}
             </div>
@@ -744,215 +864,301 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
               No workflow runs.
             </div>
           ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <table className="workflow-automation-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.88rem' }}>
-                <thead>
-                  <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Run</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Name</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Status</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Started</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Finished</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Last Error</th>
-                    <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map((run) => {
-                    const isOpen = expandedId === run.id;
-                    const rawSteps = stepsByRun[String(run.id)] ?? stepsByRun[run.id] ?? [];
-                    const runStatus = run.status;
-                    const metrics = computeStepMetrics(rawSteps as unknown as Record<string, unknown>[], rawSteps.length);
-                    return (
-                      <React.Fragment key={run.id}>
-                        <tr
-                          className="wf-main-row"
-                          onClick={() => toggleExpand(run.id)}
-                          style={{
-                            cursor: 'pointer',
-                            background: isOpen ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
-                            borderBottom: '1px solid var(--surface-border)',
-                          }}
-                        >
-                          <td style={{ padding: '10px 12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
-                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                              {isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
-                              #{run.id}
-                            </span>
-                          </td>
-                          <td style={{ padding: '10px 12px', maxWidth: 220 }}>{fmtCell(run.name)}</td>
-                          <td style={{ padding: '10px 12px' }}>{statusBadge(run.status)}</td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.started_at)}</td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.finished_at)}</td>
-                          <td style={{ padding: '10px 12px', maxWidth: 200, color: 'var(--danger-color)', fontSize: '0.82rem' }}>
-                            {fmtCell(run.last_error)}
-                          </td>
-                          <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
-                            <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-                              {(
-                                [
-                                  ['start', '▶️'],
-                                  ['pause', '⏸'],
-                                  ['resume', '↩️'],
-                                  ['stop', '⏹'],
-                                ] as const
-                              ).map(([act, emoji]) => {
-                                const enabled = canAction(run.status, act);
-                                return (
-                                  <button
-                                    key={act}
-                                    type="button"
-                                    title={act}
-                                    disabled={!enabled || controlMutation.isPending}
-                                    onClick={() => controlMutation.mutate({ runId: run.id, action: act })}
-                                    style={{
-                                      background: 'transparent',
-                                      border: 'none',
-                                      cursor: enabled ? 'pointer' : 'default',
-                                      fontSize: '1.05rem',
-                                      opacity: enabled ? 1 : 0.28,
-                                      padding: '0 2px',
-                                      lineHeight: 1,
-                                    }}
-                                  >
-                                    {emoji}
-                                  </button>
-                                );
-                              })}
-                            </span>
-                          </td>
-                        </tr>
-                        {isOpen && (
-                          <tr>
-                            <td colSpan={7} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
-                              <div
-                                style={{
-                                  borderLeft: '4px solid var(--primary-color, #6366f1)',
-                                  margin: '0 0 0 12px',
-                                  padding: '12px 16px',
-                                }}
-                              >
-                                <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary-color)', marginBottom: 8 }}>
-                                  Step Progress — Run {run.id}
-                                </div>
-                                {stepsLoading && !rawSteps.length ? (
-                                  <Loader2 className="lucide-spin" size={22} />
-                                ) : (
-                                  <>
-                                    <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
-                                      {(
-                                        [
-                                          ['Pending', metrics.pending, '#6b7280'],
-                                          ['In Progress', metrics.in_prog, '#ca8a04'],
-                                          ['Completed', metrics.completed, '#16a34a'],
-                                          ['Disabled', metrics.disabled, '#6b7280'],
-                                          ['Errors', metrics.errors, '#dc2626'],
-                                        ] as const
-                                      ).map(([label, val, color]) => (
-                                        <div key={label}>
-                                          <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
-                                          <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
-                                        </div>
-                                      ))}
-                                    </div>
-                                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-                                      <thead>
-                                        <tr style={{ background: '#e8e3f5' }}>
-                                          <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
-                                          <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody>
-                                        {rawSteps
-                                          .filter((st) => {
-                                            const cs = workflowNormStepStatus(st.status);
-                                            return cs !== 'disabled' && st.is_enabled;
-                                          })
-                                          .map((st) => {
-                                            const rd = st as unknown as Record<string, unknown>;
-                                            const cStatus = workflowNormStepStatus(st.status);
-                                            let displayErr = String(st.last_error ?? '').trim();
-                                            if (
-                                              ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
-                                              workflowIsTransientStepMessage(displayErr)
-                                            ) {
-                                              displayErr = '';
-                                            }
-                                            if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
-
-                                            const name = String(st.environment_name ?? '').trim();
-                                            const busy = workflowStepImpliesEnvBusy(rd, runStatus);
-                                            const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
-
-                                            return (
-                                              <tr key={st.id} style={{ background: st.seq % 2 === 0 ? '#f9f8ff' : '#ffffff' }}>
-                                                <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
-                                                <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
-                                                <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
-                                                <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
-                                                  {computeProgressEmoji(rd)}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
-                                                  {fmtCell(st.scan_id)}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                  {st.scan_id ? (
-                                                    <a href={`/scan-progress?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
-                                                      View Progress
-                                                    </a>
-                                                  ) : '—'}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                  {st.scan_id ? (
-                                                    <a href={`/benchmark/new?scan_id=${encodeURIComponent(st.scan_id)}`} style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}>
-                                                      Open
-                                                    </a>
-                                                  ) : '—'}
-                                                </td>
-                                                <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
-                                                  {fmtCell(st.notes)}
-                                                </td>
-                                                <td
-                                                  style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
-                                                  title={st.last_error ?? ''}
-                                                >
-                                                  {displayErr ? displayErr.slice(0, 200) : ''}
-                                                </td>
-                                              </tr>
-                                            );
-                                          })}
-                                      </tbody>
-                                    </table>
-                                    {rawSteps.length === 0 && !stepsLoading && (
-                                      <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
-                                    )}
-                                  </>
-                                )}
-                              </div>
+            <>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="workflow-automation-table" style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.88rem' }}>
+                  <thead>
+                    <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Run</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Name</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Status</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Started</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Finished</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Last Error</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {runs.map((run) => {
+                      const isOpen = expandedId === run.id;
+                      const rawSteps = allStepsByRun[String(run.id)] ?? allStepsByRun[run.id] ?? [];
+                      const runStatus = run.status;
+                      const metrics = computeStepMetrics(rawSteps as unknown as Record<string, unknown>[], rawSteps.length);
+                      return (
+                        <React.Fragment key={run.id}>
+                          <tr
+                            className="wf-main-row"
+                            onClick={() => toggleExpand(run.id)}
+                            style={{
+                              cursor: 'pointer',
+                              background: isOpen ? 'rgba(99, 102, 241, 0.08)' : 'transparent',
+                              borderBottom: '1px solid var(--surface-border)',
+                            }}
+                          >
+                            <td style={{ padding: '10px 12px', fontWeight: 600, whiteSpace: 'nowrap' }}>
+                              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                                {isOpen ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                                #{run.id}
+                              </span>
+                            </td>
+                            <td style={{ padding: '10px 12px', maxWidth: 220 }}>{fmtCell(run.name)}</td>
+                            <td style={{ padding: '10px 12px' }}>{statusBadge(run.status)}</td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.started_at)}</td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.finished_at)}</td>
+                            <td style={{ padding: '10px 12px', maxWidth: 200, color: 'var(--danger-color)', fontSize: '0.82rem' }}>
+                              {fmtCell(run.last_error)}
+                            </td>
+                            <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
+                              <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                                {(
+                                  [
+                                    ['start', '▶️'],
+                                    ['pause', '⏸'],
+                                    ['resume', '↩️'],
+                                    ['stop', '⏹'],
+                                  ] as const
+                                ).map(([act, emoji]) => {
+                                  const enabled = canAction(run.status, act);
+                                  return (
+                                    <button
+                                      key={act}
+                                      type="button"
+                                      title={act}
+                                      disabled={!enabled || controlMutation.isPending}
+                                      onClick={() => controlMutation.mutate({
+                                        runId: run.id,
+                                        action: act,
+                                        env1Id: run.env1_id,
+                                        env2Id: run.env2_id
+                                      })}
+                                      style={{
+                                        background: 'transparent',
+                                        border: 'none',
+                                        cursor: enabled ? 'pointer' : 'default',
+                                        fontSize: '1.05rem',
+                                        opacity: enabled ? 1 : 0.28,
+                                        padding: '0 2px',
+                                        lineHeight: 1,
+                                      }}
+                                    >
+                                      {emoji}
+                                    </button>
+                                  );
+                                })}
+                                <button
+                                  type="button"
+                                  title="Delete run"
+                                  disabled={!canAction(run.status, 'delete') || deleteMutation.isPending}
+                                  onClick={() => {
+                                    if (window.confirm(`Delete workflow run #${run.id}?`)) {
+                                      deleteMutation.mutate(run.id);
+                                    }
+                                  }}
+                                  style={{
+                                    background: 'transparent',
+                                    border: 'none',
+                                    cursor: canAction(run.status, 'delete') ? 'pointer' : 'default',
+                                    fontSize: '1.05rem',
+                                    opacity: canAction(run.status, 'delete') ? 1 : 0.28,
+                                    padding: '0 2px',
+                                    lineHeight: 1,
+                                  }}
+                                >
+                                  🗑️
+                                </button>
+                              </span>
                             </td>
                           </tr>
-                        )}
-                      </React.Fragment>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                          {isOpen && (
+                            <tr>
+                              <td colSpan={7} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
+                                <div
+                                  style={{
+                                    borderLeft: '4px solid var(--primary-color, #6366f1)',
+                                    margin: '0 0 0 12px',
+                                    padding: '12px 16px',
+                                  }}
+                                >
+                                  <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary-color)', marginBottom: 8 }}>
+                                    Step Progress — Run {run.id}
+                                  </div>
+                                  {stepsLoading && !rawSteps.length ? (
+                                    <Loader2 className="lucide-spin" size={22} />
+                                  ) : (
+                                    <>
+                                      {(() => {
+                                        const isCooldown =
+                                          String(runStatus || '').trim().toLowerCase() === 'running' &&
+                                          !!run.next_eligible_at &&
+                                          new Date(run.next_eligible_at).getTime() > Date.now();
+                                        const firstPendingStepId = isCooldown
+                                          ? (rawSteps.find(
+                                              (st) =>
+                                                st.is_enabled &&
+                                                workflowNormStepStatus(st.status) !== 'disabled' &&
+                                                ['', 'pending'].includes(workflowNormStepStatus(st.status))
+                                            )?.id ?? null)
+                                          : null;
+
+                                        return (
+                                          <>
+                                            <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
+                                              {(
+                                                [
+                                                  ['Pending', metrics.pending, '#6b7280'],
+                                                  ['In Progress', metrics.in_prog, '#ca8a04'],
+                                                  ['Completed', metrics.completed, '#16a34a'],
+                                                  ['Disabled', metrics.disabled, '#6b7280'],
+                                                  ['Errors', metrics.errors, '#dc2626'],
+                                                ] as const
+                                              ).map(([label, val, color]) => (
+                                                <div key={label}>
+                                                  <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
+                                                  <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
+                                                </div>
+                                              ))}
+                                            </div>
+                                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                                              <thead>
+                                                <tr style={{ background: '#e8e3f5' }}>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
+                                                </tr>
+                                              </thead>
+                                              <tbody>
+                                                {rawSteps
+                                                  .filter((st) => {
+                                                    const cs = workflowNormStepStatus(st.status);
+                                                    return cs !== 'disabled' && st.is_enabled;
+                                                  })
+                                                  .map((st) => {
+                                                    const rd = st as unknown as Record<string, unknown>;
+                                                    const cStatus = workflowNormStepStatus(st.status);
+                                                    let displayErr = String(st.last_error ?? '').trim();
+                                                    if (
+                                                      ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
+                                                      workflowIsTransientStepMessage(displayErr)
+                                                    ) {
+                                                      displayErr = '';
+                                                    }
+                                                    if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
+
+                                                    const name = String(st.environment_name ?? '').trim();
+                                                    const busy = workflowStepImpliesEnvBusy(rd, runStatus);
+                                                    const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
+
+                                                    const isCooldownStep = isCooldown && st.id === firstPendingStepId;
+                                                    const progressCell = isCooldownStep ? (
+                                                      <span style={{ color: '#b45309', fontWeight: 600 }}>
+                                                        {cooldownLabel(run.next_eligible_at)}
+                                                      </span>
+                                                    ) : (
+                                                      computeProgressEmoji(rd)
+                                                    );
+
+                                                    return (
+                                                      <tr
+                                                        key={st.id}
+                                                        style={{
+                                                          background: isCooldownStep
+                                                            ? 'rgba(254, 249, 195, 0.45)'
+                                                            : st.seq % 2 === 0
+                                                            ? '#f9f8ff'
+                                                            : '#ffffff',
+                                                        }}
+                                                      >
+                                                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
+                                                        <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
+                                                          {progressCell}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
+                                                          {fmtCell(st.scan_id)}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                          {st.scan_id ? (
+                                                            <Link
+                                                              to={`/tools/scan-status?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                              style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                            >
+                                                              View Progress
+                                                            </Link>
+                                                          ) : (
+                                                            '—'
+                                                          )}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                          {st.scan_id ? (
+                                                            <Link
+                                                              to={`/tools/add-benchmark?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                              style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                            >
+                                                              Open
+                                                            </Link>
+                                                          ) : (
+                                                            '—'
+                                                          )}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
+                                                          {fmtCell(st.notes)}
+                                                        </td>
+                                                        <td
+                                                          style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
+                                                          title={st.last_error ?? ''}
+                                                        >
+                                                          {displayErr ? displayErr.slice(0, 200) : ''}
+                                                        </td>
+                                                      </tr>
+                                                    );
+                                                  })}
+                                              </tbody>
+                                            </table>
+                                            {rawSteps.length === 0 && !stepsLoading && (
+                                              <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
+                                            )}
+                                          </>
+                                        );
+                                      })()}
+                                    </>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {runsTotal > WF_PAGE_SIZE && (
+                <div style={{ padding: '0.65rem 1rem 1rem' }}>
+                  <PaginationBar
+                    page={runPage}
+                    pageSize={WF_PAGE_SIZE}
+                    totalItems={runsTotal}
+                    onPageChange={setRunPage}
+                    ariaLabel="Workflow runs pages"
+                  />
+                </div>
+              )}
+            </>
           )}
         </div>
 

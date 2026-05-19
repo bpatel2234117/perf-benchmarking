@@ -45,8 +45,8 @@ if str(repo_root()) not in sys.path:
 def _get_db_engine():
     try:
         from sqlalchemy import create_engine
-        from db_config import DB_CONNECTION_STRING
-        return create_engine(DB_CONNECTION_STRING)
+        from benchmark_db import resolve_benchmark_database_url
+        return create_engine(resolve_benchmark_database_url())
     except ImportError:
         return None
 

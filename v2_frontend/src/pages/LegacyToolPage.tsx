@@ -3,11 +3,26 @@ import { Link, useParams } from 'react-router-dom';
 import { ExternalLink } from 'lucide-react';
 import { titleForSlug } from '../navigation/systemToolsConfig';
 
+/** Streamlit `dashboard.py` query param (?page=...) — matches sidebar `page_map` keys in dashboard.py */
+const LEGACY_STREAMLIT_PAGE: Partial<Record<string, string>> = {
+  'classifier-comparison': 'Classifier Changes',
+  'run-comparison': 'Run Comparison Tool',
+  'data-record-add': 'Add New Benchmark',
+  'records-edit': 'Edit Records',
+  'version-comparison': 'Version Comparison',
+  'data-source-create': 'Create Data Source',
+  'scanner-infra': 'Scanner Infrastructure',
+  'manage-rbac': 'Manage RBAC',
+};
+
 /** Placeholder for tools still backed by Streamlit `dashboard.py` until ported to React. */
 const LegacyToolPage: React.FC = () => {
   const { slug = '' } = useParams<{ slug: string }>();
   const title = titleForSlug(slug);
   const legacyBase = (import.meta.env.VITE_LEGACY_DASHBOARD_URL as string | undefined)?.replace(/\/$/, '') || '';
+  const streamlitPage = LEGACY_STREAMLIT_PAGE[slug];
+  const legacyHref =
+    legacyBase && streamlitPage ? `${legacyBase}?page=${encodeURIComponent(streamlitPage)}` : legacyBase || '';
 
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -21,7 +36,7 @@ const LegacyToolPage: React.FC = () => {
         {legacyBase ? (
           <>
             <a
-              href={legacyBase}
+              href={legacyHref || legacyBase}
               target="_blank"
               rel="noreferrer noopener"
               className="btn"
@@ -29,9 +44,23 @@ const LegacyToolPage: React.FC = () => {
             >
               <ExternalLink size={16} aria-hidden /> Open legacy dashboard (new tab)
             </a>
-            <p style={{ fontSize: '0.82rem', marginTop: '0.85rem' }}>
-              Tip: set <code style={{ fontSize: '0.85em' }}>VITE_LEGACY_DASHBOARD_URL</code> in <code style={{ fontSize: '0.85em' }}>v2_frontend/.env.local</code> (run <code style={{ fontSize: '0.85em' }}>python3 dashboard.py</code> or deploy URL).
-            </p>
+            {streamlitPage ? (
+              <p style={{ fontSize: '0.82rem', marginTop: '0.85rem' }}>
+                Opens Streamlit with <strong style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{streamlitPage}</strong>.
+              </p>
+            ) : null}
+            {!streamlitPage ? (
+              <p style={{ fontSize: '0.82rem', marginTop: '0.85rem' }}>
+                Tip: set <code style={{ fontSize: '0.85em' }}>VITE_LEGACY_DASHBOARD_URL</code> in{' '}
+                <code style={{ fontSize: '0.85em' }}>v2_frontend/.env.local</code> (run{' '}
+                <code style={{ fontSize: '0.85em' }}>python3 dashboard.py</code> or deploy URL).
+              </p>
+            ) : (
+              <p style={{ fontSize: '0.82rem', marginTop: '0.65rem', color: 'var(--text-secondary)' }}>
+                Tip: <code style={{ fontSize: '0.85em' }}>VITE_LEGACY_DASHBOARD_URL</code> (e.g.{' '}
+                <code style={{ fontSize: '0.85em' }}>http://127.0.0.1:8501</code>) must match your Streamlit server.
+              </p>
+            )}
           </>
         ) : (
           <p style={{ fontSize: '0.82rem', marginBottom: 0 }}>

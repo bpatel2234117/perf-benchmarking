@@ -33,17 +33,85 @@ body {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
 }
 
-/* Layout — authenticated: left sidebar + main (logout top-right) */
+/* Layout — authenticated: fixed left rail + scrollable main */
 .app-shell {
   display: flex;
   min-height: 100vh;
   width: 100%;
   align-items: stretch;
-  overflow: visible;
+  overflow-x: visible;
+  padding-top: 60px;
+  /* Space for global header */
+  position: relative;
 }
 
-/* Purple System Tools sidebar (parity with dashboard nav) */
+/* Global top header - above everything */
+.app-top-header-global {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 60px;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 1.5rem;
+  z-index: 100;
+}
+
+.app-top-header-user {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.app-top-header-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.app-top-header-username {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: #1e293b;
+}
+
+.app-top-header-logo-section {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.app-top-header-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.app-top-header-brand {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #1e293b;
+}
+
+/* Purple System Tools sidebar (parity with dashboard nav) — fixed viewport height so nav + Refresh/Logout stay visible while main scrolls */
 .app-sidebar-purple {
+  position: fixed;
+  left: 0;
+  top: 60px;
+  /* Below global header */
+  bottom: 0;
   width: 250px;
   flex-shrink: 0;
   display: flex;
@@ -53,9 +121,9 @@ body {
   padding: 1.25rem 0.75rem 1rem;
   background: linear-gradient(180deg, #6d28d9 0%, #5b21b6 52%, #4c1d95 100%);
   box-shadow: 2px 0 12px rgba(76, 29, 149, 0.25);
-  position: relative;
   z-index: 40;
-  overflow: visible;
+  overflow-x: visible;
+  overflow-y: hidden;
 }
 
 .app-sidebar-brand-white {
@@ -69,6 +137,7 @@ body {
   text-decoration: none;
   border-radius: 10px;
   transition: background 0.15s ease;
+  flex-shrink: 0;
 }
 
 .app-sidebar-brand-white:hover {
@@ -94,6 +163,7 @@ body {
   font-weight: 600;
   text-decoration: none;
   transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+  flex-shrink: 0;
 }
 
 .app-sidebar-toplink:hover {
@@ -116,6 +186,8 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: visible;
 }
 
 .sidebar-tools-trigger {
@@ -165,13 +237,15 @@ body {
   transform: rotate(180deg);
 }
 
+/* Inline below the System Tools button — do NOT position to the right of the rail:
+   .app-sidebar-purple uses overflow-y: hidden, which clips the old absolutely-positioned
+   flyout so no menu appeared while the chevron still toggled. */
 .system-tools-flyout {
-  position: absolute;
-  left: calc(100% + 8px);
-  top: 0;
-  min-width: 288px;
-  max-width: min(360px, calc(100vw - 270px));
-  max-height: min(72vh, 560px);
+  position: relative;
+  width: 100%;
+  margin-top: 0.45rem;
+  min-width: 0;
+  max-height: min(55vh, 480px);
   overflow-y: auto;
   overflow-x: hidden;
   background: #fff;
@@ -180,7 +254,7 @@ body {
   box-shadow:
     0 12px 40px rgba(15, 23, 42, 0.16),
     0 4px 12px rgba(91, 33, 182, 0.1);
-  z-index: 200;
+  z-index: 1;
 }
 
 .system-tools-menu {
@@ -232,6 +306,7 @@ body {
   gap: 0.5rem;
   margin-top: auto;
   padding-top: 0.75rem;
+  flex-shrink: 0;
 }
 
 .app-sidebar-refresh-btn,
@@ -309,6 +384,9 @@ body {
   flex-direction: column;
   min-width: 0;
   min-height: 100vh;
+  margin-left: 250px;
+  width: calc(100% - 250px);
+  max-width: calc(100% - 250px);
 }
 
 .app-topbar {
@@ -416,6 +494,7 @@ body {
   .trend-chart-grid-3 {
     grid-template-columns: 1fr;
   }
+
   .trend-chart-grid-2 {
     grid-template-columns: 1fr;
   }
@@ -424,6 +503,25 @@ body {
 @media (max-width: 1024px) {
   .app-shell {
     flex-direction: column;
+  }
+
+  .app-sidebar-purple {
+    position: relative;
+    left: auto;
+    top: auto;
+    bottom: auto;
+    width: 100%;
+    max-width: 100%;
+    height: auto;
+    min-height: 0;
+    overflow: visible;
+    box-shadow: 0 4px 12px rgba(76, 29, 149, 0.2);
+  }
+
+  .app-main-area {
+    margin-left: 0;
+    width: 100%;
+    max-width: 100%;
   }
 
   .app-sidebar {
@@ -471,6 +569,7 @@ body {
   color: var(--danger-color);
   border: 1px solid var(--danger-color);
 }
+
 .btn-danger:hover {
   background: rgba(239, 68, 68, 0.05);
 }
@@ -482,7 +581,8 @@ table {
   text-align: left;
 }
 
-th, td {
+th,
+td {
   padding: 1rem;
   border-bottom: 1px solid var(--surface-border);
   color: var(--text-primary);
@@ -570,8 +670,13 @@ tr:hover {
 }
 
 @keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .lucide-spin {

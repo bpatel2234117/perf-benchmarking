@@ -81,19 +81,26 @@ def verify_password(password: str, hashed: str) -> bool:
 
 def ensure_rbac_tables(engine):
     """Ensure tables exist and seed default admin if empty."""
-    from db_config import DDL_STATEMENTS
-    
-    # We want to ensure RBAC tables exist. 
-    # To be safe on first-run, we should probably ensure all tables from db_config exist,
-    # but at least these three must be there for login.
-    tables_to_ensure = ['app_roles', 'app_users', 'app_role_pages']
-    
+    try:
+        from benchmark_db import is_postgresql_engine
+
+        use_pg = is_postgresql_engine(engine)
+    except Exception:
+        use_pg = False
+
     try:
         with engine.begin() as conn:
-            for tbl in tables_to_ensure:
-                if tbl in DDL_STATEMENTS:
-                    conn.execute(text(DDL_STATEMENTS[tbl]))
-            
+            if use_pg:
+                # DDL comes from `ensure_test_environments_table` using `v2_api.db_config_pg` when Postgres is the dashboard DB.
+                pass
+            else:
+                from db_config import DDL_STATEMENTS
+
+                tables_to_ensure = ["app_roles", "app_users", "app_role_pages"]
+                for tbl in tables_to_ensure:
+                    if tbl in DDL_STATEMENTS:
+                        conn.execute(text(DDL_STATEMENTS[tbl]))
+
             # Seed Admin Role
             res = conn.execute(text("SELECT id FROM app_roles WHERE role_name = 'Admin'")).fetchone()
             if not res:
@@ -150,7 +157,19 @@ def check_access(page_name: str) -> bool:
     if page_name in ADMIN_ONLY_PAGES:
         return False
     
-    # Allow authenticated users access to everything else (Workflows, Progress, Trends, etc.)
+    # Trend Analysis consolidation
+    TREND_PAGES = [
+        "Data Source Trend Comparison", "Small Files Trend Analysis", "Large Files Trend Analysis",
+        "Small Files OLS Trend", "Large Files OLS Trend", "OLS vs Full Scan (Small)",
+        "OLS vs Full Scan (Large)", "Discover File FF On vs Off", "ACL ON vs OLS (ACL ON)",
+        "ACL OFF vs OLS (ACL OFF)"
+    ]
+    if page_name in TREND_PAGES:
+        user_perms = st.session_state.get("allowed_pages", [])
+        if "Trend Analysis" in user_perms:
+            return True
+
+    # Allow authenticated users access to everything else (Workflows, Progress, etc.)
     return True
 
 def get_user_permissions(engine, role_id):

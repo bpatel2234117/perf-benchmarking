@@ -32,6 +32,12 @@ def _workflow_env_occupying_sql_in() -> str:
     return ",".join(f"'{s}'" for s in WORKFLOW_ENV_OCCUPYING_STATUSES)
 
 
+def _sql_truthy(engine, column_sql: str) -> str:
+    if is_postgresql_engine(engine):
+        return f"COALESCE({column_sql}, TRUE) = TRUE"
+    return f"COALESCE({column_sql}, 1) = 1"
+
+
 import argparse
 import json
 import os
@@ -45,12 +51,12 @@ from datetime import datetime, timedelta
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import requests
 from sqlalchemy import create_engine, text
 
-from db_config import DB_CONNECTION_STRING
+from benchmark_db import is_postgresql_engine, resolve_benchmark_database_url
 from bigid_auth import Get_auth_token
 
 def _sync_env_version_standalone_runner(env_id: int) -> None:
@@ -259,6 +265,14 @@ def ensure_tracker_kv_table(engine) -> None:
                         updated_at TEXT DEFAULT (datetime('now'))
                     )
                 """))
+            elif is_postgresql_engine(engine):
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_kv (
+                        k VARCHAR(200) PRIMARY KEY,
+                        v VARCHAR(2000) NULL,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """))
             else:
                 conn.execute(text("""
                     CREATE TABLE IF NOT EXISTS tracker_kv (
@@ -319,6 +333,17 @@ def acquire_runner_lock(engine, *, ttl_seconds: int = 120) -> Tuple[bool, str]:
                         ON CONFLICT(k) DO UPDATE SET
                             v=excluded.v,
                             updated_at=datetime('now')
+                    """),
+                    {"k": RUNNER_LOCK_KEY, "v": who},
+                )
+            elif is_postgresql_engine(engine):
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_kv (k, v)
+                        VALUES (:k, :v)
+                        ON CONFLICT(k) DO UPDATE SET
+                            v=EXCLUDED.v,
+                            updated_at=CURRENT_TIMESTAMP
                     """),
                     {"k": RUNNER_LOCK_KEY, "v": who},
                 )
@@ -569,6 +594,87 @@ def ensure_workflow_tables(engine) -> None:
                 "ALTER TABLE workflow_steps ADD COLUMN build_version TEXT NULL",
                 "ALTER TABLE workflow_steps ADD COLUMN build_prefix TEXT NULL",
                 "ALTER TABLE workflow_runs ADD COLUMN scan_template_id TEXT NULL",
+            ]:
+                try:
+                    conn.execute(text(stmt))
+                except Exception:
+                    pass
+            conn.commit()
+            return
+
+        if is_postgresql_engine(engine):
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(255) NULL,
+                    status VARCHAR(32) NULL,
+                    env1_id INT NULL,
+                    env2_id INT NULL,
+                    cooldown_minutes INT DEFAULT 10,
+                    next_eligible_at TIMESTAMP NULL,
+                    last_error TEXT NULL,
+                    started_at TIMESTAMP NULL,
+                    finished_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    scan_template_id VARCHAR(128) NULL
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_steps (
+                    id SERIAL PRIMARY KEY,
+                    run_id INT NOT NULL,
+                    seq INT NOT NULL,
+                    environment_id INT NULL,
+                    ds_kind VARCHAR(64) NULL,
+                    ds_name VARCHAR(500) NULL,
+                    scan_kind VARCHAR(64) NULL,
+                    file_set_type VARCHAR(150) NULL,
+                    is_enabled BOOLEAN DEFAULT TRUE,
+                    is_acl BOOLEAN DEFAULT FALSE,
+                    is_ocr BOOLEAN DEFAULT FALSE,
+                    is_structured_ff BOOLEAN DEFAULT FALSE,
+                    is_ols BOOLEAN DEFAULT FALSE,
+                    is_lite BOOLEAN DEFAULT FALSE,
+                    feature_flags VARCHAR(500) NULL,
+                    notes VARCHAR(1000) NULL,
+                    ds_id VARCHAR(128) NULL,
+                    scan_profile_id VARCHAR(128) NULL,
+                    scan_profile_name VARCHAR(500) NULL,
+                    build_version VARCHAR(50) NULL,
+                    build_prefix VARCHAR(20) NULL,
+                    scan_id VARCHAR(128) NULL,
+                    status VARCHAR(32) NULL,
+                    last_error TEXT NULL,
+                    started_at TIMESTAMP NULL,
+                    finished_at TIMESTAMP NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(run_id, seq)
+                )
+            """))
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS workflow_templates (
+                    k VARCHAR(200) PRIMARY KEY,
+                    template_kind VARCHAR(32) NULL,
+                    payload_json TEXT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            try:
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_run_seq ON workflow_steps(run_id, seq)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_steps_status ON workflow_steps(status)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS idx_workflow_templates_kind ON workflow_templates(template_kind)"))
+            except Exception:
+                pass
+            for stmt in [
+                "ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE",
+                "ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS scan_profile_name VARCHAR(500) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS build_version VARCHAR(50) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS build_prefix VARCHAR(20) NULL",
+                "ALTER TABLE workflow_runs ADD COLUMN IF NOT EXISTS scan_template_id VARCHAR(128) NULL",
+                "ALTER TABLE workflow_steps ADD COLUMN IF NOT EXISTS is_lite BOOLEAN DEFAULT FALSE",
             ]:
                 try:
                     conn.execute(text(stmt))
@@ -846,12 +952,12 @@ def _set_env_busy(engine, env_id: int, run_id: Optional[int], is_busy: bool) -> 
         with engine.begin() as conn:
             if is_busy:
                 conn.execute(
-                    text("UPDATE test_environments SET is_busy=1, busy_by_run_id=:rid, busy_since=:now WHERE id=:eid"),
+                    text("UPDATE test_environments SET is_busy=TRUE, busy_by_run_id=:rid, busy_since=:now WHERE id=:eid"),
                     {"rid": run_id, "now": now, "eid": int(env_id)}
                 )
             else:
                 conn.execute(
-                    text("UPDATE test_environments SET is_busy=0, busy_by_run_id=NULL, busy_since=NULL WHERE id=:eid"),
+                    text("UPDATE test_environments SET is_busy=FALSE, busy_by_run_id=NULL, busy_since=NULL WHERE id=:eid"),
                     {"eid": int(env_id)}
                 )
     except Exception:
@@ -1012,6 +1118,18 @@ def upsert_template_value(engine, key: str, template_kind: str, payload_json: st
                         template_kind=excluded.template_kind,
                         payload_json=excluded.payload_json,
                         updated_at=datetime('now')
+                """),
+                {"k": k, "t": tk, "p": pj},
+            )
+        elif is_postgresql_engine(engine):
+            conn.execute(
+                text("""
+                    INSERT INTO workflow_templates (k, template_kind, payload_json)
+                    VALUES (:k, :t, :p)
+                    ON CONFLICT(k) DO UPDATE SET
+                        template_kind=EXCLUDED.template_kind,
+                        payload_json=EXCLUDED.payload_json,
+                        updated_at=CURRENT_TIMESTAMP
                 """),
                 {"k": k, "t": tk, "p": pj},
             )
@@ -1201,6 +1319,7 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
         out["Postgres_host"] = _getenv_any(["Postgres_host", "POSTGRES_host", "POSTGRES_HOST", "postgres_host", "Postgres_hostname", "POSTGRES_HOSTNAME", "postgres_hostname"])
         out["Postgres_port"] = _getenv_any(["Postgres_port", "POSTGRES_port", "POSTGRES_PORT", "postgres_port"])
         out["Postgres_rdb_url"] = _getenv_any(["Postgres_rdb_url", "POSTGRES_RDB_URL", "postgres_rdb_url"])
+        out["Postgres_rdb_name"] = _getenv_any(["Postgres_rdb_name", "POSTGRES_rdb_name", "POSTGRES_RDB_NAME", "postgres_rdb_name", "Postgres_database", "POSTGRES_DATABASE", "postgres_database"])
     elif k == "mssql":
         out["MSSQL_username"] = _getenv_any(["MSSQL_username", "MSSQL_USERNAME", "mssql_username"])
         out["MSSQL_password"] = _getenv_any(["MSSQL_password", "MSSQL_PASSWORD", "mssql_password"])
@@ -1469,16 +1588,41 @@ def ensure_runner_heartbeat_table(engine) -> None:
     (Table is also used by tracker.py; we create it here for standalone runner usage.)
     """
     try:
+        try:
+            dialect = str(getattr(getattr(engine, "dialect", None), "name", "") or "").lower()
+        except Exception:
+            dialect = ""
         with engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS tracker_heartbeat (
-                    name VARCHAR(64) PRIMARY KEY,
-                    last_started_at_utc DATETIME NULL,
-                    last_finished_at_utc DATETIME NULL,
-                    last_status VARCHAR(16) NULL,
-                    last_message VARCHAR(2000) NULL
-                )
-            """))
+            if is_postgresql_engine(engine):
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                        name VARCHAR(64) PRIMARY KEY,
+                        last_started_at_utc TIMESTAMP NULL,
+                        last_finished_at_utc TIMESTAMP NULL,
+                        last_status VARCHAR(16) NULL,
+                        last_message VARCHAR(2000) NULL
+                    )
+                """))
+            elif "sqlite" in dialect:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                        name TEXT PRIMARY KEY,
+                        last_started_at_utc TEXT NULL,
+                        last_finished_at_utc TEXT NULL,
+                        last_status TEXT NULL,
+                        last_message TEXT NULL
+                    )
+                """))
+            else:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS tracker_heartbeat (
+                        name VARCHAR(64) PRIMARY KEY,
+                        last_started_at_utc DATETIME NULL,
+                        last_finished_at_utc DATETIME NULL,
+                        last_status VARCHAR(16) NULL,
+                        last_message VARCHAR(2000) NULL
+                    )
+                """))
             conn.commit()
     except Exception:
         pass
@@ -1513,6 +1657,19 @@ def set_runner_heartbeat(engine, *, status: str, message: str = "", started: boo
                             last_finished_at_utc=COALESCE(excluded.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
                             last_status=COALESCE(excluded.last_status, tracker_heartbeat.last_status),
                             last_message=COALESCE(excluded.last_message, tracker_heartbeat.last_message)
+                    """),
+                    {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
+                )
+            elif is_postgresql_engine(engine):
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_heartbeat (name, last_started_at_utc, last_finished_at_utc, last_status, last_message)
+                        VALUES (:n, :sa, :fa, :s, :m)
+                        ON CONFLICT(name) DO UPDATE SET
+                            last_started_at_utc=COALESCE(EXCLUDED.last_started_at_utc, tracker_heartbeat.last_started_at_utc),
+                            last_finished_at_utc=COALESCE(EXCLUDED.last_finished_at_utc, tracker_heartbeat.last_finished_at_utc),
+                            last_status=COALESCE(EXCLUDED.last_status, tracker_heartbeat.last_status),
+                            last_message=COALESCE(EXCLUDED.last_message, tracker_heartbeat.last_message)
                     """),
                     {"n": RUNNER_HEARTBEAT_NAME, "sa": started_at, "fa": finished_at, "s": stv, "m": msg},
                 )
@@ -1628,12 +1785,13 @@ def _update_env_version_in_db(engine, env_id: Any, build_version: str) -> None:
 
 
 def load_env(engine, env_id: int) -> Dict[str, Any]:
+    include_expr = "COALESCE(include_in_workflow_runs, TRUE)" if is_postgresql_engine(engine) else "COALESCE(include_in_workflow_runs, 1)"
     with engine.connect() as conn:
         row = conn.execute(
-            text("""
+            text(f"""
                 SELECT id, env_name, base_url, version, auth_module_path, auth_function_name,
                        classifiers_api_path, is_active,
-                       COALESCE(include_in_workflow_runs, 1) AS include_in_workflow_runs
+                       {include_expr} AS include_in_workflow_runs
                 FROM test_environments
                 WHERE id = :id
                 LIMIT 1
@@ -1795,10 +1953,13 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
         h = _get("Postgres_host")
         pt = _get("Postgres_port")
         ru = _get("Postgres_rdb_url")
+        rn = _get("Postgres_rdb_name")
         if u:
             ds_conn["username"] = u
         if p:
             ds_conn["password"] = p
+        if rn:
+            ds_conn["rdb_name"] = rn
         _override_rdb_url(ds_conn, host=h, port=pt, url_override=ru)
         if isinstance(ap, dict):
             if u:
@@ -2560,12 +2721,12 @@ def _ensure_test_environments_workflow_column(engine) -> None:
     if _workflow_include_col_ready:
         return
     try:
+        if is_postgresql_engine(engine):
+            stmt = "ALTER TABLE test_environments ADD COLUMN IF NOT EXISTS include_in_workflow_runs BOOLEAN DEFAULT TRUE"
+        else:
+            stmt = "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE"
         with engine.connect() as conn:
-            conn.execute(
-                text(
-                    "ALTER TABLE test_environments ADD COLUMN include_in_workflow_runs BOOLEAN DEFAULT TRUE"
-                )
-            )
+            conn.execute(text(stmt))
             conn.commit()
     except Exception:
         pass
@@ -2588,7 +2749,7 @@ def _auto_resume_failed_run_if_stuck(engine, run_id: int) -> None:
         with engine.connect() as conn:
             act = conn.execute(
                 text(
-                    "SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,1)=1 "
+                    "SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(is_enabled,TRUE)=TRUE "
                     "AND LOWER(TRIM(COALESCE(status,''))) NOT IN ('completed','error','disabled') LIMIT 1"
                 ),
                 {"rid": int(run_id)},
@@ -2648,7 +2809,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     with engine.connect() as conn:
         run_rows = conn.execute(
             text("""
-                SELECT id, status, cooldown_minutes, next_eligible_at
+                SELECT id, status, cooldown_minutes, next_eligible_at, env1_id, env2_id
                 FROM workflow_runs
                 WHERE status IN ('running', 'failed')
                 ORDER BY id ASC
@@ -2674,7 +2835,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
     # --- Pre-pass: Release environments where cooldown or run has ended ---
     try:
         with engine.connect() as conn:
-            busy_envs = conn.execute(text("SELECT id, busy_by_run_id FROM test_environments WHERE is_busy=1")).fetchall()
+            busy_envs = conn.execute(text("SELECT id, busy_by_run_id FROM test_environments WHERE is_busy=TRUE")).fetchall()
         for be in busy_envs:
             be_id = int(be[0])
             be_run_id = be[1]
@@ -2730,8 +2891,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             env_rows = conn.execute(text(
                 """
                 SELECT id FROM test_environments
-                WHERE COALESCE(is_active, 0) != 0
-                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                WHERE COALESCE(is_active, FALSE) = TRUE
+                  AND COALESCE(include_in_workflow_runs, TRUE) = TRUE
                 ORDER BY id
                 """
             )).fetchall()
@@ -2745,8 +2906,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             env_rows = conn.execute(text(
                 """
                 SELECT id, is_busy, busy_by_run_id FROM test_environments
-                WHERE COALESCE(is_active, 0) != 0
-                  AND COALESCE(include_in_workflow_runs, 1) != 0
+                WHERE COALESCE(is_active, FALSE) = TRUE
+                  AND COALESCE(include_in_workflow_runs, TRUE) = TRUE
                 ORDER BY id
                 """
             )).fetchall()
@@ -2775,8 +2936,8 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         FROM workflow_steps ws
                         LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
                         WHERE ws.run_id=:rid
-                          AND COALESCE(ws.is_enabled,1)=1
-                          AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
+                          AND COALESCE(ws.is_enabled,TRUE)=TRUE
+                          AND COALESCE(ws.status,'') NOT IN ('completed','error','disabled')
                           AND (
                             (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
                             OR COALESCE(ws.status,'') IN ('scan_running','scan_waiting')
@@ -2877,9 +3038,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             
             if completed_any and completed_success_any:
                 try:
-                    c_min = int(run_row[2]) if run_row[2] is not None else 15
+                    c_min = int(run_row[2]) if run_row[2] is not None else 10
                 except Exception:
-                    c_min = 15
+                    c_min = 10
                 set_run_next_eligible(engine, run_id, _now_utc() + timedelta(minutes=float(c_min)))
         except Exception:
             pass
@@ -2923,7 +3084,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     FROM workflow_steps ws
                     INNER JOIN workflow_runs wr ON wr.id = ws.run_id
                     WHERE wr.status = 'running'
-                      AND COALESCE(ws.is_enabled, 1) = 1
+                      AND {_sql_truthy(engine, "ws.is_enabled")}
                       AND ws.environment_id IS NOT NULL
                       AND LOWER(TRIM(COALESCE(ws.status, ''))) IN ({_workflow_env_occupying_sql_in()})
                     """
@@ -2956,9 +3117,23 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             
         run_id = int(run_row[0])
         try:
-            cooldown_m = int(run_row[2]) if run_row[2] is not None else 15
+            cooldown_m = int(run_row[2]) if run_row[2] is not None else 10
         except Exception:
-            cooldown_m = 15
+            cooldown_m = 10
+
+        # Allowed environment pool for this run (from Env 1 / Env 2 selection in UI)
+        run_env_pool: List[int] = []
+        try:
+            e1 = run_row[4] # env1_id
+            e2 = run_row[5] # env2_id
+            if e1: run_env_pool.append(int(e1))
+            if e2: run_env_pool.append(int(e2))
+        except Exception:
+            pass
+        
+        # If no pool is selected, fall back to all active envs
+        effective_run_env_pool = run_env_pool if run_env_pool else active_env_ids
+        run_capacity = len(effective_run_env_pool)
             
         # Re-fetch next_eligible_at
         try:
@@ -2975,11 +3150,12 @@ def run_once(engine, *, quiet: bool = False) -> bool:
 
         # Strategy for status filter
         retry_errors = str(os.getenv("WORKFLOW_RETRY_ERROR_STEPS", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        enabled_filter = _sql_truthy(engine, "is_enabled")
         if not retry_errors:
             # Include scan_created so a step can resume (e.g. trigger scan after profile) if the runner tick ended mid-pipeline.
-            where_status = "AND COALESCE(status, 'pending') NOT IN ('completed', 'error', 'disabled') AND COALESCE(is_enabled, 1) = 1"
+            where_status = f"AND COALESCE(status, 'pending') NOT IN ('completed', 'error', 'disabled') AND {enabled_filter}"
         else:
-            where_status = "AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND COALESCE(is_enabled, 1) = 1"
+            where_status = f"AND COALESCE(status, 'pending') IN ('pending', 'error') AND COALESCE(status,'') <> 'disabled' AND {enabled_filter}"
 
         with engine.connect() as conn:
             candidates = conn.execute(
@@ -3002,10 +3178,10 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                     if not any_left:
                         with engine.connect() as conn:
                             # Re-verify one last time before closing
-                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, 1) = 1 LIMIT 1"), {"rid": run_id}).fetchone()
+                            any_active = conn.execute(text(f"SELECT 1 FROM workflow_steps WHERE run_id=:rid AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') AND COALESCE(is_enabled, TRUE) = TRUE LIMIT 1"), {"rid": run_id}).fetchone()
                             if not any_active:
                                 # Mark as failed if ANY enabled step hit an error, otherwise completed
-                                has_err = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,1)=1 LIMIT 1"), {"rid": run_id}).fetchone()
+                                has_err = conn.execute(text("SELECT 1 FROM workflow_steps WHERE run_id=:rid AND status='error' AND COALESCE(is_enabled,TRUE)=TRUE LIMIT 1"), {"rid": run_id}).fetchone()
                                 final_s = 'failed' if has_err else 'completed'
                                 conn.execute(text("UPDATE workflow_runs SET status=:s, finished_at=CURRENT_TIMESTAMP WHERE id=:rid"), {"rid": run_id, "s": final_s})
                                 conn.commit()
@@ -3015,10 +3191,13 @@ def run_once(engine, *, quiet: bool = False) -> bool:
             continue
 
         def _inner_pick(allow_scan_running: bool) -> Optional[Tuple[Any, Optional[int]]]:
-            # Parallel: run up to env_count steps at once. Step N can run whenever there is capacity:
-            # count = how many steps with seq < N are not terminal; if count < env_count, step N can start (some env free).
+            # Parallel: run up to capacity steps at once. Step N can run whenever there is capacity:
+            # count = how many steps with seq < N are not terminal; if count < capacity, step N can start (some env free).
             # So step 3 can run as soon as step 1 OR step 2 completes (whichever frees an env first).
-            num_envs = max(1, env_count)
+            num_envs = max(1, run_capacity)
+            allowed_pool = [int(x) for x in effective_run_env_pool if int(x) in active_env_ids]
+            if not allowed_pool:
+                return None
             for cand in candidates:
                 cand_id = int(cand[0])
                 cand_seq = int(cand[1])
@@ -3054,9 +3233,9 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                 if c_env is not None and c_status in WORKFLOW_ENV_OCCUPYING_STATUSES and c_status != 'scan_running':
                     return (cand, int(c_env))
 
-                # Search through ALL active environments (or just the assigned one). DB first (reserved by another run?), then API (scan running?).
+                # Search through ALLOWED active environments (or just the assigned one). DB first (reserved by another run?), then API (scan running?).
                 best_env = None
-                env_candidates = [int(c_env)] if c_env is not None else active_env_ids
+                env_candidates = [int(c_env)] if (c_env is not None and int(c_env) in allowed_pool) else allowed_pool
                 for eid in env_candidates:
                     if int(eid) not in active_env_ids:
                         continue
@@ -3317,7 +3496,7 @@ def _maybe_mark_run_completed(engine, run_id: int) -> None:
                     "SELECT 1 FROM workflow_steps "
                     "WHERE run_id=:rid "
                     "AND COALESCE(status,'pending') NOT IN ('completed','error','disabled') "
-                    "AND COALESCE(is_enabled,1)=1 "
+                    "AND COALESCE(is_enabled,TRUE)=TRUE "
                     "LIMIT 1"
                 ),
                 {"rid": int(run_id)},
@@ -3327,7 +3506,7 @@ def _maybe_mark_run_completed(engine, run_id: int) -> None:
                     "SELECT 1 FROM workflow_steps "
                     "WHERE run_id=:rid "
                     "AND COALESCE(status,'')='error' "
-                    "AND COALESCE(is_enabled,1)=1 "
+                    "AND COALESCE(is_enabled,TRUE)=TRUE "
                     "LIMIT 1"
                 ),
                 {"rid": int(run_id)},
@@ -3540,6 +3719,20 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
     # We do NOT rely on timestamps for uniqueness. We use build prefix + scenario + wf run/seq.
     existing_ds_name = str(step_dict.get("ds_name") or "").strip()
     base_ds_name = existing_ds_name or _standard_ds_base_name(step_dict)
+    
+    # Check if OLS is enabled for this workflow and auto-add OLS to name if not present
+    try:
+        if not bool(step_dict.get("is_ols")):  # Only if step doesn't already have is_ols=True
+            with engine.connect() as conn:
+                ols_row = conn.execute(text("SELECT COALESCE(ols_enabled, FALSE) FROM workflow_runs WHERE id = :rid"), {"rid": int(run_id)}).fetchone()
+            if ols_row and bool(ols_row[0]):
+                # OLS is enabled for workflow, add to name if not present
+                if "OLS" not in base_ds_name.upper():
+                    base_ds_name = f"{base_ds_name} OLS".strip()
+                    logger.info(f"Auto-added OLS to DS name for step {seq}: {base_ds_name}")
+    except Exception as ex:
+        logger.warning(f"Failed to check OLS status for workflow {run_id}: {ex}")
+    
     # Always apply build prefix (if we have it).
     base_with_prefix = _apply_build_prefix(base_ds_name, build_prefix) if build_prefix else base_ds_name
     # Ensure uniqueness per workflow run/step without timestamps.
@@ -3579,13 +3772,76 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             
             if not action_tpl:
                 raise RuntimeError(f"Missing action template for key: {action_key}")
+            
+            # If environment_id is NULL, run action on workflow's assigned environments (env1_id, env2_id)
+            if env_id is None:
+                # Get env1_id and env2_id from workflow_runs
+                with engine.connect() as conn:
+                    run_row = conn.execute(text("SELECT env1_id, env2_id FROM workflow_runs WHERE id=:rid"), {"rid": int(run_id)}).fetchone()
                 
-            action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
-            action_payload = json.loads(action_raw)
-            run_action_template(base_url, token, action_payload)
+                if not run_row:
+                    raise RuntimeError("Workflow run not found")
+                
+                env_ids = [run_row[0], run_row[1]]
+                env_ids = [eid for eid in env_ids if eid is not None]
+                
+                if not env_ids:
+                    raise RuntimeError("No environments assigned to workflow")
+                
+                # Execute action on each assigned environment
+                for env_id_item in env_ids:
+                    try:
+                        with engine.connect() as conn:
+                            env_row_item = conn.execute(text("""
+                                SELECT base_url, is_active
+                                FROM test_environments
+                                WHERE id = :eid
+                            """), {"eid": int(env_id_item)}).fetchone()
+                        
+                        if not env_row_item or not bool(env_row_item[1]):
+                            logger.warning(f"Skipping action for env {env_id_item}: not active")
+                            continue
+                        
+                        base_url_item = str(env_row_item[0] or "").strip()
+                        if not base_url_item:
+                            logger.warning(f"Skipping action for env {env_id_item}: no base_url")
+                            continue
+                        
+                        # Get auth token for this environment
+                        token_item = get_auth_token_for_env(env_id_item)
+                        if not token_item:
+                            logger.warning(f"Skipping action for env {env_id_item}: no auth token")
+                            continue
+                        
+                        action_raw = _render_template(action_tpl, {"BASE_URL": base_url_item, "TOKEN": token_item})
+                        action_payload = json.loads(action_raw)
+                        run_action_template(base_url_item, token_item, action_payload)
+                        logger.info(f"Action '{action_key}' completed on env {env_id_item}")
+                    except Exception as ex:
+                        logger.warning(f"Action '{action_key}' failed on env {env_id_item}: {ex}")
+                        # Continue with other environments even if one fails
+            else:
+                # Single environment - execute action
+                action_raw = _render_template(action_tpl, {"BASE_URL": base_url, "TOKEN": token})
+                action_payload = json.loads(action_raw)
+                run_action_template(base_url, token, action_payload)
             
             # Action completed successfully, mark step as completed
             set_step_status(engine, step_id, "completed", finished_at=_now_utc())
+            
+            # If this was an OLS enable action, mark the workflow as OLS-enabled
+            if "OLS" in action_key.upper():
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text("""
+                            UPDATE workflow_runs 
+                            SET ols_enabled = TRUE 
+                            WHERE id = :rid
+                        """), {"rid": int(run_id)})
+                    logger.info(f"Marked workflow {run_id} as OLS-enabled")
+                except Exception as ex:
+                    logger.warning(f"Failed to mark workflow as OLS-enabled: {ex}")
+            
             _set_env_busy(engine, env_id, run_id, False) # RELEASE
             set_run_next_eligible(engine, run_id, _now_utc())
             return True
@@ -3595,8 +3851,6 @@ def _process_step(engine, run_id, step, env_id, cooldown_m, now, logger, quiet) 
             _set_env_busy(engine, env_id, run_id, False) # RELEASE
             set_run_next_eligible(engine, run_id, _now_utc())
             return True
-
-    # --- Pre-step action (feature flags on/off etc) ---
 
     # --- DS create/update ---
     if not _run_is_running(engine, int(run_id)):
@@ -3998,7 +4252,7 @@ def main() -> int:
     logger = _get_logger(quiet=bool(args.quiet))
     logger.info('runner_start id=%s quiet=%s interval=%s once=%s log=%s', RUNNER_ID, bool(args.quiet), args.interval_seconds, bool(args.once), str(LOG_PATH))
 
-    engine = create_engine(DB_CONNECTION_STRING)
+    engine = create_engine(resolve_benchmark_database_url())
     # Ensure we can connect
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
@@ -4035,4 +4289,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

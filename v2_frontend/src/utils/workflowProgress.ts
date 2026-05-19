@@ -58,6 +58,15 @@ export function computeProgressEmoji(rd: Record<string, unknown>): string {
 
   if (s === 'disabled') return '🚫 Disabled';
 
+  // Action steps don't have DS/Profile/Scan pipeline - they just execute API calls
+  const dsKind = String(rd.ds_kind ?? '').trim().toLowerCase();
+  if (dsKind === 'action') {
+    if (s === 'completed') return '✅ Action';
+    if (s === 'error') return '❌ Action';
+    if (s === 'running' || s === 'pre_action_done') return '⏳ Action';
+    return '➖ Action';
+  }
+
   const dsId = String(rd.ds_id ?? '').trim();
   const spid = String(rd.scan_profile_id ?? '').trim();
   const sid = String(rd.scan_id ?? '').trim();

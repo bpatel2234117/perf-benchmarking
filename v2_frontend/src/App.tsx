@@ -6,6 +6,18 @@ import Logs from './pages/Logs';
 import Workflow from './pages/Workflow';
 import Environments from './pages/Environments';
 import LegacyToolPage from './pages/LegacyToolPage';
+import ScanStatusPage from './pages/ScanStatusPage';
+import ScanProgressRedirect from './pages/ScanProgressPage';
+import AddBenchmarkFromScanPage from './pages/AddBenchmarkFromScanPage';
+import BuildAnalysisPage from './pages/BuildAnalysisPage';
+import ClassifierComparisonPage from './pages/ClassifierComparisonPage';
+import EditRecordsPage from './pages/EditRecordsPage';
+import ManageRBACPage from './pages/ManageRBACPage';
+import ScannerInfraPage from './pages/ScannerInfraPage';
+import CreateDataSourcePage from './pages/CreateDataSourcePage';
+import RunComparisonPage from './pages/RunComparisonPage';
+import VersionComparisonPage from './pages/VersionComparisonPage';
+import GeneratedReportsPage from './pages/GeneratedReportsPage';
 import Navbar from './components/Navbar';
 
 const App = () => {
@@ -27,6 +39,20 @@ const App = () => {
       <Route path="/logs" element={token ? <Logs token={token} /> : <Navigate to="/login" />} />
       <Route path="/workflow" element={token ? <Workflow token={token} /> : <Navigate to="/login" />} />
       <Route path="/environments" element={token ? <Environments token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/scan-status" element={token ? <ScanStatusPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/scan-progress" element={token ? <ScanProgressRedirect /> : <Navigate to="/login" />} />
+      <Route path="/tools/add-benchmark" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/build-analysis" element={token ? <BuildAnalysisPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/classifier-comparison" element={token ? <ClassifierComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/records-edit" element={token ? <EditRecordsPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/manage-rbac" element={token ? <ManageRBACPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/scanner-infra" element={token ? <ScannerInfraPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/data-source-create" element={token ? <CreateDataSourcePage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/run-comparison" element={token ? <RunComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/version-comparison" element={token ? <VersionComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/generated-reports" element={token ? <GeneratedReportsPage token={token} /> : <Navigate to="/login" />} />
+      {/* data-record-add → AddBenchmarkFromScanPage (same functionality) */}
+      <Route path="/tools/data-record-add" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/:slug" element={token ? <LegacyToolPage /> : <Navigate to="/login" />} />
     </Routes>
   );
@@ -34,7 +60,7 @@ const App = () => {
   return (
     <Router>
       {token ? (
-        <Navbar onLogout={() => handleSetToken(null)}>{routesInner}</Navbar>
+        <Navbar onLogout={() => handleSetToken(null)} token={token}>{routesInner}</Navbar>
       ) : (
         <div className="main-content main-content-login">{routesInner}</div>
       )}
@@ -43,4 +69,3 @@ const App = () => {
 };
 
 export default App;
-

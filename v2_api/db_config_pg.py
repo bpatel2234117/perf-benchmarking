@@ -26,7 +26,9 @@ DDL_STATEMENTS = {
     'builds': """
         CREATE TABLE IF NOT EXISTS builds (
             id SERIAL PRIMARY KEY,
-            version VARCHAR(50) UNIQUE NOT NULL
+            version VARCHAR(50) UNIQUE NOT NULL,
+            release_milestone INT NULL,
+            quarter_label VARCHAR(50) NULL
         );
     """,
     'classifiers': """
@@ -144,9 +146,52 @@ DDL_STATEMENTS = {
             throughput_cluster_files_hr REAL,
             throughput_scanner_files_hr REAL,
             throughput_thread_files_hr REAL,
+            total_files BIGINT NULL,
+            total_folders BIGINT NULL,
+            total_size_gb REAL NULL,
+            data_type VARCHAR(50) NULL,
+            total_classification BIGINT NULL,
+            removed_attributes BIGINT NULL,
+            classifier_list TEXT NULL,
             is_active BOOLEAN DEFAULT TRUE,
+            is_release BOOLEAN DEFAULT FALSE,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            scan_id VARCHAR(128) NULL
+            scan_id VARCHAR(128) NULL,
+            created_by INT NULL REFERENCES app_users(id)
+        );
+    """,
+    'auto_scan_benchmarks': """
+        CREATE TABLE IF NOT EXISTS auto_scan_benchmarks (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL UNIQUE,
+            environment_id INT REFERENCES test_environments(id),
+            build_version VARCHAR(100),
+            run_date DATE,
+            scenario_type VARCHAR(100),
+            scan_type VARCHAR(100),
+            data_source_type VARCHAR(100),
+            data_type VARCHAR(50),
+            file_set_type VARCHAR(150),
+            scan_start_time TIMESTAMP,
+            scan_end_time TIMESTAMP,
+            total_scan_hours REAL,
+            objects_with_pi BIGINT,
+            objects_scanned BIGINT,
+            objects_enumerated BIGINT,
+            total_classification BIGINT,
+            new_attributes INT,
+            removed_attributes INT,
+            classifier_attribute_names TEXT,
+            scan_name VARCHAR(1000),
+            total_size_gb REAL,
+            total_files BIGINT,
+            total_folders BIGINT,
+            throughput_cluster_gb_hr REAL,
+            throughput_cluster_files_hr REAL,
+            is_active BOOLEAN DEFAULT TRUE,
+            is_release BOOLEAN DEFAULT FALSE,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by INT NULL REFERENCES app_users(id)
         );
     """,
     'benchmark_findings': """
@@ -179,6 +224,7 @@ DDL_STATEMENTS = {
             log_source VARCHAR(50) DEFAULT 'scanner',
             scan_id VARCHAR(50),
             subscan_id VARCHAR(50),
+            error_hash VARCHAR(32),
             is_resolved BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -231,14 +277,16 @@ DDL_STATEMENTS = {
             status VARCHAR(32) NULL,
             env1_id INT NULL,
             env2_id INT NULL,
-            cooldown_minutes INT DEFAULT 15,
+            cooldown_minutes INT DEFAULT 10,
             next_eligible_at TIMESTAMP NULL,
             last_error TEXT NULL,
             started_at TIMESTAMP NULL,
             finished_at TIMESTAMP NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            scan_template_id VARCHAR(128) NULL
+            scan_template_id VARCHAR(128) NULL,
+            created_by INT NULL REFERENCES app_users(id),
+            ols_enabled BOOLEAN DEFAULT FALSE
         );
     """,
     'workflow_steps': """
@@ -281,5 +329,65 @@ DDL_STATEMENTS = {
             payload_json TEXT NULL,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-    """
+    """,
+    # Tracker / Streamlit parity (MySQL→Postgres sync); explicit ids preserved for upserts.
+    'scan_parents': """
+        CREATE TABLE IF NOT EXISTS scan_parents (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL UNIQUE,
+            environment_id INT NULL REFERENCES test_environments(id),
+            scan_name VARCHAR(1000) NULL,
+            scan_type VARCHAR(120) NULL,
+            started_at VARCHAR(80) NULL,
+            completed_at VARCHAR(80) NULL,
+            template_name VARCHAR(255) NULL,
+            scan_status VARCHAR(120) NULL,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP NULL,
+            updated_at TIMESTAMP NULL,
+            last_seen_at TIMESTAMP NULL
+        );
+    """,
+    'scan_progress': """
+        CREATE TABLE IF NOT EXISTS scan_progress (
+            id SERIAL PRIMARY KEY,
+            scan_id VARCHAR(128) NOT NULL,
+            scan_name VARCHAR(1000) NULL,
+            environment_id INT NULL REFERENCES test_environments(id),
+            "timestamp" TIMESTAMP NULL,
+            captured_at_utc TIMESTAMP NULL,
+            scan_state VARCHAR(64) NULL,
+            completed_sub_scans BIGINT DEFAULT 0,
+            failed_sub_scans BIGINT DEFAULT 0,
+            total_sub_scans BIGINT DEFAULT 0,
+            completed_parts BIGINT DEFAULT 0,
+            failed_parts BIGINT DEFAULT 0,
+            total_parts_scanned BIGINT DEFAULT 0,
+            total_classifications BIGINT DEFAULT 0,
+            newly_added_classifications BIGINT DEFAULT 0,
+            false_removed_classifications BIGINT DEFAULT 0,
+            objects_scanned BIGINT DEFAULT 0,
+            objects_failed BIGINT DEFAULT 0,
+            objects_with_pi BIGINT DEFAULT 0
+        );
+    """,
+    # Populated by Scan Status "Sync" (BigID insights API) / tracker parity.
+    'scan_insights': """
+        CREATE TABLE IF NOT EXISTS scan_insights (
+            scan_id VARCHAR(128) PRIMARY KEY,
+            distinct_classification_attributes BIGINT NULL,
+            classifier_attribute_names TEXT NULL,
+            data_source_names TEXT NULL,
+            objects_with_pi BIGINT NULL,
+            objects_scanned BIGINT NULL,
+            objects_enumerated BIGINT NULL,
+            total_classification BIGINT NULL,
+            new_attributes_count BIGINT NULL,
+            removed_attributes_count BIGINT NULL,
+            total_size_gb REAL NULL,
+            insight_payload TEXT NULL,
+            attributes_payload TEXT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """,
 }
