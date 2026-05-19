@@ -157,7 +157,19 @@ def check_access(page_name: str) -> bool:
     if page_name in ADMIN_ONLY_PAGES:
         return False
     
-    # Allow authenticated users access to everything else (Workflows, Progress, Trends, etc.)
+    # Trend Analysis consolidation
+    TREND_PAGES = [
+        "Data Source Trend Comparison", "Small Files Trend Analysis", "Large Files Trend Analysis",
+        "Small Files OLS Trend", "Large Files OLS Trend", "OLS vs Full Scan (Small)",
+        "OLS vs Full Scan (Large)", "Discover File FF On vs Off", "ACL ON vs OLS (ACL ON)",
+        "ACL OFF vs OLS (ACL OFF)"
+    ]
+    if page_name in TREND_PAGES:
+        user_perms = st.session_state.get("allowed_pages", [])
+        if "Trend Analysis" in user_perms:
+            return True
+
+    # Allow authenticated users access to everything else (Workflows, Progress, etc.)
     return True
 
 def get_user_permissions(engine, role_id):

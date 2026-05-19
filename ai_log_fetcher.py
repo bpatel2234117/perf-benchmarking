@@ -11,8 +11,12 @@ from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
 
-# Force unbuffered output for cleaner logs
-sys.stdout.reconfigure(line_buffering=True)
+# Force unbuffered output for cleaner logs (guard for pythonw.exe where stdout may be None)
+if sys.stdout is not None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 print(f"[{datetime.now().isoformat()}] INFO: Bootstrapping dependencies...")
 
@@ -130,25 +134,50 @@ def load_enabled_log_sources(engine):
         print(f"Failed to load enabled_log_sources: {e}")
         return fallback
 
-def check_ollama_ready():
-    """Verify that Ollama is reachable before starting the analyzer loop."""
-    print(f"[{datetime.utcnow().isoformat()}] Checking Ollama connection at {OLLAMA_URL}...")
+_ollama_cache: dict = {"ts": None, "ready": False}
+_OLLAMA_CACHE_TTL_SECS = 120  # re-verify at most once every 2 minutes
+
+
+def check_ollama_ready(use_cache: bool = True) -> bool:
+    """Verify that Ollama is reachable.
+
+    Results are cached for _OLLAMA_CACHE_TTL_SECS seconds so that a large
+    batch of errors does not trigger N sequential HTTP probes against a
+    server that is already known to be down/up.
+
+    Set use_cache=False (or call from main() startup) to force a fresh check.
+    """
+    cache = _ollama_cache
+    now = datetime.utcnow()
+    if use_cache and cache["ts"] is not None:
+        elapsed = (now - cache["ts"]).total_seconds()
+        if elapsed < _OLLAMA_CACHE_TTL_SECS:
+            return cache["ready"]
+
+    print(f"[{now.isoformat()}] Checking Ollama connection at {OLLAMA_URL}...")
     try:
-        # Just check the base URL status
         base_url = "/".join(OLLAMA_URL.split("/")[:3])
         response = requests.get(base_url, timeout=5)
-        if response.status_code == 200:
-            print(f"[{datetime.utcnow().isoformat()}] [OK] Ollama is active.")
-            return True
+        ready = response.status_code == 200
+        if ready:
+            print(f"[{now.isoformat()}] [OK] Ollama is active.")
         else:
-            print(f"[{datetime.utcnow().isoformat()}] [ERROR] Ollama returned status {response.status_code}")
-            return False
+            print(f"[{now.isoformat()}] [ERROR] Ollama returned status {response.status_code}")
     except Exception as e:
-        print(f"[{datetime.utcnow().isoformat()}] [ERROR] Cannot reach Ollama: {e}")
-        return False
+        print(f"[{now.isoformat()}] [ERROR] Cannot reach Ollama: {e}")
+        ready = False
+
+    cache["ts"] = now
+    cache["ready"] = ready
+    return ready
 
 def setup_db_engine():
-    engine = create_engine(get_db_connection_string(), echo=False)
+    engine = create_engine(
+        get_db_connection_string(),
+        echo=False,
+        pool_pre_ping=True,   # verify connection health before each use
+        pool_recycle=1800,    # recycle connections after 30 min to avoid stale TCP
+    )
     ensure_app_settings_table(engine)
     try:
         with engine.connect() as conn:
@@ -511,6 +540,7 @@ def _skip_info_level_line(line: str) -> bool:
     # Even on INFO/DEBUG/TRACE — keep the line if it has a strong signal
     STRONG_SIGNALS = re.compile(
         r"(?i)(?:"
+        r"\berror\b|\bfatal\b|\bsevere\b|"
         r"\bexception\b|\bstacktrace\b|\bstack.?trace\b|\bnullpointer\b|\bnull.?pointer\b|"
         r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
         r"\b(?:40[0-9]|5[0-9]{2})\b|"          # HTTP 4xx/5xx status codes
@@ -542,8 +572,9 @@ def _looks_like_success_scan_summary(ctx: str) -> bool:
 def _line_passes_error_level_gate(line: str) -> bool:
     """
     Require a real log severity on the trigger line (defense against keyword-only false positives).
-    Default: only [ERROR], [FATAL], [SEVERE]. Set SCANNER_LOG_ERROR_REQUIRE_LEVEL=warn to include
-    [WARN]/[WARNING], or any/legacy for keyword-only matching (old behavior).
+    Default: accepts [ERROR]/[FATAL]/[SEVERE] in brackets OR bare ERROR/FATAL/SEVERE keywords
+    (BigID logs use both formats). Set SCANNER_LOG_ERROR_REQUIRE_LEVEL=warn to also include
+    WARN/WARNING, or any/legacy for keyword-only matching (old behavior).
     """
     mode = os.getenv("SCANNER_LOG_ERROR_REQUIRE_LEVEL", "error_fatal").strip().lower()
     if mode in ("any", "legacy", "all", "0", "off", "false", "no"):
@@ -551,9 +582,13 @@ def _line_passes_error_level_gate(line: str) -> bool:
     if mode in ("warn", "warning"):
         return bool(
             re.search(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", line, re.I)
+            or re.search(r"\b(?:ERROR|FATAL|SEVERE|WARN|WARNING)\b", line, re.I)
         )
-    # error_fatal (default)
-    return bool(re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I))
+    # error_fatal (default): match bracketed [ERROR]/[FATAL]/[SEVERE] or bare keywords
+    return bool(
+        re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I)
+        or re.search(r"\b(?:ERROR|FATAL|SEVERE)\b", line, re.I)
+    )
 
 
 def _parse_log_timestamp(line: str) -> Optional[datetime]:
@@ -703,8 +738,9 @@ def detect_errors_in_logs(log_text):
 
     return error_contexts
 
-def call_health_summarizer(log_text):
-    if not check_ollama_ready():
+def call_health_summarizer(log_text, ollama_available: Optional[bool] = None):
+    ready = ollama_available if ollama_available is not None else check_ollama_ready()
+    if not ready:
         return "[⚠️ System Health Review Offline] Ollama is unreachable."
     
     """
@@ -753,8 +789,9 @@ Provide a concise, high-level structural health assessment.
     except Exception as e:
         return f"Health Review failed: {e}"
 
-def call_ai_analyzer(error_context, log_source):
-    if not check_ollama_ready():
+def call_ai_analyzer(error_context, log_source, ollama_available: Optional[bool] = None):
+    ready = ollama_available if ollama_available is not None else check_ollama_ready()
+    if not ready:
         return f"[⚠️ AI Analysis Offline] Ollama is not reachable at {OLLAMA_URL}. Please ensure Ollama is running. Raw error context: {error_context[:200]}..."
     
     prompt = f"""You are an expert systems engineer and log analyst specializing in BigID data intelligence platform.
@@ -787,7 +824,8 @@ Be concise and technical. If the log line looks like a normal operational messag
         return f"AI Analysis failed: {e}"
 
 
-def call_llm_log_scanner(log_text, log_source, scan_start=None, scan_end=None):
+def call_llm_log_scanner(log_text, log_source, scan_start=None, scan_end=None,
+                         ollama_available: Optional[bool] = None):
     """
     Send the full log window to the LLM and ask it to identify any anomalies,
     errors, or suspicious patterns that regex-based detection may have missed.
@@ -795,7 +833,8 @@ def call_llm_log_scanner(log_text, log_source, scan_start=None, scan_end=None):
     Returns a list of dicts: [{"text": <context>, "severity": <str>, "summary": <str>}]
     or an empty list if nothing found or LLM is offline.
     """
-    if not check_ollama_ready():
+    ready = ollama_available if ollama_available is not None else check_ollama_ready()
+    if not ready:
         return []
 
     lines = log_text.splitlines()
@@ -963,6 +1002,10 @@ def run_once(engine):
             write_heartbeat(engine, status="ok", message="No active scans")
             return
 
+        # Check Ollama once per cycle — result is reused for every call_ai_analyzer /
+        # call_llm_log_scanner in this cycle to avoid N×1.3 s per-error probe overhead.
+        ollama_ok = check_ollama_ready()
+
         print(f"[{datetime.now().isoformat()}] Processing {len(envs)} environments...")
 
         for env in envs:
@@ -1099,7 +1142,7 @@ def run_once(engine):
                                     seen_line_hashes.add(_line_hash(_ln))
 
                             _, parsed_subscan_id = extract_scan_ids(ctx)
-                            ai_analysis = call_ai_analyzer(ctx, log_source)
+                            ai_analysis = call_ai_analyzer(ctx, log_source, ollama_available=ollama_ok)
 
                             if _store_if_new(ctx, log_ts, err_hash, ai_analysis, parsed_subscan_id):
                                 new_errors_by_scan.setdefault(linked_scan_id, [])
@@ -1117,6 +1160,7 @@ def run_once(engine):
                                 "\n".join(llm_input_lines), log_source,
                                 scan_start=str(effective_start) if effective_start else None,
                                 scan_end=str(scan_end) if scan_end else None,
+                                ollama_available=ollama_ok,
                             )
                             for finding in llm_findings:
                                 ctx_text = (
@@ -1130,7 +1174,7 @@ def run_once(engine):
                                 )
                                 err_hash   = hashlib.md5(fp[:300].encode('utf-8')).hexdigest()
                                 log_ts     = _parse_log_timestamp(finding["text"]) or datetime.utcnow()
-                                ai_detail  = call_ai_analyzer(finding["text"], log_source)
+                                ai_detail  = call_ai_analyzer(finding["text"], log_source, ollama_available=ollama_ok)
                                 full_analysis = f"[LLM Scanner: {finding['summary']}]\n\n{ai_detail}"
 
                                 if _store_if_new(ctx_text, log_ts, err_hash, full_analysis):
@@ -1168,7 +1212,7 @@ def main():
     
     print(f"Starting Scanner AI Log Analyzer (Fetch Interval: {FETCH_INTERVAL_MINUTES} min, LLM: {OLLAMA_MODEL})")
     
-    if not check_ollama_ready():
+    if not check_ollama_ready(use_cache=False):
         print(f"WARNING: Ollama is not reachable at {OLLAMA_URL}. The monitor will continue to detect errors but AI analysis will be skipped until Ollama is active.")
         # DO NOT EXIT - continue to monitor logs even without AI
         

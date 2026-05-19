@@ -27,13 +27,16 @@ import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from v2_api.db_config_pg import DB_CONNECTION_STRING
-from v2_api.pg_compat import (
+from db_config_pg import DB_CONNECTION_STRING
+from pg_compat import (
     is_postgresql,
     sql_auto_increment,
     sql_datetime,
@@ -557,28 +560,16 @@ def _kv_set(engine, key: str, value: str) -> None:
                 )
             else:
                 # MySQL
-                if is_postgresql(engine):
-                    conn.execute(
-                        text("""
-                            INSERT INTO tracker_kv (k, v)
-                            VALUES (:k, :v)
-                            ON CONFLICT (k) DO UPDATE SET
-                                v = EXCLUDED.v,
-                                updated_at = CURRENT_TIMESTAMP
-                        """),
-                        {"k": str(key), "v": str(value)},
-                    )
-                else:
-                    conn.execute(
-                        text("""
-                            INSERT INTO tracker_kv (k, v)
-                            VALUES (:k, :v)
-                            ON DUPLICATE KEY UPDATE
-                                v = VALUES(v),
-                                updated_at = CURRENT_TIMESTAMP
-                        """),
-                        {"k": str(key), "v": str(value)},
-                    )
+                conn.execute(
+                    text("""
+                        INSERT INTO tracker_kv (k, v)
+                        VALUES (:k, :v)
+                        ON DUPLICATE KEY UPDATE
+                            v = VALUES(v),
+                            updated_at = CURRENT_TIMESTAMP
+                    """),
+                    {"k": str(key), "v": str(value)},
+                )
             conn.commit()
     except Exception:
         pass
@@ -681,21 +672,43 @@ def ensure_scan_progress_table(engine) -> None:
 
         # De-dupe existing rows (keep highest id per scan_id + captured_at slot)
         # and enforce uniqueness so we cannot insert duplicates again.
+        if not is_postgresql(engine):
+            # MySQL de-dupe
+            try:
+                conn.execute(text("""
+                    DELETE sp1 FROM scan_progress sp1
+                    JOIN scan_progress sp2
+                      ON sp1.scan_id = sp2.scan_id
+                     AND sp1.captured_at_utc IS NOT NULL
+                     AND sp2.captured_at_utc IS NOT NULL
+                     AND sp1.captured_at_utc = sp2.captured_at_utc
+                     AND sp1.id < sp2.id
+                """))
+                conn.commit()
+            except Exception:
+                pass
+        else:
+            # PostgreSQL de-dupe
+            try:
+                conn.execute(text("""
+                    DELETE FROM scan_progress sp1
+                    USING scan_progress sp2
+                    WHERE sp1.scan_id = sp2.scan_id
+                      AND sp1.captured_at_utc IS NOT NULL
+                      AND sp2.captured_at_utc IS NOT NULL
+                      AND sp1.captured_at_utc = sp2.captured_at_utc
+                      AND sp1.id < sp2.id
+                """))
+                conn.commit()
+            except Exception:
+                pass
+        
+        # Add unique constraint
         try:
-            conn.execute(text("""
-                DELETE sp1 FROM scan_progress sp1
-                JOIN scan_progress sp2
-                  ON sp1.scan_id = sp2.scan_id
-                 AND sp1.captured_at_utc IS NOT NULL
-                 AND sp2.captured_at_utc IS NOT NULL
-                 AND sp1.captured_at_utc = sp2.captured_at_utc
-                 AND sp1.id < sp2.id
-            """))
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.execute(text("ALTER TABLE scan_progress ADD UNIQUE KEY uniq_scan_slot (scan_id, captured_at_utc)"))
+            if is_postgresql(engine):
+                conn.execute(text("ALTER TABLE scan_progress ADD CONSTRAINT uniq_scan_slot UNIQUE (scan_id, captured_at_utc)"))
+            else:
+                conn.execute(text("ALTER TABLE scan_progress ADD UNIQUE KEY uniq_scan_slot (scan_id, captured_at_utc)"))
             conn.commit()
         except Exception:
             pass
@@ -1723,32 +1736,61 @@ def upsert_scan_progress_record(
                     if (cau.second == 0) and (cau.minute % slot_m == 0):
                         cau = cau + timedelta(seconds=1)
                     ts0 = started_dt.replace(microsecond=0)
-                    conn.execute(text("""
-                        INSERT IGNORE INTO scan_progress (
-                            captured_at_utc, `timestamp`,
-                            scan_id, scan_name, environment_id,
-                            scan_state,
-                            completed_sub_scans, failed_sub_scans, total_sub_scans,
-                            completed_parts, failed_parts, total_parts_scanned,
-                            total_classifications, newly_added_classifications, false_removed_classifications,
-                            objects_scanned, objects_failed, objects_with_pi
-                        ) VALUES (
-                            :cau, :ts,
-                            :sid, :sname, :eid,
-                            :sst,
-                            0,0,0,
-                            0,0,0,
-                            0,0,0,
-                            0,0,0
-                        )
-                    """), {
-                        'cau': cau,
-                        'ts': ts0,
-                        'sid': str(scan_id),
-                        'sname': str(scan_name or ''),
-                        'eid': env_id_int,
-                        'sst': 'Started',
-                    })
+                    if is_postgresql(engine):
+                        conn.execute(text("""
+                            INSERT INTO scan_progress (
+                                captured_at_utc, "timestamp",
+                                scan_id, scan_name, environment_id,
+                                scan_state,
+                                completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                completed_parts, failed_parts, total_parts_scanned,
+                                total_classifications, newly_added_classifications, false_removed_classifications,
+                                objects_scanned, objects_failed, objects_with_pi
+                            ) VALUES (
+                                :cau, :ts,
+                                :sid, :sname, :eid,
+                                :sst,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0
+                            )
+                            ON CONFLICT (scan_id, captured_at_utc) DO NOTHING
+                        """), {
+                            'cau': cau,
+                            'ts': ts0,
+                            'sid': str(scan_id),
+                            'sname': str(scan_name or ''),
+                            'eid': env_id_int,
+                            'sst': 'Started',
+                        })
+                    else:
+                        conn.execute(text("""
+                            INSERT IGNORE INTO scan_progress (
+                                captured_at_utc, `timestamp`,
+                                scan_id, scan_name, environment_id,
+                                scan_state,
+                                completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                completed_parts, failed_parts, total_parts_scanned,
+                                total_classifications, newly_added_classifications, false_removed_classifications,
+                                objects_scanned, objects_failed, objects_with_pi
+                            ) VALUES (
+                                :cau, :ts,
+                                :sid, :sname, :eid,
+                                :sst,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0,
+                                0,0,0
+                            )
+                        """), {
+                            'cau': cau,
+                            'ts': ts0,
+                            'sid': str(scan_id),
+                            'sname': str(scan_name or ''),
+                            'eid': env_id_int,
+                            'sst': 'Started',
+                        })
         except Exception:
             pass
 
@@ -1821,37 +1863,70 @@ def upsert_scan_progress_record(
                     # Offset by 1s if it lands exactly on a slot to avoid collision with PULSE snapshots
                     if (cau_end.second == 0) and (cau_end.minute % slot_m == 0):
                         cau_end = cau_end + timedelta(seconds=1)
-                        
-                    conn.execute(text("""
-                        INSERT IGNORE INTO scan_progress (
-                            captured_at_utc, `timestamp`,
-                            scan_id, scan_name, environment_id,
-                            scan_state,
-                            completed_sub_scans, failed_sub_scans, total_sub_scans,
-                            completed_parts, failed_parts, total_parts_scanned,
-                            total_classifications, newly_added_classifications, false_removed_classifications,
-                            objects_scanned, objects_failed, objects_with_pi
-                        ) VALUES (
-                            :cau, :ts,
-                            :sid, :sname, :eid,
-                            :sst,
-                            :cs, :fs, :tsc,
-                            :cp, :fp, :tp,
-                            :tc, :nc, :fr,
-                            :os, :of, :owp
-                        )
-                    """), {
-                        'cau': cau_end,
-                        'ts': cau_end,
-                        'sid': str(scan_id),
-                        'sname': str(scan_name or ''),
-                        'eid': env_id_int,
-                        'sst': scan_state,
-                        'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
-                        'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
-                        'tc': total_class, 'nc': new_class, 'fr': false_removed,
-                        'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
-                    })
+                    
+                    if is_postgresql(engine):
+                        conn.execute(text("""
+                            INSERT INTO scan_progress (
+                                captured_at_utc, "timestamp",
+                                scan_id, scan_name, environment_id,
+                                scan_state,
+                                completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                completed_parts, failed_parts, total_parts_scanned,
+                                total_classifications, newly_added_classifications, false_removed_classifications,
+                                objects_scanned, objects_failed, objects_with_pi
+                            ) VALUES (
+                                :cau, :ts,
+                                :sid, :sname, :eid,
+                                :sst,
+                                :cs, :fs, :tsc,
+                                :cp, :fp, :tp,
+                                :tc, :nc, :fr,
+                                :os, :of, :owp
+                            )
+                            ON CONFLICT (scan_id, captured_at_utc) DO NOTHING
+                        """), {
+                            'cau': cau_end,
+                            'ts': cau_end,
+                            'sid': str(scan_id),
+                            'sname': str(scan_name or ''),
+                            'eid': env_id_int,
+                            'sst': scan_state,
+                            'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
+                            'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
+                            'tc': total_class, 'nc': new_class, 'fr': false_removed,
+                            'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
+                        })
+                    else:
+                        conn.execute(text("""
+                            INSERT IGNORE INTO scan_progress (
+                                captured_at_utc, `timestamp`,
+                                scan_id, scan_name, environment_id,
+                                scan_state,
+                                completed_sub_scans, failed_sub_scans, total_sub_scans,
+                                completed_parts, failed_parts, total_parts_scanned,
+                                total_classifications, newly_added_classifications, false_removed_classifications,
+                                objects_scanned, objects_failed, objects_with_pi
+                            ) VALUES (
+                                :cau, :ts,
+                                :sid, :sname, :eid,
+                                :sst,
+                                :cs, :fs, :tsc,
+                                :cp, :fp, :tp,
+                                :tc, :nc, :fr,
+                                :os, :of, :owp
+                            )
+                        """), {
+                            'cau': cau_end,
+                            'ts': cau_end,
+                            'sid': str(scan_id),
+                            'sname': str(scan_name or ''),
+                            'eid': env_id_int,
+                            'sst': scan_state,
+                            'cs': completed_sub, 'fs': failed_sub, 'tsc': total_sub,
+                            'cp': completed_parts, 'fp': failed_parts, 'tp': total_parts,
+                            'tc': total_class, 'nc': new_class, 'fr': false_removed,
+                            'os': objects_scanned, 'of': objects_failed, 'owp': objects_with_pi
+                        })
             except Exception:
                 pass
         conn.commit()
@@ -2984,7 +3059,11 @@ def track_once(engine) -> Dict[str, Any]:
                 pass
 
             return True, "ok", attempted
-        except Exception:
+        except Exception as ex:
+            # Log the actual error for debugging
+            import traceback
+            print(f"[{_now_utc_naive().isoformat()}Z] WRITE ERROR for scan {scan_id}: {ex}", flush=True)
+            print(f"[{_now_utc_naive().isoformat()}Z] Traceback: {traceback.format_exc()}", flush=True)
             return False, "write", attempted
 
     # Process jobs concurrently to keep cycle under 10 minutes
@@ -3182,7 +3261,13 @@ def main() -> int:
     ap.add_argument("--quiet", action="store_true", help="Less logging")
     args = ap.parse_args()
 
-    engine = create_engine(DB_CONNECTION_STRING)
+    engine = create_engine(
+        DB_CONNECTION_STRING,
+        pool_pre_ping=True,
+        pool_recycle=3600,
+        isolation_level="AUTOCOMMIT",
+        connect_args={"connect_timeout": 10}
+    )
     ensure_scan_tracking_tables(engine)
     ensure_scan_progress_table(engine)
 

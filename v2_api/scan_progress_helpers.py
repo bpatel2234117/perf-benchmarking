@@ -325,10 +325,9 @@ def load_scanner_performance_series(engine: Engine, scan_id: str) -> Dict[str, A
             def _ind_rows():
                 sql_wide = text(
                     """
-                    SELECT captured_at_utc, COALESCE(scanner_id,''), COALESCE(name,''), COALESCE(status,''),
-                           COALESCE(group_name,''), COALESCE(running_threads,0), COALESCE(total_num_of_threads,0),
-                           COALESCE(system_load_average,0), COALESCE(physical_memory_mb,0), COALESCE(free_memory_mb,0),
-                           cpu_pct, available_processors
+                    SELECT captured_at_utc, COALESCE(scanner_id,''), COALESCE(scanner_name,''), 
+                           COALESCE(group_name,''), COALESCE(running_threads,0), COALESCE(max_threads,0),
+                           COALESCE(physical_memory_mb,0), COALESCE(free_memory_mb,0), COALESCE(scan_speed,0)
                     FROM scanner_individual_performance
                     WHERE environment_id = :eid
                       AND captured_at_utc BETWEEN :start AND :end
@@ -337,19 +336,9 @@ def load_scanner_performance_series(engine: Engine, scan_id: str) -> Dict[str, A
                 )
                 try:
                     return conn.execute(sql_wide, {"eid": env_id, "start": start_b, "end": end_b}).fetchall()
-                except ProgrammingError:
-                    sql_narrow = text(
-                        """
-                        SELECT captured_at_utc, COALESCE(scanner_id,''), COALESCE(name,''), COALESCE(status,''),
-                               COALESCE(group_name,''), COALESCE(running_threads,0), COALESCE(total_num_of_threads,0),
-                               COALESCE(system_load_average,0), COALESCE(physical_memory_mb,0), COALESCE(free_memory_mb,0)
-                        FROM scanner_individual_performance
-                        WHERE environment_id = :eid
-                          AND captured_at_utc BETWEEN :start AND :end
-                        ORDER BY captured_at_utc ASC
-                        """
-                    )
-                    return conn.execute(sql_narrow, {"eid": env_id, "start": start_b, "end": end_b}).fetchall()
+                except ProgrammingError as e:
+                    # If columns don't exist, return empty
+                    return []
 
             irows = _ind_rows()
 
@@ -377,39 +366,27 @@ def load_scanner_performance_series(engine: Engine, scan_id: str) -> Dict[str, A
 
         individuals: List[Dict[str, Any]] = []
         for r in irows:
-            sla = float(r[7] or 0)
-            phy = float(r[8] or 0)
-            free = float(r[9] or 0)
+            phy = float(r[6] or 0)
+            free = float(r[7] or 0)
             used = max(0.0, phy - free)
             mem_pct = (used / phy * 100.0) if phy > 0 else 0.0
-            cpu_f: Optional[float] = None
-            ap_f: Optional[float] = None
-            if len(r) >= 12:
-                try:
-                    cpu_f = float(r[10]) if r[10] is not None else None
-                except Exception:
-                    cpu_f = None
-                try:
-                    ap_f = float(r[11]) if r[11] is not None else None
-                except Exception:
-                    ap_f = None
-            if cpu_f is None and ap_f and ap_f > 0:
-                cpu_f = sla * 100.0 / ap_f
+            speed = float(r[8] or 0)
             individuals.append(
                 {
                     "captured_at_utc": str(r[0]) if r[0] is not None else "",
                     "scanner_id": str(r[1] or ""),
                     "name": str(r[2] or ""),
-                    "status": str(r[3] or ""),
-                    "group_name": str(r[4] or ""),
-                    "running_threads": int(r[5] or 0),
-                    "total_num_of_threads": int(r[6] or 0),
-                    "system_load_average": sla,
+                    "status": "Running",
+                    "group_name": str(r[3] or ""),
+                    "running_threads": int(r[4] or 0),
+                    "total_num_of_threads": int(r[5] or 0),
+                    "system_load_average": 0.0,
                     "physical_memory_mb": phy,
                     "free_memory_mb": free,
                     "used_memory_mb": used,
                     "memory_usage_pct": mem_pct,
-                    "cpu_pct": cpu_f,
+                    "cpu_pct": None,
+                    "scan_speed": speed,
                 }
             )
 
@@ -467,17 +444,58 @@ def load_scan_log_errors_for_scan(engine: Engine, scan_id: str, limit: int = 40)
     lim = max(1, min(int(limit), 200))
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
+            meta = conn.execute(
                 text(
                     """
+                    SELECT sp.environment_id, sp.started_at, sp.completed_at
+                    FROM scan_parents sp
+                    WHERE sp.scan_id = :sid
+                    LIMIT 1
+                    """
+                ),
+                {"sid": sid},
+            ).fetchone()
+            env_id = meta[0] if meta and meta[0] is not None else None
+            started_at = meta[1] if meta else None
+            completed_at = meta[2] if meta else None
+            if env_id is None:
+                wr = conn.execute(
+                    text(
+                        """
+                        SELECT environment_id
+                        FROM workflow_steps
+                        WHERE scan_id = :sid AND environment_id IS NOT NULL
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"sid": sid},
+                ).fetchone()
+                env_id = wr[0] if wr and wr[0] is not None else None
+
+            params: Dict[str, Any] = {"sid": sid, "lim": lim}
+            if env_id is not None and started_at is not None:
+                params.update({"eid": env_id, "started": started_at})
+                if completed_at is not None:
+                    params["completed_cap"] = completed_at + timedelta(minutes=5)
+                    time_cap_sql = "log_timestamp <= :completed_cap"
+                else:
+                    time_cap_sql = "log_timestamp <= CURRENT_TIMESTAMP"
+                where_sql = f"environment_id = :eid AND log_timestamp >= :started AND {time_cap_sql}"
+            else:
+                return []
+
+            rows = conn.execute(
+                text(
+                    f"""
                     SELECT log_timestamp, log_source, scan_id, error_context, ai_analysis, is_resolved
                     FROM scan_log_errors
-                    WHERE scan_id = :sid
+                    WHERE {where_sql}
                     ORDER BY id DESC
                     LIMIT :lim
                     """
                 ),
-                {"sid": sid, "lim": lim},
+                params,
             ).fetchall()
         out = []
         for r in rows:

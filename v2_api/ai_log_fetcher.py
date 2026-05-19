@@ -10,23 +10,28 @@ from typing import Any, Optional
 
 from sqlalchemy import create_engine, text
 
-from v2_api.pg_compat import (
+# Add parent directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from pg_compat import (
     sql_auto_increment,
     sql_datetime,
     sql_longtext,
     sql_on_update_current_timestamp,
+    is_postgresql,
 )
 
-# Force unbuffered output for cleaner logs
-sys.stdout.reconfigure(line_buffering=True)
+# Force unbuffered output for cleaner logs (guard for pythonw.exe where stdout may be None)
+if sys.stdout is not None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
 print(f"[{datetime.now().isoformat()}] INFO: Bootstrapping dependencies...")
 
-# Add the current directory to path so we can import local modules
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
 def get_db_connection_string():
-    from v2_api.db_config_pg import DB_CONNECTION_STRING
+    from db_config_pg import DB_CONNECTION_STRING
     return DB_CONNECTION_STRING
 
 def get_auth_token(base_url, env_row):
@@ -156,24 +161,23 @@ def check_ollama_ready():
         return False
 
 def setup_db_engine():
-    engine = create_engine(get_db_connection_string(), echo=False)
+    engine = create_engine(
+        get_db_connection_string(),
+        echo=False,
+        pool_pre_ping=True,
+        pool_recycle=1800,
+    )
     ensure_app_settings_table(engine)
     
     dt = sql_datetime(engine)
     ai = sql_auto_increment(engine)
     
+    # CRITICAL: Each statement must be in its own transaction to prevent
+    # "current transaction is aborted" errors in PostgreSQL
+    
+    # 1. Tracker and Log Fetcher heartbeat table
     try:
         with engine.connect() as conn:
-            # Automatic Migration for error_hash
-            try:
-                # Version-agnostic way to add column: try it and let the except block catch 'already exists'
-                conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN error_hash VARCHAR(32)"))
-                conn.commit()
-            except Exception:
-                # Column likely already exists, safe to ignore
-                pass
-            
-            # Tracker and Log Fetcher heartbeat table
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS tracker_heartbeat (
                     name VARCHAR(50) PRIMARY KEY,
@@ -184,7 +188,12 @@ def setup_db_engine():
                 )
             """))
             conn.commit()
-            
+    except Exception as e:
+        print(f"Error creating tracker_heartbeat: {e}")
+    
+    # 2. Create scan_log_errors table
+    try:
+        with engine.connect() as conn:
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS scan_log_errors (
                     id {ai} PRIMARY KEY,
@@ -198,29 +207,46 @@ def setup_db_engine():
                     subscan_id VARCHAR(50),
                     error_hash VARCHAR(32),
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
-                );
+                )
             """))
             conn.commit()
     except Exception as e:
         print(f"Error creating scan_log_errors: {e}")
-        
-    # Ensure columns exist for users on older schemas
+    
+    # 3. Add error_hash column if it doesn't exist
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN error_hash VARCHAR(32)"))
+            conn.commit()
+    except Exception:
+        # Column likely already exists, safe to ignore
+        pass
+    
+    # 4. Add log_source column if it doesn't exist
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN log_source VARCHAR(50) DEFAULT 'scanner'"))
             conn.commit()
     except Exception:
-        pass 
-        
+        pass
+    
+    # 5. Add scan_id column if it doesn't exist
     try:
         with engine.connect() as conn:
             conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN scan_id VARCHAR(50)"))
+            conn.commit()
+    except Exception:
+        pass
+    
+    # 6. Add subscan_id column if it doesn't exist
+    try:
+        with engine.connect() as conn:
             conn.execute(text("ALTER TABLE scan_log_errors ADD COLUMN subscan_id VARCHAR(50)"))
             conn.commit()
     except Exception:
         pass
-        
-    ai = sql_auto_increment(engine)
+    
+    # 7. Create scan_log_correlations table
     try:
         with engine.connect() as conn:
             conn.execute(text(f"""
@@ -232,13 +258,13 @@ def setup_db_engine():
                     correlation_report TEXT,
                     is_final BOOLEAN DEFAULT FALSE,
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
-                );
+                )
             """))
             conn.commit()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error creating scan_log_correlations: {e}")
     
-    ai = sql_auto_increment(engine)
+    # 8. Create scan_system_health table
     try:
         with engine.connect() as conn:
             conn.execute(text(f"""
@@ -250,7 +276,7 @@ def setup_db_engine():
                     log_window_start TIMESTAMP,
                     log_window_end TIMESTAMP,
                     FOREIGN KEY (environment_id) REFERENCES test_environments(id)
-                );
+                )
             """))
             conn.commit()
     except Exception as e:
@@ -294,10 +320,10 @@ def write_heartbeat(engine, status="ok", message=""):
 
 def get_active_environments(engine):
     query = """
-        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at
+        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at, sp.completed_at
         FROM test_environments t
         JOIN scan_parents sp ON sp.environment_id = t.id
-        WHERE t.is_active = 1 
+        WHERE t.is_active = TRUE 
           AND (
               LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
                   'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled', 'paused', 'pause'
@@ -306,7 +332,17 @@ def get_active_environments(engine):
     """
     with engine.connect() as conn:
         result = conn.execute(text(query)).fetchall()
-        return [{"id": row[0], "env_name": row[1], "base_url": row[2], "active_scan_id": row[3], "scan_start_time": row[4]} for row in result]
+        return [
+            {
+                "id": row[0],
+                "env_name": row[1],
+                "base_url": row[2],
+                "active_scan_id": row[3],
+                "scan_start_time": row[4],
+                "scan_end_time": row[5],
+            }
+            for row in result
+        ]
 
 def fetch_logs(base_url, token, num_lines, log_source="scanner"):
     url = f"{base_url.rstrip('/')}/api/v1/logs/{log_source}?len={num_lines}"
@@ -359,13 +395,25 @@ def extract_scan_ids(log_text):
 
 def _skip_info_level_line(line: str) -> bool:
     """
-    BigID scanner often logs normal work at [INFO], including URLs whose path contains
-    'failed-enumeration-objects' etc. Those must not be treated as errors.
-    Set SCANNER_LOG_SKIP_INFO_LEVEL=0 to revert to legacy behavior.
+    Skip pure INFO/DEBUG/TRACE lines UNLESS they contain a strong error signal
+    that BigID sometimes logs at INFO level (e.g. 401, 403, 500, exception, stacktrace).
+    Set SCANNER_LOG_SKIP_INFO_LEVEL=0 to disable all INFO skipping.
     """
     if os.getenv("SCANNER_LOG_SKIP_INFO_LEVEL", "1").strip().lower() not in ("1", "true", "yes", "on"):
         return False
-    return bool(re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I))
+    if not re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I):
+        return False
+    # Keep the line if it carries a strong error signal even at INFO/DEBUG/TRACE level
+    STRONG_SIGNALS = re.compile(
+        r"(?i)(?:"
+        r"\berror\b|\bfatal\b|\bsevere\b|"
+        r"\bexception\b|\bstacktrace\b|\bstack.?trace\b|\bnullpointer\b|\bnull.?pointer\b|"
+        r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        r"\b(?:40[0-9]|5[0-9]{2})\b|"
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail"
+        r")"
+    )
+    return not bool(STRONG_SIGNALS.search(line))
 
 
 def _line_for_error_keyword_scan(line: str) -> str:
@@ -390,8 +438,9 @@ def _looks_like_success_scan_summary(ctx: str) -> bool:
 def _line_passes_error_level_gate(line: str) -> bool:
     """
     Require a real log severity on the trigger line (defense against keyword-only false positives).
-    Default: only [ERROR], [FATAL], [SEVERE]. Set SCANNER_LOG_ERROR_REQUIRE_LEVEL=warn to include
-    [WARN]/[WARNING], or any/legacy for keyword-only matching (old behavior).
+    Default: accepts [ERROR]/[FATAL]/[SEVERE] in brackets OR bare ERROR/FATAL/SEVERE keywords
+    (BigID logs use both formats). Set SCANNER_LOG_ERROR_REQUIRE_LEVEL=warn to also include
+    WARN/WARNING, or any/legacy for keyword-only matching (old behavior).
     """
     mode = os.getenv("SCANNER_LOG_ERROR_REQUIRE_LEVEL", "error_fatal").strip().lower()
     if mode in ("any", "legacy", "all", "0", "off", "false", "no"):
@@ -399,9 +448,13 @@ def _line_passes_error_level_gate(line: str) -> bool:
     if mode in ("warn", "warning"):
         return bool(
             re.search(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", line, re.I)
+            or re.search(r"\b(?:ERROR|FATAL|SEVERE|WARN|WARNING)\b", line, re.I)
         )
-    # error_fatal (default)
-    return bool(re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I))
+    # error_fatal (default): match bracketed [ERROR]/[FATAL]/[SEVERE] or bare keywords
+    return bool(
+        re.search(r"\[(?:ERROR|FATAL|SEVERE)\]", line, re.I)
+        or re.search(r"\b(?:ERROR|FATAL|SEVERE)\b", line, re.I)
+    )
 
 
 import hashlib
@@ -426,27 +479,43 @@ def _parse_log_timestamp(line: str) -> Optional[datetime]:
 def detect_errors_in_logs(log_text):
     """
     Structural-aware log analysis.
-    Finds error entry points (case-insensitive) and captures consecutive indented lines (stack traces).
 
-    By default (SCANNER_LOG_ERROR_REQUIRE_LEVEL=error_fatal) the trigger line must include
-    [ERROR], [FATAL], or [SEVERE] — keyword matches alone are ignored. Use warn or any for looser rules.
+    Capture strategy (two independent paths — either is sufficient):
+      A) Line has a severity tag [ERROR], [FATAL], [SEVERE], [WARN], [WARNING]
+         → always captured regardless of message body content.
+      B) Line has no severity tag but contains a known error keyword
+         (exception, timeout, refused, 4xx/5xx status, etc.)
+         → captured only when SCANNER_LOG_ERROR_REQUIRE_LEVEL allows it.
+
+    This ensures lines like:
+        [2026-04-29 08:52:34.712Z] [ERROR] scanner_file - <message with no keyword>
+    are never silently dropped.
     """
     lines = log_text.splitlines()
     error_contexts = []
     seen_fingerprints = set()
 
-    i = 0
-    # Word-boundary tokens. Unbounded 'abort' matched isAbort; 'reset' matched preset; 'throttl' matched throttle.
-    # "failed" only when followed by whitespace so hyphenated API paths do not match.
-    ERROR_PATTERN = re.compile(
+    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", re.I)
+    KEYWORD_PATTERN = re.compile(
         r"(?i)(?:"
-        r"\berror\b|\bfatal\b|\bfail\b|\bfailed\b(?=\s)|\bfailure\b|\bsevere\b|\bexception\b|\baxioserror\b|\bnohttp\b|"
-        r"status\s+[45]\d{2}|\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\breset\b|\bdenied\b|"
-        r"\babort(?:ed|ing)?\b|\bexhausted\b|"
-        r"\bthrottl(?:ing|ed)\b|\blimitreached\b|\bgraphservice\b|\bactivitylimit\b"
+        r"\berror\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bsevere\b|\bexception\b|"
+        r"\baxioserror\b|\bnohttp\b|"
+        r"\bstatus\s+[45]\d{2}\b|\bhttp\s+[45]\d{2}\b|"
+        r"\b(?:400|401|403|404|408|409|429|500|502|503|504)\b|"
+        r"\bunauthorized\b|\bforbidden\b|\bauthentication.?fail|\baccess.?denied\b|"
+        r"\btoken.?(?:expired|invalid|fail)\b|\bcredential\b|"
+        r"\btimeout\b|timed?\s*out|\brefused\b|\bunreachable\b|\bconnection.?(?:reset|closed|lost|drop)\b|"
+        r"\bsocket\b|\beof\b|\bbroken.?pipe\b|"
+        r"\bdenied\b|\bexhausted\b|\bout.?of.?memory\b|\boom\b|"
+        r"\bnull.?pointer\b|\bnullpointer\b|\bstack.?(?:trace|overflow)\b|\bstacktrace\b|"
+        r"\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
+        r"\babort(?:ed|ing)?\b|\bthrottl(?:ing|ed)?\b|\blimitreached\b|"
+        r"\bcircuit.?breaker\b|\bretry.?(?:limit|exhaust)\b|"
+        r"\bgraphservice\b|\bactivitylimit\b|\breset\b"
         r")"
     )
 
+    i = 0
     while i < len(lines):
         line = lines[i]
 
@@ -455,12 +524,11 @@ def detect_errors_in_logs(log_text):
             continue
 
         scan_line = _line_for_error_keyword_scan(line)
+        has_level_tag = bool(LEVEL_PATTERN.search(line))
+        has_keyword = bool(KEYWORD_PATTERN.search(scan_line)) if not has_level_tag else False
+        is_trigger = has_level_tag or (has_keyword and _line_passes_error_level_gate(line))
 
-        # 1. Detect starting line of an error block (Pattern-based)
-        if ERROR_PATTERN.search(scan_line):
-            if not _line_passes_error_level_gate(line):
-                i += 1
-                continue
+        if is_trigger:
             # Context before: capture 2 lines if possible for timestamps/IDs
             start = max(0, i - 2)
             
@@ -471,7 +539,10 @@ def detect_errors_in_logs(log_text):
 
                 # CRITICAL FIX: If the next line itself is a NEW error marker, 
                 # BREAK the context here so it gets its own record instead of being swallowed.
-                if ERROR_PATTERN.search(_line_for_error_keyword_scan(next_line)) and _line_passes_error_level_gate(next_line):
+                next_has_level = bool(LEVEL_PATTERN.search(next_line))
+                next_scan = _line_for_error_keyword_scan(next_line)
+                next_has_kw = bool(KEYWORD_PATTERN.search(next_scan)) if not next_has_level else False
+                if next_has_level or (next_has_kw and _line_passes_error_level_gate(next_line)):
                     break
 
                 # Match common stack trace/indented log markers
@@ -712,45 +783,56 @@ def run_once(engine):
                             ctx = err_obj["text"]
                             log_ts = err_obj["timestamp"] or datetime.utcnow()
                             err_hash = err_obj["hash"]
+                            active_scan_id = env.get("active_scan_id")
+                            if not active_scan_id:
+                                continue
                             
-                            # CRITICAL FIX 1: Age Gate (Post-Scan Start Time Only)
+                            # Map logs to the DB active scan for this environment only when
+                            # the log timestamp is inside that scan's time window. Do not trust
+                            # scan-like IDs embedded in log text; scanner logs often use subscan
+                            # or UUID-style IDs that do not match scan_parents.scan_id.
                             ts_cmp = _coerce_to_datetime(log_ts) or (
                                 log_ts if isinstance(log_ts, datetime) else datetime.utcnow()
                             )
                             scan_start = _coerce_to_datetime(env.get("scan_start_time"))
                             if scan_start is not None and ts_cmp < scan_start:
-                                # This is a stale log from April 15th or previous run. SKIP.
+                                continue
+                            scan_end = _coerce_to_datetime(env.get("scan_end_time"))
+                            if scan_end is not None and ts_cmp > (scan_end + timedelta(minutes=5)):
                                 continue
 
                             # CRITICAL FIX 2: Global Deduplication (Hash-based)
                             with engine.connect() as conn:
                                 # We check hash AND recently (within 24h) to allow same error in future scans, 
                                 # but ignore "bursts" of same error in current scan.
+                                # Calculate cutoff time in Python to avoid dialect-specific SQL
+                                cutoff_time = (datetime.utcnow() - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
+                                
                                 existing = conn.execute(
                                     text("""
                                         SELECT id FROM scan_log_errors 
                                         WHERE environment_id = :eid 
                                           AND error_hash = :hash 
-                                          AND log_timestamp > DATE_SUB(NOW(), INTERVAL 24 HOUR)
+                                          AND log_timestamp > :cutoff
                                         LIMIT 1
                                     """),
-                                    {"eid": env_id, "hash": err_hash}
+                                    {"eid": env_id, "hash": err_hash, "cutoff": cutoff_time}
                                 ).fetchone()
                             if existing: continue
                             
-                            parsed_scan_id, parsed_subscan_id = extract_scan_ids(ctx)
+                            _, parsed_subscan_id = extract_scan_ids(ctx)
                             ai_analysis = call_ai_analyzer(ctx, log_source)
                             
                             # CRITICAL FIX 3: Store REAL log timestamp
                             store_error_analysis(
                                 engine, env_id, ctx, ai_analysis, log_source, 
-                                parsed_scan_id or env.get("active_scan_id"), 
+                                active_scan_id,
                                 parsed_subscan_id, 
                                 error_hash=err_hash,
                                 actual_log_ts=log_ts
                             )
                             
-                            p_sid = parsed_scan_id or env.get("active_scan_id")
+                            p_sid = active_scan_id
                             if p_sid:
                                 if p_sid not in new_errors_by_scan:
                                     new_errors_by_scan[p_sid] = []

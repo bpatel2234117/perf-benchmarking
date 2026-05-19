@@ -40,13 +40,77 @@ body {
   width: 100%;
   align-items: stretch;
   overflow-x: visible;
+  padding-top: 60px;
+  /* Space for global header */
+  position: relative;
+}
+
+/* Global top header - above everything */
+.app-top-header-global {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 60px;
+  background: #ffffff;
+  border-bottom: 1px solid #e2e8f0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 1.5rem;
+  z-index: 100;
+}
+
+.app-top-header-user {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.app-top-header-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 0.875rem;
+}
+
+.app-top-header-username {
+  font-size: 0.9375rem;
+  font-weight: 500;
+  color: #1e293b;
+}
+
+.app-top-header-logo-section {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.app-top-header-logo {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.app-top-header-brand {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #1e293b;
 }
 
 /* Purple System Tools sidebar (parity with dashboard nav) — fixed viewport height so nav + Refresh/Logout stay visible while main scrolls */
 .app-sidebar-purple {
   position: fixed;
   left: 0;
-  top: 0;
+  top: 60px;
+  /* Below global header */
   bottom: 0;
   width: 250px;
   flex-shrink: 0;
@@ -430,6 +494,7 @@ body {
   .trend-chart-grid-3 {
     grid-template-columns: 1fr;
   }
+
   .trend-chart-grid-2 {
     grid-template-columns: 1fr;
   }
@@ -504,6 +569,7 @@ body {
   color: var(--danger-color);
   border: 1px solid var(--danger-color);
 }
+
 .btn-danger:hover {
   background: rgba(239, 68, 68, 0.05);
 }
@@ -515,7 +581,8 @@ table {
   text-align: left;
 }
 
-th, td {
+th,
+td {
   padding: 1rem;
   border-bottom: 1px solid var(--surface-border);
   color: var(--text-primary);
@@ -603,8 +670,13 @@ tr:hover {
 }
 
 @keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .lucide-spin {

@@ -73,6 +73,21 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
 
   return (
     <div className="app-shell">
+      <header className="app-top-header-global">
+        <div className="app-top-header-logo-section">
+          <img src="/logo.png" alt="BigID" className="app-top-header-logo" />
+          <span className="app-top-header-brand">Performance Management</span>
+        </div>
+        <div className="app-top-header-user">
+          <span className="app-top-header-username">
+            {userProfile?.username || 'User'}
+          </span>
+          <div className="app-top-header-avatar">
+            {userProfile?.username ? userProfile.username.charAt(0).toUpperCase() : 'U'}
+          </div>
+        </div>
+      </header>
+
       <aside ref={sidebarRef} className="app-sidebar-purple" aria-label="Main navigation">
         <Link to="/" className="app-sidebar-brand-white">
           <img src="/logo.png" alt="BigID" style={{ width: 24, height: 24, borderRadius: 6, objectFit: 'cover' }} />

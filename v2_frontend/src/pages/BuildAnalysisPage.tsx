@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Loader2, BarChart2 } from 'lucide-react';
+import { Loader2, BarChart2, ChevronRight, ChevronDown } from 'lucide-react';
 import {
     ResponsiveContainer,
     BarChart,
@@ -150,6 +150,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
 
     const [selectedBuild, setSelectedBuild] = useState<string>('');
     const [activeTab, setActiveTab] = useState<'matrix' | 'trend' | 'overview'>('matrix');
+    const [showOverviewTable, setShowOverviewTable] = useState(false);
 
     const { data: buildsData, isLoading: buildsLoading } = useQuery({
         queryKey: ['buildAnalysisBuilds', token],
@@ -341,7 +342,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                     const prevColHeader = prevMajor ? `vs ${prevMajor}.x` : null;
 
                                                     return (
-                                                        <details key={fs} open style={{ marginBottom: '0.75rem', border: '1px solid var(--surface-border)', borderRadius: 10, overflow: 'hidden' }}>
+                                                        <details key={fs} style={{ marginBottom: '0.75rem', border: '1px solid var(--surface-border)', borderRadius: 10, overflow: 'hidden' }}>
                                                             <summary style={{ padding: '0.75rem 1rem', fontWeight: 700, cursor: 'pointer', background: 'var(--surface-ground, rgba(0,0,0,0.03))', fontSize: '0.92rem' }}>
                                                                 {ds} — {fs} ({rows.length} scenario{rows.length !== 1 ? 's' : ''})
                                                             </summary>
@@ -421,7 +422,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                                     <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
                                                                     <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
                                                                     <YAxis tick={{ fontSize: 10 }} />
-                                                                    <Tooltip />
+                                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                                                                     <Bar dataKey="gb" name="GB/hr" fill="#7c3aed" />
                                                                 </BarChart>
                                                             </ResponsiveContainer>
@@ -435,7 +436,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                                     <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
                                                                     <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
                                                                     <YAxis tick={{ fontSize: 10 }} />
-                                                                    <Tooltip />
+                                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                                                                     <Bar dataKey="files" name="Files/hr" fill="#059669" />
                                                                 </BarChart>
                                                             </ResponsiveContainer>
@@ -450,40 +451,65 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
 
                             {/* ── Overview table ── */}
                             {activeTab === 'overview' && (
-                                <div style={{ overflowX: 'auto' }}>
-                                    <p style={{ margin: '0 0 0.75rem', fontSize: '0.88rem', color: 'var(--text-secondary)' }}>
-                                        All runs in <strong>{currentMajor}.x</strong> — {curMajorRows.length} rows.
-                                    </p>
-                                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-                                        <thead>
-                                            <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
-                                                {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr', 'Files/hr', 'Scan Hrs', 'Run Date'].map(h => (
-                                                    <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
-                                                ))}
-                                            </tr>
-                                        </thead>
-                                        <tbody>
-                                            {[...curMajorRows]
-                                                .sort((a, b) => sortKey(b.build_version) - sortKey(a.build_version))
-                                                .slice(0, 200)
-                                                .map(r => (
-                                                    <tr key={r.id} style={{ borderBottom: '1px solid var(--surface-border)' }}>
-                                                        <td style={{ padding: '7px 10px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>{r.build_version}</td>
-                                                        <td style={{ padding: '7px 10px' }}>{r.data_source_type ?? '—'}</td>
-                                                        <td style={{ padding: '7px 10px' }}>{r.file_set_type ?? '—'}</td>
-                                                        <td style={{ padding: '7px 10px' }}>{classifyScenario(r)}</td>
-                                                        <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.throughput_cluster_gb_hr)}</td>
-                                                        <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.throughput_cluster_files_hr, 0)}</td>
-                                                        <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.total_scan_hours)}</td>
-                                                        <td style={{ padding: '7px 10px', whiteSpace: 'nowrap' }}>{r.run_date ?? '—'}</td>
+                                <div>
+                                    <div 
+                                        onClick={() => setShowOverviewTable(!showOverviewTable)}
+                                        style={{ 
+                                            display: 'flex', 
+                                            alignItems: 'center', 
+                                            gap: '0.5rem', 
+                                            cursor: 'pointer', 
+                                            marginBottom: '1rem',
+                                            userSelect: 'none',
+                                            padding: '0.5rem 0.75rem',
+                                            background: 'var(--surface-ground, rgba(0,0,0,0.03))',
+                                            borderRadius: 8,
+                                            border: '1px solid var(--surface-border)'
+                                        }}
+                                    >
+                                        {showOverviewTable ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+                                        <span style={{ fontWeight: 700, fontSize: '0.92rem' }}>
+                                            Show Detailed Run Log ({curMajorRows.length} rows)
+                                        </span>
+                                    </div>
+
+                                    {showOverviewTable && (
+                                        <div className="animate-in" style={{ overflowX: 'auto' }}>
+                                            <p style={{ margin: '0 0 0.75rem', fontSize: '0.88rem', color: 'var(--text-secondary)' }}>
+                                                All runs in <strong>{currentMajor}.x</strong> — {curMajorRows.length} rows.
+                                            </p>
+                                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                                                <thead>
+                                                    <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
+                                                        {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr', 'Files/hr', 'Scan Hrs', 'Run Date'].map(h => (
+                                                            <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
+                                                        ))}
                                                     </tr>
-                                                ))}
-                                        </tbody>
-                                    </table>
-                                    {curMajorRows.length > 200 && (
-                                        <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
-                                            Showing first 200 of {curMajorRows.length} rows.
-                                        </p>
+                                                </thead>
+                                                <tbody>
+                                                    {[...curMajorRows]
+                                                        .sort((a, b) => sortKey(b.build_version) - sortKey(a.build_version))
+                                                        .slice(0, 200)
+                                                        .map(r => (
+                                                            <tr key={r.id} style={{ borderBottom: '1px solid var(--surface-border)' }}>
+                                                                <td style={{ padding: '7px 10px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>{r.build_version}</td>
+                                                                <td style={{ padding: '7px 10px' }}>{r.data_source_type ?? '—'}</td>
+                                                                <td style={{ padding: '7px 10px' }}>{r.file_set_type ?? '—'}</td>
+                                                                <td style={{ padding: '7px 10px' }}>{classifyScenario(r)}</td>
+                                                                <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.throughput_cluster_gb_hr)}</td>
+                                                                <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.throughput_cluster_files_hr, 0)}</td>
+                                                                <td style={{ padding: '7px 10px', textAlign: 'right' }}>{fmt(r.total_scan_hours)}</td>
+                                                                <td style={{ padding: '7px 10px', whiteSpace: 'nowrap' }}>{r.run_date ?? '—'}</td>
+                                                            </tr>
+                                                        ))}
+                                                </tbody>
+                                            </table>
+                                            {curMajorRows.length > 200 && (
+                                                <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
+                                                    Showing first 200 of {curMajorRows.length} rows.
+                                                </p>
+                                            )}
+                                        </div>
                                     )}
                                 </div>
                             )}

@@ -1319,6 +1319,7 @@ def resolve_secret_vars(ds_kind: str) -> Dict[str, str]:
         out["Postgres_host"] = _getenv_any(["Postgres_host", "POSTGRES_host", "POSTGRES_HOST", "postgres_host", "Postgres_hostname", "POSTGRES_HOSTNAME", "postgres_hostname"])
         out["Postgres_port"] = _getenv_any(["Postgres_port", "POSTGRES_port", "POSTGRES_PORT", "postgres_port"])
         out["Postgres_rdb_url"] = _getenv_any(["Postgres_rdb_url", "POSTGRES_RDB_URL", "postgres_rdb_url"])
+        out["Postgres_rdb_name"] = _getenv_any(["Postgres_rdb_name", "POSTGRES_rdb_name", "POSTGRES_RDB_NAME", "postgres_rdb_name", "Postgres_database", "POSTGRES_DATABASE", "postgres_database"])
     elif k == "mssql":
         out["MSSQL_username"] = _getenv_any(["MSSQL_username", "MSSQL_USERNAME", "mssql_username"])
         out["MSSQL_password"] = _getenv_any(["MSSQL_password", "MSSQL_PASSWORD", "mssql_password"])
@@ -1952,10 +1953,13 @@ def _apply_runtime_secrets(ds_kind: str, ds_payload: Dict[str, Any], secret_vars
         h = _get("Postgres_host")
         pt = _get("Postgres_port")
         ru = _get("Postgres_rdb_url")
+        rn = _get("Postgres_rdb_name")
         if u:
             ds_conn["username"] = u
         if p:
             ds_conn["password"] = p
+        if rn:
+            ds_conn["rdb_name"] = rn
         _override_rdb_url(ds_conn, host=h, port=pt, url_override=ru)
         if isinstance(ap, dict):
             if u:
@@ -2933,7 +2937,7 @@ def run_once(engine, *, quiet: bool = False) -> bool:
                         LEFT JOIN scan_parents sp ON sp.scan_id = ws.scan_id
                         WHERE ws.run_id=:rid
                           AND COALESCE(ws.is_enabled,TRUE)=TRUE
-                          AND COALESCE(ws.status,'') NOT IN ('completed','disabled')
+                          AND COALESCE(ws.status,'') NOT IN ('completed','error','disabled')
                           AND (
                             (ws.scan_id IS NOT NULL AND TRIM(ws.scan_id) <> '')
                             OR COALESCE(ws.status,'') IN ('scan_running','scan_waiting')

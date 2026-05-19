@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, Body, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -7,6 +8,7 @@ from pydantic import BaseModel, Field
 from typing import Dict, List, Literal, Optional
 import os
 import hashlib
+from pathlib import Path
 
 import sys
 
@@ -43,6 +45,7 @@ from v2_api.scan_progress_helpers import (
 )
 
 app = FastAPI(title="Scan Performance Benchmark API v2")
+REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 
 # Setup CORS for the React frontend
 app.add_middleware(
@@ -80,7 +83,30 @@ async def ui_config():
 
 
 # Database Setup (PostgreSQL — v2 API system of record for React + benchmarks)
-engine = create_engine(DB_CONNECTION_STRING, pool_pre_ping=True, connect_args={"connect_timeout": 3})
+engine = create_engine(
+    DB_CONNECTION_STRING, 
+    pool_pre_ping=True, 
+    pool_recycle=3600,  # Recycle connections after 1 hour
+    pool_size=10,
+    max_overflow=20,
+    isolation_level="AUTOCOMMIT",  # Each query auto-commits, no lingering transactions
+    connect_args={"connect_timeout": 3}
+)
+
+# Middleware to handle database transaction errors
+@app.middleware("http")
+async def db_session_middleware(request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        # If there's a database error, try to rollback any pending transactions
+        try:
+            with engine.connect() as conn:
+                conn.rollback()
+        except:
+            pass
+        raise e
 
 # Optional alternate Postgres URL for workflow tables only (still Postgres — never legacy MySQL).
 _workflow_optional_engine = None
@@ -179,6 +205,39 @@ class UserProfile(BaseModel):
 @app.get("/api/me", response_model=UserProfile)
 async def get_me(u=Depends(get_current_user)):
     return u
+
+
+@app.get("/api/reports")
+async def list_generated_reports(u=Depends(get_current_user)):
+    """List generated HTML reports from the repo reports/ directory."""
+    if not REPORTS_DIR.exists():
+        return {"items": []}
+    items = []
+    for path in sorted(REPORTS_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        items.append({
+            "name": path.name,
+            "url": f"/api/reports/file/{path.name}",
+            "size_bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+        })
+    return {"items": items}
+
+
+@app.get("/api/reports/file/{filename}")
+async def get_generated_report_file(filename: str):
+    """Serve a generated HTML report by safe filename."""
+    safe_name = Path(filename).name
+    if safe_name != filename or not safe_name.endswith(".html"):
+        raise HTTPException(status_code=400, detail="Invalid report filename")
+    path = (REPORTS_DIR / safe_name).resolve()
+    reports_root = REPORTS_DIR.resolve()
+    if reports_root not in path.parents or not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Report not found")
+    return FileResponse(path, media_type="text/html", filename=safe_name)
 
 class Environment(BaseModel):
     id: int
@@ -1458,7 +1517,27 @@ async def get_scanner_performance_route(scan_id: str, token: str = Depends(oauth
     sid = str(scan_id or "").strip()
     if not sid:
         raise HTTPException(status_code=400, detail="scan_id required")
-    return load_scanner_performance_series(engine, sid)
+    
+    try:
+        return load_scanner_performance_series(engine, sid)
+    except SQLAlchemyError as e:
+        # Rollback any failed transaction
+        try:
+            with engine.connect() as conn:
+                conn.rollback()
+        except:
+            pass
+        # Return empty data instead of error
+        return {
+            "available": False,
+            "scan_id": sid,
+            "environment_id": None,
+            "window_start": None,
+            "window_end": None,
+            "groups": [],
+            "individuals": [],
+            "message": f"Database error: {str(e)}"
+        }
 
 
 @app.get("/api/scan/{scan_id}/log-correlation")
@@ -1929,11 +2008,18 @@ async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, u=Depends
     """Create workflow run + step matrix (default from catalog or client-selected steps)."""
     try:
         from v2_api.workflow_ops import insert_workflow_run_with_steps  # noqa: PLC0415
+        import logging
+        logger = logging.getLogger(__name__)
 
         eng = get_workflow_sql_engine()
         steps_kw = None
         if payload.steps is not None and len(payload.steps) > 0:
             steps_kw = [s.model_dump() for s in payload.steps]
+            enabled_count = sum(1 for s in steps_kw if s.get("is_enabled", True))
+            logger.info(f"Creating workflow with {len(steps_kw)} steps ({enabled_count} enabled)")
+        else:
+            logger.info("Creating workflow with default steps (no steps provided in payload)")
+        
         rid = insert_workflow_run_with_steps(
             eng,
             payload.name,
@@ -1943,6 +2029,7 @@ async def create_workflow_run_endpoint(payload: WorkflowCreatePayload, u=Depends
             steps_override=steps_kw,
             created_by=u["id"]
         )
+        logger.info(f"Successfully created workflow run_id={rid}")
         return {"id": rid, "message": "created"}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

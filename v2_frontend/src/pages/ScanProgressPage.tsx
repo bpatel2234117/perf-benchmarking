@@ -1045,7 +1045,11 @@ export function ScanProgressDetail({ scanId, token }: { scanId: string; token: s
             <strong style={{ fontSize: '0.88rem' }}>Recent scanner / subsystem errors</strong>
             <div style={{ marginTop: '0.5rem', maxHeight: 260, overflow: 'auto' }}>
               {(scanErrorsData?.items ?? []).length === 0 ? (
-                <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)' }}>No rows in scan_log_errors for this scan.</p>
+                <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+                  No rows in <code style={{ fontSize: '0.85em' }}>scan_log_errors</code> for this scan.{' '}
+                  Errors are only stored here if <code style={{ fontSize: '0.85em' }}>ai_log_fetcher.py</code> is running and detected them —
+                  this does not confirm the system is error-free. Check the Logs page or trigger a manual log fetch if errors are expected.
+                </p>
               ) : (
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.76rem' }}>
                   <thead>

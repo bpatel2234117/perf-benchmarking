@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
-import { Loader2, TrendingUp, Layers } from 'lucide-react';
+import { Loader2, TrendingUp, Layers, ChevronRight, ChevronDown } from 'lucide-react';
 import {
   LineChart,
   Line,
@@ -113,6 +113,7 @@ const TrendSection: React.FC<{
 }> = ({ title, subtitle, rows, loading, segment, lastBuildWindow }) => {
   const [sectionDs, setSectionDs] = useState('');
   const [sectionScan, setSectionScan] = useState('');
+  const [showSummary, setShowSummary] = useState(false);
 
   const sectionDsOptions = useMemo(() => {
     const values = [...new Set(rows.map((r) => r.data_source_type).filter(Boolean))] as string[];
@@ -255,7 +256,7 @@ const TrendSection: React.FC<{
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
                 <XAxis dataKey="build" tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
                 <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
-                <Tooltip />
+                <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                 <Legend />
                 <Line type="monotone" dataKey="cluster_gb" name="Cluster" stroke="#7c3aed" strokeWidth={3} dot={{ r: 4 }} connectNulls />
                 <Line type="monotone" dataKey="scanner_gb" name="Per Scanner" stroke="#6366f1" strokeWidth={2} dot={{ r: 3 }} connectNulls />
@@ -272,7 +273,7 @@ const TrendSection: React.FC<{
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
                 <XAxis dataKey="build" tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
                 <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
-                <Tooltip />
+                <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                 <Legend />
                 <Line type="monotone" dataKey="cluster_files" name="Cluster" stroke="#059669" strokeWidth={3} dot={{ r: 4 }} connectNulls />
                 <Line type="monotone" dataKey="scanner_files" name="Per Scanner" stroke="#34d399" strokeWidth={2} dot={{ r: 3 }} connectNulls />
@@ -289,7 +290,7 @@ const TrendSection: React.FC<{
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
                 <XAxis dataKey="build" tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
                 <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
-                <Tooltip />
+                <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                 <Legend />
                 <Line type="monotone" dataKey="catalog" name="Total catalog items" stroke="#0284c7" strokeWidth={3} dot={{ r: 4 }} connectNulls />
               </LineChart>
@@ -306,7 +307,7 @@ const TrendSection: React.FC<{
               <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
               <XAxis dataKey="build" tick={{ fontSize: 10 }} stroke="var(--text-secondary)" angle={-35} textAnchor="end" height={60} />
               <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
-              <Tooltip />
+              <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
               <Legend />
               <Bar dataKey="cluster_gb" name="Cluster GB/hr" fill="#7c3aed" />
               <Bar dataKey="scanner_gb" name="Scanner GB/hr" fill="#818cf8" />
@@ -320,7 +321,7 @@ const TrendSection: React.FC<{
               <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
               <XAxis dataKey="build" tick={{ fontSize: 10 }} stroke="var(--text-secondary)" angle={-35} textAnchor="end" height={60} />
               <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
-              <Tooltip />
+              <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
               <Legend />
               <Bar dataKey="cluster_files" name="Cluster files/hr" fill="#059669" />
               <Bar dataKey="scanner_files" name="Scanner files/hr" fill="#34d399" />
@@ -330,42 +331,58 @@ const TrendSection: React.FC<{
         </div>
       </div>
 
-      <h4 className="trend-bar-heading">Summary</h4>
-      <div style={{ overflowX: 'auto' }}>
-        <table>
-          <thead>
-            <tr>
-              <th>Build</th>
-              <th>Scan type</th>
-              <th>Data source</th>
-              <th>Cluster GB/hr</th>
-              <th>Cluster files/hr</th>
-              <th>Scan hours</th>
-            </tr>
-          </thead>
-          <tbody>
-            {summarySlice.map((r) => (
-              <tr key={`${title}-${r.id}`}>
-                <td>{r.build_version}</td>
-                <td>{r.scan_type ?? '—'}</td>
-                <td>{r.data_source_type ?? '—'}</td>
-                <td>{r.throughput_cluster_gb_hr != null ? r.throughput_cluster_gb_hr.toFixed(2) : '—'}</td>
-                <td>{r.throughput_cluster_files_hr != null ? Math.round(r.throughput_cluster_files_hr).toLocaleString() : '—'}</td>
-                <td>{r.total_scan_hours != null ? r.total_scan_hours.toFixed(2) : '—'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {reversedSummary.length > SUMMARY_PAGE_SIZE && (
-          <PaginationBar
-            page={summaryPage}
-            pageSize={SUMMARY_PAGE_SIZE}
-            totalItems={reversedSummary.length}
-            onPageChange={setSummaryPage}
-            ariaLabel={`${title} summary table`}
-          />
-        )}
+      <div 
+        onClick={() => setShowSummary(!showSummary)}
+        style={{ 
+          display: 'flex', 
+          alignItems: 'center', 
+          gap: '0.5rem', 
+          cursor: 'pointer', 
+          margin: '1.5rem 0 0.75rem',
+          userSelect: 'none'
+        }}
+      >
+        {showSummary ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+        <h4 className="trend-bar-heading" style={{ margin: 0 }}>Summary</h4>
       </div>
+
+      {showSummary && (
+        <div className="animate-in" style={{ overflowX: 'auto' }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Build</th>
+                <th>Scan type</th>
+                <th>Data source</th>
+                <th>Cluster GB/hr</th>
+                <th>Cluster files/hr</th>
+                <th>Scan hours</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summarySlice.map((r) => (
+                <tr key={`${title}-${r.id}`}>
+                  <td>{r.build_version}</td>
+                  <td>{r.scan_type ?? '—'}</td>
+                  <td>{r.data_source_type ?? '—'}</td>
+                  <td>{r.throughput_cluster_gb_hr != null ? r.throughput_cluster_gb_hr.toFixed(2) : '—'}</td>
+                  <td>{r.throughput_cluster_files_hr != null ? Math.round(r.throughput_cluster_files_hr).toLocaleString() : '—'}</td>
+                  <td>{r.total_scan_hours != null ? r.total_scan_hours.toFixed(2) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {reversedSummary.length > SUMMARY_PAGE_SIZE && (
+            <PaginationBar
+              page={summaryPage}
+              pageSize={SUMMARY_PAGE_SIZE}
+              totalItems={reversedSummary.length}
+              onPageChange={setSummaryPage}
+              ariaLabel={`${title} summary table`}
+            />
+          )}
+        </div>
+      )}
     </section>
   );
 };
@@ -373,8 +390,6 @@ const TrendSection: React.FC<{
 const Dashboard: React.FC<DashboardProps> = ({ token }) => {
   const authConfig = { headers: { Authorization: `Bearer ${token}` } };
 
-  const [filterDs, setFilterDs] = useState<string>('');
-  const [filterScan, setFilterScan] = useState<string>('');
   const [filterRelease, setFilterRelease] = useState<boolean>(false);
   const [lastBuildWindow, setLastBuildWindow] = useState<number | 'all'>('all');
 
@@ -394,25 +409,13 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
 
   const filteredTrend = useMemo(() => {
     let t = trendRows;
-    if (filterDs) t = t.filter((r) => r.data_source_type === filterDs);
-    if (filterScan) t = t.filter((r) => r.scan_type === filterScan);
     if (filterRelease) t = t.filter((r) => r.is_release);
     return t;
-  }, [trendRows, filterDs, filterScan, filterRelease]);
+  }, [trendRows, filterRelease]);
 
   const structuredRows = useMemo(() => filteredTrend.filter((r) => r.data_segment === 'structured'), [filteredTrend]);
   const unstructuredRows = useMemo(() => filteredTrend.filter((r) => r.data_segment === 'unstructured'), [filteredTrend]);
 
-  const dsOptions = useMemo(() => {
-    const u = [...new Set(trendRows.map((r) => r.data_source_type).filter(Boolean))] as string[];
-    return ['', ...u.sort()];
-  }, [trendRows]);
-  const scanOptions = useMemo(() => {
-    const u = [
-      ...new Set(trendRows.filter((r) => !filterDs || r.data_source_type === filterDs).map((r) => r.scan_type).filter(Boolean)),
-    ] as string[];
-    return ['', ...u.sort()];
-  }, [trendRows, filterDs]);
 
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
@@ -449,39 +452,6 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
               ))}
             </select>
           </div>
-          <div className="input-group" style={{ margin: 0, minWidth: 200 }}>
-            <label htmlFor="trend-ds">Data source</label>
-            <select
-              id="trend-ds"
-              value={filterDs}
-              onChange={(e) => {
-                setFilterDs(e.target.value);
-                setFilterScan('');
-              }}
-              style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
-            >
-              {dsOptions.map((ds) => (
-                <option key={ds || 'all-ds'} value={ds}>
-                  {ds === '' ? 'All data sources' : ds}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="input-group" style={{ margin: 0, minWidth: 200 }}>
-            <label htmlFor="trend-scan">Scan type</label>
-            <select
-              id="trend-scan"
-              value={filterScan}
-              onChange={(e) => setFilterScan(e.target.value)}
-              style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
-            >
-              {scanOptions.map((st) => (
-                <option key={st || 'all-scan'} value={st}>
-                  {st === '' ? 'All scan types' : st}
-                </option>
-              ))}
-            </select>
-          </div>
           <div className="input-group" style={{ margin: 0, minWidth: 150, display: 'flex', flexDirection: 'row', alignItems: 'center', gap: '0.5rem', alignSelf: 'center', paddingTop: '1.2rem' }}>
             <input
               type="checkbox"
@@ -508,7 +478,7 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
           )}
         </p>
         <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', margin: '0 0 1rem', maxWidth: '52rem', lineHeight: 1.45 }}>
-          Leave <strong>Data source</strong> and <strong>Scan type</strong> on All so unstructured and structured charts both receive rows. The same filters apply to both sections — picking e.g. only S3 hides structured relational runs. Each chart shows one best run per build version per segment; if a segment has fewer distinct builds than your window, you will see fewer dots.
+          Each segment (Unstructured / Structured) has its own <strong>Data source</strong> and <strong>Scan type</strong> filters below, allowing you to compare different benchmarks side-by-side. The filters above apply globally to all charts.
         </p>
 
         <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>

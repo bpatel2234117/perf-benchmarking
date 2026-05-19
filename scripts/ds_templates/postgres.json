@@ -4,13 +4,42 @@
     "id": "{{DS_NAME}}",
     "type": "rdb-postgresql",
     "scanner_group": "{{SCANNER_GROUP}}",
+    "enabled": "yes",
+    "authStrategy": "simple",
+    "is_credential": false,
     "username": "{{Postgres_username}}",
     "password": "{{Postgres_password}}",
     "rdb_url": "{{Postgres_rdb_url}}",
+    "rdb_name": "{{Postgres_rdb_name}}",
+    "numberOfParsingThreads": "50",
+    "is_idsor_supported": true,
+    "is_include_tables": true,
+    "classification_is_enabled": true,
+    "rdb_is_only_user_objects": false,
+    "rdb_is_sample_data": false,
+    "rdb_is_scan_views": false,
+    "rdb_sample_type": "size",
+    "stop_on_failure": false,
+    "autoRetry": 0,
+    "is_certificate": false,
+    "ssl_cert": "",
+    "ssl_key": "",
+    "ssl_root": "",
+    "certificate_id": "",
     "authenticationProperties": {
       "username": "{{Postgres_username}}",
       "password": "{{Postgres_password}}"
-    }
+    },
+    "custom_fields": [
+      {
+        "field_type": "clear",
+        "field_name": "DS_LITE_MODE_ENABLED",
+        "field_value": "true",
+        "enable": true
+      }
+    ],
+    "owners_v2": [],
+    "tags": []
   },
   "isSavedAsDraft": false
 }

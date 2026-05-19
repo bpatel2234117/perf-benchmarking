@@ -188,6 +188,18 @@ function utcLabel(): string {
   return `Workflow ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`;
 }
 
+/** Returns a human-readable cooldown label like "⏸ 2m 14s" or "⏸ Starting…". */
+function cooldownLabel(nextEligibleAt: string | null | undefined): string {
+  if (!nextEligibleAt) return '⏸ Cooldown';
+  const diff = new Date(nextEligibleAt).getTime() - Date.now();
+  if (diff <= 0) return '⏸ Starting…';
+  const mins = Math.floor(diff / 60000);
+  const secs = Math.floor((diff % 60000) / 1000);
+  const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  const utcTime = new Date(nextEligibleAt).toISOString().slice(11, 16);
+  return `⏸ Cooldown ${timeStr} (→${utcTime}Z)`;
+}
+
 function statusBadge(status: string | null | undefined): React.ReactElement {
   const s = String(status ?? '').trim().toLowerCase();
   const styles: Record<string, { bg: string; fg: string }> = {
@@ -418,6 +430,10 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           feature_flags: row.feature_flags ?? null,
           notes: row.notes ?? null,
         }));
+        const enabledCount = (body.steps as any[]).filter(s => s.is_enabled).length;
+        console.log(`Creating workflow with ${(body.steps as any[]).length} steps (${enabledCount} enabled)`);
+      } else {
+        console.log('Creating workflow without steps array (will use server defaults)');
       }
       const res = await axios.post(`${API_BASE}/api/workflow/runs`, body, authConfig);
       return res.data as { id: number };
@@ -471,10 +487,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     queryKey: ['workflowSteps', token, expandedId],
     queryFn: async () => {
       if (!expandedId) return [];
-      const res = await axios.get(`${API_BASE}/api/workflow/steps`, {
-        ...authConfig,
-        params: { run_id: expandedId },
-      });
+      const res = await axios.get(`${API_BASE}/api/workflow/steps/${expandedId}`, authConfig);
       return res.data as WorkflowStepRow[];
     },
     enabled: expandedId !== null && !stepsByRun[expandedId],
@@ -812,6 +825,11 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                   Select at least one step.
                 </p>
               )}
+              {createMutation.isError && (
+                <p style={{ fontSize: '0.76rem', color: 'var(--danger-color)', marginTop: '0.45rem', marginBottom: 0 }}>
+                  Error creating workflow: {(createMutation.error as any)?.response?.data?.detail || (createMutation.error as Error)?.message || 'Unknown error'}
+                </p>
+              )}
             </div>
           ) : null}
 
@@ -968,117 +986,155 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                     <Loader2 className="lucide-spin" size={22} />
                                   ) : (
                                     <>
-                                      <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
-                                        {(
-                                          [
-                                            ['Pending', metrics.pending, '#6b7280'],
-                                            ['In Progress', metrics.in_prog, '#ca8a04'],
-                                            ['Completed', metrics.completed, '#16a34a'],
-                                            ['Disabled', metrics.disabled, '#6b7280'],
-                                            ['Errors', metrics.errors, '#dc2626'],
-                                          ] as const
-                                        ).map(([label, val, color]) => (
-                                          <div key={label}>
-                                            <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
-                                            <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
-                                          </div>
-                                        ))}
-                                      </div>
-                                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
-                                        <thead>
-                                          <tr style={{ background: '#e8e3f5' }}>
-                                            <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
-                                            <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
-                                          </tr>
-                                        </thead>
-                                        <tbody>
-                                          {rawSteps
-                                            .filter((st) => {
-                                              const cs = workflowNormStepStatus(st.status);
-                                              return cs !== 'disabled' && st.is_enabled;
-                                            })
-                                            .map((st) => {
-                                              const rd = st as unknown as Record<string, unknown>;
-                                              const cStatus = workflowNormStepStatus(st.status);
-                                              let displayErr = String(st.last_error ?? '').trim();
-                                              if (
-                                                ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
-                                                workflowIsTransientStepMessage(displayErr)
-                                              ) {
-                                                displayErr = '';
-                                              }
-                                              if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
+                                      {(() => {
+                                        const isCooldown =
+                                          String(runStatus || '').trim().toLowerCase() === 'running' &&
+                                          !!run.next_eligible_at &&
+                                          new Date(run.next_eligible_at).getTime() > Date.now();
+                                        const firstPendingStepId = isCooldown
+                                          ? (rawSteps.find(
+                                              (st) =>
+                                                st.is_enabled &&
+                                                workflowNormStepStatus(st.status) !== 'disabled' &&
+                                                ['', 'pending'].includes(workflowNormStepStatus(st.status))
+                                            )?.id ?? null)
+                                          : null;
 
-                                              const name = String(st.environment_name ?? '').trim();
-                                              const busy = workflowStepImpliesEnvBusy(rd, runStatus);
-                                              const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
-                                              return (
-                                                <tr key={st.id} style={{ background: st.seq % 2 === 0 ? '#f9f8ff' : '#ffffff' }}>
-                                                  <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
-                                                  <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
-                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
-                                                  <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
-                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
-                                                  <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
-                                                  <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
-                                                  <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
-                                                    {computeProgressEmoji(rd)}
-                                                  </td>
-                                                  <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
-                                                    {fmtCell(st.scan_id)}
-                                                  </td>
-                                                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                    {st.scan_id ? (
-                                                      <Link
-                                                        to={`/tools/scan-status?scan_id=${encodeURIComponent(st.scan_id)}`}
-                                                        style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
-                                                      >
-                                                        View Progress
-                                                      </Link>
-                                                    ) : (
-                                                      '—'
-                                                    )}
-                                                  </td>
-                                                  <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
-                                                    {st.scan_id ? (
-                                                      <Link
-                                                        to={`/tools/add-benchmark?scan_id=${encodeURIComponent(st.scan_id)}`}
-                                                        style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
-                                                      >
-                                                        Open
-                                                      </Link>
-                                                    ) : (
-                                                      '—'
-                                                    )}
-                                                  </td>
-                                                  <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
-                                                    {fmtCell(st.notes)}
-                                                  </td>
-                                                  <td
-                                                    style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
-                                                    title={st.last_error ?? ''}
-                                                  >
-                                                    {displayErr ? displayErr.slice(0, 200) : ''}
-                                                  </td>
+                                        return (
+                                          <>
+                                            <div style={{ display: 'flex', gap: 24, marginBottom: 12, flexWrap: 'wrap' }}>
+                                              {(
+                                                [
+                                                  ['Pending', metrics.pending, '#6b7280'],
+                                                  ['In Progress', metrics.in_prog, '#ca8a04'],
+                                                  ['Completed', metrics.completed, '#16a34a'],
+                                                  ['Disabled', metrics.disabled, '#6b7280'],
+                                                  ['Errors', metrics.errors, '#dc2626'],
+                                                ] as const
+                                              ).map(([label, val, color]) => (
+                                                <div key={label}>
+                                                  <div style={{ fontSize: '0.78rem', color: '#6b7280' }}>{label}</div>
+                                                  <strong style={{ fontSize: '1.05rem', color }}>{val}</strong>
+                                                </div>
+                                              ))}
+                                            </div>
+                                            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
+                                              <thead>
+                                                <tr style={{ background: '#e8e3f5' }}>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
                                                 </tr>
-                                              );
-                                            })}
-                                        </tbody>
-                                      </table>
-                                      {rawSteps.length === 0 && !stepsLoading && (
-                                        <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
-                                      )}
+                                              </thead>
+                                              <tbody>
+                                                {rawSteps
+                                                  .filter((st) => {
+                                                    const cs = workflowNormStepStatus(st.status);
+                                                    return cs !== 'disabled' && st.is_enabled;
+                                                  })
+                                                  .map((st) => {
+                                                    const rd = st as unknown as Record<string, unknown>;
+                                                    const cStatus = workflowNormStepStatus(st.status);
+                                                    let displayErr = String(st.last_error ?? '').trim();
+                                                    if (
+                                                      ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
+                                                      workflowIsTransientStepMessage(displayErr)
+                                                    ) {
+                                                      displayErr = '';
+                                                    }
+                                                    if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
+
+                                                    const name = String(st.environment_name ?? '').trim();
+                                                    const busy = workflowStepImpliesEnvBusy(rd, runStatus);
+                                                    const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
+
+                                                    const isCooldownStep = isCooldown && st.id === firstPendingStepId;
+                                                    const progressCell = isCooldownStep ? (
+                                                      <span style={{ color: '#b45309', fontWeight: 600 }}>
+                                                        {cooldownLabel(run.next_eligible_at)}
+                                                      </span>
+                                                    ) : (
+                                                      computeProgressEmoji(rd)
+                                                    );
+
+                                                    return (
+                                                      <tr
+                                                        key={st.id}
+                                                        style={{
+                                                          background: isCooldownStep
+                                                            ? 'rgba(254, 249, 195, 0.45)'
+                                                            : st.seq % 2 === 0
+                                                            ? '#f9f8ff'
+                                                            : '#ffffff',
+                                                        }}
+                                                      >
+                                                        <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
+                                                        <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
+                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
+                                                          {progressCell}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
+                                                          {fmtCell(st.scan_id)}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                          {st.scan_id ? (
+                                                            <Link
+                                                              to={`/tools/scan-status?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                              style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                            >
+                                                              View Progress
+                                                            </Link>
+                                                          ) : (
+                                                            '—'
+                                                          )}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>
+                                                          {st.scan_id ? (
+                                                            <Link
+                                                              to={`/tools/add-benchmark?scan_id=${encodeURIComponent(st.scan_id)}`}
+                                                              style={{ color: 'var(--primary-color)', fontSize: '0.8rem', textDecoration: 'none', fontWeight: 500 }}
+                                                            >
+                                                              Open
+                                                            </Link>
+                                                          ) : (
+                                                            '—'
+                                                          )}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
+                                                          {fmtCell(st.notes)}
+                                                        </td>
+                                                        <td
+                                                          style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
+                                                          title={st.last_error ?? ''}
+                                                        >
+                                                          {displayErr ? displayErr.slice(0, 200) : ''}
+                                                        </td>
+                                                      </tr>
+                                                    );
+                                                  })}
+                                              </tbody>
+                                            </table>
+                                            {rawSteps.length === 0 && !stepsLoading && (
+                                              <div style={{ color: '#6b7280', fontStyle: 'italic' }}>No steps found for this run.</div>
+                                            )}
+                                          </>
+                                        );
+                                      })()}
                                     </>
                                   )}
                                 </div>

@@ -202,11 +202,11 @@ def _slot_minutes() -> int:
     Controlled by TRACKER_SLOT_MINUTES (default 10).
     """
     try:
-        m = int(_getenv_str('TRACKER_SLOT_MINUTES', '10') or '10')
+        m = int(_getenv_str('TRACKER_SLOT_MINUTES', '20') or '20')
     except Exception:
-        m = 10
+        m = 20
     if m <= 0:
-        m = 10
+        m = 20
     if m > 60:
         m = 60
     return m

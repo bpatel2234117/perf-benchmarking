@@ -568,6 +568,7 @@ def load_data(include_inactive=False):
             b.is_active,
             CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
+            COALESCE(NULLIF(sp.scan_name, ''), '') as scan_name,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
             COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
@@ -610,6 +611,7 @@ def load_data(include_inactive=False):
             b.is_active,
             CASE WHEN TRIM(COALESCE(bu.release_milestone, '')) != '' THEN 1 ELSE 0 END as is_release,
             b.scan_id,
+            COALESCE(NULLIF(sp.scan_name, ''), '') as scan_name,
             COALESCE(sp.scan_status, 'Completed') as Scan_Status,
             COALESCE(NULLIF(si.objects_scanned, 0), NULLIF(b.total_files, 0), 0) as objects_scanned
         FROM benchmarks b
@@ -4452,29 +4454,40 @@ def create_workflow_run(
         if not steps or len(steps) < 5:
             steps = _build_default_workflow_steps()
             
+        seq_idx = 1
         seq_rows = []
-        for i, stp in enumerate(steps or [], start=1):
+        for stp in (steps or []):
             if not isinstance(stp, dict):
                 continue
             enabled = bool(stp.get("is_enabled", True))
-            seq_rows.append({
-                "rid": int(run_id),
-                "seq": int(i),
-                "eid": None,
-                "dk": str(stp.get("ds_kind") or "").strip() or None,
-                "dn": str(stp.get("ds_name") or "").strip() or None,
-                "sk": str(stp.get("scan_kind") or "").strip() or None,
-                "fs": str(stp.get("file_set_type") or "").strip() or None,
-                "en": 1 if enabled else 0,
-                "acl": 1 if bool(stp.get("is_acl")) else 0,
-                "ocr": 1 if bool(stp.get("is_ocr")) else 0,
-                "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
-                "ols": 1 if bool(stp.get("is_ols")) else 0,
-                "islite": 1 if bool(stp.get("is_lite") or stp.get("lite_mode")) else 0,
-                "ff": str(stp.get("feature_flags") or "").strip() or None,
-                "notes": str(stp.get("notes") or "").strip() or None,
-                "status": ("pending" if enabled else "disabled"),
-            })
+            ds_kind = str(stp.get("ds_kind") or "").strip()
+            
+            # Action steps must execute on ALL assigned environments to preserve parallelism.
+            is_action = ds_kind.lower() == "action"
+            envs_to_assign = [eid for eid in (env1_id, env2_id) if eid is not None] if is_action else [None]
+            if not envs_to_assign:
+                envs_to_assign = [None]
+                
+            for eid in envs_to_assign:
+                seq_rows.append({
+                    "rid": int(run_id),
+                    "seq": seq_idx,
+                    "eid": eid,
+                    "dk": ds_kind or None,
+                    "dn": str(stp.get("ds_name") or "").strip() or None,
+                    "sk": str(stp.get("scan_kind") or "").strip() or None,
+                    "fs": str(stp.get("file_set_type") or "").strip() or None,
+                    "en": 1 if enabled else 0,
+                    "acl": 1 if bool(stp.get("is_acl")) else 0,
+                    "ocr": 1 if bool(stp.get("is_ocr")) else 0,
+                    "sff": 1 if bool(stp.get("is_structured_ff")) else 0,
+                    "ols": 1 if bool(stp.get("is_ols")) else 0,
+                    "islite": 1 if bool(stp.get("is_lite") or stp.get("lite_mode")) else 0,
+                    "ff": str(stp.get("feature_flags") or "").strip() or None,
+                    "notes": str(stp.get("notes") or "").strip() or None,
+                    "status": ("pending" if enabled else "disabled"),
+                })
+                seq_idx += 1
         if seq_rows:
             conn.execute(
                 text("""
@@ -6650,7 +6663,7 @@ def _detect_log_errors_structural(log_text: str) -> List[str]:
         # logs real problems at INFO level.
         if re.search(r"\[(?:INFO|DEBUG|TRACE)\]", line, re.I):
             STRONG = re.compile(
-                r"(?i)(?:\bexception\b|\bstacktrace\b|\bnull.?pointer\b|"
+                r"(?i)(?:\berror\b|\bfatal\b|\bsevere\b|\bexception\b|\bstacktrace\b|\bnull.?pointer\b|"
                 r"\bout.?of.?memory\b|\boom\b|\bkilled\b|\bpanic\b|\bcrash(?:ed)?\b|"
                 r"\b(?:40[0-9]|5[0-9]{2})\b|\bunauthorized\b|\bforbidden\b|\bauthentication.?fail)"
             )
@@ -10754,12 +10767,50 @@ def page_build_analysis(df):
         st.caption("Side-by-side comparison of all scenario variations for each File Set Type. Compares Base (Full Scan, no flags), ACL On, OLS Scan, and Structured Discovery FF scans.")
 
         # --- classify each row into a named scenario ---
+        def _truthy_flag(v) -> bool:
+            try:
+                if pd.isna(v):
+                    return False
+            except Exception:
+                pass
+            if isinstance(v, str):
+                return v.strip().lower() not in {"", "0", "false", "no", "none", "nan"}
+            return bool(v)
+
+        def _row_text(row, *cols) -> str:
+            return " ".join(str(row.get(c) or "") for c in cols).strip()
+
+        def _scenario_flags(row):
+            text = _row_text(
+                row,
+                "Scan_Type",
+                "Scenario_Type",
+                "feature_flags",
+                "comment",
+                "file_set_type",
+                "scan_name",
+            )
+            upper = text.upper()
+            is_acl = _truthy_flag(row.get("is_acl"))
+            if "WITHOUT ACL" in upper:
+                is_acl = False
+            elif "ACL" in upper:
+                is_acl = True
+
+            is_ff = _truthy_flag(row.get("is_feature_flags"))
+            if "STRUCTURED DISCOVERY" in upper or "STRUCTURED" in upper:
+                is_ff = True
+
+            has_ols = "OLS" in upper and "NO OLS" not in upper and "WITHOUT OLS" not in upper
+            return is_acl, is_ff, has_ols
+
         def _classify_scenario(row):
-            scan_type = str(row.get("Scan_Type") or "").strip().lower()
-            is_acl = bool(row.get("is_acl"))
-            is_ff  = bool(row.get("is_feature_flags"))
-            has_ols = "ols" in scan_type
-            # OLS + Structured FF must be checked before plain OLS
+            is_acl, is_ff, has_ols = _scenario_flags(row)
+            # Most specific combinations first so ACL+OLS is not swallowed by plain OLS.
+            if has_ols and is_acl and is_ff:
+                return "ACL + OLS + Structured FF"
+            if has_ols and is_acl:
+                return "ACL + OLS Scan"
             if has_ols and is_ff:
                 return "OLS + Structured FF"
             if has_ols:
@@ -10773,11 +10824,25 @@ def page_build_analysis(df):
             return "Base (Full Scan)"
 
         sm_df = build_df.copy()
+        def _matrix_group_values(row):
+            ds_type = str(row.get("Data_Source_Type") or "").strip()
+            file_set = str(row.get("file_set_type") or "").strip()
+            text = _row_text(row, "Data_Source_Type", "file_set_type", "Scenario_Type", "scan_name")
+            upper = text.upper()
+
+            # CSV benchmark rows can be saved as "Other (custom)" / "file-system",
+            # but these workflow CSV scenarios run on S3 and should compare together.
+            if "CSV" in upper:
+                return pd.Series({"_matrix_ds_type": "S3", "_matrix_file_set": "CSV Files"})
+
+            return pd.Series({"_matrix_ds_type": ds_type, "_matrix_file_set": file_set})
+
+        sm_df[["_matrix_ds_type", "_matrix_file_set"]] = sm_df.apply(_matrix_group_values, axis=1)
         sm_df["Scenario"] = sm_df.apply(_classify_scenario, axis=1)
 
         # Pick best row per (DS type, file set, scenario)
         metric_cols = ["throughput_cluster_gb_hr", "throughput_cluster_files_hr", "total_scan_hours", "objects_scanned"]
-        mgrp_cols   = ["Data_Source_Type", "file_set_type", "Scenario"]
+        mgrp_cols   = ["_matrix_ds_type", "_matrix_file_set", "Scenario"]
         sm_best = (
             sm_df.groupby(mgrp_cols, group_keys=False, sort=False)
             .apply(lambda g: g.loc[g["throughput_cluster_gb_hr"].idxmax()] if g["throughput_cluster_gb_hr"].notna().any() else g.iloc[0])
@@ -10787,10 +10852,12 @@ def page_build_analysis(df):
         SCENARIO_ORDER = [
             "Base (Full Scan)",
             "ACL On",
-            "OLS Scan",
-            "OLS + Structured FF",
             "Structured FF",
             "ACL + Structured FF",
+            "OLS Scan",
+            "ACL + OLS Scan",
+            "OLS + Structured FF",
+            "ACL + OLS + Structured FF",
         ]
 
         # ── Major-version comparison lookup ──────────────────────────────────
@@ -10819,20 +10886,21 @@ def page_build_analysis(df):
             prev_major_builds = [v for v in all_versions if _major_ver(v) == prev_major]
             prev_major_df = df[df["Build_Version"].astype(str).isin(prev_major_builds)].copy()
             if not prev_major_df.empty:
+                prev_major_df[["_matrix_ds_type", "_matrix_file_set"]] = prev_major_df.apply(_matrix_group_values, axis=1)
                 prev_major_df["_scenario"] = prev_major_df.apply(_classify_scenario, axis=1)
                 for _, pmr in prev_major_df.iterrows():
                     tp_pm = pmr.get("throughput_cluster_gb_hr")
                     if tp_pm and pd.notna(tp_pm) and float(tp_pm) > 0:
                         key = (
                             pmr.get("_scenario", ""),
-                            str(pmr.get("Data_Source_Type") or ""),
-                            str(pmr.get("file_set_type") or ""),
+                            str(pmr.get("_matrix_ds_type") or ""),
+                            str(pmr.get("_matrix_file_set") or ""),
                         )
                         prev_major_best[key] = max(
                             prev_major_best.get(key, 0.0), float(tp_pm)
                         )
 
-        groups = sm_best.groupby(["Data_Source_Type", "file_set_type"])
+        groups = sm_best.groupby(["_matrix_ds_type", "_matrix_file_set"])
         if groups.ngroups == 0:
             st.info("No benchmark records found for this build. Add scans via 'Add New Benchmark'.")
         else:
@@ -16722,7 +16790,7 @@ def page_scan_progress():
                             st.markdown("**Log Snippet**:")
                             st.code(row['error_context'], language="text")
                 else:
-                    st.success("No recent application errors detected. System looks healthy.")
+                    st.info("No errors found in scan_log_errors for this time window. This does not mean the system is error-free — errors are only stored if ai_log_fetcher.py is running and detected them. Check the Logs page or run the log fetcher manually if errors are expected.")
             except Exception as ex:
                 st.exception(ex)
         else:
@@ -17299,6 +17367,12 @@ def page_workflow_automation():
 
         # --- Pre-load step data first (derive env busy from steps + te.is_busy; API sync lags te.is_busy alone) ---
         run_status_map = dict(zip(runs_df["id"], runs_df["status"]))
+        run_next_eligible_map: dict = {}
+        try:
+            if "next_eligible_at" in runs_df.columns:
+                run_next_eligible_map = dict(zip(runs_df["id"], runs_df["next_eligible_at"]))
+        except Exception:
+            pass
         all_run_steps = {}
         run_ids_list = runs_df["id"].tolist()
         batch_steps_df = load_workflow_steps_batch(run_ids_list)
@@ -17348,6 +17422,27 @@ def page_workflow_automation():
             try:
                 sdf = batch_steps_df[batch_steps_df["run_id"] == rid]
                 steps_to_show = []
+                # Detect cooldown for this run so the first pending step can show it in the Progress column
+                _run_in_cooldown = False
+                _run_cooldown_label = ""
+                _first_pending_done = False
+                try:
+                    _ne_raw = run_next_eligible_map.get(rid)
+                    if _ne_raw and str(run_status_map.get(rid, "")).strip().lower() == "running":
+                        _ne_dt = None
+                        if isinstance(_ne_raw, datetime):
+                            _ne_dt = _ne_raw
+                        elif isinstance(_ne_raw, str) and str(_ne_raw).strip() not in ("", "None", "nan", "NaT"):
+                            _ne_dt = _parse_utc_dt(str(_ne_raw).strip())
+                        if _ne_dt and _ne_dt > datetime.utcnow():
+                            _run_in_cooldown = True
+                            _diff_s = int(max(0, (_ne_dt - datetime.utcnow()).total_seconds()))
+                            _mins, _secs = divmod(_diff_s, 60)
+                            _utc_str = _ne_dt.strftime("%H:%M")
+                            _time_str = f"{_mins}m {_secs}s" if _mins > 0 else f"{_secs}s"
+                            _run_cooldown_label = f"⏸ Cooldown {_time_str} (→{_utc_str}Z)"
+                except Exception:
+                    pass
                 # Initialize counts for the summary bar
                 completed = 0
                 errors = 0
@@ -17383,6 +17478,11 @@ def page_workflow_automation():
                         in_prog += 1
 
                     prog = _pf(rd)
+
+                    # Override progress for the first pending step during cooldown
+                    if _run_in_cooldown and not _first_pending_done and c_status in {"", "pending"}:
+                        prog = _run_cooldown_label
+                        _first_pending_done = True
 
                     # Visibility filter: "no need to show disable steps"
                     if c_status == "disabled": continue
@@ -17739,7 +17839,9 @@ def page_workflow_automation():
                 conn.execute(text("""
                     UPDATE workflow_steps 
                     SET environment_id = CASE WHEN (seq % 2) = 1 THEN :e1 ELSE :e2 END
-                    WHERE run_id=:rid AND COALESCE(status,'') NOT IN ('scan_running', 'completed', 'disabled')
+                    WHERE run_id=:rid 
+                      AND LOWER(COALESCE(ds_kind,'')) != 'action'
+                      AND COALESCE(status,'') NOT IN ('scan_running', 'completed', 'disabled')
                 """), {"e1": e1_id, "e2": e2_id, "rid": r_id})
                 conn.commit()
 

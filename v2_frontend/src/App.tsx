@@ -17,6 +17,7 @@ import ScannerInfraPage from './pages/ScannerInfraPage';
 import CreateDataSourcePage from './pages/CreateDataSourcePage';
 import RunComparisonPage from './pages/RunComparisonPage';
 import VersionComparisonPage from './pages/VersionComparisonPage';
+import GeneratedReportsPage from './pages/GeneratedReportsPage';
 import Navbar from './components/Navbar';
 
 const App = () => {
@@ -49,6 +50,7 @@ const App = () => {
       <Route path="/tools/data-source-create" element={token ? <CreateDataSourcePage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/run-comparison" element={token ? <RunComparisonPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/version-comparison" element={token ? <VersionComparisonPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/generated-reports" element={token ? <GeneratedReportsPage token={token} /> : <Navigate to="/login" />} />
       {/* data-record-add → AddBenchmarkFromScanPage (same functionality) */}
       <Route path="/tools/data-record-add" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/:slug" element={token ? <LegacyToolPage /> : <Navigate to="/login" />} />
@@ -67,4 +69,3 @@ const App = () => {
 };
 
 export default App;
-

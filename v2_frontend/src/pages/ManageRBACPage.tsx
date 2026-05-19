@@ -23,10 +23,8 @@ interface Role {
 }
 
 const ALL_PAGES = [
-    "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Data Source Trend Comparison",
-    "Small Files Trend Analysis", "Large Files Trend Analysis", "Small Files OLS Trend", "Large Files OLS Trend",
-    "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)", "Discover File FF On vs Off",
-    "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)", "Edit Records", "Manage Classifiers",
+    "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Trend Analysis",
+    "Edit Records", "Manage Classifiers",
     "Classifier Changes", "Manage Test Environments", "Version Comparison", "Workflow Automation",
     "Create Data Source", "Scan Status", "Scan Progress"
 ];
