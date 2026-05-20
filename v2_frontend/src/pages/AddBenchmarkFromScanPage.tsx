@@ -127,7 +127,10 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
   });
 
   useEffect(() => {
+    // Reset all prefill state when scan changes so stale values don't carry over
     setAppliedApiDefaults(false);
+    setTotalDbSizeGb('');
+    setTotalTables('');
   }, [scanId]);
 
   useEffect(() => {
@@ -137,14 +140,29 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
       setThreadCount(d.thread_count);
       setAppliedApiDefaults(true);
     }
-    // Pre-fill DB Size and Total Tables from file_set_details if Structured
+    // Pre-fill Total DB Size and Total Tables for structured DS.
+    // Priority: file_set_details → effective_volumes (actual scan insights)
     const fsdLocal = detail?.benchmark_context?.file_set_details;
-    if (fsdLocal?.total_size_gb != null && totalDbSizeGb === '') setTotalDbSizeGb(fsdLocal.total_size_gb);
-    if (fsdLocal?.total_files != null && totalTables === '') setTotalTables(fsdLocal.total_files);
+    const ev = detail?.benchmark_context?.effective_volumes;
+    // Total Tables: prefer file_set_details.total_files (configured table count)
+    if (fsdLocal?.total_files != null) {
+      setTotalTables(fsdLocal.total_files);
+    } else if (typeof ev?.total_files === 'number' && ev.total_files > 0) {
+      setTotalTables(ev.total_files);
+    }
+    // Total DB Size: file_set_details rarely has this for Postgres; prefer effective_volumes
+    if (fsdLocal?.total_size_gb != null && fsdLocal.total_size_gb > 0) {
+      setTotalDbSizeGb(fsdLocal.total_size_gb);
+    } else if (typeof ev?.total_gb === 'number' && ev.total_gb > 0) {
+      setTotalDbSizeGb(ev.total_gb);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail?.benchmark_context]);
 
-  const isStructured = (detail?.benchmark_context?.run_metrics?.data_type ?? '').toLowerCase() === 'structured';
+  const _STRUCTURED_DS = ['postgres', 'mssql', 'mysql', 'oracle'];
+  const isStructured =
+    (detail?.benchmark_context?.run_metrics?.data_type ?? '').toLowerCase() === 'structured' ||
+    _STRUCTURED_DS.includes((detail?.benchmark_context?.run_metrics?.data_source_type ?? '').toLowerCase());
 
   const throughputLive = useMemo(() => {
     const bc = detail?.benchmark_context;
