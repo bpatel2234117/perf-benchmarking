@@ -83,6 +83,7 @@ def load_benchmarks(engine, *, environment_id: Optional[int]) -> pd.DataFrame:
             {updated_at_expr},
             sp.environment_id,
             COALESCE(sp.scan_status, '') AS scan_status,
+            COALESCE(sp.scan_name, '') AS scan_name,
             COALESCE(si.total_classification, b.total_classification, 0) AS total_classification,
             COALESCE(si.new_attributes_count, b.total_catalog_items, 0) AS new_attributes_count,
             COALESCE(si.removed_attributes_count, b.removed_attributes, 0) AS removed_attributes_count,
@@ -109,7 +110,7 @@ def load_benchmarks(engine, *, environment_id: Optional[int]) -> pd.DataFrame:
         query += " AND sp.environment_id = :eid"
         params["eid"] = int(environment_id)
     with engine.connect() as conn:
-        return pd.read_sql(text(query), conn, params=params)
+        return base.normalize_benchmark_dataframe(pd.read_sql(text(query), conn, params=params))
 
 
 def load_available_builds(engine, *, environment_id: Optional[int]) -> List[Tuple[str, int]]:

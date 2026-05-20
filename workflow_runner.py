@@ -56,6 +56,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import requests
 from sqlalchemy import create_engine, text
 
+from benchmark_scenario_normalizer import canonical_benchmark_fields
 from benchmark_db import is_postgresql_engine, resolve_benchmark_database_url
 from bigid_auth import Get_auth_token
 
@@ -3330,7 +3331,8 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
         with engine.connect() as conn:
             step_row = conn.execute(
                 text("""
-                    SELECT ds_kind, ds_name, file_set_type, feature_flags, build_version
+                    SELECT ds_kind, ds_name, file_set_type, feature_flags, build_version,
+                           is_acl, is_ols, is_structured_ff, environment_id
                     FROM workflow_steps WHERE id = :sid LIMIT 1
                 """),
                 {"sid": step_id},
@@ -3341,6 +3343,19 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
         ds_name       = str(step_row[1] or "").strip()
         file_set_type = str(step_row[2] or "").strip() or None
         build_version = str(step_row[4] or "").strip() or "unknown"
+        canonical = canonical_benchmark_fields({
+            "data_source_type": ds_kind,
+            "ds_name": ds_name,
+            "file_set_type": file_set_type,
+            "feature_flags": step_row[3],
+            "is_acl": step_row[5],
+            "is_ols": step_row[6],
+            "is_structured_ff": step_row[7],
+        })
+        ds_kind = str(canonical.get("data_source_type") or ds_kind or "").strip()
+        file_set_type = str(canonical.get("file_set_type") or file_set_type or "").strip() or None
+        scan_type = str(canonical.get("scan_type") or "Full Scan").strip()
+        scenario_type = str(canonical.get("matrix_file_set_type") or file_set_type or ds_name or ds_kind or "Workflow Auto").strip()
 
         # Pull scan timing:
         # - start: scan_parents.started_at (BigID-reported scan start, most accurate)
@@ -3406,7 +3421,7 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
                         WHERE environment_id = :eid
                           AND captured_at_utc BETWEEN :start AND :end
                     """),
-                    {"eid": step_row[10] if step_row and step_row[10] else -1,
+                    {"eid": step_row[8] if step_row and step_row[8] else -1,
                      "start": scan_start, "end": scan_end},
                 ).fetchone()
             if gp_row and gp_row[0]:
@@ -3423,17 +3438,18 @@ def _auto_save_benchmark_from_step(engine, step_id: int, scan_id: str, run_id: i
 
         # Build INSERT dynamically based on schema
         cols = [
-            "build_id", "run_date", "scenario_type", "data_source_type", "file_set_type",
+            "build_id", "run_date", "scenario_type", "scan_type", "data_source_type", "file_set_type",
             "total_files", "scan_start_time", "scan_end_time",
             "total_scan_hours",
             "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
         ]
-        vals = [":b_id", "CURRENT_DATE", ":scenario", ":dst", ":fstype",
+        vals = [":b_id", "CURRENT_DATE", ":scenario", ":scan_type", ":dst", ":fstype",
                 ":tf", ":ss", ":se", ":tsh",
                 ":tpcf", ":tpsf", ":tptf"]
         params: Dict[str, Any] = {
             "b_id": b_id,
-            "scenario": ds_name or ds_kind or "Workflow Auto",
+            "scenario": scenario_type,
+            "scan_type": scan_type,
             "dst": ds_kind or None,
             "fstype": file_set_type,
             "tf": objects_scanned,

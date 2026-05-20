@@ -1,0 +1,35 @@
+# Stage 1: Build React Application
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY v2_frontend/package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy source code
+COPY v2_frontend/ .
+
+# Build argument for API base URL (defaults to empty, falling back to localhost:8000 in apiConfig.ts)
+ARG VITE_API_BASE_URL
+ENV VITE_API_BASE_URL=$VITE_API_BASE_URL
+
+# Build the application
+RUN npm run build
+
+# Stage 2: Serve Application with Nginx
+FROM nginx:alpine
+
+# Copy custom Nginx configuration
+COPY v2_frontend/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy build output from Stage 1
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Expose the port matching custom nginx configuration
+EXPOSE 5174
+
+# Start Nginx
+CMD ["nginx", "-g", "daemon off;"]

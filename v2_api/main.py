@@ -43,6 +43,7 @@ from v2_api.scan_progress_helpers import (
     load_scan_log_errors_for_scan,
     load_scanner_performance_series,
 )
+from benchmark_scenario_normalizer import canonical_benchmark_fields
 
 app = FastAPI(title="Scan Performance Benchmark API v2")
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
@@ -2158,12 +2159,39 @@ async def save_benchmark(payload: BenchmarkSavePayload, u=Depends(get_current_us
     """
     try:
         with engine.begin() as conn:
+            scan_name = ""
+            if payload.scan_id:
+                row = conn.execute(
+                    text("SELECT scan_name FROM scan_parents WHERE scan_id = :sid LIMIT 1"),
+                    {"sid": payload.scan_id},
+                ).fetchone()
+                scan_name = str(row[0] or "") if row else ""
+            canon = canonical_benchmark_fields({
+                "scan_name": scan_name,
+                "scenario_type": payload.scenario_type,
+                "scan_type": payload.scan_type,
+                "data_source_type": payload.data_source_type,
+                "file_set_type": payload.file_set_type,
+                "is_acl": payload.is_acl,
+                "is_feature_flags": payload.is_feature_flags,
+                "feature_flags": payload.feature_flags,
+            })
+            save_scenario_type = str(canon.get("matrix_file_set_type") or payload.scenario_type).strip()
+            save_scan_type = str(canon.get("scan_type") or payload.scan_type).strip()
+            save_data_source_type = str(canon.get("data_source_type") or payload.data_source_type).strip()
+            save_file_set_type = str(canon.get("file_set_type") or payload.file_set_type).strip()
+            save_is_acl = bool(canon.get("is_acl"))
+            save_is_ff = bool(canon.get("is_feature_flags"))
+            save_feature_flags = payload.feature_flags
+            if save_is_ff and not str(save_feature_flags or "").strip():
+                save_feature_flags = "Structured"
+
             build_id = _get_or_create_build(conn, payload.build_version.strip())
-            dst_id = _get_or_create_id(conn, "data_source_types", "name", payload.data_source_type.strip())
+            dst_id = _get_or_create_id(conn, "data_source_types", "name", save_data_source_type)
 
             # file_set_types may have extra columns — upsert name only, update sizes if provided
             fst_row = conn.execute(
-                text("SELECT id FROM file_set_types WHERE name = :n"), {"n": payload.file_set_type.strip()}
+                text("SELECT id FROM file_set_types WHERE name = :n"), {"n": save_file_set_type}
             ).fetchone()
             if fst_row:
                 fst_id = int(fst_row[0])
@@ -2184,7 +2212,7 @@ async def save_benchmark(payload: BenchmarkSavePayload, u=Depends(get_current_us
                         INSERT INTO file_set_types (name, data_type, total_files, total_folders, total_size_gb)
                         VALUES (:n, :dt, :tf, :tfo, :tsg) RETURNING id
                     """),
-                    {"n": payload.file_set_type.strip(),
+                    {"n": save_file_set_type,
                      "dt": payload.data_type or None,
                      "tf": payload.total_files, "tfo": payload.total_folders,
                      "tsg": payload.total_size_gb},
@@ -2193,7 +2221,7 @@ async def save_benchmark(payload: BenchmarkSavePayload, u=Depends(get_current_us
 
             config_id = _get_or_create_config(
                 conn, payload.scanner_count, payload.thread_count,
-                payload.is_acl, payload.is_ocr, payload.is_feature_flags, payload.feature_flags
+                save_is_acl, payload.is_ocr, save_is_ff, save_feature_flags
             )
 
             # Parse timestamps
@@ -2231,7 +2259,7 @@ async def save_benchmark(payload: BenchmarkSavePayload, u=Depends(get_current_us
                 """),
                 {
                     "bid": build_id, "cid": config_id,
-                    "rd": payload.run_date, "st": payload.scenario_type, "sct": payload.scan_type,
+                    "rd": payload.run_date, "st": save_scenario_type, "sct": save_scan_type,
                     "dst": dst_id, "fst": fst_id,
                     "ss": _parse_ts(payload.scan_start_time), "se": _parse_ts(payload.scan_end_time),
                     "tsh": payload.total_scan_hours,
@@ -2311,20 +2339,22 @@ async def get_build_analysis_data(
                     b.total_scan_hours::double precision,
                     COALESCE(si.objects_scanned, b.total_catalog_items, 0)::bigint AS objects_scanned,
                     b.run_date,
-                    b.scan_id
+                    b.scan_id,
+                    COALESCE(sp.scan_name, '') AS scan_name
                 FROM benchmarks b
                 JOIN builds bv ON bv.id = b.build_id
                 LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
                 LEFT JOIN file_set_types fst ON fst.id = b.file_set_type_id
                 LEFT JOIN configurations cfg ON cfg.id = b.config_id
                 LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
                 {where}
                 ORDER BY bv.id DESC, b.id DESC
             """), params).fetchall()
 
         out = []
         for r in rows:
-            out.append({
+            raw = {
                 "id": r[0],
                 "build_version": str(r[1] or ""),
                 "is_release": bool(r[2]),
@@ -2342,7 +2372,18 @@ async def get_build_analysis_data(
                 "objects_scanned": r[14],
                 "run_date": str(r[15]) if r[15] else None,
                 "scan_id": r[16],
+                "scan_name": r[17],
+            }
+            canon = canonical_benchmark_fields(raw)
+            raw.update({
+                "data_source_type": canon["data_source_type"],
+                "file_set_type": canon["matrix_file_set_type"],
+                "scan_type": canon["scan_type"],
+                "is_acl": bool(canon["is_acl"]),
+                "is_feature_flags": bool(canon["is_feature_flags"]),
+                "scenario_label": canon["scenario_label"],
             })
+            out.append(raw)
         return {"rows": out, "total": len(out)}
     except SQLAlchemyError as e:
         raise HTTPException(status_code=500, detail=str(e))

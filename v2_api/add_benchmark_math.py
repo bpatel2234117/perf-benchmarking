@@ -46,11 +46,22 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name: Any) -> Dict[str, Any
 
     has_small_file = "SMALL FILES" in upper_name or "SMALL FILE" in upper_name
     has_large_file = "LARGE FILES" in upper_name or "LARGE FILE" in upper_name
-    has_csv_file = "CSV FILES" in upper_name or "CSV FILE" in upper_name
-    has_with_aci = ("WITH ACI" in upper_name or "ACL" in upper_name) and "NO ACL" not in upper_name
+    has_csv_file = (
+        "CSV FILES" in upper_name
+        or "CSV FILE" in upper_name
+        or "DSV FILES" in upper_name
+        or "DSV FILE" in upper_name
+        or "DSV" in upper_name
+    )
+    has_no_acl = "NO ACL" in upper_name or "WITHOUT ACL" in upper_name or "NO_ACL" in upper_name
+    has_with_aci = (
+        ("WITH ACI" in upper_name or "ACL" in upper_name or "WITH ACL" in upper_name)
+        and not has_no_acl
+    )
     has_struct_disc = (
         "STRUCT DISC" in upper_name
         or "STRUCTURE DISCOVERY" in upper_name
+        or "STRUCTURED DISCOVERY" in upper_name
         or "STRUCTURED FILES DISCOVERY" in upper_name
         or "STRUCTURED FILE DISCOVERY" in upper_name
     )
@@ -89,12 +100,27 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name: Any) -> Dict[str, Any
     elif has_csv_file:
         file_set_type = "CSV Files"
 
+    # Only default to S3 for CSV/DSV scans if no explicit data source was matched
+    if has_csv_file and not data_source_type:
+        data_source_type = "S3"
+
+    # Determine scan type: WITH OLS takes priority over any "Full Scan" suffix BigID appends
+    has_ols = bool(re.search(r"\bWITH OLS\b|\bOLS SCAN\b", upper_name)) and "NO OLS" not in upper_name
+    if has_ols:
+        scan_type = "OLS Scan"
+    elif "INCREMENTAL" in upper_name:
+        scan_type = "Incremental Scan"
+    elif "DIFFERENTIAL" in upper_name or "DIFF SCAN" in upper_name:
+        scan_type = "Differential Scan"
+    else:
+        scan_type = "Full Scan"
+
     return {
         "build_version": build_version,
         "scenario_type": scenario_type,
         "file_set_type": file_set_type,
         "is_acl": has_with_aci,
-        "scan_type": "OLS Scan" if "OLS" in upper_name and "NO OLS" not in upper_name else "Full Scan",
+        "scan_type": scan_type,
         "is_ff": has_struct_disc,
         "is_ocr": False,
         "data_source_type": data_source_type,

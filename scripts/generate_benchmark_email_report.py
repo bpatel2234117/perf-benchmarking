@@ -57,6 +57,11 @@ repo = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(repo))
 
 from db_config import DB_CONNECTION_STRING  # noqa: E402
+from benchmark_scenario_normalizer import (  # noqa: E402
+    classify_scenario,
+    normalize_benchmark_dataframe,
+    normalize_ds_name,
+)
 
 
 UNSTRUCTURED_DS_ORDER = ["S3", "SMB"]
@@ -159,6 +164,7 @@ def load_benchmarks(engine, *, environment_id: Optional[int]) -> pd.DataFrame:
             {updated_at_expr},
             sp.environment_id,
             COALESCE(sp.scan_status, '') AS scan_status,
+            COALESCE(sp.scan_name, '') AS scan_name,
             COALESCE(si.total_classification, 0) AS total_classification,
             COALESCE(si.new_attributes_count, 0) AS new_attributes_count,
             COALESCE(si.removed_attributes_count, 0) AS removed_attributes_count,
@@ -184,7 +190,7 @@ def load_benchmarks(engine, *, environment_id: Optional[int]) -> pd.DataFrame:
         params["eid"] = int(environment_id)
     with engine.connect() as conn:
         df = pd.read_sql(text(query), conn, params=params)
-    return df
+    return normalize_benchmark_dataframe(df)
 
 
 def load_available_builds(engine, *, environment_id: Optional[int]) -> List[Tuple[str, int]]:
@@ -245,24 +251,6 @@ def best_rows_for_build(df: pd.DataFrame, build_version: str) -> pd.DataFrame:
     ):
         rows.append(select_best_run(grp))
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=df.columns)
-
-
-def normalize_ds_name(name: Any) -> str:
-    raw = str(name or "").strip()
-    low = raw.lower()
-    if low in {"s3"}:
-        return "S3"
-    if low in {"smb"}:
-        return "SMB"
-    if low in {"mssql", "ms sql", "sql server", "microsoft sql server"}:
-        return "MSSQL"
-    if low in {"postgres", "postgresql"}:
-        return "Postgres"
-    if low in {"onedrive", "onedrive-v2"}:
-        return "OneDrive"
-    if low in {"sharepoint", "sharepoint online", "sharepoint-online-v2"}:
-        return "SharePoint Online"
-    return raw
 
 
 def _major_line(v: Any) -> str:
@@ -752,23 +740,7 @@ def build_cross_ds_section(current_build_df: pd.DataFrame, current_build: str, i
 
 
 def _scenario_label(row: pd.Series) -> str:
-    """Classify a benchmark row into a scenario name.
-    Kept consistent with dashboard.py _classify_scenario logic."""
-    scan_type = str(row.get("scan_type") or "").strip().lower()
-    is_acl = bool(int(_safe_float(row.get("is_acl")) or 0))
-    is_ff = bool(int(_safe_float(row.get("is_feature_flags")) or 0))
-    has_ols = "ols" in scan_type
-    if has_ols and is_ff:
-        return "OLS + Structured FF"
-    if has_ols:
-        return "OLS Scan"
-    if is_acl and is_ff:
-        return "ACL + Structured FF"
-    if is_acl:
-        return "ACL On"
-    if is_ff:
-        return "Structured FF"
-    return "Base (Full Scan)"
+    return classify_scenario(row)
 
 
 def build_scenario_matrix_section(
@@ -793,7 +765,9 @@ def build_scenario_matrix_section(
         """
 
     work = work_df.copy()
-    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
+    work["norm_ds"] = work.get("matrix_data_source_type", work["data_source_type"]).map(normalize_ds_name)
+    if "matrix_file_set_type" in work.columns:
+        work["file_set_type"] = work["matrix_file_set_type"]
     ds_scope = UNSTRUCTURED_DS_ORDER + (STRUCTURED_DS_ORDER if include_structured else [])
     work = work[work["norm_ds"].isin(ds_scope)].copy()
     if work.empty:
@@ -820,7 +794,9 @@ def build_scenario_matrix_section(
     prev_best: Dict[Tuple[str, str, str], float] = {}
     if prev_major_df is not None and not prev_major_df.empty:
         pm = prev_major_df.copy()
-        pm["norm_ds"] = pm["data_source_type"].map(normalize_ds_name)
+        pm["norm_ds"] = pm.get("matrix_data_source_type", pm["data_source_type"]).map(normalize_ds_name)
+        if "matrix_file_set_type" in pm.columns:
+            pm["file_set_type"] = pm["matrix_file_set_type"]
         pm["scenario_label"] = pm.apply(_scenario_label, axis=1)
         # Deduplicate prev major the same way
         pm_dedup: List[pd.Series] = []
@@ -843,10 +819,12 @@ def build_scenario_matrix_section(
     scenario_order = {
         "Base (Full Scan)": 0,
         "ACL On": 1,
-        "OLS Scan": 2,
-        "OLS + Structured FF": 3,
-        "Structured FF": 4,
-        "ACL + Structured FF": 5,
+        "Structured FF": 2,
+        "ACL + Structured FF": 3,
+        "OLS Scan": 4,
+        "ACL + OLS Scan": 5,
+        "OLS + Structured FF": 6,
+        "ACL + OLS + Structured FF": 7,
     }
     # File set order: Small Files first, then Large Files, then CSV, then anything else
     _FILE_SET_ORDER = {"small": 0, "large": 1, "csv": 2}

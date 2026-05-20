@@ -44,6 +44,13 @@ except ImportError:
         DB_CONFIG = None
 
 from bigid_auth import Get_auth_token, get_saved_environment_credentials, save_environment_credentials
+from benchmark_scenario_normalizer import (
+    canonical_benchmark_fields,
+    classify_scenario,
+    matrix_group_values,
+    normalize_benchmark_dataframe,
+    scenario_flags,
+)
 from scanner_performance import ensure_scanner_performance_tables, capture_scanner_performance_for_env
 from dashboard_auth import ensure_rbac_tables, login_user, logout_user, check_access, get_user_permissions, hash_password, verify_password
 try:
@@ -443,7 +450,7 @@ def _ensure_throughput_columns(df: pd.DataFrame) -> pd.DataFrame:
     Non-breaking: if required inputs are missing, leaves values as-is.
     """
     if df is None or df.empty:
-        return df
+        return normalize_benchmark_dataframe(df)
     out = df
     try:
         if "total_scan_hours" not in out.columns:
@@ -852,6 +859,18 @@ def get_data_source_types():
                 )
             """))
             conn.commit()
+            
+            # Ensure standard data source types exist
+            defaults = ["S3", "SMB", "MSSQL", "MySQL", "Postgres", "Oracle", "NFS"]
+            for d in defaults:
+                try:
+                    exist = conn.execute(text("SELECT 1 FROM data_source_types WHERE name = :name LIMIT 1"), {"name": d}).fetchone()
+                    if not exist:
+                        conn.execute(text("INSERT INTO data_source_types (name) VALUES (:name)"), {"name": d})
+                except Exception:
+                    pass
+            conn.commit()
+            
             rows = conn.execute(text("SELECT name FROM data_source_types ORDER BY name")).fetchall()
             return [r[0] for r in rows]
     except Exception:
@@ -7714,12 +7733,20 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name):
 
     has_small_file = "SMALL FILES" in upper_name or "SMALL FILE" in upper_name
     has_large_file = "LARGE FILES" in upper_name or "LARGE FILE" in upper_name
-    has_csv_file = "CSV FILES" in upper_name or "CSV FILE" in upper_name
-    has_with_aci = ("WITH ACI" in upper_name or "ACL" in upper_name) and "NO ACL" not in upper_name
+    has_csv_file = (
+        "CSV FILES" in upper_name 
+        or "CSV FILE" in upper_name 
+        or "DSV FILES" in upper_name 
+        or "DSV FILE" in upper_name
+        or "DSV" in upper_name
+    )
+    has_no_acl = "NO ACL" in upper_name or "WITHOUT ACL" in upper_name or "NO_ACL" in upper_name
+    has_with_aci = ("WITH ACI" in upper_name or "ACL" in upper_name or "WITH ACL" in upper_name) and not has_no_acl
     has_no_ols = "NO OLS" in upper_name
     has_struct_disc = (
         "STRUCT DISC" in upper_name
         or "STRUCTURE DISCOVERY" in upper_name
+        or "STRUCTURED DISCOVERY" in upper_name
         or "STRUCTURED FILES DISCOVERY" in upper_name
         or "STRUCTURED FILE DISCOVERY" in upper_name
     )
@@ -7752,12 +7779,26 @@ def infer_add_benchmark_defaults_from_scan_name(scan_name):
     elif has_large_file: file_set_type = "Large Files"
     elif has_csv_file: file_set_type = "CSV Files"
 
+    if has_csv_file and not data_source_type:
+        data_source_type = "S3"
+
+    # Determine scan type: OLS takes priority if explicitly stated, regardless of "Full Scan" suffix in name
+    has_ols = re.search(r"\bWITH OLS\b|\bOLS SCAN\b", upper_name) and "NO OLS" not in upper_name
+    if has_ols:
+        scan_type = "OLS Scan"
+    elif "INCREMENTAL" in upper_name:
+        scan_type = "Incremental Scan"
+    elif "DIFFERENTIAL" in upper_name or "DIFF SCAN" in upper_name:
+        scan_type = "Differential Scan"
+    else:
+        scan_type = "Full Scan"
+
     return {
         "build_version": build_version,
         "scenario_type": scenario_type,
         "file_set_type": file_set_type,
         "is_acl": has_with_aci,
-        "scan_type": "OLS Scan" if "OLS" in upper_name and "NO OLS" not in upper_name else "Full Scan",
+        "scan_type": scan_type,
         "is_ff": has_struct_disc,
         "is_ocr": False,
         "data_source_type": data_source_type,
@@ -8167,6 +8208,7 @@ def page_add_benchmark():
         "scan_type": "OLS Scan",
         "is_ff": False,
         "is_ocr": False,
+        "is_release": False,
     }
     scan_prefill_id = ""
     scan_prefill_name = ""
@@ -8190,6 +8232,7 @@ def page_add_benchmark():
         st.session_state["add_scan_type"] = str(prefill.get("scan_type") or "OLS Scan")
         st.session_state["add_is_acl"] = bool(prefill.get("is_acl"))
         st.session_state["add_is_ff"] = bool(prefill.get("is_ff"))
+        st.session_state["add_is_release"] = bool(prefill.get("is_release"))
         ds_prefill = str(prefill.get("data_source_type") or "").strip()
         ds_options_prefill = get_data_source_types() or ["S3", "SMB", "MSSQL", "Oracle", "NFS", "Unknown"]
         if ds_prefill and ds_prefill in ds_options_prefill:
@@ -8213,7 +8256,8 @@ def page_add_benchmark():
         st.session_state["findings_prefill_rows"] = prefill_findings
         if "findings_editor" in st.session_state:
             del st.session_state["findings_editor"]
-        st.session_state["_last_scan_prefill_id"] = scan_prefill_id
+        if scan_prefill_name:
+            st.session_state["_last_scan_prefill_id"] = scan_prefill_id
     if scan_prefill_id:
         st.caption(f"Prefill source scan id: `{scan_prefill_id}`" + (f" | name: `{scan_prefill_name}`" if scan_prefill_name else ""))
 
@@ -8247,6 +8291,7 @@ def page_add_benchmark():
     
     is_acl = c5.checkbox("ACL Enabled", key="add_is_acl")
     is_ff = c6.checkbox("Structured Discovery FF", key="add_is_ff")
+    is_release = c7.checkbox("Is Release Build", key="add_is_release")
     
     feature_flags = st.text_input("Additional Feature Flags (comma-separated)")
     comment = st.text_area("Configuration Comment (Optional)")
@@ -8632,6 +8677,25 @@ def page_add_benchmark():
                 # Per thread (cluster total / total thread count)
                 tp_thread_gb = tp_cluster_gb / thread_count if thread_count > 0 else 0
                 tp_thread_files = tp_cluster_files / thread_count if thread_count > 0 else 0
+
+                canonical = canonical_benchmark_fields({
+                    "scan_name": scan_prefill_name,
+                    "scenario_type": scenario_type,
+                    "scan_type": scan_type,
+                    "data_source_type": ds_type,
+                    "file_set_type": file_set_type,
+                    "is_acl": is_acl,
+                    "is_feature_flags": is_ff,
+                    "feature_flags": feature_flags,
+                })
+                scenario_type = canonical.get("matrix_file_set_type") or scenario_type
+                scan_type = canonical.get("scan_type") or scan_type
+                ds_type = canonical.get("data_source_type") or ds_type
+                file_set_type = canonical.get("file_set_type") or file_set_type
+                is_acl = bool(canonical.get("is_acl"))
+                is_ff = bool(canonical.get("is_feature_flags"))
+                if is_ff and not str(feature_flags or "").strip():
+                    feature_flags = "Structured"
                 
                 with engine.connect() as conn:
                     # A. Insert Build
@@ -10766,75 +10830,12 @@ def page_build_analysis(df):
         st.subheader(f"🧩 Scenario Matrix — Build `{selected_build}`")
         st.caption("Side-by-side comparison of all scenario variations for each File Set Type. Compares Base (Full Scan, no flags), ACL On, OLS Scan, and Structured Discovery FF scans.")
 
-        # --- classify each row into a named scenario ---
-        def _truthy_flag(v) -> bool:
-            try:
-                if pd.isna(v):
-                    return False
-            except Exception:
-                pass
-            if isinstance(v, str):
-                return v.strip().lower() not in {"", "0", "false", "no", "none", "nan"}
-            return bool(v)
-
-        def _row_text(row, *cols) -> str:
-            return " ".join(str(row.get(c) or "") for c in cols).strip()
-
-        def _scenario_flags(row):
-            text = _row_text(
-                row,
-                "Scan_Type",
-                "Scenario_Type",
-                "feature_flags",
-                "comment",
-                "file_set_type",
-                "scan_name",
-            )
-            upper = text.upper()
-            is_acl = _truthy_flag(row.get("is_acl"))
-            if "WITHOUT ACL" in upper:
-                is_acl = False
-            elif "ACL" in upper:
-                is_acl = True
-
-            is_ff = _truthy_flag(row.get("is_feature_flags"))
-            if "STRUCTURED DISCOVERY" in upper or "STRUCTURED" in upper:
-                is_ff = True
-
-            has_ols = "OLS" in upper and "NO OLS" not in upper and "WITHOUT OLS" not in upper
-            return is_acl, is_ff, has_ols
-
         def _classify_scenario(row):
-            is_acl, is_ff, has_ols = _scenario_flags(row)
-            # Most specific combinations first so ACL+OLS is not swallowed by plain OLS.
-            if has_ols and is_acl and is_ff:
-                return "ACL + OLS + Structured FF"
-            if has_ols and is_acl:
-                return "ACL + OLS Scan"
-            if has_ols and is_ff:
-                return "OLS + Structured FF"
-            if has_ols:
-                return "OLS Scan"
-            if is_acl and is_ff:
-                return "ACL + Structured FF"
-            if is_acl:
-                return "ACL On"
-            if is_ff:
-                return "Structured FF"
-            return "Base (Full Scan)"
+            return classify_scenario(row)
 
         sm_df = build_df.copy()
         def _matrix_group_values(row):
-            ds_type = str(row.get("Data_Source_Type") or "").strip()
-            file_set = str(row.get("file_set_type") or "").strip()
-            text = _row_text(row, "Data_Source_Type", "file_set_type", "Scenario_Type", "scan_name")
-            upper = text.upper()
-
-            # CSV benchmark rows can be saved as "Other (custom)" / "file-system",
-            # but these workflow CSV scenarios run on S3 and should compare together.
-            if "CSV" in upper:
-                return pd.Series({"_matrix_ds_type": "S3", "_matrix_file_set": "CSV Files"})
-
+            ds_type, file_set = matrix_group_values(row)
             return pd.Series({"_matrix_ds_type": ds_type, "_matrix_file_set": file_set})
 
         sm_df[["_matrix_ds_type", "_matrix_file_set"]] = sm_df.apply(_matrix_group_values, axis=1)
@@ -10958,7 +10959,10 @@ def page_build_analysis(df):
 
                         styled = disp.style
                         if delta_col:
-                            styled = styled.applymap(_color_delta, subset=[delta_col])
+                            if hasattr(styled, "map"):
+                                styled = styled.map(_color_delta, subset=[delta_col])
+                            else:
+                                styled = styled.applymap(_color_delta, subset=[delta_col])
                         st.dataframe(
                             styled,
                             hide_index=True,
@@ -13052,7 +13056,7 @@ def load_auto_trend_as_manual_like_df():
     out["Scan_Status"] = "Completed"
     if "scan_id" not in out.columns and "id" in out.columns:
         out["scan_id"] = out["id"]
-    return out
+    return normalize_benchmark_dataframe(out)
 
 def load_latest_scan_progress_map_for_scan_ids(scan_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     """Batch-load latest scan_progress metrics for scan_ids."""

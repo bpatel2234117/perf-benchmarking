@@ -10,7 +10,6 @@ import {
     YAxis,
     CartesianGrid,
     Tooltip,
-    Legend,
 } from 'recharts';
 import { API_BASE } from '../apiConfig';
 
@@ -36,6 +35,8 @@ interface BenchmarkRow {
     objects_scanned: number | null;
     run_date: string | null;
     scan_id: string | null;
+    scan_name?: string | null;
+    scenario_label?: string | null;
 }
 
 interface BuildOption {
@@ -45,10 +46,14 @@ interface BuildOption {
 
 // ── Scenario classification (mirrors dashboard.py _classify_scenario) ────────
 function classifyScenario(row: BenchmarkRow): string {
+    if (row.scenario_label) return row.scenario_label;
     const scanType = (row.scan_type || '').toLowerCase();
+    const text = `${row.scan_type || ''} ${row.feature_flags || ''} ${row.scan_name || ''}`.toLowerCase();
     const hasOls = scanType.includes('ols');
-    const isAcl = row.is_acl;
-    const isFf = row.is_feature_flags;
+    const isAcl = row.is_acl || (text.includes('acl') && !text.includes('without acl') && !text.includes('no acl'));
+    const isFf = row.is_feature_flags || text.includes('structured discovery') || text.includes('structured file');
+    if (hasOls && isAcl && isFf) return 'ACL + OLS + Structured FF';
+    if (hasOls && isAcl) return 'ACL + OLS Scan';
     if (hasOls && isFf) return 'OLS + Structured FF';
     if (hasOls) return 'OLS Scan';
     if (isAcl && isFf) return 'ACL + Structured FF';
@@ -60,10 +65,12 @@ function classifyScenario(row: BenchmarkRow): string {
 const SCENARIO_ORDER = [
     'Base (Full Scan)',
     'ACL On',
-    'OLS Scan',
-    'OLS + Structured FF',
     'Structured FF',
     'ACL + Structured FF',
+    'OLS Scan',
+    'ACL + OLS Scan',
+    'OLS + Structured FF',
+    'ACL + OLS + Structured FF',
 ];
 
 function majorOf(v: string): string {
