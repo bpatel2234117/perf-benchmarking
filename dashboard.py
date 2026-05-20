@@ -8241,10 +8241,16 @@ def page_add_benchmark():
         elif ds_prefill:
             st.session_state["add_ds_type_choice"] = "Other (custom)"
             st.session_state["add_custom_ds_type"] = ds_prefill
-        if str(prefill.get("file_set_type") or "").strip().lower() == "small file":
+        _pf_fs_raw = str(prefill.get("file_set_type") or "").strip().lower()
+        _pf_ds_raw = str(prefill.get("data_source_type") or ds_prefill or "").strip().upper()
+        if _pf_fs_raw == "small file":
             st.session_state["data_type"] = "Unstructured"
             st.session_state["file_set_unstructured"] = "Small Files"
             st.session_state["custom_file_set_type"] = "Small File"
+        elif _pf_ds_raw in ("POSTGRES", "MSSQL", "MYSQL", "ORACLE"):
+            st.session_state["data_type"] = "Structured"
+        elif _pf_ds_raw in ("S3", "SMB", "NFS"):
+            st.session_state["data_type"] = "Unstructured"
         if started_dt:
             st.session_state["scan_start_date"] = started_dt.date()
             st.session_state["scan_start_time_str"] = started_dt.strftime("%H:%M:%S")
@@ -8256,6 +8262,10 @@ def page_add_benchmark():
         st.session_state["findings_prefill_rows"] = prefill_findings
         if "findings_editor" in st.session_state:
             del st.session_state["findings_editor"]
+        # Reset structured override fields and file set so they pick up fresh defaults
+        for _k in ("add_total_db_size_gb", "add_total_tables", "file_set_structured"):
+            if _k in st.session_state:
+                del st.session_state[_k]
         if scan_prefill_name:
             st.session_state["_last_scan_prefill_id"] = scan_prefill_id
     if scan_prefill_id:
@@ -8495,12 +8505,36 @@ def page_add_benchmark():
         }
     st.table(pd.DataFrame([details_row]))
 
-    # Use values from selected file set details (no duplicate fields in UI)
+    # Use values from selected file set details as baseline defaults
     total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
     total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
     total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
+    total_catalog_items = 0
 
-    # For Structured DS (Postgres, MSSQL etc.) allow manual override of DB-specific metrics
+    # Load scan insights BEFORE rendering inputs so values are available as defaults
+    _si_captions = []
+    try:
+        if scan_prefill_id:
+            m = load_scan_insight_map_for_scan_ids([scan_prefill_id]).get(str(scan_prefill_id), {}) or {}
+            osc = m.get("objects_scanned")
+            oen = m.get("objects_enumerated")
+            tgb = m.get("total_size_gb")
+            nac = m.get("new_attributes_count")
+            if osc is not None and str(osc).strip() != "":
+                total_files = int(osc)
+                _si_captions.append(f"Prefilled from scan_insights: {'Total Tables' if data_type == 'Structured' else 'Total Files'} = `{total_files:,}`")
+            if oen is not None and str(oen).strip() != "":
+                total_folders = int(oen)
+            if tgb is not None and str(tgb).strip() != "":
+                total_gb = float(tgb)
+                _si_captions.append(f"Prefilled from scan_insights: Total Size (GB) = `{total_gb:.2f}`")
+            if nac is not None and str(nac).strip() != "":
+                total_catalog_items = int(nac)
+    except Exception:
+        pass
+
+    # For Structured DS (Postgres, MSSQL etc.) allow manual override of DB-specific metrics.
+    # Render AFTER scan_insights are loaded so value= reflects actual scan data.
     if data_type == "Structured":
         _db_c1, _db_c2 = st.columns(2)
         total_gb = _db_c1.number_input(
@@ -8515,30 +8549,8 @@ def page_add_benchmark():
             key="add_total_tables",
             help="Total number of tables in the database"
         ))
-    total_catalog_items = 0
-
-    try:
-        if scan_prefill_id:
-            m = load_scan_insight_map_for_scan_ids([scan_prefill_id]).get(str(scan_prefill_id), {}) or {}
-            
-            # Prioritize volumes from actual scan
-            osc = m.get("objects_scanned")
-            oen = m.get("objects_enumerated")
-            tgb = m.get("total_size_gb")
-            nac = m.get("new_attributes_count")
-            
-            if osc is not None and str(osc).strip() != "":
-                total_files = int(osc)
-                st.caption(f"Prefilled from scan_insights: Total Files = `{total_files:,}`")
-            if oen is not None and str(oen).strip() != "":
-                total_folders = int(oen)
-            if tgb is not None and str(tgb).strip() != "":
-                total_gb = float(tgb)
-                st.caption(f"Prefilled from scan_insights: Total Size (GB) = `{total_gb:.2f}`")
-            if nac is not None and str(nac).strip() != "":
-                total_catalog_items = int(nac)
-    except Exception:
-        pass
+    for _cap in _si_captions:
+        st.caption(_cap)
 
     # Force sync button - outside of form
     if scan_prefill_id:
