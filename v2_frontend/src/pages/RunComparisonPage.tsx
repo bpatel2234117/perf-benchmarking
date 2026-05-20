@@ -122,12 +122,14 @@ const RunComparisonPage: React.FC<RunComparisonPageProps> = ({ token }) => {
     const ra = pickBest(rowsA);
     const rb = pickBest(rowsB);
 
+    const _isStructuredCmp = [dsA, dsB].some(d => ['postgres','mssql','mysql','oracle'].includes((d ?? '').toLowerCase()));
+    const _fUnitCmp = _isStructuredCmp ? 'Tables' : 'Files';
     const metrics = [
         { label: 'Cluster GB/hr', a: ra?.throughput_cluster_gb_hr, b: rb?.throughput_cluster_gb_hr },
         { label: 'Scanner GB/hr', a: ra?.throughput_scanner_gb_hr, b: rb?.throughput_scanner_gb_hr },
         { label: 'Thread GB/hr', a: ra?.throughput_thread_gb_hr, b: rb?.throughput_thread_gb_hr },
-        { label: 'Cluster Files/hr', a: ra?.throughput_cluster_files_hr, b: rb?.throughput_cluster_files_hr },
-        { label: 'Scanner Files/hr', a: ra?.throughput_scanner_files_hr, b: rb?.throughput_scanner_files_hr },
+        { label: `Cluster ${_fUnitCmp}/hr`, a: ra?.throughput_cluster_files_hr, b: rb?.throughput_cluster_files_hr },
+        { label: `Scanner ${_fUnitCmp}/hr`, a: ra?.throughput_scanner_files_hr, b: rb?.throughput_scanner_files_hr },
         { label: 'Scan Hours', a: ra?.total_scan_hours, b: rb?.total_scan_hours },
     ];
 

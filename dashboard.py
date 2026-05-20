@@ -8916,11 +8916,12 @@ def page_add_benchmark():
                                 })
                     conn.commit()
                     
+                    _add_f_unit = "tables" if str(data_type).lower() == "structured" else "files"
                     st.success(f"✅ Successfully added Benchmark run for Build {build_ver}!")
                     st.info(f"📊 **Calculated Throughputs:**\n\n"
-                           f"- Cluster: {tp_cluster_gb:.2f} GB/hr, {tp_cluster_files:,.2f} files/hr\n"
-                           f"- Per Scanner: {tp_scanner_gb:.2f} GB/hr, {tp_scanner_files:,.2f} files/hr\n"
-                           f"- Per Thread: {tp_thread_gb:.2f} GB/hr, {tp_thread_files:,.2f} files/hr")
+                           f"- Cluster: {tp_cluster_gb:.2f} GB/hr, {tp_cluster_files:,.2f} {_add_f_unit}/hr\n"
+                           f"- Per Scanner: {tp_scanner_gb:.2f} GB/hr, {tp_scanner_files:,.2f} {_add_f_unit}/hr\n"
+                           f"- Per Thread: {tp_thread_gb:.2f} GB/hr, {tp_thread_files:,.2f} {_add_f_unit}/hr")
                     st.toast("Data Saved!")
                     # Clear only benchmark data cache so the new record is visible immediately
                     try: load_data.clear()
@@ -11267,14 +11268,17 @@ def page_comparison(df):
     files_b = rb['throughput_cluster_files_hr'] or 0
     delta_f = files_b - files_a
     pct_f = (delta_f / files_a * 100) if files_a else 0
+    _cmp_structured = str(ds_a).lower() in {"postgres", "mssql", "mysql", "oracle"} or str(ds_b).lower() in {"postgres", "mssql", "mysql", "oracle"}
+    _cmp_f_unit = "Tables" if _cmp_structured else "Files"
+    _cmp_f_col = f"{_cmp_f_unit}/hr"
     
-    k2.metric("File Throughput (Files/hr)", 
+    k2.metric(f"{_cmp_f_unit} Throughput ({_cmp_f_col})", 
               f"{files_b:,.0f}", 
               f"{delta_f:+,.0f} ({pct_f:+.1f}%)",
               delta_color="normal")
     
-    # Total Files
-    k3.metric("Total Files", 
+    # Total Files / Tables
+    k3.metric(f"Total {_cmp_f_unit}", 
               f"{rb['Total_Files']:,.0f}" if rb['Total_Files'] else "N/A",
               f"{(rb['Total_Files'] or 0) - (ra['Total_Files'] or 0):+,.0f}")
     
@@ -11297,16 +11301,16 @@ def page_comparison(df):
     with l2:
         line_df_f = pd.DataFrame({
             "Configuration": ["Baseline", "Candidate"],
-            "Files/hr": [files_a, files_b]
+            _cmp_f_col: [files_a, files_b]
         })
-        fig_line_f = px.line(line_df_f, x="Configuration", y="Files/hr", markers=True, title="File Throughput (Files/hr)")
+        fig_line_f = px.line(line_df_f, x="Configuration", y=_cmp_f_col, markers=True, title=f"{_cmp_f_unit} Throughput ({_cmp_f_col})")
         fig_line_f.update_traces(line=dict(color="#10B981", width=3))
         st.plotly_chart(fig_line_f, width="stretch")
 
     # Summary table
     st.markdown("### Summary Table")
     summary_df = pd.DataFrame({
-        "Metric": ["Data Throughput (GB/hr)", "File Throughput (Files/hr)", "Total Files", "Total Size (GB)", "Scan Hours"],
+        "Metric": ["Data Throughput (GB/hr)", f"{_cmp_f_unit} Throughput ({_cmp_f_col})", f"Total {_cmp_f_unit}", "Total Size (GB)", "Scan Hours"],
         "Baseline": [
             f"{tp_a:.2f}",
             f"{files_a:,.0f}",
@@ -11332,8 +11336,8 @@ def page_comparison(df):
     with chart_col1:
         # Throughput comparison
         chart_data = pd.DataFrame([
-            {'Configuration': f"Baseline\n({ver_a})", 'GB/hr': tp_a, 'Files/hr': files_a},
-            {'Configuration': f"Candidate\n({ver_b})", 'GB/hr': tp_b, 'Files/hr': files_b}
+            {'Configuration': f"Baseline\n({ver_a})", 'GB/hr': tp_a, _cmp_f_col: files_a},
+            {'Configuration': f"Candidate\n({ver_b})", 'GB/hr': tp_b, _cmp_f_col: files_b}
         ])
         
         fig1 = px.bar(chart_data, x='Configuration', y='GB/hr', 
@@ -11343,8 +11347,8 @@ def page_comparison(df):
         st.plotly_chart(fig1, width="stretch")
     
     with chart_col2:
-        fig2 = px.bar(chart_data, x='Configuration', y='Files/hr', 
-                     title="File Throughput Comparison",
+        fig2 = px.bar(chart_data, x='Configuration', y=_cmp_f_col, 
+                     title=f"{_cmp_f_unit} Throughput Comparison",
                      color='Configuration',
                      color_discrete_sequence=['#8B5CF6', '#6366F1'])
         st.plotly_chart(fig2, width="stretch")

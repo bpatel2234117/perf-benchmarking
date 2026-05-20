@@ -506,15 +506,15 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
                 <ul style={{ margin: 0, paddingLeft: '1.15rem' }}>
                   <li>
                     Cluster: {throughputLive.throughput_cluster_gb_hr.toFixed(2)} GB/hr,{' '}
-                    {fmtFiles(throughputLive.throughput_cluster_files_hr)} files/hr
+                    {fmtFiles(throughputLive.throughput_cluster_files_hr)} {isStructured ? 'tables/hr' : 'files/hr'}
                   </li>
                   <li>
                     Per scanner: {throughputLive.throughput_scanner_gb_hr.toFixed(2)} GB/hr,{' '}
-                    {fmtFiles(throughputLive.throughput_scanner_files_hr)} files/hr
+                    {fmtFiles(throughputLive.throughput_scanner_files_hr)} {isStructured ? 'tables/hr' : 'files/hr'}
                   </li>
                   <li>
                     Per thread: {throughputLive.throughput_thread_gb_hr.toFixed(2)} GB/hr,{' '}
-                    {fmtFiles(throughputLive.throughput_thread_files_hr)} files/hr
+                    {fmtFiles(throughputLive.throughput_thread_files_hr)} {isStructured ? 'tables/hr' : 'files/hr'}
                   </li>
                 </ul>
               </div>
