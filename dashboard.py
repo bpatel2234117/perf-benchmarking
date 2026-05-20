@@ -8358,25 +8358,31 @@ def page_add_benchmark():
     fs_names, fs_details = get_file_set_types(data_type)
     with c_fs:
         if data_type == "Structured":
-            fs_defaults = ["Small Tables", "Large Tables", "Mixed Tables"]
-            # Only show names that belong to the selected DS — filter out names
-            # that start with a different known DS prefix (e.g. hide "Postgres MSSQL Large Tables"
-            # when DS=Postgres, because that's an MSSQL entry stored with a wrong prefix).
+            # Only show names that belong to the selected DS
             _known_ds_prefixes = ["postgres", "mssql", "mysql", "oracle", "s3", "smb", "nfs", "sharepoint"]
             def _fs_belongs_to_ds(name):
                 n = name.lower().strip()
                 if ds_clean and n.startswith(ds_clean.lower() + " "):
-                    return True   # belongs to selected DS
+                    return True
+                if ds_clean and n == ds_clean.lower():
+                    return True  # exact DS name match (e.g. "Postgres")
                 for pfx in _known_ds_prefixes:
                     if pfx != ds_clean.lower() and n.startswith(pfx + " "):
                         return False  # belongs to a different DS
-                return True  # generic, keep it
+                return True  # generic
             fs_filtered = [n for n in fs_names if _fs_belongs_to_ds(n)]
+            # Only add generic fallback defaults when the DB has NO entries for this DS.
+            # This prevents synthesizing "Postgres Large Tables" etc. when "Postgres" already exists.
+            _ds_has_entries = any(
+                n.lower() == ds_clean.lower() or n.lower().startswith(ds_clean.lower() + " ")
+                for n in fs_filtered
+            ) if ds_clean else False
+            fs_defaults = [] if _ds_has_entries else ["Small Tables", "Large Tables", "Mixed Tables"]
             fs_raw_options = sorted(set(fs_filtered + fs_defaults))
             _seen_display = set()
             fs_display_options = []
             for raw in fs_raw_options:
-                disp = raw if (ds_clean and raw.lower().startswith(ds_clean.lower() + " ")) else (f"{ds_clean} {raw}".strip() if ds_clean else raw)
+                disp = raw if (ds_clean and (raw.lower().startswith(ds_clean.lower() + " ") or raw.lower() == ds_clean.lower())) else (f"{ds_clean} {raw}".strip() if ds_clean else raw)
                 if disp not in _seen_display:
                     _seen_display.add(disp)
                     fs_display_options.append(disp)
