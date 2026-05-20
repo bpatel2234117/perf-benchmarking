@@ -8266,6 +8266,10 @@ def page_add_benchmark():
         for _k in ("add_total_db_size_gb", "add_total_tables", "file_set_structured"):
             if _k in st.session_state:
                 del st.session_state[_k]
+        # Clear any previous scan's init flag so new scan always re-prefills
+        _old_init_key = f"_si_prefill_{st.session_state.get('_last_scan_prefill_id', '')}"
+        if _old_init_key in st.session_state:
+            del st.session_state[_old_init_key]
         if scan_prefill_name:
             st.session_state["_last_scan_prefill_id"] = scan_prefill_id
     if scan_prefill_id:
@@ -8369,10 +8373,14 @@ def page_add_benchmark():
                 return True  # generic, keep it
             fs_filtered = [n for n in fs_names if _fs_belongs_to_ds(n)]
             fs_raw_options = sorted(set(fs_filtered + fs_defaults))
-            fs_display_options = [
-                (raw if ds_clean and raw.lower().startswith(ds_clean.lower() + " ") else (f"{ds_clean} {raw}".strip() if ds_clean else raw))
-                for raw in fs_raw_options
-            ] + ["Other (custom)"]
+            _seen_display = set()
+            fs_display_options = []
+            for raw in fs_raw_options:
+                disp = raw if (ds_clean and raw.lower().startswith(ds_clean.lower() + " ")) else (f"{ds_clean} {raw}".strip() if ds_clean else raw)
+                if disp not in _seen_display:
+                    _seen_display.add(disp)
+                    fs_display_options.append(disp)
+            fs_display_options.append("Other (custom)")
             
             # Stable indexing for Structured
             current_val = st.session_state.get("file_set_structured")
@@ -8534,8 +8542,14 @@ def page_add_benchmark():
         pass
 
     # For Structured DS (Postgres, MSSQL etc.) allow manual override of DB-specific metrics.
-    # Render AFTER scan_insights are loaded so value= reflects actual scan data.
+    # Use a per-scan init flag so session state is force-set on first load of this scan,
+    # but user edits after that are preserved until they navigate to a different scan.
     if data_type == "Structured":
+        _si_init_key = f"_si_prefill_{scan_prefill_id}"
+        if scan_prefill_id and not st.session_state.get(_si_init_key):
+            st.session_state["add_total_db_size_gb"] = float(total_gb) if total_gb else 0.0
+            st.session_state["add_total_tables"] = int(total_files) if total_files else 0
+            st.session_state[_si_init_key] = True
         _db_c1, _db_c2 = st.columns(2)
         total_gb = _db_c1.number_input(
             "Total DB Size (GB)", min_value=0.0, step=1.0,
