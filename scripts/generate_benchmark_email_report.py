@@ -229,15 +229,17 @@ def pick_default_builds(available: Sequence[Tuple[str, int]]) -> Tuple[Optional[
 def select_best_run(group: pd.DataFrame) -> pd.Series:
     if group.empty:
         raise ValueError("empty group")
-    # Prefer the row with the highest cluster throughput (best performance result).
-    # Fall back to lowest scan hours only when throughput is unavailable.
-    valid_tp = group[pd.to_numeric(group["throughput_cluster_gb_hr"], errors="coerce").notna()]
-    if not valid_tp.empty:
-        return valid_tp.loc[pd.to_numeric(valid_tp["throughput_cluster_gb_hr"], errors="coerce").idxmax()]
-    valid_time = group[pd.to_numeric(group["total_scan_hours"], errors="coerce").notna()]
-    if not valid_time.empty:
-        return valid_time.loc[pd.to_numeric(valid_time["total_scan_hours"], errors="coerce").idxmin()]
-    return group.iloc[0]
+    # Reset index to guarantee uniqueness — without this, idxmax()/idxmin() can return a
+    # label shared by multiple rows (after filters/concats), causing .loc to return a
+    # DataFrame instead of a Series and silently picking the wrong row.
+    g = group.reset_index(drop=True)
+    tp = pd.to_numeric(g["throughput_cluster_gb_hr"], errors="coerce")
+    if tp.notna().any():
+        return g.loc[tp.idxmax()]
+    hrs = pd.to_numeric(g["total_scan_hours"], errors="coerce")
+    if hrs.notna().any():
+        return g.loc[hrs.idxmin()]
+    return g.iloc[0]
 
 
 def best_rows_for_build(df: pd.DataFrame, build_version: str) -> pd.DataFrame:
@@ -251,6 +253,20 @@ def best_rows_for_build(df: pd.DataFrame, build_version: str) -> pd.DataFrame:
     ):
         rows.append(select_best_run(grp))
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=df.columns)
+
+
+_STRUCTURED_DS = {"postgres", "mssql", "mysql", "oracle"}
+
+def _is_structured_ds(ds_name: str) -> bool:
+    return str(ds_name or "").lower().strip() in _STRUCTURED_DS
+
+def _files_unit(ds_name: str) -> str:
+    """Return 'tables' for structured DS, 'files' for everything else."""
+    return "tables" if _is_structured_ds(ds_name) else "files"
+
+def _files_label(ds_name: str, per_hour: bool = True) -> str:
+    unit = _files_unit(ds_name)
+    return f"{unit.capitalize()}/hour" if per_hour else unit.capitalize()
 
 
 def _major_line(v: Any) -> str:
@@ -303,26 +319,24 @@ def best_rows_for_major_line(df: pd.DataFrame, major_line: Optional[str]) -> pd.
 
 
 def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str, y_label: str) -> str:
-    """Trend chart using only release_milestone=1 builds, x-axis labelled by major version (e.g. '252').
-    Multiple release builds within the same major → best throughput is used."""
-    req = {"build_version", "data_source_type", value_col, "file_set_type", "is_release"}
+    """Trend chart showing best Base (Full Scan) result per major version across ALL builds.
+    X-axis labelled by major version (e.g. '252'). Multiple sub-versions → best throughput wins."""
+    req = {"build_version", "data_source_type", value_col, "file_set_type"}
     if df is None or df.empty or not req.issubset(set(df.columns)):
-        return "<div class='muted'>No release trend data available.</div>"
+        return "<div class='muted'>No trend data available.</div>"
 
     work = df.copy()
     work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
     work = work[work["norm_ds"] == ds_name].copy()
-    # Filter to release-milestone builds only (is_release column = release_milestone from builds)
-    work = work[pd.to_numeric(work["is_release"], errors="coerce").fillna(0).astype(int) == 1].copy()
     if work.empty:
-        return f"<div class='muted'>No release-milestone {html.escape(ds_name)} data available.</div>"
+        return f"<div class='muted'>No {html.escape(ds_name)} data available.</div>"
 
     # Prefer Small Files; fall back to all if not present
     small = work[work["file_set_type"].astype(str).str.contains("Small Files", case=False, na=False)]
     if not small.empty:
         work = small.copy()
 
-    # Base scan only (no ACL, no FF, no OLS)
+    # Full Scan baseline: no ACL, no feature flags, no OLS.
     if "is_acl" in work.columns:
         work = work[pd.to_numeric(work["is_acl"], errors="coerce").fillna(0).astype(int) == 0]
     if "is_feature_flags" in work.columns:
@@ -330,9 +344,8 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
     if "scan_type" in work.columns:
         work = work[~work["scan_type"].astype(str).str.lower().str.contains("ols", na=False)]
     if work.empty:
-        return f"<div class='muted'>No release-flagged Base scan data for {html.escape(ds_name)}.</div>"
+        return f"<div class='muted'>No {html.escape(ds_name)} Full Scan data available.</div>"
 
-    # Group by major version label (e.g. "252"), pick best per major
     work["major_label"] = work["build_version"].astype(str).map(_major_line)
     rows = []
     for _, grp in work.groupby("major_label", dropna=False):
@@ -343,6 +356,10 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
 
     plot_df["sort_key"] = plot_df["major_label"].map(lambda v: _build_sort_key(v))
     plot_df = plot_df.sort_values("sort_key")
+    # Keep only the last 8 major release lines to avoid old/miscategorized entries (e.g. 249)
+    _MAX_RELEASE_MAJORS = 8
+    if len(plot_df) > _MAX_RELEASE_MAJORS:
+        plot_df = plot_df.iloc[-_MAX_RELEASE_MAJORS:].copy()
     x_vals = plot_df["major_label"].astype(str).tolist()
 
     if value_col == "throughput_cluster_gb_hr":
@@ -351,8 +368,9 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
             ("Per Scanner", "throughput_scanner_gb_hr", "#6366F1", 2.0, 5),
         ]
     else:
+        _unit = _files_unit(ds_name).capitalize()
         series_defs = [
-            ("Cluster Files/hr", "throughput_cluster_files_hr", "#10B981", 3.4, 8),
+            (f"Cluster {_unit}/hr", "throughput_cluster_files_hr", "#10B981", 3.4, 8),
             ("Per Scanner", "throughput_scanner_files_hr", "#34D399", 2.0, 5),
         ]
 
@@ -398,21 +416,29 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
 
 
 def build_major_release_section(full_df: pd.DataFrame, include_structured: bool) -> str:
-    """Card showing throughput trend across major releases (release_milestone=1 builds only).
-    Multiple release builds per major → best throughput wins."""
-    if full_df is None or full_df.empty or "is_release" not in full_df.columns:
+    """Card showing throughput trend across release builds only (is_release=1).
+    Multiple sub-versions within the same major → best throughput wins."""
+    if full_df is None or full_df.empty:
         return ""
-    release_df = full_df[pd.to_numeric(full_df["is_release"], errors="coerce").fillna(0).astype(int) == 1]
+
+    # Only include rows explicitly marked as release builds
+    if "is_release" in full_df.columns:
+        release_df = full_df[pd.to_numeric(full_df["is_release"], errors="coerce").fillna(0).astype(int) == 1].copy()
+    else:
+        release_df = full_df.copy()
+
     if release_df.empty:
         return ""
 
     ds_list = UNSTRUCTURED_DS_ORDER + (STRUCTURED_DS_ORDER if include_structured else [])
     panels = []
     for ds in ds_list:
-        gb_chart  = _release_trend_chart_html(full_df, ds, "throughput_cluster_gb_hr",
+        _fl = _files_label(ds)
+        _fu = _files_unit(ds)
+        gb_chart  = _release_trend_chart_html(release_df, ds, "throughput_cluster_gb_hr",
                                                f"{ds} — Data Throughput (GB/hr)", "GB/hour")
-        fil_chart = _release_trend_chart_html(full_df, ds, "throughput_cluster_files_hr",
-                                               f"{ds} — File Throughput (files/hr)", "Files/hour")
+        fil_chart = _release_trend_chart_html(release_df, ds, "throughput_cluster_files_hr",
+                                               f"{ds} — {_fu.capitalize()} Throughput ({_fu}/hr)", _fl)
         panels.append(f"""
         <div class="trend-panel">
           <div class="trend-panel-head">{html.escape(ds)}</div>
@@ -429,8 +455,8 @@ def build_major_release_section(full_df: pd.DataFrame, include_structured: bool)
     <div class="card card-release">
       <div class="section-title">📦 Major Release Benchmark Trends</div>
       <div class="section-subtitle">
-        Best Base (Full Scan) result per major release. If multiple builds in the same major
-        are marked as release, the best throughput is shown. X-axis shows major version (e.g. 252).
+        Release builds only (marked as Release Milestone). Best Base Full Scan result per major version.
+        Multiple sub-versions in the same major → highest throughput is shown.
       </div>
       <div class="chart-band">
         {''.join(panels)}
@@ -450,8 +476,7 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
     small_file_work = work[work["file_set_type"].astype(str).str.contains("Small Files", case=False, na=False)].copy()
     if not small_file_work.empty:
         work = small_file_work
-    # If no "Small Files" subset exists, use all available data for this DS
-    # Keep Base (Full Scan) only: no ACL, no feature flags, no OLS
+    # Base Full Scan only: no ACL, no FF, no OLS — keeps comparison consistent across builds.
     if "is_acl" in work.columns:
         work = work[pd.to_numeric(work["is_acl"], errors="coerce").fillna(0).astype(int) == 0]
     if "is_feature_flags" in work.columns:
@@ -459,19 +484,23 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
     if "scan_type" in work.columns:
         work = work[~work["scan_type"].astype(str).str.lower().str.contains("ols", na=False)]
     if work.empty:
-        return f"<div class='muted'>No {html.escape(ds_name)} small-files trend data available.</div>"
+        return f"<div class='muted'>No {html.escape(ds_name)} Base Full Scan data available.</div>"
 
+    # Group by major version (e.g. "253" covers "253.5" and "253.11") and pick best per major.
+    work = work.copy()
+    work["_major"] = work["build_version"].astype(str).map(_major_line)
     rows = []
-    for _, grp in work.groupby(["build_version"], dropna=False):
+    for _, grp in work.groupby(["_major"], dropna=False):
         rows.append(select_best_run(grp))
     plot_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=work.columns)
     if plot_df.empty or value_col not in plot_df.columns:
         return "<div class='muted'>No trend data available.</div>"
 
-    plot_df["sort_key"] = plot_df["build_version"].map(_build_sort_key)
+    plot_df["_major"] = plot_df["build_version"].astype(str).map(_major_line)
+    plot_df["sort_key"] = plot_df["_major"].map(_build_sort_key)
     plot_df = plot_df.sort_values("sort_key")
     fig, ax = plt.subplots(figsize=(7.4, 3.6))
-    x_vals = plot_df["build_version"].astype(str).tolist()
+    x_vals = plot_df["_major"].astype(str).tolist()
     if value_col == "throughput_cluster_gb_hr":
         series_defs = [
             ("Cluster", "throughput_cluster_gb_hr", "#8B5CF6", 3.4, 7),
@@ -479,8 +508,9 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
             ("Per Thread", "throughput_thread_gb_hr", "#A78BFA", 2.0, 5),
         ]
     else:
+        _unit2 = _files_unit(ds_name).capitalize()
         series_defs = [
-            ("Cluster", "throughput_cluster_files_hr", "#10B981", 3.4, 7),
+            (f"Cluster {_unit2}/hr", "throughput_cluster_files_hr", "#10B981", 3.4, 7),
             ("Per Scanner", "throughput_scanner_files_hr", "#34D399", 2.2, 5),
             ("Per Thread", "throughput_thread_files_hr", "#6EE7B7", 2.0, 5),
         ]
@@ -532,13 +562,15 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
 
 
 def _build_ds_trend_panel(full_df: pd.DataFrame, ds_name: str) -> str:
+    _fl = _files_label(ds_name)
+    _fu = _files_unit(ds_name)
     return f"""
     <div class="trend-panel">
       <div class="trend-panel-head">{html.escape(ds_name)} Trends</div>
       <table style="width: 100%; border-collapse: collapse;">
         <tr>
-          <td style="width: 50%; padding-right: 7px;">{_trend_chart_html(full_df, ds_name, "throughput_cluster_gb_hr", f"Data Throughput Trend (GB/hr)", "GB/hour")}</td>
-          <td style="width: 50%; padding-left: 7px;">{_trend_chart_html(full_df, ds_name, "throughput_cluster_files_hr", f"File Throughput Trend (files/hr)", "Files/hour")}</td>
+          <td style="width: 50%; padding-right: 7px;">{_trend_chart_html(full_df, ds_name, "throughput_cluster_gb_hr", "Data Throughput Trend (GB/hr)", "GB/hour")}</td>
+          <td style="width: 50%; padding-left: 7px;">{_trend_chart_html(full_df, ds_name, "throughput_cluster_files_hr", f"{_fu.capitalize()} Throughput Trend ({_fu}/hr)", _fl)}</td>
         </tr>
       </table>
     </div>
@@ -691,13 +723,23 @@ def _ols_vs_base_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str
 
 
 def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFrame, ds_order: Sequence[str], card_class: str, show_ols_comparison: bool = False) -> str:
+    _all_structured = bool(ds_order) and all(_is_structured_ds(ds) for ds in ds_order)
+    _f_unit = "Tables" if _all_structured else "Files"
+    _f_label = f"{_f_unit}/hr"
     ols_chart = ""
     if show_ols_comparison:
         ols_chart = f"""
-        <table style="width: 100%; border-collapse: collapse; margin-top: 14px;">
+        <div style="display:flex; align-items:center; margin: 20px 0 12px 0; gap: 12px;">
+          <hr style="flex:1; border:none; border-top: 1.5px solid #e5e7eb; margin:0;" />
+          <span style="font-size:13px; font-weight:700; color:#6b7280; white-space:nowrap; letter-spacing:0.04em; text-transform:uppercase;">
+            Full Scan vs OLS Scan Comparison
+          </span>
+          <hr style="flex:1; border:none; border-top: 1.5px solid #e5e7eb; margin:0;" />
+        </div>
+        <table style="width: 100%; border-collapse: collapse;">
           <tr>
             <td style="width: 50%; padding-right: 7px;">{_ols_vs_base_bar_chart_html(current_build_df, "throughput_cluster_gb_hr", "Full Scan vs OLS — GB/hr", "GB/hr", ds_order)}</td>
-            <td style="width: 50%; padding-left: 7px;">{_ols_vs_base_bar_chart_html(current_build_df, "throughput_cluster_files_hr", "Full Scan vs OLS — Files/hr", "Files/hr", ds_order)}</td>
+            <td style="width: 50%; padding-left: 7px;">{_ols_vs_base_bar_chart_html(current_build_df, "throughput_cluster_files_hr", f"Full Scan vs OLS — {_f_label}", _f_label, ds_order)}</td>
           </tr>
         </table>
         """
@@ -709,7 +751,7 @@ def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFr
         <table style="width: 100%; border-collapse: collapse;">
           <tr>
             <td style="width: 50%; padding-right: 7px;">{_cross_ds_bar_chart_html(current_build_df, "throughput_cluster_gb_hr", "Data Throughput By DS", "GB/hr", ds_order)}</td>
-            <td style="width: 50%; padding-left: 7px;">{_cross_ds_bar_chart_html(current_build_df, "throughput_cluster_files_hr", "File Throughput By DS", "Files/hr", ds_order)}</td>
+            <td style="width: 50%; padding-left: 7px;">{_cross_ds_bar_chart_html(current_build_df, "throughput_cluster_files_hr", f"{_f_unit} Throughput By DS", _f_label, ds_order)}</td>
           </tr>
         </table>
         {ols_chart}
@@ -850,8 +892,9 @@ def build_scenario_matrix_section(
         part["scenario_rank"] = part["scenario_label"].map(lambda s: scenario_order.get(str(s), 99))
         part = part.sort_values(["scenario_rank", "sort_hours", "sort_gb"], ascending=[True, True, False])
 
-        base_row = part[part["scenario_label"] == "Base (Full Scan)"].head(1)
-        base_gb = _safe_float(base_row.iloc[0].get("throughput_cluster_gb_hr")) if not base_row.empty else None
+        base_candidates = part[part["scenario_label"] == "Base (Full Scan)"]
+        base_row_series = select_best_run(base_candidates) if not base_candidates.empty else None
+        base_gb = _safe_float(base_row_series.get("throughput_cluster_gb_hr")) if base_row_series is not None else None
         rows_html = []
         for _, row in part.iterrows():
             cur_gb = _safe_float(row.get("throughput_cluster_gb_hr"))
@@ -889,7 +932,7 @@ def build_scenario_matrix_section(
               <table class="report-table">
                 <thead>
                   <tr>
-                    <th>Scenario</th><th>GB/hr</th><th>Files/hr</th><th>Scan Hrs</th><th>Objects</th><th>vs Base</th>{prev_th}
+                    <th>Scenario</th><th>GB/hr</th><th>{"Tables/hr" if _is_structured_ds(ds) else "Files/hr"}</th><th>Scan Hrs</th><th>Objects</th><th>vs Base</th>{prev_th}
                   </tr>
                 </thead>
                 <tbody>
@@ -1578,26 +1621,29 @@ def _build_scanner_env_section(env_data: Dict[str, Any], env_name: str = "") -> 
 
     display_name = env_name if env_name else f"Environment {env_data.get('env_id', '')}"
     return f"""
-    <div class="env-perf-section">
-      <div class="env-perf-head">{html.escape(display_name)}
+    <details class="env-perf-section" open>
+      <summary class="env-perf-summary">
+        <span class="env-perf-head">{html.escape(display_name)}</span>
         <span class="env-perf-range">{html.escape(start_label)} → {html.escape(end_label)}</span>
+      </summary>
+      <div class="env-perf-body">
+        <div class="section-subtitle" style="margin-top:10px;">Avg scan speed: <strong>{avg_speed} KiB/s</strong></div>
+        {stat_cards}
+        {summary_table}
+        <div class="chart-band">
+          <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+              <td style="width: 50%; padding-right: 7px; padding-bottom: 14px;">{_group_series_chart_html(cpu_by_group, "avg_cpu_pct", "Scanner CPU by Group", "CPU %")}</td>
+              <td style="width: 50%; padding-left: 7px; padding-bottom: 14px;">{_group_series_chart_html(group_by_ts, "used_memory_mb", "Scanner Memory by Group", "Used MB")}</td>
+            </tr>
+            <tr>
+              <td style="width: 50%; padding-right: 7px;">{_group_series_chart_html(group_by_ts, "avg_scan_speed_kib_s", "Average Scan Speed by Group", "KiB/s")}</td>
+              <td style="width: 50%; padding-left: 7px;">{_time_series_chart_html(group_ts, "captured_at_utc", "running_scanners", "Running Scanners", "Count", "#2563eb")}</td>
+            </tr>
+          </table>
+        </div>
       </div>
-      <div class="section-subtitle">Avg scan speed: <strong>{avg_speed} KiB/s</strong></div>
-      {stat_cards}
-      {summary_table}
-      <div class="chart-band">
-        <table style="width: 100%; border-collapse: collapse;">
-          <tr>
-            <td style="width: 50%; padding-right: 7px; padding-bottom: 14px;">{_group_series_chart_html(cpu_by_group, "avg_cpu_pct", "Scanner CPU by Group", "CPU %")}</td>
-            <td style="width: 50%; padding-left: 7px; padding-bottom: 14px;">{_group_series_chart_html(group_by_ts, "used_memory_mb", "Scanner Memory by Group", "Used MB")}</td>
-          </tr>
-          <tr>
-            <td style="width: 50%; padding-right: 7px;">{_group_series_chart_html(group_by_ts, "avg_scan_speed_kib_s", "Average Scan Speed by Group", "KiB/s")}</td>
-            <td style="width: 50%; padding-left: 7px;">{_time_series_chart_html(group_ts, "captured_at_utc", "running_scanners", "Running Scanners", "Count", "#2563eb")}</td>
-          </tr>
-        </table>
-      </div>
-    </div>
+    </details>
     """
 
 
@@ -1735,7 +1781,9 @@ def build_html_report(
 ) -> str:
     build_comp_html = build_build_comparison_section(cur_df, prev_df, full_df, current_major, previous_major, include_structured)
     major_release_html = build_major_release_section(full_df, include_structured)
-    cross_ds_html = build_cross_ds_section(current_build_df, current_build, include_structured)
+    # Use major-line best rows (cur_df) so data from all sub-versions (e.g. 253.5 + 253.11)
+    # is considered — ensures OLS and Full Scan runs from any sub-version are included.
+    cross_ds_html = build_cross_ds_section(cur_df, f"{current_major}.x (best)", include_structured)
     scenario_matrix_html = build_scenario_matrix_section(
         current_build_df,
         current_build,
@@ -1758,7 +1806,7 @@ def build_html_report(
     summary_points = [
         f"Current report build is {current_build}; trend comparison is grouped by major line {current_major}.x versus {previous_major + '.x' if previous_major else 'the previous line'}.",
         "Unstructured DS charts show cluster, per-scanner, and per-thread throughput for S3 and SMB, including Full Scan vs OLS comparison.",
-        f"Cross-DS charts compare the best available result inside build {current_build}.",
+        f"Cross-DS charts compare the best available result across {current_major}.x (all sub-versions).",
         f"Scenario Matrix shows best result per scenario across {current_major}.x{f', compared against {previous_major}.x' if previous_major else ''}.",
     ]
     # Classifier highlights in Executive Summary
@@ -1923,7 +1971,7 @@ def build_html_report(
       border-color: #fde68a;
     }}
     .section-title {{
-      font-size: 28px;
+      font-size: 22px;
       font-weight: 800;
       color: #1f2937;
       margin-bottom: 8px;
@@ -2108,24 +2156,53 @@ def build_html_report(
     .env-perf-section {{
       border: 1px solid #bfdbfe;
       border-radius: 14px;
-      padding: 18px 18px 14px 18px;
+      padding: 0;
       margin-bottom: 18px;
       background: rgba(255,255,255,0.7);
+      overflow: hidden;
     }}
     .env-perf-section:last-child {{
       margin-bottom: 0;
     }}
+    .env-perf-summary {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      cursor: pointer;
+      list-style: none;
+      background: rgba(239,246,255,0.8);
+      border-bottom: 1px solid #bfdbfe;
+      border-radius: 14px;
+      user-select: none;
+    }}
+    .env-perf-section[open] > .env-perf-summary {{
+      border-radius: 14px 14px 0 0;
+    }}
+    .env-perf-summary::-webkit-details-marker {{ display: none; }}
+    .env-perf-summary::before {{
+      content: "▶";
+      font-size: 11px;
+      color: #2563eb;
+      transition: transform 0.2s;
+      flex-shrink: 0;
+    }}
+    .env-perf-section[open] > .env-perf-summary::before {{
+      content: "▼";
+    }}
+    .env-perf-body {{
+      padding: 18px 18px 14px 18px;
+    }}
     .env-perf-head {{
-      font-size: 18px;
+      font-size: 17px;
       font-weight: 800;
       color: #1e40af;
-      margin-bottom: 6px;
     }}
     .env-perf-range {{
       font-size: 13px;
       font-weight: 400;
       color: #6b7280;
-      margin-left: 12px;
+      margin-left: 4px;
     }}
     .card-env {{
       background: linear-gradient(180deg, rgba(255, 247, 237, 0.95) 0%, rgba(255,255,255,0.97) 100%);

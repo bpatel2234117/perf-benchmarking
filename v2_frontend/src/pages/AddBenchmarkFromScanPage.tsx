@@ -97,6 +97,8 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
   const [scannerCount, setScannerCount] = useState(5);
   const [threadCount, setThreadCount] = useState(50);
   const [appliedApiDefaults, setAppliedApiDefaults] = useState(false);
+  const [totalDbSizeGb, setTotalDbSizeGb] = useState<number | ''>('');
+  const [totalTables, setTotalTables] = useState<number | ''>('');
 
   const authConfig = { headers: { Authorization: `Bearer ${token}` } };
 
@@ -135,17 +137,29 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
       setThreadCount(d.thread_count);
       setAppliedApiDefaults(true);
     }
-  }, [detail?.benchmark_context?.throughput_defaults, appliedApiDefaults]);
+    // Pre-fill DB Size and Total Tables from file_set_details if Structured
+    const fsdLocal = detail?.benchmark_context?.file_set_details;
+    if (fsdLocal?.total_size_gb != null && totalDbSizeGb === '') setTotalDbSizeGb(fsdLocal.total_size_gb);
+    if (fsdLocal?.total_files != null && totalTables === '') setTotalTables(fsdLocal.total_files);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail?.benchmark_context]);
+
+  const isStructured = (detail?.benchmark_context?.run_metrics?.data_type ?? '').toLowerCase() === 'structured';
 
   const throughputLive = useMemo(() => {
     const bc = detail?.benchmark_context;
     const dur = bc?.timing?.duration_hours;
     if (dur == null || dur <= 0) return null;
     const ev = bc?.effective_volumes;
-    const totalFiles = typeof ev?.total_files === 'number' ? ev.total_files : 0;
-    const totalGb = typeof ev?.total_gb === 'number' ? ev.total_gb : 0;
+    // For Structured DS use the user-editable DB size / table count
+    const totalFiles = isStructured && totalTables !== ''
+      ? Number(totalTables)
+      : (typeof ev?.total_files === 'number' ? ev.total_files : 0);
+    const totalGb = isStructured && totalDbSizeGb !== ''
+      ? Number(totalDbSizeGb)
+      : (typeof ev?.total_gb === 'number' ? ev.total_gb : 0);
     return computeThroughputs(dur, totalGb, totalFiles, scannerCount, threadCount);
-  }, [detail?.benchmark_context, scannerCount, threadCount]);
+  }, [detail?.benchmark_context, scannerCount, threadCount, isStructured, totalDbSizeGb, totalTables]);
 
   const saveMutation = useMutation({
     mutationFn: async () => {
@@ -172,9 +186,13 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
         is_acl: rm.is_acl ?? false,
         is_ocr: false,
         is_feature_flags: rm.is_ff ?? false,
-        total_files: typeof ev?.total_files === 'number' ? ev.total_files : (fsd as any)?.total_files ?? null,
+        total_files: rm?.data_type?.toLowerCase() === 'structured' && totalTables !== ''
+          ? Number(totalTables)
+          : (typeof ev?.total_files === 'number' ? ev.total_files : (fsd as any)?.total_files ?? null),
         total_folders: typeof ev?.total_folders === 'number' ? ev.total_folders : (fsd as any)?.total_folders ?? null,
-        total_size_gb: typeof ev?.total_gb === 'number' ? ev.total_gb : (fsd as any)?.total_size_gb ?? null,
+        total_size_gb: rm?.data_type?.toLowerCase() === 'structured' && totalDbSizeGb !== ''
+          ? Number(totalDbSizeGb)
+          : (typeof ev?.total_gb === 'number' ? ev.total_gb : (fsd as any)?.total_size_gb ?? null),
         scan_start_time: tf?.scan_start_date && tf?.scan_start_time ? `${tf.scan_start_date} ${tf.scan_start_time}` : null,
         scan_end_time: tf?.scan_end_date && tf?.scan_end_time ? `${tf.scan_end_date} ${tf.scan_end_time}` : null,
         total_scan_hours: bc?.timing?.duration_hours ?? null,
@@ -390,6 +408,35 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
                 {c}
               </p>
             ))}
+
+            {isStructured && (
+              <div style={{ marginTop: '0.85rem', display: 'flex', flexWrap: 'wrap', gap: '1rem' }}>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.85rem', fontWeight: 600 }}>
+                  Total DB Size (GB)
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    value={totalDbSizeGb}
+                    onChange={(e) => setTotalDbSizeGb(e.target.value === '' ? '' : Number(e.target.value))}
+                    placeholder="e.g. 20"
+                    style={{ padding: '0.45rem 0.5rem', borderRadius: 6, border: '1px solid var(--surface-border)', maxWidth: 140 }}
+                  />
+                </label>
+                <label style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: '0.85rem', fontWeight: 600 }}>
+                  Total Tables
+                  <input
+                    type="number"
+                    min={0}
+                    step={100}
+                    value={totalTables}
+                    onChange={(e) => setTotalTables(e.target.value === '' ? '' : Number(e.target.value))}
+                    placeholder="e.g. 10000"
+                    style={{ padding: '0.45rem 0.5rem', borderRadius: 6, border: '1px solid var(--surface-border)', maxWidth: 140 }}
+                  />
+                </label>
+              </div>
+            )}
 
             <h3 style={{ margin: '1rem 0 0.45rem', fontSize: '1rem', fontWeight: 700 }}>Scan timing</h3>
             <p style={{ margin: '0 0 0.45rem', fontSize: '0.82rem', color: 'var(--text-secondary)' }}>

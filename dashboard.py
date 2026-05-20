@@ -8345,7 +8345,20 @@ def page_add_benchmark():
     with c_fs:
         if data_type == "Structured":
             fs_defaults = ["Small Tables", "Large Tables", "Mixed Tables"]
-            fs_raw_options = sorted(set(fs_names + fs_defaults))
+            # Only show names that belong to the selected DS — filter out names
+            # that start with a different known DS prefix (e.g. hide "Postgres MSSQL Large Tables"
+            # when DS=Postgres, because that's an MSSQL entry stored with a wrong prefix).
+            _known_ds_prefixes = ["postgres", "mssql", "mysql", "oracle", "s3", "smb", "nfs", "sharepoint"]
+            def _fs_belongs_to_ds(name):
+                n = name.lower().strip()
+                if ds_clean and n.startswith(ds_clean.lower() + " "):
+                    return True   # belongs to selected DS
+                for pfx in _known_ds_prefixes:
+                    if pfx != ds_clean.lower() and n.startswith(pfx + " "):
+                        return False  # belongs to a different DS
+                return True  # generic, keep it
+            fs_filtered = [n for n in fs_names if _fs_belongs_to_ds(n)]
+            fs_raw_options = sorted(set(fs_filtered + fs_defaults))
             fs_display_options = [
                 (raw if ds_clean and raw.lower().startswith(ds_clean.lower() + " ") else (f"{ds_clean} {raw}".strip() if ds_clean else raw))
                 for raw in fs_raw_options
@@ -8486,11 +8499,22 @@ def page_add_benchmark():
     total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
     total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
     total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
-    # [FIX] Prefill volume metrics (Files/Size) from scan insights if available.
-    # This prevents the 0-throughput issue in Image 2 when a preset isn't matched.
-    total_files = int(preset.get("total_files")) if preset.get("total_files") is not None else 0
-    total_folders = int(preset.get("total_folders")) if preset.get("total_folders") is not None else 0
-    total_gb = float(preset.get("total_size_gb")) if preset.get("total_size_gb") is not None else 0.0
+
+    # For Structured DS (Postgres, MSSQL etc.) allow manual override of DB-specific metrics
+    if data_type == "Structured":
+        _db_c1, _db_c2 = st.columns(2)
+        total_gb = _db_c1.number_input(
+            "Total DB Size (GB)", min_value=0.0, step=1.0,
+            value=float(total_gb) if total_gb else 0.0,
+            key="add_total_db_size_gb",
+            help="Total size of the database in GB"
+        )
+        total_files = int(_db_c2.number_input(
+            "Total Tables", min_value=0, step=100,
+            value=int(total_files) if total_files else 0,
+            key="add_total_tables",
+            help="Total number of tables in the database"
+        ))
     total_catalog_items = 0
 
     try:
@@ -11055,12 +11079,13 @@ def page_comparison(df):
     with c1:
         st.markdown("#### 🅰️ Baseline Configuration")
         # keep explicit values visible (after selections)
-        
-        ver_a_options = _uniq_sorted(df.get("Build_Version"))
+
+        # Show major versions only (e.g. "253" covers "253.5" and "253.11")
+        ver_a_options = _uniq_sorted(df['Build_Version'].astype(str).str.split('.').str[0])
         ver_a = st.selectbox("Build Version", ver_a_options, key='v_a')
-        
-        # Get available options based on version A
-        df_a_filtered = df[df['Build_Version'].astype(str) == str(ver_a)].copy()
+
+        # Match all sub-versions of the selected major (e.g. 253.5, 253.11)
+        df_a_filtered = df[df['Build_Version'].astype(str).str.split('.').str[0] == str(ver_a)].copy()
         
         ds_a_options = _uniq_sorted(df_a_filtered.get("Data_Source_Type"))
         ds_a = st.selectbox("Data Source", ds_a_options, key='d_a')
@@ -11088,8 +11113,8 @@ def page_comparison(df):
         ver_b_options = ver_a_options
         ver_b_default_idx = min(1, max(0, len(ver_b_options) - 1))
         ver_b = st.selectbox("Build Version", ver_b_options, key='v_b', index=ver_b_default_idx)
-        
-        df_b_filtered = df[df['Build_Version'].astype(str) == str(ver_b)].copy()
+
+        df_b_filtered = df[df['Build_Version'].astype(str).str.split('.').str[0] == str(ver_b)].copy()
         
         ds_b_options = _uniq_sorted(df_b_filtered.get("Data_Source_Type"))
         ds_b = st.selectbox("Data Source", ds_b_options, key='d_b')
@@ -11131,21 +11156,24 @@ def page_comparison(df):
     baseline_title = f"#### 🅰️ Baseline ({scan_a} {ds_a} {fs_a} | ACL {acl_a}) Configuration"
     candidate_title = f"#### 🅱️ Candidate ({scan_b} {ds_b} {fs_b} | ACL {acl_b}) Configuration"
     
-    run_a = run_a.sort_values('Date', ascending=False)
-    run_b = run_b.sort_values('Date', ascending=False)
-
     if run_a.empty or run_b.empty:
         st.error("❌ No data found for one or both selections. Please adjust your filters.")
         return
 
-    # If multiple runs match, let user select
+    def _pick_best_run(df_in):
+        df_in = df_in.reset_index(drop=True)
+        tp = pd.to_numeric(df_in.get('throughput_cluster_gb_hr', pd.Series(dtype=float)), errors='coerce')
+        if tp.notna().any():
+            return df_in.loc[tp.idxmax()]
+        return df_in.iloc[0]
+
     if len(run_a) > 1:
-        st.info(f"ℹ️ Found {len(run_a)} runs matching Baseline criteria. Using most recent.")
+        st.info(f"ℹ️ Found {len(run_a)} runs matching Baseline criteria. Using best throughput (highest GB/hr).")
     if len(run_b) > 1:
-        st.info(f"ℹ️ Found {len(run_b)} runs matching Candidate criteria. Using most recent.")
-        
-    ra = run_a.iloc[0]
-    rb = run_b.iloc[0]
+        st.info(f"ℹ️ Found {len(run_b)} runs matching Candidate criteria. Using best throughput (highest GB/hr).")
+
+    ra = _pick_best_run(run_a)
+    rb = _pick_best_run(run_b)
 
     st.divider()
     st.divider()
@@ -12070,44 +12098,34 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
         if filter_ff:
             df_filtered = df_filtered[df_filtered['is_feature_flags'] == 1]
     
-    # Handle duplicates/Best Run selection
-    def select_best_run(group):
-        # 1. Try to pick fastest run by completion time
-        if 'total_scan_hours' in group.columns and group['total_scan_hours'].notna().any():
-            valid_time = group[group['total_scan_hours'].notna()]
-            return valid_time.loc[valid_time['total_scan_hours'].idxmin()]
-        
-        # 2. Fallback: Pick run with highest throughput
-        if 'throughput_cluster_gb_hr' in group.columns and group['throughput_cluster_gb_hr'].notna().any():
-            valid_tp = group[group['throughput_cluster_gb_hr'].notna()]
-            return valid_tp.loc[valid_tp['throughput_cluster_gb_hr'].idxmax()]
-            
-        return group.iloc[0]
+    # Group by major build version (e.g. "253" from "253.11" or "253.5") and pick
+    # the best result per major build = highest throughput_cluster_gb_hr.
+    # Multiple sub-versions (253.5, 253.11) collapse into one point per major version.
+    df_filtered = df_filtered.copy()
+    df_filtered['_major_build'] = df_filtered['Build_Version'].astype(str).str.split('.').str[0].str.strip()
 
-    # Group by Build and Compare_By if present
-    group_cols = ['Build_Version']
+    # Group by major build + compare_by if present
+    group_cols = ['_major_build']
     if compare_by: group_cols.append(compare_by)
-    
-    # Pick best run per (Build_Version, compare_by?) without groupby.apply().
-    # This avoids pandas deprecation warnings AND keeps grouping columns (Build_Version),
-    # which we need for sorting/plotting.
+
     picked_idxs = []
     try:
         gb = df_filtered.groupby(group_cols, sort=False, dropna=False)
     except TypeError:
-        # Older pandas: no dropna kwarg
         gb = df_filtered.groupby(group_cols, sort=False)
     for _, group in gb:
         try:
-            if 'total_scan_hours' in group.columns and group['total_scan_hours'].notna().any():
-                valid_time = group[group['total_scan_hours'].notna()]
-                if not valid_time.empty:
-                    picked_idxs.append(valid_time['total_scan_hours'].idxmin())
-                    continue
+            # Pick highest throughput first
             if 'throughput_cluster_gb_hr' in group.columns and group['throughput_cluster_gb_hr'].notna().any():
                 valid_tp = group[group['throughput_cluster_gb_hr'].notna()]
                 if not valid_tp.empty:
                     picked_idxs.append(valid_tp['throughput_cluster_gb_hr'].idxmax())
+                    continue
+            # Fallback: lowest scan hours
+            if 'total_scan_hours' in group.columns and group['total_scan_hours'].notna().any():
+                valid_time = group[group['total_scan_hours'].notna()]
+                if not valid_time.empty:
+                    picked_idxs.append(valid_time['total_scan_hours'].idxmin())
                     continue
             picked_idxs.append(group.index[0])
         except Exception:
@@ -12116,6 +12134,10 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             except Exception:
                 pass
     plot_df = df_filtered.loc[picked_idxs].copy() if picked_idxs else df_filtered.head(0).copy()
+    # Use major version as the display label on the X-axis
+    plot_df['Build_Version'] = plot_df['_major_build']
+    plot_df = plot_df.drop(columns=['_major_build'], errors='ignore')
+    df_filtered = df_filtered.drop(columns=['_major_build'], errors='ignore')
     plot_df = plot_df.reset_index(drop=True)
     plot_df = plot_df.sort_values('Build_Version')
     # Drop rows with missing cluster throughput
@@ -12189,7 +12211,9 @@ def render_trend_analysis(df, title, file_set_filter=None, scan_type_filter=None
             except Exception:
                 pass
         
-        fig2.update_layout(title="File Throughput Trend (files/hr)", xaxis_title="Build Version", yaxis_title="Files/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        _is_structured_ds = str(selected_ds).lower() in {"postgres", "mssql", "mysql", "oracle"}
+        _f_unit_dash = "Tables" if _is_structured_ds else "Files"
+        fig2.update_layout(title=f"{_f_unit_dash} Throughput Trend ({_f_unit_dash.lower()}/hr)", xaxis_title="Build Version", yaxis_title=f"{_f_unit_dash}/hour", hovermode='x unified', legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         fig2.update_xaxes(type='category', categoryorder='category ascending')
         st.plotly_chart(fig2, width="stretch")
 

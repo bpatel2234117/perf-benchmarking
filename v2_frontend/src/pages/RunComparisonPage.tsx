@@ -89,24 +89,38 @@ const RunComparisonPage: React.FC<RunComparisonPageProps> = ({ token }) => {
     const [aclB, setAclB] = useState<FlagFilter>('All');
     const [ffB, setFfB] = useState<FlagFilter>('All');
 
-    const versions = useMemo(() => uniq('build_version'), [rows]);
+    // Show major versions only (e.g. "253" covers "253.5" and "253.11")
+    const majorOf = (v: string) => (v || '').split('.')[0].trim();
+    const versions = useMemo(() => {
+        const majors = new Set(rows.map(r => majorOf(String(r.build_version ?? ''))).filter(Boolean));
+        return [...majors].sort((a, b) => parseInt(b, 10) - parseInt(a, 10));
+    }, [rows]);
 
     const filterRows = (ver: string, ds: string, scan: string, fs: string, acl: FlagFilter, ff: FlagFilter) => {
         let r = rows;
-        if (ver) r = r.filter(x => x.build_version === ver);
+        // Match all sub-versions of the selected major (e.g. 253 matches 253.5 and 253.11)
+        if (ver) r = r.filter(x => majorOf(String(x.build_version ?? '')) === ver);
         if (ds) r = r.filter(x => x.data_source_type === ds);
         if (scan) r = r.filter(x => x.scan_type === scan);
         if (fs) r = r.filter(x => x.file_set_type === fs);
         r = applyFlag(r, 'is_acl', acl);
         r = applyFlag(r, 'is_feature_flags', ff);
-        return r.sort((a, b) => (b.run_date ?? '').localeCompare(a.run_date ?? ''));
+        return r;
+    };
+
+    // Pick best throughput from matched rows (not most recent)
+    const pickBest = (r: BenchmarkRow[]): BenchmarkRow | null => {
+        if (!r.length) return null;
+        return r.reduce((best, cur) =>
+            (cur.throughput_cluster_gb_hr ?? -1) > (best.throughput_cluster_gb_hr ?? -1) ? cur : best
+        );
     };
 
     const rowsA = useMemo(() => filterRows(verA, dsA, scanA, fsA, aclA, ffA), [rows, verA, dsA, scanA, fsA, aclA, ffA]);
     const rowsB = useMemo(() => filterRows(verB, dsB, scanB, fsB, aclB, ffB), [rows, verB, dsB, scanB, fsB, aclB, ffB]);
 
-    const ra = rowsA[0] ?? null;
-    const rb = rowsB[0] ?? null;
+    const ra = pickBest(rowsA);
+    const rb = pickBest(rowsB);
 
     const metrics = [
         { label: 'Cluster GB/hr', a: ra?.throughput_cluster_gb_hr, b: rb?.throughput_cluster_gb_hr },
@@ -123,9 +137,9 @@ const RunComparisonPage: React.FC<RunComparisonPageProps> = ({ token }) => {
         Candidate: m.a ?? 0,
     }));
 
-    const dsOptions = (ver: string) => [...new Set(rows.filter(r => !ver || r.build_version === ver).map(r => r.data_source_type ?? '').filter(Boolean))].sort();
-    const scanOptions = (ver: string, ds: string) => [...new Set(rows.filter(r => (!ver || r.build_version === ver) && (!ds || r.data_source_type === ds)).map(r => r.scan_type ?? '').filter(Boolean))].sort();
-    const fsOptions = (ver: string, ds: string, scan: string) => [...new Set(rows.filter(r => (!ver || r.build_version === ver) && (!ds || r.data_source_type === ds) && (!scan || r.scan_type === scan)).map(r => r.file_set_type ?? '').filter(Boolean))].sort();
+    const dsOptions = (ver: string) => [...new Set(rows.filter(r => !ver || majorOf(String(r.build_version ?? '')) === ver).map(r => r.data_source_type ?? '').filter(Boolean))].sort();
+    const scanOptions = (ver: string, ds: string) => [...new Set(rows.filter(r => (!ver || majorOf(String(r.build_version ?? '')) === ver) && (!ds || r.data_source_type === ds)).map(r => r.scan_type ?? '').filter(Boolean))].sort();
+    const fsOptions = (ver: string, ds: string, scan: string) => [...new Set(rows.filter(r => (!ver || majorOf(String(r.build_version ?? '')) === ver) && (!ds || r.data_source_type === ds) && (!scan || r.scan_type === scan)).map(r => r.file_set_type ?? '').filter(Boolean))].sort();
 
     const colStyle: React.CSSProperties = { flex: '1 1 340px', minWidth: 280 };
     const labelStyle: React.CSSProperties = { fontSize: '0.78rem', color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 2 };

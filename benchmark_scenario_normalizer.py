@@ -86,7 +86,7 @@ def scenario_flags(row: Mapping[str, Any]) -> Tuple[bool, bool, bool]:
     upper = text.upper()
 
     is_acl = truthy_flag(row.get("is_acl"))
-    if "WITHOUT ACL" in upper or "NO ACL" in upper:
+    if "WITHOUT ACL" in upper or "NO ACL" in upper or "WITHOUT ACI" in upper or "NO ACI" in upper:
         is_acl = False
     elif re.search(r"\bACL\b|\bACI\b", upper):
         is_acl = True

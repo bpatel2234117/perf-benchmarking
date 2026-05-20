@@ -135,17 +135,19 @@ function buildTrendData(
         !r.is_acl && !r.is_feature_flags &&
         !(r.scan_type || '').toLowerCase().includes('ols')
     );
-    const byBuild = new Map<string, BenchmarkRow>();
+    // Group by major version (e.g. "253" covers "253.5" and "253.11"), pick highest throughput.
+    const byMajor = new Map<string, BenchmarkRow>();
     for (const r of filtered) {
-        const cur = byBuild.get(r.build_version);
+        const major = majorOf(r.build_version);
+        const cur = byMajor.get(major);
         if (!cur || (r.throughput_cluster_gb_hr ?? -1) > (cur.throughput_cluster_gb_hr ?? -1)) {
-            byBuild.set(r.build_version, r);
+            byMajor.set(major, r);
         }
     }
-    return [...byBuild.entries()]
+    return [...byMajor.entries()]
         .sort((a, b) => sortKey(a[0]) - sortKey(b[0]))
-        .map(([build, r]) => ({
-            build,
+        .map(([major, r]) => ({
+            build: major,
             gb: r.throughput_cluster_gb_hr,
             files: r.throughput_cluster_files_hr,
         }));
@@ -359,7 +361,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                                         <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'left' }}>Scenario</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>GB/hr</th>
-                                                                            <th style={{ padding: '8px 10px', textAlign: 'right' }}>Files/hr</th>
+                                                                            <th style={{ padding: '8px 10px', textAlign: 'right' }}>{['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'}</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>Scan Hrs</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>Objects</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>vs Base</th>
@@ -436,15 +438,15 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                         </div>
                                                     </div>
                                                     <div>
-                                                        <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: 6, color: 'var(--text-secondary)' }}>File Throughput (files/hr)</div>
-                                                        <div style={{ height: 220 }}>
-                                                            <ResponsiveContainer width="100%" height="100%">
-                                                                <BarChart data={trendData} margin={{ top: 4, right: 8, left: 0, bottom: 40 }}>
-                                                                    <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                                                                    <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
-                                                                    <YAxis tick={{ fontSize: 10 }} />
-                                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
-                                                                    <Bar dataKey="files" name="Files/hr" fill="#059669" />
+                                        <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: 6, color: 'var(--text-secondary)' }}>{['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Table Throughput (tables/hr)' : 'File Throughput (files/hr)'}</div>
+                                        <div style={{ height: 220 }}>
+                                            <ResponsiveContainer width="100%" height="100%">
+                                                <BarChart data={trendData} margin={{ top: 4, right: 8, left: 0, bottom: 40 }}>
+                                                    <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                                                    <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
+                                                    <YAxis tick={{ fontSize: 10 }} />
+                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
+                                                    <Bar dataKey="files" name={['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'} fill="#059669" />
                                                                 </BarChart>
                                                             </ResponsiveContainer>
                                                         </div>

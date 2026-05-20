@@ -48,29 +48,40 @@ interface DashboardProps {
   token: string;
 }
 
+function majorVersion(v: string): string {
+  return String(v || 'unknown').split('.')[0].trim();
+}
+
+/** Pick the row with higher throughput; fall back to lower scan hours. */
 function betterRow(a: TrendRow, b: TrendRow): TrendRow {
+  const ga = a.throughput_cluster_gb_hr;
+  const gb = b.throughput_cluster_gb_hr;
+  if (ga != null && gb != null) return ga >= gb ? a : b;
+  if (ga != null) return a;
+  if (gb != null) return b;
   const ta = a.total_scan_hours;
   const tb = b.total_scan_hours;
   if (ta != null && tb != null) return ta <= tb ? a : b;
   if (ta != null) return a;
   if (tb != null) return b;
-  const ga = a.throughput_cluster_gb_hr ?? 0;
-  const gb = b.throughput_cluster_gb_hr ?? 0;
-  return ga >= gb ? a : b;
+  return a;
 }
 
-/** One best row per build (same rule as Streamlit trend: min hours, else max GB/hr). */
+/** One best row per major build version (e.g. "253" covers "253.5" and "253.11").
+ *  Best = highest throughput_cluster_gb_hr; fallback = lowest total_scan_hours. */
 function pickBestPerBuild(rows: TrendRow[]): TrendRow[] {
   const m = new Map<string, TrendRow>();
   for (const r of rows) {
-    const k = String(r.build_version || 'unknown');
+    const k = majorVersion(String(r.build_version || 'unknown'));
     const cur = m.get(k);
     if (!cur) m.set(k, r);
     else m.set(k, betterRow(cur, r));
   }
-  return Array.from(m.values()).sort((a, b) =>
-    String(a.build_version).localeCompare(String(b.build_version), undefined, { numeric: true, sensitivity: 'base' })
-  );
+  return Array.from(m.entries())
+    .map(([major, r]) => ({ ...r, build_version: major }))
+    .sort((a, b) =>
+      String(a.build_version).localeCompare(String(b.build_version), undefined, { numeric: true, sensitivity: 'base' })
+    );
 }
 
 /** After ascending sort by build label, keep only the newest N points (slice from end). */
@@ -200,7 +211,7 @@ const TrendSection: React.FC<{
         </div>
       </div>
       <p className="trend-caption">
-        Builds plotted: <strong>{windowHint}</strong> (best run per build: shortest duration, else highest cluster GB/hr)
+        Builds plotted: <strong>{windowHint}</strong> (one point per major build — best run = highest cluster GB/hr, else shortest duration)
       </p>
 
       <div
@@ -266,7 +277,7 @@ const TrendSection: React.FC<{
           </div>
         </div>
         <div className="trend-chart-cell">
-          <h4 className="trend-chart-heading">File Throughput Trend (files/hr)</h4>
+          <h4 className="trend-chart-heading">{segment === 'structured' ? 'Table Throughput Trend (tables/hr)' : 'File Throughput Trend (files/hr)'}</h4>
           <div className="chart-container chart-trend">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chart} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
@@ -275,7 +286,7 @@ const TrendSection: React.FC<{
                 <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
                 <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
                 <Legend />
-                <Line type="monotone" dataKey="cluster_files" name="Cluster" stroke="#059669" strokeWidth={3} dot={{ r: 4 }} connectNulls />
+                <Line type="monotone" dataKey="cluster_files" name={segment === 'structured' ? 'Cluster tables/hr' : 'Cluster files/hr'} stroke="#059669" strokeWidth={3} dot={{ r: 4 }} connectNulls />
                 <Line type="monotone" dataKey="scanner_files" name="Per Scanner" stroke="#34d399" strokeWidth={2} dot={{ r: 3 }} connectNulls />
                 <Line type="monotone" dataKey="thread_files" name="Per Thread" stroke="#a7f3d0" strokeWidth={2} dot={{ r: 3 }} connectNulls />
               </LineChart>
@@ -323,9 +334,9 @@ const TrendSection: React.FC<{
               <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
               <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
               <Legend />
-              <Bar dataKey="cluster_files" name="Cluster files/hr" fill="#059669" />
-              <Bar dataKey="scanner_files" name="Scanner files/hr" fill="#34d399" />
-              <Bar dataKey="thread_files" name="Thread files/hr" fill="#86efac" />
+              <Bar dataKey="cluster_files" name={segment === 'structured' ? 'Cluster tables/hr' : 'Cluster files/hr'} fill="#059669" />
+              <Bar dataKey="scanner_files" name={segment === 'structured' ? 'Scanner tables/hr' : 'Scanner files/hr'} fill="#34d399" />
+              <Bar dataKey="thread_files" name={segment === 'structured' ? 'Thread tables/hr' : 'Thread files/hr'} fill="#86efac" />
             </BarChart>
           </ResponsiveContainer>
         </div>
@@ -355,7 +366,7 @@ const TrendSection: React.FC<{
                 <th>Scan type</th>
                 <th>Data source</th>
                 <th>Cluster GB/hr</th>
-                <th>Cluster files/hr</th>
+                <th>{segment === 'structured' ? 'Cluster tables/hr' : 'Cluster files/hr'}</th>
                 <th>Scan hours</th>
               </tr>
             </thead>
