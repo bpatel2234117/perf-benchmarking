@@ -386,8 +386,8 @@ const AddBenchmarkFromScanPage: React.FC<{ token: string }> = ({ token }) => {
                 <thead>
                   <tr style={{ background: 'var(--surface-ground, rgba(0,0,0,0.04))' }}>
                     <th style={{ ...cellStyle, textAlign: 'left' }}>File set type</th>
-                    <th style={{ ...cellStyle, textAlign: 'left' }}>Total files</th>
-                    <th style={{ ...cellStyle, textAlign: 'left' }}>Total folders</th>
+                    <th style={{ ...cellStyle, textAlign: 'left' }}>{isStructured ? 'Total tables' : 'Total files'}</th>
+                    <th style={{ ...cellStyle, textAlign: 'left' }}>{isStructured ? 'Total schemas' : 'Total folders'}</th>
                     <th style={{ ...cellStyle, textAlign: 'left' }}>Total size (GB)</th>
                   </tr>
                 </thead>

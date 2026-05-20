@@ -283,7 +283,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                                     <th style={{ padding: '12px 10px', textAlign: 'left', color: '#475569', minWidth: 140 }}>Scenario / DS Type</th>
                                     <th style={{ padding: '12px 10px', textAlign: 'left', color: '#475569', minWidth: 130 }}>Scan / File Set</th>
                                     <th style={{ padding: '12px 10px', textAlign: 'right', color: '#475569' }}>GB/hr</th>
-                                    <th style={{ padding: '12px 10px', textAlign: 'right', color: '#475569' }}>Files/hr</th>
+                                    <th style={{ padding: '12px 10px', textAlign: 'right', color: '#475569' }}>Files / Tables /hr</th>
                                     <th style={{ padding: '12px 10px', textAlign: 'center', color: '#475569' }}>Active</th>
                                     <th style={{ padding: '12px 10px', textAlign: 'center', color: '#475569' }}>Rel</th>
                                     <th style={{ padding: '12px 10px', textAlign: 'right', color: '#475569' }}>Actions</th>
@@ -380,10 +380,10 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                                                                 <label style={labelStyle}>Data Type</label>
                                                                 <input style={inp} value={String(getVal(row, 'data_type') ?? '')} onChange={e => setField(row.id, 'data_type', e.target.value)} />
                                                             </div>
-                                                            <div className="input-group" style={{ margin: 0 }}>
-                                                                <label style={labelStyle}>Total Files</label>
-                                                                <input type="number" style={inp} value={String(getVal(row, 'total_files') ?? '')} onChange={e => setField(row.id, 'total_files', e.target.value === '' ? null : parseInt(e.target.value))} />
-                                                            </div>
+                                            <div className="input-group" style={{ margin: 0 }}>
+                                                <label style={labelStyle}>{['postgres','mssql','mysql','oracle'].includes((row.data_source_type ?? '').toLowerCase()) ? 'Total Tables' : 'Total Files'}</label>
+                                                <input type="number" style={inp} value={String(getVal(row, 'total_files') ?? '')} onChange={e => setField(row.id, 'total_files', e.target.value === '' ? null : parseInt(e.target.value))} />
+                                            </div>
                                                             <div className="input-group" style={{ margin: 0 }}>
                                                                 <label style={labelStyle}>Total Size (GB)</label>
                                                                 <input type="number" style={inp} value={String(getVal(row, 'total_size_gb') ?? '')} onChange={e => setField(row.id, 'total_size_gb', e.target.value === '' ? null : parseFloat(e.target.value))} />

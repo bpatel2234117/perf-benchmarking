@@ -490,9 +490,11 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
                                                 <thead>
                                                     <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
-                                                        {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr', 'Files/hr', 'Scan Hrs', 'Run Date'].map(h => (
-                                                            <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
-                                                        ))}
+                                        {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr',
+                                          dsTypes.length > 0 && dsTypes.every(d => ['postgres','mssql','mysql','oracle'].includes(d.toLowerCase())) ? 'Tables/hr' : 'Files/hr',
+                                          'Scan Hrs', 'Run Date'].map(h => (
+                                            <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
+                                        ))}
                                                     </tr>
                                                 </thead>
                                                 <tbody>
