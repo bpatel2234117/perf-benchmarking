@@ -1,0 +1,56 @@
+v2_api/scan_bigid_sync.py
+  s_eae33cfc6e6260::t_b959cbec10c555 254,748-781
+  s_eae33cfc6e6260::t_44193b6072286d 12
+  s_2a28ad5b172727::t_84e11a3d6cdf99 186-188
+  s_eae33cfc6e6260::t_05494c76c03e74 866-896,1146
+  s_eae33cfc6e6260::t_9c850ff306fda7 266,307,336,713,722,784,790,1017-1018,1030-1031,1069,1082-1117,1132
+  s_eae33cfc6e6260::t_09e2dd52f7c2e8 252-253
+  s_eae33cfc6e6260::t_bb11294d666aba 255-257,263-265
+  s_eae33cfc6e6260::t_0529260e0eb232 305-306
+  s_eae33cfc6e6260::t_fa6e8a0a9d9f68 308-310
+  s_eae33cfc6e6260::t_a0956a2d40e6e3 337-339
+  s_eae33cfc6e6260::t_89e4add9c716f1 710-712
+  s_eae33cfc6e6260::t_21741357a77005 714-716,719-721
+  s_eae33cfc6e6260::t_d1288d2fc32eab 723-725
+  s_eae33cfc6e6260::t_3fdfe0530925e8 747
+  s_eae33cfc6e6260::t_c04905980d4b8a 782
+  s_eae33cfc6e6260::t_c098f6f75f3d87 785-789
+  s_eae33cfc6e6260::t_23e1df129132de 791-793
+  s_eae33cfc6e6260::t_c08f289cb20709 863-865
+  s_eae33cfc6e6260::t_69a36b3361af6e 897-899
+  s_eae33cfc6e6260::t_9a846d884e5cec 1014-1016
+  s_eae33cfc6e6260::t_5ebeddd0aa913f 1019-1021,1027-1029
+  s_eae33cfc6e6260::t_01de9419a97606 1032-1034,1066-1068
+  s_eae33cfc6e6260::t_00cedd179f935a 1070-1072,1079-1081
+  s_eae33cfc6e6260::t_a60ebc143932ce 1118-1120,1129-1131
+  s_eae33cfc6e6260::t_2877c67b83d1cc 1133-1135,1143-1145
+  s_eae33cfc6e6260::t_cd2c4dbf5b3061 1147-1149
+v2_api/workflow_scan_reconcile.py
+  s_2a28ad5b172727::t_8cdf0f64fa4b2e 38
+  s_2a28ad5b172727::t_b45ec7897644f7 35-37
+  s_2a28ad5b172727::t_af4eb6ff82e1da 39-41
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "889160fe6e0b97cd97c8ac012f00b49aefcd08c1",
+  "prompts": {},
+  "sessions": {
+    "s_2a28ad5b172727": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82cfea8f-af78-4585-a321-c237ed4118ea",
+        "model": "claude-opus-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_eae33cfc6e6260": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d0c8aefb-6fd9-4df3-8ebc-d865a2c90c08",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
