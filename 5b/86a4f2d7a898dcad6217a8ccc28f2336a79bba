@@ -1,0 +1,35 @@
+v2_api/main.py
+  s_1c8c3ecdb5a540::t_8b7f69f8180feb 1340
+  s_1c8c3ecdb5a540::t_021b19d3f035dd 1299-1300
+  s_1c8c3ecdb5a540::t_6bf952f1523bb0 1347-1348
+  s_1c8c3ecdb5a540::t_0f98c2e62bb1e7 1450-1458,1460-1482,1484,1486-1487
+  s_1c8c3ecdb5a540::t_024a7b335b33fb 1459,1483,1485
+  s_1c8c3ecdb5a540::t_2b91cf95ed7d18 1349-1446
+  s_1c8c3ecdb5a540::t_15146a4903abd1 1251-1254,1257,1260-1283,1285,1288,1303,1308,1310-1327,1344,1346
+v2_api/workflow_scan_reconcile.py
+  s_2a28ad5b172727::t_8cdf0f64fa4b2e 64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "5b86a4f2d7a898dcad6217a8ccc28f2336a79bba",
+  "prompts": {},
+  "sessions": {
+    "s_1c8c3ecdb5a540": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2fcf2a0a-b57a-4bc1-865e-ac3c22977f01",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": null
+    },
+    "s_2a28ad5b172727": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82cfea8f-af78-4585-a321-c237ed4118ea",
+        "model": "claude-opus-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
