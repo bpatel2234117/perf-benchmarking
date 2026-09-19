@@ -1,0 +1,24 @@
+v2_api/main.py
+  s_1c8c3ecdb5a540::t_2b91cf95ed7d18 1349-1446
+  s_1c8c3ecdb5a540::t_8b7f69f8180feb 1340
+  s_1c8c3ecdb5a540::t_021b19d3f035dd 1299-1300
+  s_1c8c3ecdb5a540::t_0f98c2e62bb1e7 1450-1488
+  s_1c8c3ecdb5a540::t_15146a4903abd1 1251-1254,1257,1260-1283,1285,1288,1303,1308,1310-1327,1344,1346
+  s_1c8c3ecdb5a540::t_6bf952f1523bb0 1347-1348
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d39da29c70a2b815dfb29ec30de460205520f32a",
+  "prompts": {},
+  "sessions": {
+    "s_1c8c3ecdb5a540": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2fcf2a0a-b57a-4bc1-865e-ac3c22977f01",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
