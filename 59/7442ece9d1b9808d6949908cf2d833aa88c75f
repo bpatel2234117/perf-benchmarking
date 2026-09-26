@@ -1,0 +1,22 @@
+v2_api/bigid_license.py
+  s_157bb5c0d1f9b5::t_ce2057e809a0ab 75,96,109
+bigid_auth.py
+  s_157bb5c0d1f9b5::t_21dd7366f3f8b2 196-209,216-219,244
+  s_157bb5c0d1f9b5::t_db4a3b50d070c5 255,257
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "597442ece9d1b9808d6949908cf2d833aa88c75f",
+  "prompts": {},
+  "sessions": {
+    "s_157bb5c0d1f9b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0040c995-d7cb-4129-89fd-1116c76446d2",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
