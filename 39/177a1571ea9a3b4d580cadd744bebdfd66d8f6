@@ -1,0 +1,19 @@
+v2_api/workflow_runner.py
+  s_157bb5c0d1f9b5::t_98119ad2018937 520,522-523,526-527,533-534,536
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "39177a1571ea9a3b4d580cadd744bebdfd66d8f6",
+  "prompts": {},
+  "sessions": {
+    "s_157bb5c0d1f9b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0040c995-d7cb-4129-89fd-1116c76446d2",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
