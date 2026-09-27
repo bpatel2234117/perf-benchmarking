@@ -1,0 +1,20 @@
+v2_api/main.py
+  s_157bb5c0d1f9b5::t_d0d1933abb71c4 1788-1790,1796
+  s_157bb5c0d1f9b5::t_15bf366b557b8d 2459-2477
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9a3f78683ca0b35e8c5baf72327e24a25b41c920",
+  "prompts": {},
+  "sessions": {
+    "s_157bb5c0d1f9b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0040c995-d7cb-4129-89fd-1116c76446d2",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
