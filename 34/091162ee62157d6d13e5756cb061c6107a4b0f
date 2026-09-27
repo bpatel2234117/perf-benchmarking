@@ -1,0 +1,19 @@
+v2_api/scan_bigid_sync.py
+  s_157bb5c0d1f9b5::t_2c977e9b071695 791-793
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "34091162ee62157d6d13e5756cb061c6107a4b0f",
+  "prompts": {},
+  "sessions": {
+    "s_157bb5c0d1f9b5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0040c995-d7cb-4129-89fd-1116c76446d2",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
