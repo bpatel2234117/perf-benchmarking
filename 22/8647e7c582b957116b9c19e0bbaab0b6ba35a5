@@ -1,0 +1,19 @@
+v2_api/tracker.py
+  s_9188e3a24ea48e::t_b977518aa1e6bd 1375
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "228647e7c582b957116b9c19e0bbaab0b6ba35a5",
+  "prompts": {},
+  "sessions": {
+    "s_9188e3a24ea48e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e756601a-4afc-4f44-a6c1-559e7befb809",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
