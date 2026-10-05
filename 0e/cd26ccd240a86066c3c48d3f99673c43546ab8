@@ -1,0 +1,14 @@
+test.txt
+  h_9bc63150fb2429 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0ecd26ccd240a86066c3c48d3f99673c43546ab8",
+  "prompts": {},
+  "humans": {
+    "h_9bc63150fb2429": {
+      "author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
