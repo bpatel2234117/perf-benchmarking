@@ -1,0 +1,20 @@
+v2_api/tracker.py
+  s_2c25216346a99a::t_3bd60d4fe5c50c 1619
+  s_2c25216346a99a::t_7f2c73dbaf30a2 1693
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "45ab6a1bdb6ac7ff1c7143307af0c018afeea87a",
+  "prompts": {},
+  "sessions": {
+    "s_2c25216346a99a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b325a37-49f7-4e07-9cb0-0f100442a68b",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
