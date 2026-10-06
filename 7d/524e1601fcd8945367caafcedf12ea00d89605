@@ -1,0 +1,27 @@
+test.txt
+  h_9bc63150fb2429 1
+v2_api/tracker.py
+  s_2c25216346a99a::t_d5375f3488329d 1693,1695
+  s_2c25216346a99a::t_893cb3dc5158bd 1618,1620
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d524e1601fcd8945367caafcedf12ea00d89605",
+  "prompts": {},
+  "humans": {
+    "h_9bc63150fb2429": {
+      "author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  },
+  "sessions": {
+    "s_2c25216346a99a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b325a37-49f7-4e07-9cb0-0f100442a68b",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
