@@ -1,0 +1,217 @@
+v2_api/main.py
+  s_af0482b7dfae2a::t_852222df6e775e 2142-2145
+  s_eefccc0bfedb33::t_12ed8b4aad32d4 61,2114-2115,2121,2128-2137,2140,2146,2148-2150,2152-2155,2165-2167,2207,2209-2213,2230,2236-2238,2241-2244,2259-2260,2265-2274,2276,2281
+  s_23c61fe40963bb::t_1e1815c2809ff3 2151,2254-2257
+  s_af0482b7dfae2a::t_7f607a982c2e00 2107-2111
+  s_e0e7a1a2da956e::t_0c06076cc778c7 2791,2795,2799-2804
+  s_e0e7a1a2da956e::t_d4d74e458534c0 2698-2743,2745,2750,2755-2758
+  s_af0482b7dfae2a::t_2b437ccb199611 2214-2218,2220-2228
+  s_af0482b7dfae2a::t_77229c77482c17 2219
+  s_e5ad4feecce280::t_711c462c52c8b1 3142-3152
+  s_af0482b7dfae2a::t_cca623b15710a2 2231-2235
+  s_af0482b7dfae2a::t_a87ca4e35e59b4 2277-2280
+  s_eefccc0bfedb33::t_04d0ecf64e287c 9
+  s_eefccc0bfedb33::t_c6794879233504 2264
+  s_e5ad4feecce280::t_591c84a17f852c 594
+  s_eefccc0bfedb33::t_9411d38f75c09f 60
+  s_eefccc0bfedb33::t_ce10d244ee2d96 59
+  s_b4699f25bf9715::t_a11b2c5ad597be 1514-1540
+  s_eefccc0bfedb33::t_fd4de8ded2c704 4415-4417,4943,4948
+  s_af0482b7dfae2a::t_72dd3454be5a9d 2192-2194
+  s_e0e7a1a2da956e::t_77814e8d2166fe 612-615
+  s_e0e7a1a2da956e::t_4cd492bd7820ca 44-50
+  s_eefccc0bfedb33::t_e5bdac0174e319 2112-2113,2122-2127,2138,2147,2208,2282-2283
+  s_eefccc0bfedb33::t_96b2454fc0d061 2116-2120,2141,2156-2164,2168-2186,2188-2191,2195,2200,2202-2205,2239-2240,2245-2253,2258,2261-2263
+  s_e0e7a1a2da956e::t_f113fb279ffb5f 2651-2682,2691-2697
+  s_af0482b7dfae2a::t_c56e6134503ac8 2229
+  s_af0482b7dfae2a::t_21715d3f2639b3 2683-2690
+  s_eefccc0bfedb33::t_66826c23a68aad 2139
+  s_b4699f25bf9715::t_e5678640b1d048 2762-2771
+  s_7a35f84d6c6ba1::t_b3d5a1975981b5 4835-4914,4917-4920,4923-4924,4926-4927,4930,4937,4950-4954,4959-4960,4965,4967-4973,4978-4982,4986,4988-4997,4999,5002-5005
+  s_eefccc0bfedb33::t_404893beb15e68 2187,2196-2199,2201,2206,2275
+  s_e0e7a1a2da956e::t_c2e07956977a77 2773,2778,2783,2785
+  s_eefccc0bfedb33::t_c86ab1787f81db 4938-4942,4944-4947,4949,4955-4958
+  s_7a35f84d6c6ba1::t_7b9791a727af47 5008
+v2_frontend/src/pages/ScannerInfraPage.tsx
+  s_7a35f84d6c6ba1::t_1e5c36c61b32f3 134,138,144,155
+  s_7a35f84d6c6ba1::t_5a451d682e00eb 287
+  s_35800cca4d9e48::t_b6528443c7becf 142-143,146,153
+  s_35800cca4d9e48::t_f34ab4e027c656 422-424
+  s_35800cca4d9e48::t_d332e4b3b363dc 400,402,406,408,410,412
+  s_35800cca4d9e48::t_d8dd74df476372 93-94
+  s_7a35f84d6c6ba1::t_b9c2fdacca62b7 87-92
+  s_7a35f84d6c6ba1::t_926188b0cf1f45 382-387,389-390,396
+  s_7a35f84d6c6ba1::t_a9119dac99da29 366
+v2_api/workflow_runner.py
+  s_eefccc0bfedb33::t_35e178e45ffdbe 1387-1418,1457-1463
+v2_api/workflow_action_templates.py
+  s_eefccc0bfedb33::t_239e727f40e024 47-49,63
+  s_eefccc0bfedb33::t_3ea49ee4722554 26,28
+v2_frontend/src/pages/ScanStatusPage.tsx
+  s_e0e7a1a2da956e::t_763f1b8e8f54b5 636
+  s_e0e7a1a2da956e::t_7909aa27be73fe 107
+  s_e0e7a1a2da956e::t_92adf7197ba255 99-106,108-109
+  s_e0e7a1a2da956e::t_2378b26dc0f26c 377-397
+  s_e0e7a1a2da956e::t_825b2aecbe6bf2 343,347-348
+  s_e0e7a1a2da956e::t_c2a957ce39ad56 410
+  s_e0e7a1a2da956e::t_ec4e27b36daf72 478-498
+  s_e0e7a1a2da956e::t_804ea82e66ec19 239-252
+v2_frontend/src/pages/ScanProgressPage.tsx
+  s_696dbd4f13866e::t_d39d12f918384e 771
+  s_eefccc0bfedb33::t_f58e1fbc97c603 202,299,318,2016-2018,2023-2035,2050
+  s_af0482b7dfae2a::t_3c926e579f4387 2147
+  s_af0482b7dfae2a::t_c0fa373e948f54 172
+  s_b4699f25bf9715::t_c8b03b4bfa2238 2750,2752
+  s_af0482b7dfae2a::t_4cbbea8df08161 163-166
+  s_b4699f25bf9715::t_937ac92e9fd0b1 1394,1396,1406-1411
+  s_696dbd4f13866e::t_3972e2f101be1e 628-668
+  s_696dbd4f13866e::t_75a7d8d5de3e04 22
+  s_af0482b7dfae2a::t_667c83a1cf3e88 1948-1952
+  s_23c61fe40963bb::t_271087068c6c32 2102
+  s_eefccc0bfedb33::t_c6b711d8f41a4a 147,151-157,167-171,173-174,204,207-211,285,295,300,305-310,316-317,800-803,1953-1962,2036-2047,2087,2094-2096
+  s_b4699f25bf9715::t_e5b3d975aa4de8 1589
+  s_b4699f25bf9715::t_acbc3b0c43b18c 436,443
+  s_696dbd4f13866e::t_605cb18c817898 1540-1542,1576-1577,1674,1730,1743,1758,1760,1773,1828,1831-1842,1940,2151,2568,2570,2623,2625,2734,2736
+  s_eefccc0bfedb33::t_81289a2885d4e5 1943,1947,1967,1970-1973,1978-1980,2144-2146,2148,2150
+  s_eefccc0bfedb33::t_2318f201a6220b 1963-1966,1974,1983,2142-2143
+  s_b4699f25bf9715::t_78ac34dc24e0f5 1380-1393,1412-1416,1418-1420
+  s_eefccc0bfedb33::t_e2f60e0458f176 1,195-201,203,205-206,286-294,296-298,301-304,311-315,319-323,799,804,1944-1946,1975-1977,1981-1982,1984-2003,2006-2014,2019-2022,2051-2074,2076-2086,2088-2093,2097-2101,2103-2128,2130-2141
+  s_696dbd4f13866e::t_425dc760ce4026 2
+  s_b4699f25bf9715::t_5358e767b405e8 1417
+  s_eefccc0bfedb33::t_5d77ac228432c9 130,132-140,149-150,158-161,175,327-328
+  s_b4699f25bf9715::t_67a6d01a6bb4e0 1395,1398-1404
+  s_b4699f25bf9715::t_831196572f5503 717-728
+  s_eefccc0bfedb33::t_c6b41e0fb5f311 789-798
+  s_696dbd4f13866e::t_dd0bb6d06c907f 1942,2149,2591
+  s_af0482b7dfae2a::t_f34dd6244034fc 212-284
+  s_23c61fe40963bb::t_597e90b93f3ded 141-142,2075,2129
+  s_b4699f25bf9715::t_48fff7850006eb 1597,1602
+  s_eefccc0bfedb33::t_93eaa58a2b4b44 125-129,131,143-146,148,162,176-194,324-326,2004-2005,2015
+  s_af0482b7dfae2a::t_14a8b249c9b100 1968-1969
+  s_b4699f25bf9715::t_288e09874f657f 2774,2776
+  s_b4699f25bf9715::t_52731d18aa8df0 437-442,444-445
+  s_eefccc0bfedb33::t_581516b7cddb50 2048-2049
+v2_api/scan_bigid_sync.py
+  s_e0e7a1a2da956e::t_e3a0ad2e4596ae 252-255,268
+v2_api/db_config_pg.py
+  s_e0e7a1a2da956e::t_e9c5dd26b06ec5 447-448
+  s_e0e7a1a2da956e::t_2871f11c140642 521-522
+v2_api/tracker.py
+  s_af0482b7dfae2a::t_00967ed0a6c3e5 3630-3631,3635-3639,3643-3649
+  s_eefccc0bfedb33::t_8081d88c8dc3f8 3584,3586-3587,3589,3591-3602,3605,3608-3609
+  s_2c25216346a99a::t_7b7dbf8a286dc9 1626-1627
+  s_af0482b7dfae2a::t_536d1b373a663f 3658-3660
+  s_2c25216346a99a::t_e465809569eabf 1702-1703
+  s_af0482b7dfae2a::t_20931979e46cc5 3664-3669
+  s_af0482b7dfae2a::t_489a780b25c45c 3652-3654,3656,3662,3670-3671
+  s_af0482b7dfae2a::t_8cfbe37d3fff14 4573-4576
+  s_af0482b7dfae2a::t_a4d7c3581b480a 5491-5494
+  s_af0482b7dfae2a::t_6a14b8b4bf6272 5528-5531
+  s_af0482b7dfae2a::t_d218c1f893cf34 3663
+  s_23c61fe40963bb::t_cc239dbfbb56eb 3672-3687,5495-5498,5532-5535
+  s_af0482b7dfae2a::t_04266b795a8043 3612-3629,3655,3657,3661
+  s_eefccc0bfedb33::t_6a43af846433c9 4545-4548
+  s_e0e7a1a2da956e::t_7b85ee416d94be 2752-2755,2767
+  s_af0482b7dfae2a::t_4bccf683251ef6 1184-1189
+  s_af0482b7dfae2a::t_ebabffcff1fe0b 3632-3634,3640-3642,3650-3651
+  s_eefccc0bfedb33::t_404893beb15e68 3603
+  s_eefccc0bfedb33::t_8070f5aee23d12 3555-3583,3585,3588,3590,3604,3606-3607,3610-3611,3701
+scanner_performance.py
+  s_eefccc0bfedb33::t_09ece264d533b0 632-663,666-668,679-695,726,729-732,793,800,802,804-813,816-823,825-828
+  s_23c61fe40963bb::t_fa771343dbfe1d 714
+  s_23c61fe40963bb::t_eb88cca871b4b6 664-665,669-678
+  s_eefccc0bfedb33::t_e321cdd97ace91 696-713,715-725,727-728,733-792,794-799,801,803
+  s_23c61fe40963bb::t_bb86df528885ec 814-815,824
+v2_frontend/src/pages/Workflow.tsx
+  s_eefccc0bfedb33::t_9a4716e2e1aa2b 457-458
+  s_eefccc0bfedb33::t_9001ee21a2c5d5 275-287
+  s_eefccc0bfedb33::t_8c1c776b656954 1175-1201
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "af4a781cedc7469553e22a73d9e64cb45fb8ae78",
+  "prompts": {},
+  "sessions": {
+    "s_23c61fe40963bb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4a2ce98e-3c34-4618-9971-81b47408a5c3",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_2c25216346a99a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5b325a37-49f7-4e07-9cb0-0f100442a68b",
+        "model": "claude-haiku-4-5-20251001"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_35800cca4d9e48": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c1fe1e5f-4bf5-41fb-a806-c78975bd7248",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_696dbd4f13866e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e490186a-9c87-403b-896d-6961233f46d2",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_7a35f84d6c6ba1": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0ec527e9-c723-43dd-b320-dfad32d9352e",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_af0482b7dfae2a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bffa7ad2-6d02-4051-92b2-9cb96acc142f",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_b4699f25bf9715": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "206be534-f862-462e-a289-aa1d7e65577f",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_e0e7a1a2da956e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "07165033-d1ab-436e-b327-71e75d0371db",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_e5ad4feecce280": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4e0b5f97-7f8f-4125-b128-6751209382ad",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    },
+    "s_eefccc0bfedb33": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf25a3f5-ce15-4068-ab87-5e2264c18f02",
+        "model": "claude-haiku-5-5"
+      },
+      "human_author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
