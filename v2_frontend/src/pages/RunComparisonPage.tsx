@@ -72,9 +72,6 @@ const RunComparisonPage: React.FC<RunComparisonPageProps> = ({ token }) => {
 
     const rows = data ?? [];
 
-    const uniq = (field: keyof BenchmarkRow) =>
-        [...new Set(rows.map(r => String(r[field] ?? '')).filter(Boolean))].sort();
-
     const [verA, setVerA] = useState('');
     const [dsA, setDsA] = useState('');
     const [scanA, setScanA] = useState('');
@@ -217,7 +214,7 @@ const RunComparisonPage: React.FC<RunComparisonPageProps> = ({ token }) => {
                                     </thead>
                                     <tbody>
                                         {metrics.map(m => {
-                                            const delta = pctDelta(m.a, m.b);
+                                            const delta = pctDelta(m.a ?? null, m.b ?? null);
                                             const isPos = delta.startsWith('+');
                                             const isNeg = delta.startsWith('-');
                                             return (

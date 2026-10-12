@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
-def _stp(kind, fs=None, acl=False, ols=False, sff=False, notes=""):
+def _stp(kind, fs=None, acl=False, ols=False, sff=False, notes="", enabled=True):
     ffs = []
     if acl:
         ffs.append("ACL")
@@ -22,12 +22,16 @@ def _stp(kind, fs=None, acl=False, ols=False, sff=False, notes=""):
         "is_structured_ff": sff,
         "feature_flags": ", ".join(ffs) if ffs else None,
         "notes": notes or None,
-        "is_enabled": True,
+        "is_enabled": bool(enabled),
     }
 
 
 def _raw_seed_steps() -> List[Dict[str, Any]]:
     return [
+        # Pre-flight actions first (seq 1–2; off by default). Runner applies each to every
+        # free workflow-pool env (is_active + include_in_workflow_runs), not odd/even pinning.
+        _stp("action", None, notes="ENABLE DS_LITE MODE", enabled=False),
+        _stp("action", None, notes="DISABLE OLS FEATURE FLAGS", enabled=False),
         _stp("mssql", None, notes="MSSQL Full Scan"),
         _stp("postgres", None, notes="Postgres Full Scan"),
         _stp("s3", "Small Files", notes="S3 Small Files (Standard)"),
@@ -38,11 +42,12 @@ def _raw_seed_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, notes="SMB Small Files WITH ACL"),
         _stp("s3", "Large Files", acl=True, notes="S3 Large Files WITH ACL"),
         _stp("smb", "Large Files", acl=True, notes="SMB Large Files WITH ACL"),
-        _stp("file-system", "CSV Files", notes="CSV Small Files WITHOUT ACL"),
-        _stp("file-system", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
-        _stp("file-system", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
-        _stp("file-system", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
-        _stp("action", None, notes="ENABLE OLS FEATURE FLAGS"),
+        _stp("s3", "CSV Files", notes="CSV Small Files WITHOUT ACL"),
+        _stp("s3", "CSV Files", sff=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY"),
+        _stp("s3", "CSV Files", acl=True, notes="CSV Small Files WITH ACL"),
+        _stp("s3", "CSV Files", acl=True, sff=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY"),
+        # Step 17 — ENABLE OLS (only here, before OLS-tagged scans; not in pre-flight block at steps 1–2)
+        _stp("action", None, notes="ENABLE OLS FEATURE FLAGS", enabled=False),
         _stp("s3", "Small Files", ols=True, notes="S3 Small Files WITH OLS"),
         _stp("smb", "Small Files", ols=True, notes="SMB Small Files WITH OLS"),
         _stp("s3", "Large Files", ols=True, notes="S3 Large Files WITH OLS"),
@@ -51,10 +56,10 @@ def _raw_seed_steps() -> List[Dict[str, Any]]:
         _stp("smb", "Small Files", acl=True, ols=True, notes="SMB Small Files WITH ACL AND OLS"),
         _stp("s3", "Large Files", acl=True, ols=True, notes="S3 Large Files WITH ACL AND OLS"),
         _stp("smb", "Large Files", acl=True, ols=True, notes="SMB Large Files WITH ACL AND OLS"),
-        _stp("file-system", "CSV Files", ols=True, notes="CSV Small Files WITHOUT ACL WITH OLS"),
-        _stp("file-system", "CSV Files", sff=True, ols=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY WITH OLS"),
-        _stp("file-system", "CSV Files", acl=True, ols=True, notes="CSV Small Files WITH ACL WITH OLS"),
-        _stp("file-system", "CSV Files", acl=True, sff=True, ols=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        _stp("s3", "CSV Files", ols=True, notes="CSV Small Files WITHOUT ACL WITH OLS"),
+        _stp("s3", "CSV Files", sff=True, ols=True, notes="CSV Small Files WITHOUT ACL WITH STRUCTURED DISCOVERY WITH OLS"),
+        _stp("s3", "CSV Files", acl=True, ols=True, notes="CSV Small Files WITH ACL WITH OLS"),
+        _stp("s3", "CSV Files", acl=True, sff=True, ols=True, notes="CSV Small Files WITH ACL WITH STRUCTURED DISCOVERY WITH OLS"),
         _stp("onedrive-v2", "Small Files", notes="OneDrive Small Files (Standard)"),
         _stp("sharepoint-online-v2", "Small Files", notes="SharePoint Online Small Files (Standard)"),
         _stp("onedrive-v2", "Small Files", acl=True, notes="OneDrive Small Files WITH ACL"),
@@ -77,7 +82,7 @@ def _standard_workflow_ds_name(ds_kind: str, file_set_type: Optional[str], is_ac
         return "MSSQL"
     if k == "mysql":
         return "MySQL"
-    if k == "file-system" and fs == "CSV Files":
+    if fs == "CSV Files":
         nm = "CSV Files"
         nm += " WITH ACL" if bool(is_acl) else " WITHOUT ACL"
         if bool(is_structured_ff):

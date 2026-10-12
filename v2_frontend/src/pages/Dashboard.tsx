@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { Loader2, TrendingUp, Layers, ChevronRight, ChevronDown } from 'lucide-react';
+import PageHeader from '../components/PageHeader';
 import {
   LineChart,
   Line,
@@ -32,6 +33,7 @@ export interface TrendRow {
   data_source_type: string | null;
   file_set_type: string | null;
   is_feature_flags: boolean;
+  is_acl?: boolean;
   data_segment: 'structured' | 'unstructured';
   total_scan_hours: number | null;
   throughput_cluster_gb_hr: number | null;
@@ -52,44 +54,66 @@ function majorVersion(v: string): string {
   return String(v || 'unknown').split('.')[0].trim();
 }
 
-/** Pick the row with higher throughput; fall back to lower scan hours. */
-function betterRow(a: TrendRow, b: TrendRow): TrendRow {
-  const ga = a.throughput_cluster_gb_hr;
-  const gb = b.throughput_cluster_gb_hr;
-  if (ga != null && gb != null) return ga >= gb ? a : b;
-  if (ga != null) return a;
-  if (gb != null) return b;
-  const ta = a.total_scan_hours;
-  const tb = b.total_scan_hours;
-  if (ta != null && tb != null) return ta <= tb ? a : b;
-  if (ta != null) return a;
-  if (tb != null) return b;
-  return a;
+/** Structured Discovery (FF) is a real scenario — EXCEPT for CSV, which is always FF in
+ *  BigID (inherent, not a distinct scenario), so CSV never counts as Structured Discovery. */
+function isStructuredDiscovery(r: TrendRow): boolean {
+  return !!r.is_feature_flags && !(r.file_set_type || '').toLowerCase().includes('csv');
 }
 
-/** One best row per major build version (e.g. "253" covers "253.5" and "253.11").
- *  Best = highest throughput_cluster_gb_hr; fallback = lowest total_scan_hours. */
-function pickBestPerBuild(rows: TrendRow[]): TrendRow[] {
-  const m = new Map<string, TrendRow>();
+/** Scenario signature within a (data source + file set): ACL, OLS, Structured Discovery. */
+function scenarioLabel(r: TrendRow): string {
+  const ols = (r.scan_type || '').toLowerCase().includes('ols');
+  const parts: string[] = [];
+  if (r.is_acl) parts.push('ACL');
+  if (ols) parts.push('OLS');
+  if (isStructuredDiscovery(r)) parts.push('Struct');
+  return parts.length ? parts.join('+') : 'Full';
+}
+
+type AvgRow = TrendRow & { __combo: string };
+
+/** Distinct line colors for multi-scenario comparison mode. */
+const SERIES_COLORS = ['#7c3aed', '#2563eb', '#059669', '#db2777', '#d97706', '#0891b2', '#9333ea', '#dc2626'];
+const MAX_SERIES = SERIES_COLORS.length;
+
+/** One AVERAGED row per (major build × full scenario). A major build (e.g. "254") covers all
+ *  its minor builds; metrics are the mean across ALL runs in that major build FOR THAT
+ *  SCENARIO. The scenario (`__combo`) is the full file-set + ACL/OLS/Struct signature, so
+ *  different data sources / sizes / modes are never blended into one mean — each becomes its
+ *  own line in comparison mode. build_version stays the clean major (e.g. "254"). */
+function averageByMajorBuild(rows: TrendRow[]): AvgRow[] {
+  const groups = new Map<string, { major: string; combo: string; rs: TrendRow[] }>();
   for (const r of rows) {
-    const k = majorVersion(String(r.build_version || 'unknown'));
-    const cur = m.get(k);
-    if (!cur) m.set(k, r);
-    else m.set(k, betterRow(cur, r));
+    const major = majorVersion(String(r.build_version || 'unknown'));
+    const combo = `${r.file_set_type || '—'} · ${scenarioLabel(r)}`;
+    const k = `${major}||${combo}`;
+    const g = groups.get(k);
+    if (g) g.rs.push(r);
+    else groups.set(k, { major, combo, rs: [r] });
   }
-  return Array.from(m.entries())
-    .map(([major, r]) => ({ ...r, build_version: major }))
+  const mean = (rs: TrendRow[], key: keyof TrendRow): number | null => {
+    const vals = rs.map((r) => r[key] as number | null).filter((v): v is number => v != null && Number.isFinite(v));
+    if (!vals.length) return null;
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  };
+  return [...groups.values()]
+    .map(({ major, combo, rs }) => ({
+      ...rs[0],
+      build_version: major,
+      __combo: combo,
+      throughput_cluster_gb_hr: mean(rs, 'throughput_cluster_gb_hr'),
+      throughput_scanner_gb_hr: mean(rs, 'throughput_scanner_gb_hr'),
+      throughput_thread_gb_hr: mean(rs, 'throughput_thread_gb_hr'),
+      throughput_cluster_files_hr: mean(rs, 'throughput_cluster_files_hr'),
+      throughput_scanner_files_hr: mean(rs, 'throughput_scanner_files_hr'),
+      throughput_thread_files_hr: mean(rs, 'throughput_thread_files_hr'),
+      total_scan_hours: mean(rs, 'total_scan_hours'),
+      total_catalog_items: mean(rs, 'total_catalog_items'),
+    }))
     .sort((a, b) =>
-      String(a.build_version).localeCompare(String(b.build_version), undefined, { numeric: true, sensitivity: 'base' })
+      String(a.build_version).localeCompare(String(b.build_version), undefined, { numeric: true, sensitivity: 'base' }) ||
+      a.__combo.localeCompare(b.__combo)
     );
-}
-
-/** After ascending sort by build label, keep only the newest N points (slice from end). */
-function takeLastBuilds(plot: TrendRow[], lastN: number | 'all'): TrendRow[] {
-  if (!plot.length) return plot;
-  if (lastN === 'all') return plot;
-  if (typeof lastN !== 'number' || lastN < 1) return plot;
-  return plot.length <= lastN ? plot : plot.slice(-lastN);
 }
 
 function toChartPoints(rows: TrendRow[]) {
@@ -122,46 +146,137 @@ const TrendSection: React.FC<{
   segment: 'structured' | 'unstructured';
   lastBuildWindow: number | 'all';
 }> = ({ title, subtitle, rows, loading, segment, lastBuildWindow }) => {
-  const [sectionDs, setSectionDs] = useState('');
-  const [sectionScan, setSectionScan] = useState('');
+  const [sectionDs, setSectionDs] = useState<string[]>([]);
+  const [sectionFileSize, setSectionFileSize] = useState<string[]>([]);
+  const [sectionScan, setSectionScan] = useState<string[]>([]);
+  const [sectionAcl, setSectionAcl] = useState<boolean>(false);  // ACL is a scenario, not "all"; default Off
+  const [sectionStruct, setSectionStruct] = useState<boolean>(false);  // Structured Discovery; default Off
   const [showSummary, setShowSummary] = useState(false);
 
   const sectionDsOptions = useMemo(() => {
     const values = [...new Set(rows.map((r) => r.data_source_type).filter(Boolean))] as string[];
-    return ['', ...values.sort()];
+    return values.sort();
   }, [rows]);
-  const sectionScanOptions = useMemo(() => {
+
+  const defaultDs = useMemo(
+    () => sectionDsOptions.find((ds) => ds.trim().toUpperCase() === 'S3') || sectionDsOptions[0] || '',
+    [sectionDsOptions]
+  );
+
+  const sectionFileSizeOptions = useMemo(() => {
+    const activeDs = sectionDs.length > 0 ? sectionDs : [defaultDs];
     const values = [
       ...new Set(
         rows
-          .filter((r) => !sectionDs || r.data_source_type === sectionDs)
+          .filter((r) => activeDs.length === 0 || activeDs.includes(r.data_source_type || ''))
+          .map((r) => r.file_set_type)
+          .filter(Boolean)
+      ),
+    ] as string[];
+    return values.sort();
+  }, [rows, sectionDs, defaultDs]);
+
+  const defaultFileSize = useMemo(
+    () => sectionFileSizeOptions.find((fs) => fs.toLowerCase().includes('small')) || sectionFileSizeOptions[0] || '',
+    [sectionFileSizeOptions]
+  );
+
+  const sectionScanOptions = useMemo(() => {
+    const activeDs = sectionDs.length > 0 ? sectionDs : [defaultDs];
+    const activeFs = sectionFileSize.length > 0 ? sectionFileSize : [defaultFileSize];
+    const values = [
+      ...new Set(
+        rows
+          .filter((r) =>
+            (activeDs.length === 0 || activeDs.includes(r.data_source_type || '')) &&
+            (activeFs.length === 0 || activeFs.includes(r.file_set_type || ''))
+          )
           .map((r) => r.scan_type)
           .filter(Boolean)
       ),
     ] as string[];
-    return ['', ...values.sort()];
-  }, [rows, sectionDs]);
+    return values.sort();
+  }, [rows, sectionDs, sectionFileSize, defaultDs, defaultFileSize]);
+
+  const defaultScan = useMemo(() =>
+    sectionScanOptions.find((st) => st.toLowerCase() === 'full scan') || sectionScanOptions[0] || '',
+    [sectionScanOptions]
+  );
+
   const sectionRows = useMemo(() => {
     let out = rows;
-    if (sectionDs) out = out.filter((r) => r.data_source_type === sectionDs);
-    if (sectionScan) out = out.filter((r) => r.scan_type === sectionScan);
+
+    // Apply Data Source filter (multi-select)
+    const activeDs = sectionDs.length > 0 ? sectionDs : [defaultDs];
+    if (activeDs.length > 0) {
+      out = out.filter((r) => activeDs.includes(r.data_source_type || ''));
+    }
+
+    // Apply File Size filter (multi-select)
+    const activeFs = sectionFileSize.length > 0 ? sectionFileSize : [defaultFileSize];
+    if (activeFs.length > 0) {
+      out = out.filter((r) => activeFs.includes(r.file_set_type || ''));
+    }
+
+    // Apply Scan Type filter (multi-select)
+    const activeScan = sectionScan.length > 0 ? sectionScan : [defaultScan];
+    if (activeScan.length > 0) {
+      out = out.filter((r) => activeScan.includes(r.scan_type || ''));
+    }
+
+    // Apply ACL + Structured Discovery filters (each a scenario dimension; CSV is never
+    // treated as Structured Discovery — its FF flag is inherent).
+    out = out.filter((r) => (r.is_acl ?? false) === sectionAcl);
+    out = out.filter((r) => isStructuredDiscovery(r) === sectionStruct);
+
     return out;
-  }, [rows, sectionDs, sectionScan]);
+  }, [rows, sectionDs, sectionFileSize, sectionScan, sectionAcl, sectionStruct, defaultDs, defaultFileSize, defaultScan]);
+
+  // Auto-select defaults when options load
+  useEffect(() => {
+    if (sectionDs.length === 0 && defaultDs) {
+      setSectionDs([defaultDs]);
+    }
+  }, [defaultDs, sectionDs]);
 
   useEffect(() => {
-    if (sectionDs && !sectionDsOptions.includes(sectionDs)) {
-      setSectionDs('');
+    if (sectionFileSize.length === 0 && defaultFileSize) {
+      setSectionFileSize([defaultFileSize]);
     }
-  }, [sectionDs, sectionDsOptions]);
-  useEffect(() => {
-    if (sectionScan && !sectionScanOptions.includes(sectionScan)) {
-      setSectionScan('');
-    }
-  }, [sectionScan, sectionScanOptions]);
+  }, [defaultFileSize, sectionFileSize]);
 
-  const plot = useMemo(() => pickBestPerBuild(sectionRows), [sectionRows]);
-  const displayPlot = useMemo(() => takeLastBuilds(plot, lastBuildWindow), [plot, lastBuildWindow]);
+  useEffect(() => {
+    if (sectionScan.length === 0 && defaultScan) {
+      setSectionScan([defaultScan]);
+    }
+  }, [defaultScan, sectionScan]);
+
+  const plot = useMemo(() => averageByMajorBuild(sectionRows), [sectionRows]);
+  // Window by distinct MAJOR build (not by row count — there can be many scenario rows per build).
+  const majorsSorted = useMemo(
+    () => [...new Set(plot.map((r) => r.build_version))].sort((a, b) => String(a).localeCompare(String(b), undefined, { numeric: true })),
+    [plot]
+  );
+  const windowMajors = useMemo(
+    () => (typeof lastBuildWindow === 'number' && lastBuildWindow > 0 ? majorsSorted.slice(-lastBuildWindow) : majorsSorted),
+    [majorsSorted, lastBuildWindow]
+  );
+  const windowSet = useMemo(() => new Set(windowMajors), [windowMajors]);
+  const displayPlot = useMemo(() => plot.filter((r) => windowSet.has(r.build_version)), [plot, windowSet]);
+  const combos = useMemo(() => [...new Set(displayPlot.map((r) => r.__combo))].sort(), [displayPlot]);
+  const shownCombos = useMemo(() => combos.slice(0, MAX_SERIES), [combos]);
+  const multi = combos.length > 1;
+  // Single-scenario: keep the detailed cluster/scanner/thread view.
   const chart = useMemo(() => toChartPoints(displayPlot), [displayPlot]);
+  // Multi-scenario comparison: one line per scenario, on the headline (cluster) metric.
+  const buildSeries = (key: 'throughput_cluster_gb_hr' | 'throughput_cluster_files_hr') =>
+    windowMajors.map((b) => {
+      const o: Record<string, number | string | null> = { build: b };
+      for (const r of displayPlot) if (r.build_version === b && shownCombos.includes(r.__combo)) o[r.__combo] = r[key] ?? null;
+      return o;
+    });
+  const comboGb = useMemo(() => buildSeries('throughput_cluster_gb_hr'), [windowMajors, displayPlot, shownCombos]);
+  const comboFiles = useMemo(() => buildSeries('throughput_cluster_files_hr'), [windowMajors, displayPlot, shownCombos]);
 
   const SUMMARY_PAGE_SIZE = 25;
   const [summaryPage, setSummaryPage] = useState(0);
@@ -199,7 +314,7 @@ const TrendSection: React.FC<{
   }
 
   const windowHint =
-    lastBuildWindow === 'all' ? `all ${plot.length}` : `${displayPlot.length} newest of ${plot.length}`;
+    lastBuildWindow === 'all' ? `all ${majorsSorted.length}` : `${windowMajors.length} newest of ${majorsSorted.length}`;
 
   return (
     <section className="trend-section glass-panel" style={{ padding: '1.25rem' }}>
@@ -211,7 +326,7 @@ const TrendSection: React.FC<{
         </div>
       </div>
       <p className="trend-caption">
-        Builds plotted: <strong>{windowHint}</strong> (one point per major build — best run = highest cluster GB/hr, else shortest duration)
+        Builds plotted: <strong>{windowHint}</strong> (one point per major build version — averaged across all runs in that build)
       </p>
 
       <div
@@ -223,41 +338,142 @@ const TrendSection: React.FC<{
           margin: '0.75rem 0 1rem',
         }}
       >
-        <div className="input-group" style={{ margin: 0, minWidth: 180 }}>
-          <label htmlFor={`${segment}-trend-ds`}>{title} data source</label>
+        <div className="input-group" style={{ margin: 0, minWidth: 160 }}>
+          <label htmlFor={`${segment}-trend-ds`}>Data Source (multi-select)</label>
           <select
             id={`${segment}-trend-ds`}
+            multiple
             value={sectionDs}
             onChange={(e) => {
-              setSectionDs(e.target.value);
-              setSectionScan('');
+              const selected = Array.from(e.target.selectedOptions, (opt) => opt.value);
+              setSectionDs(selected);
+              // File sets are data-source-prefixed (e.g. "S3 Small Files"), so a selection
+              // carried over from another source would match no rows. Reset dependent
+              // filters to their defaults for the newly chosen source.
+              setSectionFileSize([]);
+              setSectionScan([]);
             }}
-            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
+            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%', minHeight: '80px' }}
           >
             {sectionDsOptions.map((ds) => (
-              <option key={`${segment}-ds-${ds || 'all'}`} value={ds}>
-                {ds === '' ? `All ${title.toLowerCase()} sources` : ds}
+              <option key={`${segment}-ds-${ds}`} value={ds}>
+                {ds}
               </option>
             ))}
           </select>
         </div>
-        <div className="input-group" style={{ margin: 0, minWidth: 180 }}>
-          <label htmlFor={`${segment}-trend-scan`}>{title} scan type</label>
+        <div className="input-group" style={{ margin: 0, minWidth: 160 }}>
+          <label htmlFor={`${segment}-trend-fs`}>File Size (multi-select)</label>
           <select
-            id={`${segment}-trend-scan`}
-            value={sectionScan}
-            onChange={(e) => setSectionScan(e.target.value)}
-            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
+            id={`${segment}-trend-fs`}
+            multiple
+            value={sectionFileSize}
+            onChange={(e) => {
+              const selected = Array.from(e.target.selectedOptions, (opt) => opt.value);
+              setSectionFileSize(selected);
+              setSectionScan([]);  // reset scan-type selection to valid defaults for this file set
+            }}
+            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%', minHeight: '80px' }}
           >
-            {sectionScanOptions.map((st) => (
-              <option key={`${segment}-scan-${st || 'all'}`} value={st}>
-                {st === '' ? 'All scan types' : st}
+            {sectionFileSizeOptions.map((fs) => (
+              <option key={`${segment}-fs-${fs}`} value={fs}>
+                {fs}
               </option>
             ))}
+          </select>
+        </div>
+        <div className="input-group" style={{ margin: 0, minWidth: 160 }}>
+          <label htmlFor={`${segment}-trend-scan`}>Scan Type (multi-select)</label>
+          <select
+            id={`${segment}-trend-scan`}
+            multiple
+            value={sectionScan}
+            onChange={(e) => {
+              const selected = Array.from(e.target.selectedOptions, (opt) => opt.value);
+              setSectionScan(selected);
+            }}
+            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%', minHeight: '80px' }}
+          >
+            {sectionScanOptions.map((st) => (
+              <option key={`${segment}-scan-${st}`} value={st}>
+                {st}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="input-group" style={{ margin: 0, minWidth: 120 }}>
+          <label htmlFor={`${segment}-trend-acl`}>ACL</label>
+          <select
+            id={`${segment}-trend-acl`}
+            value={sectionAcl ? 'true' : 'false'}
+            onChange={(e) => setSectionAcl(e.target.value === 'true')}
+            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
+          >
+            <option value="false">Off</option>
+            <option value="true">On</option>
+          </select>
+        </div>
+        <div className="input-group" style={{ margin: 0, minWidth: 150 }}>
+          <label htmlFor={`${segment}-trend-struct`}>Structured Discovery</label>
+          <select
+            id={`${segment}-trend-struct`}
+            value={sectionStruct ? 'true' : 'false'}
+            onChange={(e) => setSectionStruct(e.target.value === 'true')}
+            style={{ padding: '0.45rem 0.65rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
+          >
+            <option value="false">Off</option>
+            <option value="true">On</option>
           </select>
         </div>
       </div>
 
+      {multi && (
+        <>
+          {combos.length > MAX_SERIES && (
+            <p style={{ color: '#b45309', fontSize: '0.85rem', margin: '0 0 8px' }}>
+              {combos.length} scenarios match — showing the first {MAX_SERIES}. Narrow Data source / File size / Scan type / ACL for a clearer comparison.
+            </p>
+          )}
+          <div className="trend-chart-grid-2">
+            <div className="trend-chart-cell">
+              <h4 className="trend-chart-heading">Cluster {segment === 'structured' ? 'Tables' : 'GB'}/hr — by scenario (avg per major build)</h4>
+              <div className="chart-container chart-trend">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={comboGb} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
+                    <XAxis dataKey="build" tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
+                    <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
+                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
+                    <Legend />
+                    {shownCombos.map((c, i) => (
+                      <Line key={c} type="monotone" dataKey={c} name={c} stroke={SERIES_COLORS[i % SERIES_COLORS.length]} strokeWidth={2} dot={{ r: 3 }} connectNulls />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+            <div className="trend-chart-cell">
+              <h4 className="trend-chart-heading">Cluster {segment === 'structured' ? 'tables' : 'files'}/hr — by scenario (avg per major build)</h4>
+              <div className="chart-container chart-trend">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={comboFiles} margin={{ top: 8, right: 8, left: 8, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="var(--surface-border)" />
+                    <XAxis dataKey="build" tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
+                    <YAxis tick={{ fontSize: 11 }} stroke="var(--text-secondary)" />
+                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
+                    <Legend />
+                    {shownCombos.map((c, i) => (
+                      <Line key={c} type="monotone" dataKey={c} name={c} stroke={SERIES_COLORS[i % SERIES_COLORS.length]} strokeWidth={2} dot={{ r: 3 }} connectNulls />
+                    ))}
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </>
+      )}
+
+      {!multi && (<>
       <div className="trend-chart-grid-3">
         <div className="trend-chart-cell">
           <h4 className="trend-chart-heading">Data Throughput Trend (GB/hr)</h4>
@@ -341,14 +557,15 @@ const TrendSection: React.FC<{
           </ResponsiveContainer>
         </div>
       </div>
+      </>)}
 
-      <div 
+      <div
         onClick={() => setShowSummary(!showSummary)}
-        style={{ 
-          display: 'flex', 
-          alignItems: 'center', 
-          gap: '0.5rem', 
-          cursor: 'pointer', 
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '0.5rem',
+          cursor: 'pointer',
           margin: '1.5rem 0 0.75rem',
           userSelect: 'none'
         }}
@@ -413,7 +630,8 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
       });
       return res.data;
     },
-    refetchInterval: 20000,
+    refetchInterval: 60000, // Refetch every 60 seconds instead of 20
+    staleTime: 30000, // Data is fresh for 30 seconds
   });
 
   const trendRows = trendPayload?.rows ?? [];
@@ -431,12 +649,7 @@ const Dashboard: React.FC<DashboardProps> = ({ token }) => {
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
       <section>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '0.5rem' }}>
-          <TrendingUp size={28} style={{ color: 'var(--primary-color)' }} />
-          <div>
-            <h2 style={{ color: 'var(--text-primary)', fontSize: '1.35rem', fontWeight: 700 }}>Small Files Trend Analysis</h2>
-          </div>
-        </div>
+        <PageHeader icon={TrendingUp} title="Small Files Trend Analysis" />
 
         {trendError && (
           <div className="glass-panel" style={{ padding: '1rem', color: 'var(--danger-color)', marginBottom: '1rem' }}>

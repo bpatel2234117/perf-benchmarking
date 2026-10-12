@@ -11,6 +11,8 @@
   },
   "dependencies": {
     "@tanstack/react-query": "5.100.4",
+    "@tanstack/react-query-persist-client": "^5.100.4",
+    "@tanstack/query-sync-storage-persister": "^5.100.4",
     "axios": "1.15.2",
     "lucide-react": "1.11.0",
     "react": "^18.2.0",

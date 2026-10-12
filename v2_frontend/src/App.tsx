@@ -18,6 +18,8 @@ import CreateDataSourcePage from './pages/CreateDataSourcePage';
 import RunComparisonPage from './pages/RunComparisonPage';
 import VersionComparisonPage from './pages/VersionComparisonPage';
 import GeneratedReportsPage from './pages/GeneratedReportsPage';
+import GenerateBenchmarkReportPage from './pages/GenerateBenchmarkReportPage';
+import AdminBenchmarkDataPage from './pages/AdminBenchmarkDataPage';
 import Navbar from './components/Navbar';
 
 const App = () => {
@@ -51,6 +53,8 @@ const App = () => {
       <Route path="/tools/run-comparison" element={token ? <RunComparisonPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/version-comparison" element={token ? <VersionComparisonPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/generated-reports" element={token ? <GeneratedReportsPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/generate-report" element={token ? <GenerateBenchmarkReportPage token={token} /> : <Navigate to="/login" />} />
+      <Route path="/tools/benchmark-data" element={token ? <AdminBenchmarkDataPage token={token} /> : <Navigate to="/login" />} />
       {/* data-record-add → AddBenchmarkFromScanPage (same functionality) */}
       <Route path="/tools/data-record-add" element={token ? <AddBenchmarkFromScanPage token={token} /> : <Navigate to="/login" />} />
       <Route path="/tools/:slug" element={token ? <LegacyToolPage /> : <Navigate to="/login" />} />

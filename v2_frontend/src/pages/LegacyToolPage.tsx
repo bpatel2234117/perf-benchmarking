@@ -52,8 +52,7 @@ const LegacyToolPage: React.FC = () => {
             {!streamlitPage ? (
               <p style={{ fontSize: '0.82rem', marginTop: '0.85rem' }}>
                 Tip: set <code style={{ fontSize: '0.85em' }}>VITE_LEGACY_DASHBOARD_URL</code> in{' '}
-                <code style={{ fontSize: '0.85em' }}>v2_frontend/.env.local</code> (run{' '}
-                <code style={{ fontSize: '0.85em' }}>python3 dashboard.py</code> or deploy URL).
+                <code style={{ fontSize: '0.85em' }}>v2_frontend/.env.local</code> to point to your running dashboard URL.
               </p>
             ) : (
               <p style={{ fontSize: '0.82rem', marginTop: '0.65rem', color: 'var(--text-secondary)' }}>

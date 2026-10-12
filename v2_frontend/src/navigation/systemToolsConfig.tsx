@@ -14,6 +14,8 @@ import {
   TerminalSquare,
   Wrench,
   BarChart2,
+  Mail,
+  Database,
 } from 'lucide-react';
 
 export type AppNavPath =
@@ -28,7 +30,9 @@ export type AppNavPath =
   | '/tools/scanner-infra'
   | '/tools/data-source-create'
   | '/tools/run-comparison'
-  | '/tools/version-comparison';
+  | '/tools/version-comparison'
+  | '/tools/generate-report'
+  | '/tools/benchmark-data';
 
 export type SystemToolEntry =
   | { kind: 'app'; path: AppNavPath; label: string; icon: LucideIcon }
@@ -43,8 +47,10 @@ export const SYSTEM_TOOLS_ENTRIES: readonly SystemToolEntry[] = [
   { kind: 'app', path: '/environments', label: 'Manage Test Environments', icon: Globe },
   { kind: 'app', path: '/tools/version-comparison', label: 'Version Comparison', icon: GitBranch },
   { kind: 'app', path: '/tools/data-source-create', label: 'Create Data Source', icon: Puzzle },
+  { kind: 'app', path: '/tools/generate-report', label: 'Generate Benchmark Report', icon: Mail },
   { kind: 'app', path: '/tools/scan-status', label: 'Scan Status', icon: Satellite },
   { kind: 'app', path: '/tools/scanner-infra', label: 'Scanner Infrastructure', icon: Monitor },
+  { kind: 'app', path: '/tools/benchmark-data', label: 'Benchmark Data', icon: Database },
   { kind: 'app', path: '/tools/manage-rbac', label: 'Manage RBAC', icon: ShieldCheck },
   { kind: 'app', path: '/logs', label: 'AI Logs', icon: TerminalSquare },
 ];

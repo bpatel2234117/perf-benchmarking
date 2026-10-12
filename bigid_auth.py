@@ -28,8 +28,30 @@ def _extract_token(payload):
     return ""
 
 
+def normalize_bigid_base_url(base_url: str) -> str:
+    """
+    Canonical base URL for storage and API calls:
+    - collapse http://http://...
+    - ensure scheme
+    - no trailing slash (never store http://host/)
+    """
+    raw = str(base_url or "").strip()
+    if not raw:
+        return ""
+    while True:
+        fixed = re.sub(r"^(https?://)(?:https?://)+", r"\1", raw, flags=re.IGNORECASE)
+        if fixed == raw:
+            break
+        raw = fixed
+    if not re.match(r"^https?://", raw, re.IGNORECASE):
+        raw = "http://" + raw.lstrip("/")
+    while raw.endswith("/"):
+        raw = raw[:-1]
+    return raw.strip()
+
+
 def _build_url(base_url, path):
-    base = str(base_url or "").strip().rstrip("/")
+    base = normalize_bigid_base_url(base_url)
     p = str(path or "").strip()
     if p.startswith("http://") or p.startswith("https://"):
         return p
@@ -137,25 +159,52 @@ def save_environment_credentials(env_name, username, password):
     os.environ[pass_key] = p
 
 
-def _resolve_credentials(env_name):
+def _resolve_credentials(env_name, env_row=None):
+    # 1) DB-stored encrypted credentials (highest priority)
+    if isinstance(env_row, dict):
+        db_user = str(env_row.get("bigid_username") or "").strip()
+        db_pass_enc = str(env_row.get("bigid_password_enc") or "").strip()
+        if db_user and db_pass_enc:
+            try:
+                from v2_api.credentials_crypto import decrypt_password
+                db_pass = decrypt_password(db_pass_enc)
+                if db_pass:
+                    return db_user, db_pass, "db_encrypted"
+            except Exception:
+                pass
+
     dotenv_map = _read_dotenv_map()
     user_key, pass_key = _env_keys_for_environment(env_name)
 
-    # 1) Env-specific creds
+    # 2) Env-specific creds from .env / os.environ
     if user_key and pass_key:
         u = os.getenv(user_key, "") or dotenv_map.get(user_key, "")
         p = os.getenv(pass_key, "") or dotenv_map.get(pass_key, "")
         if u and p:
             return u, p, f"env_specific:{_sanitize_env_name(env_name)}"
 
-    # 2) Global auth env vars
+    # 3) Global auth env vars
     u = os.getenv("BIGID_AUTH_USERNAME", os.getenv("BIGID_USERNAME", "")).strip()
     p = os.getenv("BIGID_AUTH_PASSWORD", os.getenv("BIGID_PASSWORD", "")).strip()
     if u and p:
         return u, p, "global_env"
 
-    # 3) Default credentials requested by user
+    # 4) Default credentials
     return "bigid", "bigid111", "default"
+
+
+def _get_ssl_verify_for_url(url: str) -> bool:
+    """
+    Determine SSL verification setting based on URL protocol.
+    - HTTP: always verify=True (no SSL involved)
+    - HTTPS: respect BIGID_SSL_VERIFY env var (default False for self-signed certs)
+    """
+    url_lower = str(url or "").lower().strip()
+    if url_lower.startswith("http://"):
+        return True
+    if url_lower.startswith("https://"):
+        return str(os.getenv("BIGID_SSL_VERIFY", "0")).strip().lower() in ("1", "true", "yes")
+    return False
 
 
 def Get_auth_token(base_url, _env_row=None):
@@ -164,6 +213,10 @@ def Get_auth_token(base_url, _env_row=None):
     Priority:
     1) BIGID_AUTH_TOKEN
     2) Login API with BIGID_AUTH_USERNAME/BIGID_AUTH_PASSWORD
+
+    Supports both HTTP and HTTPS:
+    - HTTP: standard requests
+    - HTTPS: respects BIGID_SSL_VERIFY env var for self-signed certificates
     """
     static_token = os.getenv("BIGID_AUTH_TOKEN", "").strip()
     if static_token:
@@ -172,7 +225,7 @@ def Get_auth_token(base_url, _env_row=None):
     env_name = ""
     if isinstance(_env_row, dict):
         env_name = str(_env_row.get("env_name") or "").strip()
-    username, password, source = _resolve_credentials(env_name)
+    username, password, source = _resolve_credentials(env_name, env_row=_env_row)
     credential_candidates = [(username, password, source)]
 
     login_path = os.getenv("BIGID_AUTH_LOGIN_PATH", "/api/v1/sessions").strip() or "/api/v1/sessions"
@@ -188,6 +241,7 @@ def Get_auth_token(base_url, _env_row=None):
     errors = []
     for path in login_paths:
         url = _build_url(base_url, path)
+        ssl_verify = _get_ssl_verify_for_url(url)
         for username, password, source in credential_candidates:
             payloads = [
                 ("json", {"username": username, "password": password}),
@@ -198,9 +252,9 @@ def Get_auth_token(base_url, _env_row=None):
             for mode, body in payloads:
                 try:
                     if mode == "json":
-                        resp = requests.post(url, json=body, timeout=30)
+                        resp = requests.post(url, json=body, timeout=30, verify=ssl_verify)
                     else:
-                        resp = requests.post(url, data=body, timeout=30)
+                        resp = requests.post(url, data=body, timeout=30, verify=ssl_verify)
 
                     if resp.status_code >= 400:
                         errors.append(f"{url} [{resp.status_code}] ({source})")

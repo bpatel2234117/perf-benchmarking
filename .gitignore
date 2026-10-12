@@ -1,41 +1,11 @@
-.DS_Store
-
-# secrets / editor swap
 .env
-.env.*
-*.swp
-*.swo
-
-# python
+data/environment_licenses/*.json
+data/environment_licenses/install_token
+!data/environment_licenses/.gitkeep
+node_modules/
 __pycache__/
 *.pyc
-*.prof
-
-# logs
-logs/
-
-# local db/artifacts
-benchmark.db
-benchmark_charts/
-*.zip
-uploaded_media_*.png
-uploaded_media_*.webp
-
-# local runner pidfiles
-*.pid
-.tracker*.pid
-.workflow_runner.pid
-
-# scanner ai outputs
-scanner_ai_*/
-scanner_forensic_output/
-scanner_logs_*/
-
-# frontend
-node_modules/
-dist/
-build/
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+.env
+data/
+venv/
+.venv/

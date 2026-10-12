@@ -194,6 +194,60 @@ def duration_hours_between(started_at: Any, completed_at: Any) -> Optional[float
     return seconds / 3600.0
 
 
+def format_running_time_hms(total_seconds: float) -> str:
+    """Wall-clock duration as HH:MM:SS (matches BigID / scan list running time style)."""
+    try:
+        s = max(0, int(round(float(total_seconds))))
+    except Exception:
+        return "—"
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    return f"{h:02d}:{m:02d}:{sec:02d}"
+
+
+def format_running_time_label(total_seconds: float) -> str:
+    try:
+        s = max(0, int(round(float(total_seconds))))
+    except Exception:
+        return "—"
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    parts: list[str] = []
+    if h:
+        parts.append(f"{h}h")
+    if m or (h and not sec):
+        parts.append(f"{m}m")
+    if sec or not parts:
+        parts.append(f"{sec}s")
+    return " ".join(parts)
+
+
+def running_time_from_interval(started_at: Any, completed_at: Any) -> Optional[Dict[str, Any]]:
+    """Actual scan running time from parent start → completion timestamps."""
+    start_dt = parse_iso_datetime(started_at)
+    end_dt = parse_iso_datetime(completed_at)
+    if not start_dt or not end_dt:
+        return None
+    if start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+    seconds = (end_dt - start_dt).total_seconds()
+    if seconds <= 0:
+        return None
+    hours = seconds / 3600.0
+    return {
+        "duration_seconds": int(round(seconds)),
+        "duration_hours": hours,
+        "running_time_hms": format_running_time_hms(seconds),
+        "running_time_label": format_running_time_label(seconds),
+        "started_at": start_dt.isoformat(),
+        "completed_at": end_dt.isoformat(),
+    }
+
+
 def compute_throughputs(
     *,
     total_gb: float,

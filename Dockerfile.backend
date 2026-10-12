@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY v2_api/requirements.txt ./v2_api_requirements.txt
 
 # Install dependencies, adding pandas and requests since tracker/api import them
-RUN pip install --no-cache-dir -r v2_api_requirements.txt pandas requests openpyxl
+RUN pip install --no-cache-dir -r v2_api_requirements.txt requests openpyxl
 
 # Copy application files
 COPY . .

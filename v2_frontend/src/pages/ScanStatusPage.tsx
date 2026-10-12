@@ -6,6 +6,7 @@ import { ArrowDown, ArrowUp, ArrowUpDown, Loader2, Satellite } from 'lucide-reac
 import { API_BASE } from '../apiConfig';
 import { ScanProgressDetail } from './ScanProgressPage';
 import PaginationBar from '../components/Pagination';
+import PageHeader from '../components/PageHeader';
 
 /** Matches `/api/scan/unified` sort_by keys (`_SCAN_UNIFIED_SORT_SQL` in v2_api/main.py). */
 export type UnifiedSort =
@@ -86,10 +87,63 @@ function fmtCell(v: string | null | undefined): string {
   return t || '—';
 }
 
+/** Strip a leading build prefix (e.g. "246-2 ", "247-12 ") from a scan name for display only.
+ *  Mirrors the backend _strip_leading_build_prefix regex. The stored scan_name and all
+ *  benchmark/chart data are untouched — this only changes the label in the picker. */
+function stripBuildPrefix(v: string | null | undefined): string {
+  const t = String(v ?? '').trim();
+  const m = t.match(/^2\d{2}[-.]\d{1,3}\s+(.+)$/);
+  return m ? m[1].trim() : t;
+}
+
+/** Same set as TERMINAL_STATES in v2_api/scan_bigid_sync.py, compacted (lowercase, no spaces). */
+const TERMINAL_STATUS_KEYS = new Set(
+  ['Failed', 'CompletedWithFailures', 'Completed', 'Stopped', 'Aborted', 'Cancelled', 'Canceled'].map((s) =>
+    s.toLowerCase()
+  )
+);
+
+function compactStatus(v: string | null | undefined): string {
+  return String(v ?? '').trim().toLowerCase().replace(/ /g, '');
+}
+
 function fmtNumCell(v: string | number | null | undefined): string {
   if (v == null || v === '') return '—';
   if (typeof v === 'number' && Number.isNaN(v)) return '—';
   return String(v);
+}
+
+function scanStatusBadge(status: string | null | undefined): React.ReactElement {
+  const s = (status ?? '').trim();
+  if (!s) return <span style={{ color: 'var(--text-secondary)' }}>—</span>;
+  const low = s.toLowerCase();
+  let bg = 'var(--surface-hover)';
+  let color = 'var(--text-secondary)';
+  if (['inprogress', 'running', 'scan_running', 'active'].includes(low)) {
+    bg = '#dcfce7'; color = '#166534';
+  } else if (['completed', 'done', 'success'].includes(low)) {
+    bg = '#dbeafe'; color = '#1e3a8a';
+  } else if (['failed', 'error'].includes(low)) {
+    bg = '#fee2e2'; color = '#991b1b';
+  } else if (['stopped', 'stoprequested', 'stop_requested', 'cancelled', 'canceled'].includes(low)) {
+    bg = '#ffedd5'; color = '#9a3412';
+  } else if (['pending', 'queued'].includes(low)) {
+    bg = '#f3f4f6'; color = '#374151';
+  }
+  return (
+    <span style={{
+      display: 'inline-block',
+      padding: '2px 8px',
+      borderRadius: 999,
+      fontSize: '0.75rem',
+      fontWeight: 600,
+      background: bg,
+      color,
+      whiteSpace: 'nowrap',
+    }}>
+      {s}
+    </span>
+  );
 }
 
 type UnifiedSortCol =
@@ -182,6 +236,20 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
     },
   });
 
+  const markStoppedMutation = useMutation({
+    mutationFn: async (scanId: string) => {
+      const res = await axios.post<{ ok: boolean; changed?: boolean }>(
+        `${API_BASE}/api/scan/mark-stopped`,
+        { scan_id: scanId },
+        authConfig
+      );
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['scanUnified'] });
+    },
+  });
+
   const resyncParentsMutation = useMutation({
     mutationFn: async (environmentId: number) => {
       const res = await axios.post<{ ok: boolean; upserted?: number }>(
@@ -227,7 +295,6 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
       const res = await axios.get(`${API_BASE}/api/scan/unified`, { ...authConfig, params });
       return res.data as ScanUnifiedResponse;
     },
-    refetchInterval: 15000,
   });
 
   const items = unifiedData?.items ?? [];
@@ -273,10 +340,12 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
     boxShadow: '4px 0 8px -2px rgba(0,0,0,0.15)',
   };
 
-  function renderScanActions(scanId: string) {
+  function renderScanActions(scanId: string, scanStatus: string | null) {
     const benchPath = `/tools/add-benchmark?scan_id=${encodeURIComponent(scanId)}`;
     const progressDetailPath = `/tools/scan-status?scan_id=${encodeURIComponent(scanId)}`;
     const busy = syncMutation.isPending && syncMutation.variables === scanId;
+    const stopBusy = markStoppedMutation.isPending && markStoppedMutation.variables === scanId;
+    const canMarkStopped = !TERMINAL_STATUS_KEYS.has(compactStatus(scanStatus));
     return (
       <td style={actionCellStyle}>
         <div style={{ display: 'flex', flexDirection: 'row', flexWrap: 'wrap', gap: '10px', alignItems: 'center' }}>
@@ -305,6 +374,27 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
           >
             {busy ? '…' : 'Sync'}
           </button>
+          {canMarkStopped && (
+            <button
+              type="button"
+              disabled={stopBusy}
+              title="Mark this scan as stopped. The tracker stops polling it; it does not stop the scan in BigID."
+              onClick={() => markStoppedMutation.mutate(scanId)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#9a3412',
+                cursor: stopBusy ? 'wait' : 'pointer',
+                fontFamily: 'inherit',
+                fontWeight: 600,
+                fontSize: '0.76rem',
+                padding: 0,
+                textDecoration: 'underline',
+              }}
+            >
+              {stopBusy ? '…' : 'Mark stopped'}
+            </button>
+          )}
         </div>
       </td>
     );
@@ -317,23 +407,7 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
       <section>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.65rem' }}>
-          <Satellite size={26} style={{ color: 'var(--primary-color)' }} aria-hidden />
-          <div>
-            <h2 style={{ color: 'var(--text-primary)', fontSize: '1.35rem', fontWeight: 700, margin: 0 }}>Scan Status</h2>
-            <p style={{ color: 'var(--text-secondary)', margin: '0.35rem 0 0', fontSize: '0.9rem' }}>
-              One table: <strong style={{ fontWeight: 600, color: 'var(--text-primary)' }}>scan_parents</strong> with the{' '}
-              <strong style={{ fontWeight: 600, color: 'var(--text-primary)' }}>latest scan_progress</strong> snapshot per scan (when the tracker has written rows).{' '}
-              <strong style={{ fontWeight: 600 }}>Actions</strong> (left-to-right:{' '}
-              <strong>Open</strong> → New UI Add benchmark from scan (<code style={{ fontSize: '0.85em' }}>/tools/add-benchmark</code>, Postgres via API);{' '}
-              <strong>View</strong> → scan progress detail here; <strong>Sync</strong> → insights into{' '}
-              <code style={{ fontSize: '0.85em' }}>scan_insights</code>. Actions are in the{' '}
-              <strong style={{ fontWeight: 600 }}>first column</strong> so they stay visible when you scroll sideways.{' '}
-              <strong style={{ fontWeight: 600 }}>Click column headers</strong> to sort ({PAGE_SIZE} rows per page). Default:{' '}
-              <em>latest parent activity</em>.
-            </p>
-          </div>
-        </div>
+        <PageHeader icon={Satellite} title="Scan Status" />
 
         <div
           className="glass-panel"
@@ -401,6 +475,27 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
               {resyncParentsMutation.isPending ? 'Re-syncing…' : 'Re-sync list (BigID API)'}
             </button>
           </div>
+          <div className="input-group" style={{ margin: 0, minWidth: 120 }}>
+            <label htmlFor="scan-status-refresh">Reload list</label>
+            <button
+              id="scan-status-refresh"
+              type="button"
+              disabled={unifiedLoading}
+              onClick={() => queryClient.invalidateQueries({ queryKey: ['scanUnified'] })}
+              style={{
+                padding: '0.5rem 0.85rem',
+                borderRadius: 6,
+                border: '1px solid var(--surface-border)',
+                background: 'var(--surface-ground)',
+                fontFamily: 'inherit',
+                fontWeight: 600,
+                cursor: unifiedLoading ? 'wait' : 'pointer',
+              }}
+              title="Fetch the latest rows from Postgres. The list does not refresh on a timer."
+            >
+              Refresh
+            </button>
+          </div>
         </div>
 
         {unifiedError && (
@@ -424,9 +519,9 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
                 List re-sync failed:{' '}
                 {axios.isAxiosError(resyncParentsMutation.error)
                   ? String(
-                      (resyncParentsMutation.error.response?.data as { detail?: string } | undefined)?.detail ??
-                        resyncParentsMutation.error.message
-                    )
+                    (resyncParentsMutation.error.response?.data as { detail?: string } | undefined)?.detail ??
+                    resyncParentsMutation.error.message
+                  )
                   : String(resyncParentsMutation.error)}
               </div>
             )}
@@ -440,7 +535,7 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
             </div>
           ) : (
             <>
-              <div style={{ overflowX: 'auto' }}>
+              <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 'calc(100vh - 260px)' }}>
                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.8rem' }}>
                   <thead>
                     <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
@@ -497,12 +592,6 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
                           <SortGlyph dir={unifiedSortArrow(sortUnified, 'template')} />
                         </button>
                       </th>
-                      <th style={{ padding: '9px 10px', textAlign: 'left' }}>
-                        <button type="button" style={thBtn} onClick={() => setSortUnified((s) => toggleUnifiedSort(s, 'state'))}>
-                          Tracker state
-                          <SortGlyph dir={unifiedSortArrow(sortUnified, 'state')} />
-                        </button>
-                      </th>
                       <th style={{ padding: '9px 10px', textAlign: 'right' }}>
                         <button
                           type="button"
@@ -511,16 +600,6 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
                         >
                           Objects
                           <SortGlyph dir={unifiedSortArrow(sortUnified, 'objects')} />
-                        </button>
-                      </th>
-                      <th style={{ padding: '9px 10px', textAlign: 'right' }}>
-                        <button
-                          type="button"
-                          style={{ ...thBtn, justifyContent: 'flex-end' }}
-                          onClick={() => setSortUnified((s) => toggleUnifiedSort(s, 'subscans'))}
-                        >
-                          Sub-scans
-                          <SortGlyph dir={unifiedSortArrow(sortUnified, 'subscans')} />
                         </button>
                       </th>
                       <th style={{ padding: '9px 10px', textAlign: 'right' }}>
@@ -554,24 +633,18 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
                   <tbody>
                     {items.map((row) => (
                       <tr key={row.scan_id} style={{ borderBottom: '1px solid var(--surface-border)' }}>
-                        {renderScanActions(row.scan_id)}
+                        {renderScanActions(row.scan_id, row.scan_status)}
                         <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{fmtCell(row.environment_name)}</td>
                         <td style={{ padding: '8px 10px', fontFamily: 'ui-monospace, monospace', fontSize: '0.76rem' }}>
                           {fmtCell(row.scan_id)}
                         </td>
-                        <td style={{ padding: '8px 10px', maxWidth: 220 }}>{fmtCell(row.scan_name)}</td>
+                        <td style={{ padding: '8px 10px', maxWidth: 220 }} title={fmtCell(row.scan_name)}>{fmtCell(stripBuildPrefix(row.scan_name))}</td>
                         <td style={{ padding: '8px 10px' }}>{fmtCell(row.scan_type)}</td>
-                        <td style={{ padding: '8px 10px' }}>{fmtCell(row.scan_status)}</td>
+                        <td style={{ padding: '8px 10px' }}>{scanStatusBadge(row.scan_status)}</td>
                         <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{fmtCell(row.started_at)}</td>
                         <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{fmtCell(row.completed_at)}</td>
                         <td style={{ padding: '8px 10px' }}>{fmtCell(row.template_name)}</td>
-                        <td style={{ padding: '8px 10px' }}>{fmtNumCell(row.scan_state)}</td>
                         <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmtNumCell(row.objects_scanned)}</td>
-                        <td style={{ padding: '8px 10px', textAlign: 'right', whiteSpace: 'nowrap' }}>
-                          {row.completed_sub_scans != null && row.total_sub_scans != null
-                            ? `${row.completed_sub_scans} / ${row.total_sub_scans}`
-                            : fmtNumCell(row.total_sub_scans)}
-                        </td>
                         <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmtNumCell(row.total_parts_scanned)}</td>
                         <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmtNumCell(row.total_classifications)}</td>
                         <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>{fmtNumCell(row.last_snapshot_at)}</td>
@@ -579,7 +652,7 @@ const ScanStatusPage: React.FC<ScanStatusPageProps> = ({ token }) => {
                     ))}
                     {items.length === 0 && (
                       <tr>
-                        <td colSpan={15} style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
+                        <td colSpan={12} style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)', lineHeight: 1.6 }}>
                           No rows match this filter, or <code>scan_parents</code> is empty / not synced yet. Tracker snapshots appear under{' '}
                           <strong style={{ fontWeight: 600 }}>Tracker state</strong> when <code style={{ fontSize: '0.85em' }}>scan_progress</code>{' '}
                           has data.

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
 import { 
     Shield, Users, Lock, Plus, Save, Loader2, 
-    CheckCircle2, AlertCircle, Trash2, Edit2, X
+    CheckCircle2, AlertCircle, Edit2, X
 } from 'lucide-react';
 import { API_BASE } from '../apiConfig';
 
@@ -22,9 +22,13 @@ interface Role {
     role_name: string;
 }
 
-const ALL_PAGES = [
-    "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Trend Analysis",
-    "Edit Records", "Manage Classifiers",
+// Canonical list is served by GET /api/rbac/all-pages (db_config_pg.RBAC_ALL_PAGES).
+// This is only a fallback if that request fails; keep it in sync with the backend.
+const FALLBACK_ALL_PAGES = [
+    "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Data Source Trend Comparison",
+    "Small Files Trend Analysis", "Large Files Trend Analysis", "Small Files OLS Trend", "Large Files OLS Trend",
+    "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)", "Discover File FF On vs Off",
+    "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)", "Edit Records", "Manage Classifiers",
     "Classifier Changes", "Manage Test Environments", "Version Comparison", "Workflow Automation",
     "Create Data Source", "Scan Status", "Scan Progress"
 ];
@@ -44,8 +48,10 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
     const [isAddingUser, setIsAddingUser] = useState(false);
     const [newUserEmail, setNewUserEmail] = useState('');
     const [newUserRole, setNewUserRole] = useState<number | ''>('');
+    const [newUserPassword, setNewUserPassword] = useState('');
     const [editingUser, setEditingUser] = useState<number | null>(null);
     const [editUserRole, setEditUserRole] = useState<number | ''>('');
+    const [editUserPassword, setEditUserPassword] = useState('');
 
     // Roles Tab State
     const [isAddingRole, setIsAddingRole] = useState(false);
@@ -56,17 +62,26 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
     const [selectedPages, setSelectedPages] = useState<string[]>([]);
 
     // Queries
-    const { data: users = [], isLoading: usersLoading } = useQuery<User[]>({
+    const { data: users = [] } = useQuery<User[]>({
         queryKey: ['rbac_users'],
         queryFn: async () => (await axios.get(`${API_BASE}/api/rbac/users`, authConfig)).data
     });
 
-    const { data: roles = [], isLoading: rolesLoading } = useQuery<Role[]>({
+    const { data: roles = [] } = useQuery<Role[]>({
         queryKey: ['rbac_roles'],
         queryFn: async () => (await axios.get(`${API_BASE}/api/rbac/roles`, authConfig)).data
     });
 
-    const { data: rolePerms = [], isLoading: permsLoading, refetch: refetchPerms } = useQuery<string[]>({
+    const { data: allPages = FALLBACK_ALL_PAGES } = useQuery<string[]>({
+        queryKey: ['rbac_all_pages'],
+        queryFn: async () => {
+            const res = await axios.get(`${API_BASE}/api/rbac/all-pages`, authConfig);
+            const pages = (res.data?.pages ?? []) as string[];
+            return pages.length ? pages : FALLBACK_ALL_PAGES;
+        },
+    });
+
+    const { data: rolePerms = [], isLoading: permsLoading } = useQuery<string[]>({
         queryKey: ['rbac_perms', selectedRoleForPerms],
         queryFn: async () => {
             if (!selectedRoleForPerms) return [];
@@ -81,17 +96,17 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
 
     // Mutations
     const createUserMut = useMutation({
-        mutationFn: async () => await axios.post(`${API_BASE}/api/rbac/users`, { username: newUserEmail, role_id: newUserRole }, authConfig),
+        mutationFn: async () => await axios.post(`${API_BASE}/api/rbac/users`, { username: newUserEmail, role_id: newUserRole, password: newUserPassword }, authConfig),
         onSuccess: () => {
             qc.invalidateQueries({ queryKey: ['rbac_users'] });
-            setIsAddingUser(false); setNewUserEmail(''); setNewUserRole('');
+            setIsAddingUser(false); setNewUserEmail(''); setNewUserRole(''); setNewUserPassword('');
             setBanner({ kind: 'ok', text: 'User created successfully.' });
         },
         onError: e => setBanner({ kind: 'err', text: errMsg(e) })
     });
 
     const updateUserMut = useMutation({
-        mutationFn: async () => await axios.put(`${API_BASE}/api/rbac/users/${editingUser}`, { role_id: editUserRole }, authConfig),
+        mutationFn: async () => await axios.put(`${API_BASE}/api/rbac/users/${editingUser}`, { role_id: editUserRole, password: editUserPassword || undefined }, authConfig),
         onSuccess: () => {
             qc.invalidateQueries({ queryKey: ['rbac_users'] });
             setEditingUser(null); setEditUserRole('');
@@ -185,10 +200,14 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
                         </div>
 
                         {isAddingUser && (
-                            <div className="animate-in" style={{ padding: '1.25rem', background: '#f8fafc', borderRadius: 12, border: '1px solid var(--surface-border)', display: 'grid', gridTemplateColumns: '1fr 1fr auto', gap: '1rem', alignItems: 'end' }}>
+                            <div className="animate-in" style={{ padding: '1.25rem', background: '#f8fafc', borderRadius: 12, border: '1px solid var(--surface-border)', display: 'grid', gridTemplateColumns: '1fr 1fr 1fr auto', gap: '1rem', alignItems: 'end' }}>
                                 <div>
                                     <label style={{ fontSize: '0.75rem', fontWeight: 700, display: 'block', marginBottom: 6 }}>EMAIL (@bigid.com)</label>
                                     <input style={inputStyle} value={newUserEmail} onChange={e => setNewUserEmail(e.target.value)} placeholder="user@bigid.com" />
+                                </div>
+                                <div>
+                                    <label style={{ fontSize: '0.75rem', fontWeight: 700, display: 'block', marginBottom: 6 }}>PASSWORD</label>
+                                    <input type="password" style={inputStyle} value={newUserPassword} onChange={e => setNewUserPassword(e.target.value)} placeholder="Set a password" />
                                 </div>
                                 <div>
                                     <label style={{ fontSize: '0.75rem', fontWeight: 700, display: 'block', marginBottom: 6 }}>ROLE</label>
@@ -201,7 +220,7 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
                                     <button className="btn-primary" onClick={() => createUserMut.mutate()} disabled={createUserMut.isPending}>
                                         {createUserMut.isPending ? <Loader2 className="lucide-spin" size={16} /> : 'Create'}
                                     </button>
-                                    <button className="btn" onClick={() => setIsAddingUser(false)} style={{ background: '#fff' }}>Cancel</button>
+                                    <button className="btn" onClick={() => { setIsAddingUser(false); setNewUserPassword(''); }} style={{ background: '#fff' }}>Cancel</button>
                                 </div>
                             </div>
                         )}
@@ -222,9 +241,12 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
                                             <td style={{ padding: '12px 16px', fontWeight: 500 }}>{u.username}</td>
                                             <td style={{ padding: '12px 16px' }}>
                                                 {editingUser === u.id ? (
-                                                    <select style={{ ...inputStyle, padding: '4px 8px' }} value={editUserRole} onChange={e => setEditUserRole(Number(e.target.value))}>
-                                                        {roles.map(r => <option key={r.id} value={r.id}>{r.role_name}</option>)}
-                                                    </select>
+                                                    <div style={{ display: 'flex', gap: 6 }}>
+                                                        <select style={{ ...inputStyle, padding: '4px 8px' }} value={editUserRole} onChange={e => setEditUserRole(Number(e.target.value))}>
+                                                            {roles.map(r => <option key={r.id} value={r.id}>{r.role_name}</option>)}
+                                                        </select>
+                                                        <input type="password" style={{ ...inputStyle, padding: '4px 8px', width: 130 }} value={editUserPassword} onChange={e => setEditUserPassword(e.target.value)} placeholder="New password" />
+                                                    </div>
                                                 ) : (
                                                     <span style={{ padding: '2px 8px', background: 'rgba(99,102,241,0.1)', color: 'var(--primary-color)', borderRadius: 6, fontSize: '0.8rem', fontWeight: 600 }}>
                                                         {u.role_name}
@@ -236,10 +258,10 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
                                                 {editingUser === u.id ? (
                                                     <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
                                                         <button onClick={() => updateUserMut.mutate()} disabled={updateUserMut.isPending} style={{ color: '#10b981', background: 'none', border: 'none', cursor: 'pointer' }}><Save size={18} /></button>
-                                                        <button onClick={() => setEditingUser(null)} style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer' }}><X size={18} /></button>
+                                                        <button onClick={() => { setEditingUser(null); setEditUserPassword(''); }} style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer' }}><X size={18} /></button>
                                                     </div>
                                                 ) : (
-                                                    <button onClick={() => { setEditingUser(u.id); setEditUserRole(u.role_id); }} style={{ color: 'var(--primary-color)', background: 'none', border: 'none', cursor: 'pointer', opacity: 0.7 }}><Edit2 size={16} /></button>
+                                                    <button onClick={() => { setEditingUser(u.id); setEditUserRole(u.role_id); setEditUserPassword(''); }} style={{ color: 'var(--primary-color)', background: 'none', border: 'none', cursor: 'pointer', opacity: 0.7 }}><Edit2 size={16} /></button>
                                                 )}
                                             </td>
                                         </tr>
@@ -308,7 +330,7 @@ const ManageRBACPage: React.FC<ManageRBACPageProps> = ({ token }) => {
                         {selectedRoleForPerms && (
                             <div className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '0.75rem' }}>
-                                    {ALL_PAGES.map(p => {
+                                    {allPages.map(p => {
                                         const isSelected = selectedPages.includes(p);
                                         return (
                                             <label key={p} style={{ 

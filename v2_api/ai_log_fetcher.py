@@ -28,7 +28,47 @@ if sys.stdout is not None:
     except Exception:
         pass
 
+# Live logs integration: push to incident_intelligence
+try:
+    from incident_intelligence_pusher import get_pusher, push_to_incident_intelligence
+except ImportError:
+    try:
+        from ..incident_intelligence_pusher import get_pusher, push_to_incident_intelligence
+    except ImportError:
+        # Fallback if module not available
+        get_pusher = None
+        push_to_incident_intelligence = None
+
+"""
+AI log fetcher (spb_logs).
+
+Policy: only process environments while at least one parent scan is actively running.
+Log lines are stored only when their timestamp falls inside that scan's start/end window.
+When no scan is running for an environment, this service does not fetch or analyze logs.
+"""
+
 print(f"[{datetime.now().isoformat()}] INFO: Bootstrapping dependencies...")
+
+_TERMINAL_SCAN_STATUSES = frozenset(
+    s.replace(" ", "").lower()
+    for s in (
+        "completed",
+        "completedwithfailures",
+        "failed",
+        "stopped",
+        "stop",
+        "aborted",
+        "cancelled",
+        "canceled",
+        "paused",
+        "pause",
+    )
+)
+
+
+def _is_active_scan_status(status: Any) -> bool:
+    s = str(status or "").strip().replace(" ", "").lower()
+    return bool(s) and s not in _TERMINAL_SCAN_STATUSES
 
 def get_db_connection_string():
     from db_config_pg import DB_CONNECTION_STRING
@@ -42,8 +82,16 @@ def get_auth_token(base_url, env_row):
 FETCH_INTERVAL_MINUTES = int(os.getenv("SCANNER_LOG_FETCH_MINUTES", "5"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/generate")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+# Ollama is opt-in. Keep log collection/error detection running without making any
+# network request to an unavailable local or remote model service.
+OLLAMA_ENABLED = os.getenv("OLLAMA_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+# Bound generation so a slow (CPU) model still finishes inside the timeout, and keep the
+# model loaded so it isn't reloaded (~18s) between calls. All env-overridable.
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "300") or "300")
+OLLAMA_TIMEOUT = int(os.getenv("OLLAMA_TIMEOUT", "180") or "180")
+OLLAMA_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m") or "30m"
 LOG_LEN = int(os.getenv("SCANNER_LOG_FETCH_LEN", "3000"))
-DEFAULT_LOG_FETCH_SOURCES = ["scanner", "orch", "orch2", "aci", "api-gateway", "data-manager"]
+DEFAULT_LOG_FETCH_SOURCES = ["scanner", "orch", "orch2", "web", "aci", "api-gateway", "data-manager"]
 DEFAULT_LOG_SOURCE_OPTIONS = [
     "web",
     "orch",
@@ -67,28 +115,43 @@ DEFAULT_LOG_SOURCE_OPTIONS = [
 
 
 def _coerce_to_datetime(value: Any) -> Optional[datetime]:
-    """Normalize DB/driver timestamps (datetime, date, str) for comparisons."""
+    """Normalize DB/driver timestamps to naive UTC for comparisons (matches tracker)."""
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value
+        dt = value
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.astimezone(tz=None).replace(tzinfo=None)
+        return dt
     if isinstance(value, date_cls):
         return datetime.combine(value, datetime.min.time())
     s = str(value).strip()
     if not s:
         return None
-    s = s.replace("T", " ").rstrip("Z")
-    if "+" in s and " " in s:
-        s = s.split("+", 1)[0].strip()
+    try:
+        iso = s
+        if iso.endswith("Z"):
+            iso = iso[:-1] + "+00:00"
+        dt = datetime.fromisoformat(iso)
+        if getattr(dt, "tzinfo", None) is not None:
+            return dt.astimezone(tz=None).replace(tzinfo=None)
+        return dt
+    except ValueError:
+        pass
+    s = s.replace("T", " ").rstrip("Z").strip()
     for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
             return datetime.strptime(s[:26], fmt)
         except ValueError:
             continue
-    try:
-        return datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    return None
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
 def _normalize_log_source_name(value):
@@ -145,6 +208,8 @@ def load_enabled_log_sources(engine):
 
 def check_ollama_ready():
     """Verify that Ollama is reachable before starting the analyzer loop."""
+    if not OLLAMA_ENABLED:
+        return False
     print(f"[{datetime.utcnow().isoformat()}] Checking Ollama connection at {OLLAMA_URL}...")
     try:
         # Just check the base URL status
@@ -319,30 +384,36 @@ def write_heartbeat(engine, status="ok", message=""):
         print(f"Failed to write heartbeat: {e}")
 
 def get_active_environments(engine):
+    """Environments with at least one non-terminal (running) parent scan — only these are processed."""
     query = """
-        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at, sp.completed_at
+        SELECT DISTINCT t.id, t.env_name, t.base_url, sp.scan_id, sp.started_at, sp.completed_at, sp.scan_status
         FROM test_environments t
         JOIN scan_parents sp ON sp.environment_id = t.id
-        WHERE t.is_active = TRUE 
-          AND (
-              LOWER(REPLACE(sp.scan_status, ' ', '')) NOT IN (
-                  'completed', 'completedwithfailures', 'failed', 'stopped', 'stop', 'aborted', 'cancelled', 'canceled', 'paused', 'pause'
-              )
+        WHERE t.is_active = TRUE
+          AND LOWER(REPLACE(COALESCE(sp.scan_status, ''), ' ', '')) NOT IN (
+              'completed', 'completedwithfailures', 'failed', 'stopped', 'stop',
+              'aborted', 'cancelled', 'canceled', 'paused', 'pause'
           )
     """
     with engine.connect() as conn:
         result = conn.execute(text(query)).fetchall()
-        return [
-            {
-                "id": row[0],
-                "env_name": row[1],
-                "base_url": row[2],
-                "active_scan_id": row[3],
-                "scan_start_time": row[4],
-                "scan_end_time": row[5],
-            }
-            for row in result
-        ]
+        out = []
+        for row in result:
+            status = row[6]
+            if not _is_active_scan_status(status):
+                continue
+            out.append(
+                {
+                    "id": row[0],
+                    "env_name": row[1],
+                    "base_url": row[2],
+                    "active_scan_id": row[3],
+                    "scan_start_time": row[4],
+                    "scan_end_time": row[5],
+                    "scan_status": status,
+                }
+            )
+        return out
 
 def fetch_logs(base_url, token, num_lines, log_source="scanner"):
     url = f"{base_url.rstrip('/')}/api/v1/logs/{log_source}?len={num_lines}"
@@ -385,7 +456,9 @@ def extract_scan_ids(log_text):
     ss_match = re.search(r'(?i)(?:sub[_-]?scan[_-]?id)[^\w\n]*?([a-f0-9]{24})', log_text)
     if not ss_match and s_match:
         # Check for subscan ID following the scan ID in the SDK format
-        ss_match = re.search(fr'sdk-object-scan-{scan_id}-([a-f0-9]{24})', log_text)
+        # Escape {{24}} so the f-string emits the regex quantifier {24}, not the
+        # literal "24" (an f-string treats {24} as a format field). Escape scan_id too.
+        ss_match = re.search(fr'sdk-object-scan-{re.escape(scan_id)}-([a-f0-9]{{24}})', log_text)
         
     if ss_match:
         subscan_id = ss_match.group(1)
@@ -464,6 +537,7 @@ def _parse_log_timestamp(line: str) -> Optional[datetime]:
     Parses BigID log timestamps: [2026-04-15 17:27:04.729Z] or [2026-04-20 10:08:26]
     Returns a UTC datetime object or None.
     """
+    line = _strip_ansi(line)
     match = re.search(r'\[(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)\]', line)
     if not match:
         return None
@@ -491,11 +565,20 @@ def detect_errors_in_logs(log_text):
         [2026-04-29 08:52:34.712Z] [ERROR] scanner_file - <message with no keyword>
     are never silently dropped.
     """
+    log_text = _strip_ansi(log_text)
     lines = log_text.splitlines()
     error_contexts = []
     seen_fingerprints = set()
 
-    LEVEL_PATTERN = re.compile(r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]", re.I)
+    # Path A severity tags. Whether WARN/WARNING auto-captures is governed by the same
+    # SCANNER_LOG_ERROR_REQUIRE_LEVEL switch used by the keyword gate, so both behaviors
+    # are available: default "error_fatal" => ERROR/FATAL/SEVERE only; "warn" => +WARN/WARNING.
+    _level_mode = os.getenv("SCANNER_LOG_ERROR_REQUIRE_LEVEL", "error_fatal").strip().lower()
+    _include_warn = _level_mode in ("warn", "warning")
+    LEVEL_PATTERN = re.compile(
+        r"\[(?:ERROR|FATAL|SEVERE|WARN|WARNING)\]" if _include_warn else r"\[(?:ERROR|FATAL|SEVERE)\]",
+        re.I,
+    )
     KEYWORD_PATTERN = re.compile(
         r"(?i)(?:"
         r"\berror\b|\bfatal\b|\bfail(?:ed|ure)?\b|\bsevere\b|\bexception\b|"
@@ -515,6 +598,21 @@ def detect_errors_in_logs(log_text):
         r")"
     )
 
+    # Operational noise that is NOT a scan error — never captured/stored (e.g. Datadog
+    # metrics publisher "Invalid API Key"). Extend via SCANNER_LOG_NOISE_REGEX (a regex).
+    _noise_extra = (os.getenv("SCANNER_LOG_NOISE_REGEX", "") or "").strip()
+    NOISE_PATTERN = re.compile(
+        r"(?i)(?:datadog|micrometer\.datadog|datadogmeterregistry|metrics[-\s]?publisher|failed to send metrics"
+        # Platform/control-plane noise that is NOT a scan error — never captured:
+        r"|could not load license propert|license_key is either null"          # license check warnings
+        r"|kube-probe|/health/(?:readiness|liveness|startup)|/healthz"           # k8s health probes
+        r"|ds-connection-test|/api/v1/ds-connection-test"                        # test-connection client noise
+        r"|tpa-installation|installtpa|/api/v1/tpa"                              # third-party app install
+        r"|deprecationwarning|\bdep0\d+\b"                                       # node deprecation warnings
+        + (("|" + _noise_extra) if _noise_extra else "")
+        + r")"
+    )
+
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -526,7 +624,7 @@ def detect_errors_in_logs(log_text):
         scan_line = _line_for_error_keyword_scan(line)
         has_level_tag = bool(LEVEL_PATTERN.search(line))
         has_keyword = bool(KEYWORD_PATTERN.search(scan_line)) if not has_level_tag else False
-        is_trigger = has_level_tag or (has_keyword and _line_passes_error_level_gate(line))
+        is_trigger = (has_level_tag or (has_keyword and _line_passes_error_level_gate(line))) and not NOISE_PATTERN.search(line)
 
         if is_trigger:
             # Context before: capture 2 lines if possible for timestamps/IDs
@@ -571,10 +669,15 @@ def detect_errors_in_logs(log_text):
                 i = end
                 continue
 
-            # IMPROVED FINGERPRINTING: Mask timestamps to avoid 
-            # skipping unique errors just because their log prefix is the same.
-            fingerprint_text = re.sub(r'\d{4}-\d{2}-\d{2}T?\s?\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_text)
-            fingerprint = fingerprint_text[:300]
+            # IMPROVED FINGERPRINTING: mask volatile tokens (timestamps, UUIDs, trace/span/
+            # scan IDs, large counts) so structurally-identical errors collapse to ONE hash.
+            # Without this, trace/span IDs make every recurrence look unique, defeating dedup
+            # and forcing a fresh Ollama call for every duplicate.
+            fp = re.sub(r'\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?', '[TS]', ctx_text)
+            fp = re.sub(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', '[UUID]', fp, flags=re.I)
+            fp = re.sub(r'\b[0-9a-f]{16,}\b', '[HEX]', fp, flags=re.I)   # 24-hex scan/subscan ids, long hashes
+            fp = re.sub(r'\b\d{6,}\b', '[N]', fp)                         # large counts/ports (keep 3-digit status codes)
+            fingerprint = fp[:300]
             
             if fingerprint not in seen_fingerprints:
                 seen_fingerprints.add(fingerprint)
@@ -592,7 +695,61 @@ def detect_errors_in_logs(log_text):
                 
     return error_contexts
 
-def call_health_summarizer(log_text):
+def parse_all_logs(log_text, log_source=""):
+    """
+    Extract ALL log statements (INFO, WARN, DEBUG, ERROR) for timeline building.
+    Does NOT filter - returns every log line parsed with level and timestamp.
+    
+    Returns list of log entries with:
+    - text: The log message
+    - timestamp: Extracted or None
+    - level: Log level (ERROR, WARN, INFO, DEBUG, TRACE, UNKNOWN)
+    - hash: SHA256 hash for deduplication
+    - raw_line: Original line
+    - log_source: Which service this came from
+    """
+    import hashlib
+    
+    log_text = _strip_ansi(log_text)
+    lines = log_text.splitlines()
+    
+    all_logs = []
+    
+    for line in lines:
+        if not line or not line.strip():
+            continue
+        
+        # Extract log level
+        level_match = re.search(r'\[(ERROR|WARN|WARNING|INFO|DEBUG|TRACE|FATAL|SEVERE)\]', line, re.I)
+        level = level_match.group(1).upper() if level_match else "UNKNOWN"
+        
+        # Extract timestamp if present (common formats: 2026-08-05 14:23:45 or 2026-08-05T14:23:45)
+        ts_match = re.search(r'(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})', line)
+        timestamp = _coerce_to_datetime(ts_match.group(1)) if ts_match else None
+        
+        # Extract message (everything after level or first 5000 chars)
+        if level_match:
+            message = line[level_match.end():].strip()[:5000]
+        else:
+            message = line.strip()[:5000]
+        
+        if not message:
+            continue
+        
+        # Create hash for deduplication (log_source + level + message)
+        hashable = f"{log_source}:{level}:{message}"
+        event_hash = hashlib.sha256(hashable.encode()).hexdigest()
+        
+        all_logs.append({
+            'text': message,
+            'timestamp': timestamp,
+            'level': level,
+            'hash': event_hash,
+            'raw_line': line[:1000],
+            'log_source': log_source,
+        })
+    
+    return all_logs
     if not check_ollama_ready():
         return "[⚠️ System Health Review Offline] Ollama is unreachable."
     
@@ -643,8 +800,10 @@ Provide a concise, high-level structural health assessment.
         return f"Health Review failed: {e}"
 
 def call_ai_analyzer(error_context, log_source):
+    if not OLLAMA_ENABLED:
+        return None
     if not check_ollama_ready():
-        return f"[⚠️ AI Analysis Offline] Ollama is not reachable at {OLLAMA_URL}. Please ensure Ollama is running. Raw error context: {error_context[:200]}..."
+        return None
     
     prompt = f"""
 You are an expert systems engineer and log analyst.
@@ -667,9 +826,11 @@ Provide a concise, highly technical answer.
             json={
                 "model": OLLAMA_MODEL,
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "keep_alive": OLLAMA_KEEP_ALIVE,
+                "options": {"num_predict": OLLAMA_NUM_PREDICT, "temperature": 0.2},
             },
-            timeout=120
+            timeout=OLLAMA_TIMEOUT,
         )
         response.raise_for_status()
         return response.json().get("response", "No response from AI")
@@ -683,7 +844,16 @@ def call_correlation_analyzer(error_batch):
     """
     if not error_batch:
         return None
-        
+
+    if not OLLAMA_ENABLED:
+        return None
+
+    if not check_ollama_ready():
+        # Don't persist the offline/connection error as if it were a real correlation
+        # report — store_correlation_report() skips falsy values, so the panel stays clean.
+        print(f"[{datetime.utcnow().isoformat()}] Skipping correlation report: Ollama offline at {OLLAMA_URL}")
+        return None
+
     contexts_str = ""
     for idx, (source, ctx, sid) in enumerate(error_batch):
         contexts_str += f"\n--- Error {idx+1} (Source: {source}, ScanID: {sid}) ---\n{ctx}\n"
@@ -714,9 +884,36 @@ Provide a high-level, technical correlation report.
         response.raise_for_status()
         return response.json().get("response", "No correlation response from AI")
     except Exception as e:
-        return f"Correlation Analysis failed: {e}"
+        # Return None (not the error text) so failed AI calls are not stored as reports.
+        print(f"[{datetime.utcnow().isoformat()}] Correlation Analysis call failed: {e}")
+        return None
 
-def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash=None, actual_log_ts=None):
+def classify_log_category(error_context: str) -> str:
+    """Bucket an error line into a coarse category for filtering/reporting.
+
+    Returns one of: auth_error | connection_error | timeout | parse_error | scan_error | unknown.
+    Order matters: auth/timeout/connection are checked before the broad 'scan' keyword.
+    """
+    t = (error_context or "").lower()
+    if not t.strip():
+        return "unknown"
+    if any(k in t for k in ("401", "403", "unauthorized", "forbidden", "authentication",
+                            "invalid token", "access denied", "auth token", "authtoken")):
+        return "auth_error"
+    if "timeout" in t or "timed out" in t or "timed-out" in t:
+        return "timeout"
+    if any(k in t for k in ("connection refused", "econnrefused", "connection reset",
+                            "connection closed", "connection lost", "unreachable",
+                            "no route to host", "host not found", "502", "503", "504",
+                            "refused")):
+        return "connection_error"
+    if any(k in t for k in ("parse", "json", "deserializ", "unmarshal", "malformed", "invalid format")):
+        return "parse_error"
+    if any(k in t for k in ("scan", "classif", "enumerat", "subscan")):
+        return "scan_error"
+    return "unknown"
+
+def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash=None, actual_log_ts=None, manual_triage=None):
     with engine.connect() as conn:
         ts_to_store = actual_log_ts if actual_log_ts else datetime.utcnow()
         if isinstance(ts_to_store, datetime):
@@ -724,8 +921,8 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
 
         conn.execute(
             text("""
-                INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash)
-                VALUES (:eid, :lt, :ctx, :ai, :ls, :sid, :ssid, :hash)
+                INSERT INTO scan_log_errors (environment_id, log_timestamp, error_context, ai_analysis, log_source, scan_id, subscan_id, error_hash, log_category, manual_triage)
+                VALUES (:eid, :lt, :ctx, :ai, :ls, :sid, :ssid, :hash, :cat, :triage)
             """),
             {
                 "eid": env_id,
@@ -735,10 +932,50 @@ def store_error_analysis(engine, env_id, error_context, ai_analysis, log_source,
                 "ls": log_source,
                 "sid": scan_id,
                 "ssid": subscan_id,
-                "hash": error_hash
+                "hash": error_hash,
+                "cat": classify_log_category(error_context),
+                "triage": manual_triage,
             }
         )
         conn.commit()
+        
+        # Push to incident_intelligence (non-blocking, fire-and-forget)
+        if push_to_incident_intelligence and get_pusher:
+            try:
+                pusher = get_pusher()
+                if pusher.should_push():
+                    # Build error row dict to transform
+                    error_row = {
+                        'id': None,  # Will be generated by DB
+                        'scan_id': scan_id,
+                        'log_timestamp': ts_to_store,
+                        'error_context': error_context,
+                        'log_source': log_source,
+                        'environment_id': env_id,
+                        'subscan_id': subscan_id,
+                        'ai_analysis': ai_analysis,
+                        'is_resolved': False,
+                        'manual_triage': manual_triage,
+                    }
+                    log_event = pusher.transform_error_to_log(error_row)
+                    push_to_incident_intelligence([log_event])
+            except Exception as e:
+                # Non-blocking: log but don't raise
+                print(f"[WARN] Failed to push error log to incident_intelligence: {e}")
+
+def store_correlation_report(engine, env_id, scan_id, report, is_final=False):
+    if not report or not scan_id:
+        return
+    with engine.connect() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO scan_log_correlations (environment_id, scan_id, correlation_report, is_final)
+                VALUES (:eid, :sid, :report, :final)
+            """),
+            {"eid": env_id, "sid": scan_id, "report": report, "final": bool(is_final)},
+        )
+        conn.commit()
+
 
 def store_health_summary(engine, env_id, summary):
     with engine.connect() as conn:
@@ -778,6 +1015,39 @@ def run_once(engine):
                         logs = fetch_logs(base_url, token, 3000, log_source)
                         if not logs: continue
                         
+                        # Parse ALL logs (INFO, WARN, DEBUG, ERROR) for timeline
+                        all_logs = parse_all_logs(logs, log_source)
+                        
+                        # Push all logs to incident_intelligence
+                        if all_logs and push_to_incident_intelligence and get_pusher:
+                            try:
+                                pusher = get_pusher()
+                                if pusher.should_push():
+                                    log_events = []
+                                    for log_entry in all_logs:
+                                        log_event = {
+                                            "timestamp": log_entry['timestamp'].isoformat() if log_entry['timestamp'] else datetime.utcnow().isoformat(),
+                                            "service": "scan_benchmark_app",
+                                            "severity": log_entry['level'],  # ERROR, WARN, INFO, DEBUG, etc
+                                            "message": log_entry['text'],
+                                            "raw_line": log_entry['raw_line'],
+                                            "scan_id": env.get("active_scan_id"),
+                                            "parent_scan_id": env.get("active_scan_id"),
+                                            "metadata": {
+                                                "source": "scan_benchmark_app_logs",
+                                                "log_source": log_source,
+                                                "environment_id": env_id,
+                                                "log_hash": log_entry['hash'],
+                                            }
+                                        }
+                                        log_events.append(log_event)
+                                    
+                                    if log_events:
+                                        push_to_incident_intelligence(log_events)
+                            except Exception as e:
+                                print(f"[WARN] Failed to push logs from {log_source}: {e}")
+                        
+                        # Also process errors separately (existing flow for AI analysis)
                         errors = detect_errors_in_logs(logs)
                         for err_obj in errors:
                             ctx = err_obj["text"]
@@ -797,6 +1067,7 @@ def run_once(engine):
                             scan_start = _coerce_to_datetime(env.get("scan_start_time"))
                             if scan_start is not None and ts_cmp < scan_start:
                                 continue
+                            # End window only when scan is no longer running (completed_at set on terminal).
                             scan_end = _coerce_to_datetime(env.get("scan_end_time"))
                             if scan_end is not None and ts_cmp > (scan_end + timedelta(minutes=5)):
                                 continue
@@ -812,24 +1083,66 @@ def run_once(engine):
                                     text("""
                                         SELECT id FROM scan_log_errors 
                                         WHERE environment_id = :eid 
+                                          AND scan_id = :sid
                                           AND error_hash = :hash 
                                           AND log_timestamp > :cutoff
                                         LIMIT 1
                                     """),
-                                    {"eid": env_id, "hash": err_hash, "cutoff": cutoff_time}
+                                    {
+                                        "eid": env_id,
+                                        "sid": active_scan_id,
+                                        "hash": err_hash,
+                                        "cutoff": cutoff_time,
+                                    },
                                 ).fetchone()
                             if existing: continue
-                            
+
                             _, parsed_subscan_id = extract_scan_ids(ctx)
-                            ai_analysis = call_ai_analyzer(ctx, log_source)
-                            
+                            # For this error signature, look up (a) any manual triage and
+                            # (b) the most recent REAL AI analysis — both keyed by error_hash.
+                            # Manual triage wins and SKIPS Ollama entirely; otherwise reuse a
+                            # prior real analysis; only a brand-new signature hits the LLM.
+                            existing_triage = None
+                            reused_analysis = None
+                            try:
+                                with engine.connect() as conn:
+                                    sig = conn.execute(
+                                        text("""
+                                            SELECT
+                                              MAX(NULLIF(TRIM(COALESCE(manual_triage, '')), '')) AS triage,
+                                              (ARRAY_AGG(ai_analysis ORDER BY created_at DESC)
+                                                 FILTER (WHERE ai_analysis IS NOT NULL AND ai_analysis <> ''
+                                                         AND ai_analysis NOT LIKE '%Analysis Offline%'
+                                                         AND ai_analysis NOT LIKE 'AI Analysis failed%'))[1] AS analysis
+                                            FROM scan_log_errors
+                                            WHERE error_hash = :hash
+                                        """),
+                                        {"hash": err_hash},
+                                    ).fetchone()
+                                if sig:
+                                    existing_triage = sig[0]
+                                    reused_analysis = sig[1]
+                            except Exception:
+                                existing_triage = None
+                                reused_analysis = None
+
+                            triage_for_row = existing_triage or None
+                            if existing_triage:
+                                # Already triaged by a human — do NOT call Ollama.
+                                ai_analysis = "[Skipped — manually triaged]"
+                            elif reused_analysis:
+                                ai_analysis = reused_analysis
+                            else:
+                                ai_analysis = call_ai_analyzer(ctx, log_source)
+
                             # CRITICAL FIX 3: Store REAL log timestamp
                             store_error_analysis(
-                                engine, env_id, ctx, ai_analysis, log_source, 
+                                engine, env_id, ctx, ai_analysis, log_source,
                                 active_scan_id,
-                                parsed_subscan_id, 
+                                parsed_subscan_id,
                                 error_hash=err_hash,
-                                actual_log_ts=log_ts
+                                actual_log_ts=log_ts,
+                                manual_triage=triage_for_row
                             )
                             
                             p_sid = active_scan_id
@@ -840,6 +1153,16 @@ def run_once(engine):
 
                     except Exception as source_err:
                         print(f"[{datetime.now().isoformat()}] [{env_name}] Error processing source {log_source}: {source_err}")
+
+                for scan_id, batch in new_errors_by_scan.items():
+                    if not batch:
+                        continue
+                    try:
+                        report = call_correlation_analyzer(batch)
+                        if report:
+                            store_correlation_report(engine, env_id, scan_id, report, is_final=False)
+                    except Exception as corr_err:
+                        print(f"[{datetime.now().isoformat()}] [{env_name}] Correlation failed for {scan_id}: {corr_err}")
                 
             except Exception as env_err:
                 print(f"[{datetime.now().isoformat()}] [ERROR] Failed processing environment {env_name}: {env_err}")
@@ -855,9 +1178,10 @@ def main():
     
     print(f"Starting Scanner AI Log Analyzer (Fetch Interval: {FETCH_INTERVAL_MINUTES} min, LLM: {OLLAMA_MODEL})")
     
-    if not check_ollama_ready():
-        print(f"WARNING: Ollama is not reachable at {OLLAMA_URL}. The monitor will continue to detect errors but AI analysis will be skipped until Ollama is active.")
-        # DO NOT EXIT - continue to monitor logs even without AI
+    if OLLAMA_ENABLED and not check_ollama_ready():
+        print(f"WARNING: Ollama is not reachable at {OLLAMA_URL}. AI analysis is disabled for this run.")
+    elif not OLLAMA_ENABLED:
+        print("Ollama analysis disabled; log/error monitoring will continue without model requests.")
         
     engine = setup_db_engine()
     

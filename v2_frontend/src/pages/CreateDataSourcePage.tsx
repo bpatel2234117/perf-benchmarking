@@ -2,9 +2,9 @@ import React, { useState } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { 
-    Puzzle, Globe, Info, Play, Save, Loader2, 
-    CheckCircle2, AlertCircle, Database, Terminal,
-    FileJson, RefreshCw, Send
+    Puzzle, Info, Save, Loader2, 
+    CheckCircle2, AlertCircle, Terminal,
+    FileJson, Send
 } from 'lucide-react';
 import { API_BASE } from '../apiConfig';
 

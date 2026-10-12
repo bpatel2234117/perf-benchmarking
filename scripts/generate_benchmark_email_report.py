@@ -30,6 +30,7 @@ import base64
 import html
 import io
 import os
+import re
 import statistics
 import sys
 import tempfile
@@ -56,7 +57,7 @@ from sqlalchemy import bindparam, create_engine, text
 repo = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(repo))
 
-from db_config import DB_CONNECTION_STRING  # noqa: E402
+from benchmark_db import is_postgresql_engine, resolve_benchmark_database_url  # noqa: E402
 from benchmark_scenario_normalizer import (  # noqa: E402
     classify_scenario,
     normalize_benchmark_dataframe,
@@ -66,15 +67,227 @@ from benchmark_scenario_normalizer import (  # noqa: E402
 
 UNSTRUCTURED_DS_ORDER = ["S3", "SMB"]
 STRUCTURED_DS_ORDER = ["MSSQL", "Postgres"]
+ALL_REPORT_DS_ORDER = UNSTRUCTURED_DS_ORDER + STRUCTURED_DS_ORDER
 matplotlib.use("Agg")
+
+
+def parse_ds_csv(value: Optional[str], allowed: Sequence[str]) -> List[str]:
+    """Parse comma-separated DS names; keep only allowed values in stable order."""
+    if value is None:
+        return []
+    picked: List[str] = []
+    for part in str(value).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        norm = normalize_ds_name(token)
+        if norm in allowed and norm not in picked:
+            picked.append(norm)
+    return [d for d in allowed if d in picked]
+
+
+def resolve_ds_scope(
+    unstructured_ds: Optional[str] = None,
+    structured_ds: Optional[str] = None,
+    *,
+    include_structured_legacy: bool = False,
+) -> List[str]:
+    """
+    Build ordered DS scope for report sections.
+    None for a category → all DS in that category (default).
+    Empty string → none from that category.
+    """
+    if unstructured_ds is None:
+        un = list(UNSTRUCTURED_DS_ORDER)
+    else:
+        un = parse_ds_csv(unstructured_ds, UNSTRUCTURED_DS_ORDER)
+
+    if structured_ds is None:
+        if include_structured_legacy:
+            st = list(STRUCTURED_DS_ORDER)
+        else:
+            st = []
+    else:
+        st = parse_ds_csv(structured_ds, STRUCTURED_DS_ORDER)
+
+    scope: List[str] = []
+    for d in ALL_REPORT_DS_ORDER:
+        if d in un or d in st:
+            scope.append(d)
+    return scope
+
+
+def ds_scope_label(ds_scope: Sequence[str]) -> str:
+    parts = [d for d in ALL_REPORT_DS_ORDER if d in ds_scope]
+    return " / ".join(parts) if parts else "none"
+
+
+def unstructured_ds_in_scope(ds_scope: Sequence[str]) -> List[str]:
+    return [d for d in UNSTRUCTURED_DS_ORDER if d in ds_scope]
+
+
+def structured_ds_in_scope(ds_scope: Sequence[str]) -> List[str]:
+    return [d for d in STRUCTURED_DS_ORDER if d in ds_scope]
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.dates as mdates  # noqa: E402
 
 
+# --- Email-safe rendering -------------------------------------------------
+# Default container width for the --email-safe variant. Sits inside Gmail's
+# desktop reading pane and Outlook without forcing horizontal scroll.
+EMAIL_SAFE_WIDTH = 680
+
+
+def _email_safe_css(width: int) -> str:
+    """CSS overrides that make the report survive Gmail/Outlook.
+
+    Appended last inside <style> so it wins over the screen layout. Drops the
+    things mail clients strip or mangle (gradients, backdrop-filter, shadows,
+    unused grid rules) and pins the page to a fixed narrow width instead of
+    letting `.page` expand to 1120px.
+    """
+    inner = width - 32  # .content horizontal padding
+    return f"""
+    /* ===== email-safe overrides ({width}px, Gmail/Outlook) ===== */
+    html, body {{
+      margin: 0;
+      padding: 0;
+      background: #f4f6fb;
+      -webkit-text-size-adjust: 100%;
+      -ms-text-size-adjust: 100%;
+    }}
+    .page {{
+      width: {width}px;
+      max-width: {width}px;
+      margin: 0 auto;
+      background: #ffffff;
+      box-shadow: none;
+      border-radius: 8px;
+    }}
+    /* Mail clients drop these outright; make the fallback intentional. */
+    .header {{ background: #f6f8ff; }}
+    .card {{ backdrop-filter: none; box-shadow: none; }}
+    .card-warm {{ background: #fffbeb; }}
+    .card-sky, .card-env {{ background: #eff6ff; }}
+    .card-mint {{ background: #ecfdf5; }}
+    .card-release {{ background: #eef2ff; }}
+    .chart-band {{ background: #fafcff; box-shadow: none; }}
+    .trend-panel {{ box-shadow: none; }}
+    /* Images must never exceed the content box or Gmail will letterbox them. */
+    .chart-img, .chart-band img, .trend-panel img, img {{
+      max-width: {inner}px;
+      width: 100%;
+      height: auto;
+      display: block;
+      border: 0;
+      outline: none;
+      text-decoration: none;
+    }}
+    /* 8-column scenario tables: fixed layout keeps them inside {width}px. */
+    table.report-table {{
+      width: 100%;
+      table-layout: fixed;
+      border-collapse: collapse;
+      mso-line-height-rule: exactly;
+    }}
+    table.report-table th, table.report-table td {{
+      word-break: break-word;
+      overflow-wrap: break-word;
+    }}
+    /* Unused on the emitted markup, but strip so nothing inherits them. */
+    .hero-grid, .mini-grid, .split, .chart-grid, .trend-panel-grid {{
+      display: block;
+    }}
+"""
+
+
+# Matches the side-by-side chart pairs the section builders emit, e.g.
+#   <td style="width: 50%; padding-right: 7px;">CHART</td>
+#   <td style="width: 50%; padding-left: 7px;">CHART</td>
+# Base64 payloads contain no '<', so the non-greedy </td> boundary is safe.
+_CHART_PAIR_RE = re.compile(
+    r'<td style="width: 50%; padding-right: 7px;(?P<a_extra>[^"]*)">(?P<a>.*?)</td>\s*'
+    r'<td style="width: 50%; padding-left: 7px;(?P<b_extra>[^"]*)">(?P<b>.*?)</td>',
+    re.S,
+)
+
+
+def _email_safe_postprocess(html_doc: str, width: int) -> str:
+    """Structural fixes that CSS alone cannot carry into Gmail.
+
+    Two things break at a narrow fixed width:
+
+    1. Charts are emitted two-per-row at `width: 50%`. Inside 680px that is
+       ~290px for a plot rendered ~1180px wide, which makes the axis labels
+       illegible. `display: block` on a `<td>` would fix it in a browser but
+       Gmail strips it, so the pair is split into two real rows instead.
+    2. The KPI tile strip pins each cell to `min-width: 88px` inline. Six
+       tiles then demand 716px and overflow the container; inline styles beat
+       a stylesheet rule, so the value is rewritten rather than overridden.
+    """
+    def _stack(m: re.Match) -> str:
+        return (
+            f'<td style="width: 100%;{m.group("a_extra")}">{m.group("a")}</td>'
+            f'</tr><tr>'
+            f'<td style="width: 100%; padding-top: 12px;{m.group("b_extra")}">{m.group("b")}</td>'
+        )
+
+    html_doc, n_stacked = _CHART_PAIR_RE.subn(_stack, html_doc)
+    html_doc, n_tiles = re.subn(r'min-width: 88px;', 'min-width: 0;', html_doc)
+    print(
+        f"  email-safe: {width}px shell, stacked {n_stacked} chart pair(s), "
+        f"relaxed {n_tiles} KPI tile min-width(s)",
+        file=sys.stderr,
+    )
+    return html_doc
+
+
+def _email_safe_shell(width: int) -> Tuple[str, str]:
+    """Table-based centering shell for the email-safe variant.
+
+    A fixed `width` attribute plus an inline width is the only thing that
+    reliably survives Gmail's sanitiser and Outlook's Word renderer, so the
+    `.page` div is nested inside one rather than relying on max-width alone.
+    """
+    open_html = (
+        '<table role="presentation" border="0" cellpadding="0" cellspacing="0" '
+        'width="100%" style="background:#f4f6fb;border-collapse:collapse;margin:0;padding:0;">\n'
+        '    <tr>\n'
+        '      <td align="center" style="padding:12px 8px;">\n'
+        f'        <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="{width}" '
+        f'style="width:{width}px;max-width:{width}px;border-collapse:collapse;">\n'
+        '          <tr>\n'
+        '            <td style="padding:0;">\n'
+        '  <div class="page">'
+    )
+    close_html = (
+        '  </div>\n'
+        '            </td>\n'
+        '          </tr>\n'
+        '        </table>\n'
+        '      </td>\n'
+        '    </tr>\n'
+        '  </table>'
+    )
+    return open_html, close_html
+
+
 def _db_has_column(engine, table: str, col: str) -> bool:
+    """Check if a column exists in a table, compatible with MySQL and PostgreSQL."""
     try:
         with engine.connect() as conn:
-            row = conn.execute(text(f"SHOW COLUMNS FROM {table} LIKE :col"), {"col": col}).fetchone()
+            if is_postgresql_engine(engine):
+                # PostgreSQL: query information_schema
+                row = conn.execute(
+                    text("""
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name = :tbl AND column_name = :col
+                    """),
+                    {"tbl": table, "col": col}
+                ).fetchone()
+            else:
+                # MySQL: use SHOW COLUMNS
+                row = conn.execute(text(f"SHOW COLUMNS FROM {table} LIKE :col"), {"col": col}).fetchone()
             return row is not None
     except Exception:
         return False
@@ -188,8 +401,7 @@ def load_benchmarks(engine, *, environment_id: Optional[int]) -> pd.DataFrame:
     if environment_id is not None:
         query += " AND sp.environment_id = :eid"
         params["eid"] = int(environment_id)
-    with engine.connect() as conn:
-        df = pd.read_sql(text(query), conn, params=params)
+    df = pd.read_sql(text(query), engine, params=params)
     return normalize_benchmark_dataframe(df)
 
 
@@ -226,33 +438,159 @@ def pick_default_builds(available: Sequence[Tuple[str, int]]) -> Tuple[Optional[
     return current, previous
 
 
+def _scan_type_for_trend(work: pd.DataFrame) -> pd.Series:
+    """Use raw DB scan_type when available (matches Dashboard /api/trends/small-files)."""
+    if "scan_type_db" in work.columns:
+        return work["scan_type_db"].astype(str)
+    return work.get("scan_type", pd.Series("", index=work.index)).astype(str)
+
+
+def _filter_dashboard_trend_rows(df: pd.DataFrame, ds_name: str) -> pd.DataFrame:
+    """
+    Row filter aligned with Dashboard.tsx TrendSection defaults:
+    - Data source = ds_name
+    - Scan type = Full Scan (DB value), excluding OLS-labeled scan types
+    - Unstructured: prefer Small Files when present
+    - Structured: drop blank file_set_type when labeled presets exist
+    - Base scenario only: ACL-on and Structured-Discovery runs dropped
+
+    The ACL / Structured-Discovery exclusion is also applied upstream in
+    generate_benchmark_email_report_pg.load_trend_benchmark_rows (on the raw DB
+    flags) for the trend charts, where it is a no-op by the time we get here.
+    It is repeated here because callers such as build_major_release_section feed
+    in the unfiltered full_df, and averaging ACL runs into the base trend made
+    the report disagree with the Dashboard (e.g. S3 257: 13.86 vs 17.32 GB/hr).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
+    work = work[work["norm_ds"] == ds_name].copy()
+    if work.empty:
+        return work
+
+    scan = _scan_type_for_trend(work).str.strip().str.lower()
+    work = work[
+        scan.str.contains("full scan", na=False)
+        & ~scan.str.contains("ols", na=False)
+    ].copy()
+    if work.empty:
+        return work
+
+    # Base scenario only — ACL and Structured Discovery are separate scenarios on the
+    # Dashboard, not part of the base trend. CSV's feature flag is inherent to the file
+    # set and never counts as Structured Discovery.
+    is_acl = (
+        work["is_acl"].fillna(False).astype(bool)
+        if "is_acl" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    is_ff = (
+        work["is_feature_flags"].fillna(False).astype(bool)
+        if "is_feature_flags" in work.columns
+        else pd.Series(False, index=work.index)
+    )
+    struct_disc = is_ff & ~work["file_set_type"].astype(str).str.contains("csv", case=False, na=False)
+    work = work[~is_acl & ~struct_disc].copy()
+    if work.empty:
+        return work
+
+    fst = work["file_set_type"].astype(str).str.strip()
+    if _is_structured_ds(ds_name):
+        labeled = fst != ""
+        if labeled.any():
+            work = work[labeled].copy()
+            fst = work["file_set_type"].astype(str).str.strip()
+    else:
+        small_mask = fst.str.contains("Small Files", case=False, na=False) | fst.str.contains(
+            "Small File", case=False, na=False
+        )
+        if small_mask.any():
+            work = work[small_mask].copy()
+
+    return work
+
+
+def _trend_points_per_major(work: pd.DataFrame) -> pd.DataFrame:
+    """One best row per major build (highest cluster GB/hr, else shortest scan hours)."""
+    if work.empty:
+        return work
+    work = work.copy()
+    work["_major"] = work["build_version"].astype(str).map(_major_line)
+    rows: List[pd.Series] = []
+    for _, grp in work.groupby(["_major"], dropna=False):
+        rows.append(select_best_run(grp))
+    plot_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=work.columns)
+    if plot_df.empty:
+        return plot_df
+    plot_df["_major"] = plot_df["build_version"].astype(str).map(_major_line)
+    plot_df["sort_key"] = plot_df["_major"].map(_build_sort_key)
+    return plot_df.sort_values("sort_key")
+
+
 def select_best_run(group: pd.DataFrame) -> pd.Series:
+    """Average the runs in a scenario group (mean of the numeric metrics).
+
+    Reports now present the averaged-per-major-build figure rather than a single
+    cherry-picked best run, matching build_major_averages and the trend charts. The
+    function name is retained because it is the representative-row picker used throughout
+    this module; only the aggregation (best -> mean) changed.
+    """
     if group.empty:
         raise ValueError("empty group")
-    # Reset index to guarantee uniqueness — without this, idxmax()/idxmin() can return a
-    # label shared by multiple rows (after filters/concats), causing .loc to return a
-    # DataFrame instead of a Series and silently picking the wrong row.
     g = group.reset_index(drop=True)
-    tp = pd.to_numeric(g["throughput_cluster_gb_hr"], errors="coerce")
-    if tp.notna().any():
-        return g.loc[tp.idxmax()]
-    hrs = pd.to_numeric(g["total_scan_hours"], errors="coerce")
-    if hrs.notna().any():
-        return g.loc[hrs.idxmin()]
-    return g.iloc[0]
+    row = g.iloc[0].copy()
+    numeric_cols = (
+        "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
+        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+        "total_scan_hours", "objects_scanned", "total_size_gb", "total_files", "total_folders",
+        "total_classification", "total_catalog_items", "new_attributes_count", "removed_attributes_count",
+        "new_attributes", "removed_attributes",
+    )
+    for col in numeric_cols:
+        if col in g.columns:
+            vals = pd.to_numeric(g[col], errors="coerce")
+            if vals.notna().any():
+                row[col] = vals.mean()
+    return row
+
+
+def _prepare_work_for_best_pick(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize DS/file-set/scenario so best picks never mix Base, ACL, OLS, etc."""
+    work = df.copy()
+    if "matrix_data_source_type" in work.columns:
+        work["norm_ds"] = work["matrix_data_source_type"].map(normalize_ds_name)
+    else:
+        work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
+    if "matrix_file_set_type" in work.columns:
+        mfst = work["matrix_file_set_type"].astype(str).str.strip()
+        fst = work["file_set_type"].astype(str).str.strip()
+        work["file_set_type"] = mfst.where(mfst != "", fst)
+    if "scenario_label" not in work.columns or work["scenario_label"].isna().all():
+        work["scenario_label"] = work.apply(_scenario_label, axis=1)
+    else:
+        blank = work["scenario_label"].astype(str).str.strip() == ""
+        if blank.any():
+            work.loc[blank, "scenario_label"] = work.loc[blank].apply(_scenario_label, axis=1)
+    return work
 
 
 def best_rows_for_build(df: pd.DataFrame, build_version: str) -> pd.DataFrame:
     part = df[df["build_version"].astype(str) == str(build_version).strip()].copy()
     if part.empty:
         return pd.DataFrame(columns=df.columns)
+    work = _prepare_work_for_best_pick(part)
     rows: List[pd.Series] = []
-    for _, grp in part.groupby(
-        ["data_source_type", "scan_type", "file_set_type", "is_acl", "is_feature_flags"],
-        dropna=False,
-    ):
+    
+    # Group by SCENARIO (ds + file set + Base/ACL/OLS), NOT scan_name, so all runs in the
+    # major line for the same scenario are AVERAGED together — matching the Dashboard
+    # (/api/trends/small-files) and the trend charts. Grouping by scan_name previously showed a
+    # single representative run (e.g. SMB Base 255 = 10.08) instead of the per-major mean (11.48).
+    groupby_cols = ["norm_ds", "file_set_type", "scenario_label"]
+    
+    for _, grp in work.groupby(groupby_cols, dropna=False):
         rows.append(select_best_run(grp))
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=df.columns)
+    return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame(columns=part.columns)
 
 
 _STRUCTURED_DS = {"postgres", "mssql", "mysql", "oracle"}
@@ -305,17 +643,44 @@ def filter_major_line(df: pd.DataFrame, major_line: Optional[str]) -> pd.DataFra
     return df[df["build_version"].astype(str).map(_major_line) == str(major_line).strip()].copy()
 
 
-def best_rows_for_major_line(df: pd.DataFrame, major_line: Optional[str]) -> pd.DataFrame:
+def best_rows_for_major_line(
+    df: pd.DataFrame,
+    major_line: Optional[str],
+    *,
+    anchor_build: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Best throughput row per major line (e.g. all 254.x) for each distinct scenario.
+    
+    Groups by scan_name to identify unique scenarios (e.g., "S3 Small Files", "ACI Large Files"),
+    then selects the best throughput across all builds in that major line (254.6, 254.15, 254.20).
+    This ensures each data source environment gets its own best throughput independently.
+
+    When anchor_build is set (e.g. report current 253.11), prefer that sub-version so
+    scenario comparisons are apples-to-apples. Only fall back to another sub-version
+    in the same major when the anchor has no run for that scenario.
+    """
     part = filter_major_line(df, major_line)
     if part.empty:
         return pd.DataFrame(columns=df.columns)
+    work = _prepare_work_for_best_pick(part)
+    anchor = str(anchor_build or "").strip()
     rows: List[pd.Series] = []
-    for _, grp in part.groupby(
-        ["data_source_type", "scan_type", "file_set_type", "is_acl", "is_feature_flags"],
-        dropna=False,
-    ):
+    
+    # Group by SCENARIO (ds + file set + Base/ACL/OLS), NOT scan_name, so all runs in the
+    # major line for the same scenario are AVERAGED together — matching the Dashboard
+    # (/api/trends/small-files) and the trend charts. Grouping by scan_name previously showed a
+    # single representative run (e.g. SMB Base 255 = 10.08) instead of the per-major mean (11.48).
+    groupby_cols = ["norm_ds", "file_set_type", "scenario_label"]
+    
+    for _, grp in work.groupby(groupby_cols, dropna=False):
+        if anchor:
+            anchored = grp[grp["build_version"].astype(str) == anchor]
+            if not anchored.empty:
+                rows.append(select_best_run(anchored))
+                continue
         rows.append(select_best_run(grp))
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=df.columns)
+    return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame(columns=part.columns)
 
 
 def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str, y_label: str) -> str:
@@ -325,37 +690,15 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
     if df is None or df.empty or not req.issubset(set(df.columns)):
         return "<div class='muted'>No trend data available.</div>"
 
-    work = df.copy()
-    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
-    work = work[work["norm_ds"] == ds_name].copy()
-    if work.empty:
-        return f"<div class='muted'>No {html.escape(ds_name)} data available.</div>"
-
-    # Prefer Small Files; fall back to all if not present
-    small = work[work["file_set_type"].astype(str).str.contains("Small Files", case=False, na=False)]
-    if not small.empty:
-        work = small.copy()
-
-    # Full Scan baseline: no ACL, no feature flags, no OLS.
-    if "is_acl" in work.columns:
-        work = work[pd.to_numeric(work["is_acl"], errors="coerce").fillna(0).astype(int) == 0]
-    if "is_feature_flags" in work.columns:
-        work = work[pd.to_numeric(work["is_feature_flags"], errors="coerce").fillna(0).astype(int) == 0]
-    if "scan_type" in work.columns:
-        work = work[~work["scan_type"].astype(str).str.lower().str.contains("ols", na=False)]
+    work = _filter_dashboard_trend_rows(df, ds_name)
     if work.empty:
         return f"<div class='muted'>No {html.escape(ds_name)} Full Scan data available.</div>"
 
-    work["major_label"] = work["build_version"].astype(str).map(_major_line)
-    rows = []
-    for _, grp in work.groupby("major_label", dropna=False):
-        rows.append(select_best_run(grp))
-    plot_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=work.columns)
+    plot_df = _trend_points_per_major(work)
     if plot_df.empty or value_col not in plot_df.columns:
         return "<div class='muted'>No release trend data available.</div>"
 
-    plot_df["sort_key"] = plot_df["major_label"].map(lambda v: _build_sort_key(v))
-    plot_df = plot_df.sort_values("sort_key")
+    plot_df["major_label"] = plot_df["_major"].astype(str)
     # Keep only the last 8 major release lines to avoid old/miscategorized entries (e.g. 249)
     _MAX_RELEASE_MAJORS = 8
     if len(plot_df) > _MAX_RELEASE_MAJORS:
@@ -412,10 +755,10 @@ def _release_trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, ti
     ax.legend(loc="upper left", frameon=False, fontsize=8.5, ncol=2)
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.18, top=0.86)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
-def build_major_release_section(full_df: pd.DataFrame, include_structured: bool) -> str:
+def build_major_release_section(full_df: pd.DataFrame, ds_scope: Sequence[str]) -> str:
     """Card showing throughput trend across release builds only (is_release=1).
     Multiple sub-versions within the same major → best throughput wins."""
     if full_df is None or full_df.empty:
@@ -430,7 +773,9 @@ def build_major_release_section(full_df: pd.DataFrame, include_structured: bool)
     if release_df.empty:
         return ""
 
-    ds_list = UNSTRUCTURED_DS_ORDER + (STRUCTURED_DS_ORDER if include_structured else [])
+    ds_list = [d for d in ALL_REPORT_DS_ORDER if d in ds_scope]
+    if not ds_list:
+        return ""
     panels = []
     for ds in ds_list:
         _fl = _files_label(ds)
@@ -455,8 +800,9 @@ def build_major_release_section(full_df: pd.DataFrame, include_structured: bool)
     <div class="card card-release">
       <div class="section-title">📦 Major Release Benchmark Trends</div>
       <div class="section-subtitle">
-        Release builds only (marked as Release Milestone). Best Base Full Scan result per major version.
-        Multiple sub-versions in the same major → highest throughput is shown.
+        Release builds only (marked as Release Milestone). Base Full Scan per major version — ACL and
+        Structured Discovery runs excluded. Multiple sub-versions in the same major → averaged (matches
+        the Dashboard trend charts).
       </div>
       <div class="chart-band">
         {''.join(panels)}
@@ -470,35 +816,13 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
     if df is None or df.empty or not req.issubset(set(df.columns)):
         return "<div class='muted'>No trend data available.</div>"
 
-    work = df.copy()
-    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
-    work = work[work["norm_ds"] == ds_name].copy()
-    small_file_work = work[work["file_set_type"].astype(str).str.contains("Small Files", case=False, na=False)].copy()
-    if not small_file_work.empty:
-        work = small_file_work
-    # Base Full Scan only: no ACL, no FF, no OLS — keeps comparison consistent across builds.
-    if "is_acl" in work.columns:
-        work = work[pd.to_numeric(work["is_acl"], errors="coerce").fillna(0).astype(int) == 0]
-    if "is_feature_flags" in work.columns:
-        work = work[pd.to_numeric(work["is_feature_flags"], errors="coerce").fillna(0).astype(int) == 0]
-    if "scan_type" in work.columns:
-        work = work[~work["scan_type"].astype(str).str.lower().str.contains("ols", na=False)]
+    work = _filter_dashboard_trend_rows(df, ds_name)
     if work.empty:
-        return f"<div class='muted'>No {html.escape(ds_name)} Base Full Scan data available.</div>"
+        return f"<div class='muted'>No {html.escape(ds_name)} Full Scan data available.</div>"
 
-    # Group by major version (e.g. "253" covers "253.5" and "253.11") and pick best per major.
-    work = work.copy()
-    work["_major"] = work["build_version"].astype(str).map(_major_line)
-    rows = []
-    for _, grp in work.groupby(["_major"], dropna=False):
-        rows.append(select_best_run(grp))
-    plot_df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=work.columns)
+    plot_df = _trend_points_per_major(work)
     if plot_df.empty or value_col not in plot_df.columns:
         return "<div class='muted'>No trend data available.</div>"
-
-    plot_df["_major"] = plot_df["build_version"].astype(str).map(_major_line)
-    plot_df["sort_key"] = plot_df["_major"].map(_build_sort_key)
-    plot_df = plot_df.sort_values("sort_key")
     fig, ax = plt.subplots(figsize=(7.4, 3.6))
     x_vals = plot_df["_major"].astype(str).tolist()
     if value_col == "throughput_cluster_gb_hr":
@@ -558,7 +882,7 @@ def _trend_chart_html(df: pd.DataFrame, ds_name: str, value_col: str, title: str
     ax.legend(loc="upper right", frameon=False, fontsize=8.5, ncol=3, handlelength=2.2, columnspacing=1.2)
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.28, top=0.88)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
 def _build_ds_trend_panel(full_df: pd.DataFrame, ds_name: str) -> str:
@@ -577,21 +901,61 @@ def _build_ds_trend_panel(full_df: pd.DataFrame, ds_name: str) -> str:
     """
 
 
+def _restrict_unstructured_to_small_files(work: pd.DataFrame, ds_order: Sequence[str]) -> pd.DataFrame:
+    """S3/SMB charts must use Small Files only — Large Files rows inflate cluster GB/hr."""
+    unstructured = [d for d in ds_order if not _is_structured_ds(d)]
+    if not unstructured or work.empty:
+        return work
+    fst = work["file_set_type"].astype(str)
+    small_mask = fst.str.contains("Small Files", case=False, na=False) | fst.str.contains(
+        "Small File", case=False, na=False
+    )
+    u_mask = work["norm_ds"].isin(unstructured)
+    return work[(~u_mask) | small_mask].copy()
+
+
+def _major_line_comparison_rows(
+    df: pd.DataFrame,
+    current_major: str,
+    ds_order: Sequence[str],
+) -> pd.DataFrame:
+    """All rows for current major line (254.x), prepared for cross-DS / OLS cluster comparisons."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = filter_major_line(df, current_major)
+    if work.empty:
+        return work
+    work = _prepare_work_for_best_pick(work)
+    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
+    work = work[work["norm_ds"].isin(set(ds_order))].copy()
+    return _restrict_unstructured_to_small_files(work, ds_order)
+
+
 def _cross_ds_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str, y_label: str, ds_order: Sequence[str]) -> str:
     req = {"data_source_type", value_col}
     if cur_df is None or cur_df.empty or not req.issubset(set(cur_df.columns)):
         return "<div class='muted'>No current-build DS chart data available.</div>"
 
     work = cur_df.copy()
-    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
+    if "norm_ds" not in work.columns:
+        work = _prepare_work_for_best_pick(work)
+        work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
     ds_filter = set(ds_order)
     work = work[work["norm_ds"].isin(ds_filter)].copy()
+    work = _restrict_unstructured_to_small_files(work, ds_order)
     if work.empty:
         return "<div class='muted'>No current-build DS chart data available.</div>"
 
+    # Side-by-side DS bars: Base (Full Scan), best cluster row per DS (Small Files for S3/SMB).
+    base = work[work["scenario_label"] == "Base (Full Scan)"].copy()
+    if ds_order and all(_is_structured_ds(d) for d in ds_order):
+        labeled = base["file_set_type"].astype(str).str.strip() != ""
+        if labeled.any():
+            base = base[labeled].copy()
+
     best_rows = []
     for ds in ds_order:
-        part = work[work["norm_ds"] == ds].copy()
+        part = base[base["norm_ds"] == ds].copy()
         if part.empty:
             continue
         best_rows.append(select_best_run(part))
@@ -619,7 +983,7 @@ def _cross_ds_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str, y
     for bar, val in zip(bars, vals):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), _fmt_num(val, 1), ha="center", va="bottom", fontsize=8)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
 def _build_trend_group(title: str, subtitle: str, full_df: pd.DataFrame, ds_order: Sequence[str], card_class: str) -> str:
@@ -635,7 +999,16 @@ def _build_trend_group(title: str, subtitle: str, full_df: pd.DataFrame, ds_orde
     """
 
 
-def build_build_comparison_section(cur_df: pd.DataFrame, prev_df: pd.DataFrame, full_df: pd.DataFrame, current_major: str, previous_major: Optional[str], include_structured: bool) -> str:
+def build_build_comparison_section(
+    cur_df: pd.DataFrame,
+    prev_df: pd.DataFrame,
+    full_df: pd.DataFrame,
+    current_major: str,
+    previous_major: Optional[str],
+    ds_scope: Sequence[str],
+    *,
+    trend_df: Optional[pd.DataFrame] = None,
+) -> str:
     required_cols = {"data_source_type", "scan_type", "file_set_type", "is_acl", "is_feature_flags"}
     if cur_df is None or cur_df.empty or not required_cols.issubset(set(cur_df.columns)):
         return """
@@ -646,27 +1019,44 @@ def build_build_comparison_section(cur_df: pd.DataFrame, prev_df: pd.DataFrame, 
         </div>
         """
 
-    subtitle = f"Last {len(set(full_df['build_version'].astype(str)))} builds across all major lines."
-    sections = [
-        _build_trend_group("Unstructured DS Trend Comparison", subtitle, full_df, UNSTRUCTURED_DS_ORDER, "card-warm")
-    ]
-    if include_structured:
+    trend_source = trend_df if trend_df is not None and not trend_df.empty else full_df
+    major_count = len({_major_line(v) for v in trend_source.get("build_version", pd.Series(dtype=str)).astype(str) if _major_line(v)})
+    subtitle = (
+        f"Last {major_count} major build(s) — Base Full Scan, averaged per major "
+        f"(matches dashboard trend charts)."
+    )
+    sections: List[str] = []
+    un_ds = unstructured_ds_in_scope(ds_scope)
+    st_ds = structured_ds_in_scope(ds_scope)
+    if un_ds:
         sections.append(
-            _build_trend_group("Structured DS Trend Comparison", subtitle, full_df, STRUCTURED_DS_ORDER, "card-mint")
+            _build_trend_group("Unstructured DS Trend Comparison", subtitle, trend_source, un_ds, "card-warm")
+        )
+    if st_ds:
+        sections.append(
+            _build_trend_group("Structured DS Trend Comparison", subtitle, trend_source, st_ds, "card-mint")
         )
     return "".join(sections)
 
 
-def _ols_vs_base_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str, y_label: str, ds_order: Sequence[str]) -> str:
-    """Grouped bar chart: Base (Full Scan) vs OLS Scan, one group per DS."""
-    req = {"data_source_type", value_col, "scan_type", "is_feature_flags"}
+def _ols_vs_base_bar_chart_html(
+    cur_df: pd.DataFrame,
+    value_col: str,
+    title: str,
+    y_label: str,
+    ds_order: Sequence[str],
+) -> str:
+    """Grouped bar chart: Base (Full Scan) vs OLS Scan — best Small Files cluster throughput per DS."""
+    req = {"data_source_type", value_col}
     if cur_df is None or cur_df.empty or not req.issubset(set(cur_df.columns)):
         return "<div class='muted'>No Full Scan vs OLS data available.</div>"
 
     work = cur_df.copy()
-    work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
-    work["scenario_label"] = work.apply(_scenario_label, axis=1)
+    if "norm_ds" not in work.columns or "scenario_label" not in work.columns:
+        work = _prepare_work_for_best_pick(work)
+        work["norm_ds"] = work["data_source_type"].map(normalize_ds_name)
     work = work[work["norm_ds"].isin(set(ds_order))].copy()
+    work = _restrict_unstructured_to_small_files(work, ds_order)
     if work.empty:
         return "<div class='muted'>No Full Scan vs OLS data available.</div>"
 
@@ -675,15 +1065,16 @@ def _ols_vs_base_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str
     if not ds_list:
         return "<div class='muted'>No Full Scan vs OLS data available.</div>"
 
-    # Best value per (ds, scenario)
+    # Best cluster row per (ds, scenario) — same pick logic as scenario matrix / spreadsheet.
     data: Dict[str, Dict[str, float]] = {scen: {} for scen in scenarios}
     for ds in ds_list:
         for scen in scenarios:
             part = work[(work["norm_ds"] == ds) & (work["scenario_label"] == scen)]
             if not part.empty:
-                best = pd.to_numeric(part[value_col], errors="coerce").max()
-                if pd.notna(best):
-                    data[scen][ds] = float(best)
+                best_row = select_best_run(part)
+                val = pd.to_numeric(best_row.get(value_col), errors="coerce")
+                if pd.notna(val):
+                    data[scen][ds] = float(val)
 
     # Only render if at least one OLS value exists
     has_ols = any(data["OLS Scan"])
@@ -719,13 +1110,20 @@ def _ols_vs_base_bar_chart_html(cur_df: pd.DataFrame, value_col: str, title: str
     ax.legend(loc="upper right", frameon=False, fontsize=8.5)
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.14, top=0.88)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
-def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFrame, ds_order: Sequence[str], card_class: str, show_ols_comparison: bool = False) -> str:
+def _build_cross_ds_group(
+    title: str,
+    subtitle: str,
+    major_line_df: pd.DataFrame,
+    ds_order: Sequence[str],
+    card_class: str,
+    show_ols_comparison: bool = False,
+) -> str:
     _all_structured = bool(ds_order) and all(_is_structured_ds(ds) for ds in ds_order)
     _f_unit = "Tables" if _all_structured else "Files"
-    _f_label = f"{_f_unit}/hr"
+    _cluster_files_label = f"Cluster {_f_unit}/hr"
     ols_chart = ""
     if show_ols_comparison:
         ols_chart = f"""
@@ -738,8 +1136,8 @@ def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFr
         </div>
         <table style="width: 100%; border-collapse: collapse;">
           <tr>
-            <td style="width: 50%; padding-right: 7px;">{_ols_vs_base_bar_chart_html(current_build_df, "throughput_cluster_gb_hr", "Full Scan vs OLS — GB/hr", "GB/hr", ds_order)}</td>
-            <td style="width: 50%; padding-left: 7px;">{_ols_vs_base_bar_chart_html(current_build_df, "throughput_cluster_files_hr", f"Full Scan vs OLS — {_f_label}", _f_label, ds_order)}</td>
+            <td style="width: 50%; padding-right: 7px;">{_ols_vs_base_bar_chart_html(major_line_df, "throughput_cluster_gb_hr", "Full Scan vs OLS — Cluster GB/hr", "Cluster GB/hr", ds_order)}</td>
+            <td style="width: 50%; padding-left: 7px;">{_ols_vs_base_bar_chart_html(major_line_df, "throughput_cluster_files_hr", f"Full Scan vs OLS — {_cluster_files_label}", _cluster_files_label, ds_order)}</td>
           </tr>
         </table>
         """
@@ -750,8 +1148,8 @@ def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFr
       <div class="chart-band">
         <table style="width: 100%; border-collapse: collapse;">
           <tr>
-            <td style="width: 50%; padding-right: 7px;">{_cross_ds_bar_chart_html(current_build_df, "throughput_cluster_gb_hr", "Data Throughput By DS", "GB/hr", ds_order)}</td>
-            <td style="width: 50%; padding-left: 7px;">{_cross_ds_bar_chart_html(current_build_df, "throughput_cluster_files_hr", f"{_f_unit} Throughput By DS", _f_label, ds_order)}</td>
+            <td style="width: 50%; padding-right: 7px;">{_cross_ds_bar_chart_html(major_line_df, "throughput_cluster_gb_hr", "Cluster GB/hr By DS", "Cluster GB/hr", ds_order)}</td>
+            <td style="width: 50%; padding-left: 7px;">{_cross_ds_bar_chart_html(major_line_df, "throughput_cluster_files_hr", f"{_cluster_files_label} By DS", _cluster_files_label, ds_order)}</td>
           </tr>
         </table>
         {ols_chart}
@@ -760,9 +1158,13 @@ def _build_cross_ds_group(title: str, subtitle: str, current_build_df: pd.DataFr
     """
 
 
-def build_cross_ds_section(current_build_df: pd.DataFrame, current_build: str, include_structured: bool) -> str:
-    required_cols = {"data_source_type", "scan_type", "file_set_type", "is_acl"}
-    if current_build_df is None or current_build_df.empty or not required_cols.issubset(set(current_build_df.columns)):
+def build_cross_ds_section(
+    full_df: pd.DataFrame,
+    current_major: str,
+    ds_scope: Sequence[str],
+) -> str:
+    required_cols = {"data_source_type", "scan_type", "file_set_type", "is_acl", "build_version"}
+    if full_df is None or full_df.empty or not required_cols.issubset(set(full_df.columns)):
         return """
         <div class="card">
           <div class="section-title">Current Build Unstructured DS Comparison</div>
@@ -770,13 +1172,40 @@ def build_cross_ds_section(current_build_df: pd.DataFrame, current_build: str, i
           <div class="muted">No cross-DS benchmark rows were found for the selected current build.</div>
         </div>
         """
-    subtitle = f"Best available result inside build <strong>{html.escape(current_build)}</strong>."
-    sections = [
-        _build_cross_ds_group("Current Build Unstructured DS Comparison", subtitle, current_build_df, UNSTRUCTURED_DS_ORDER, "card-sky", show_ols_comparison=True)
-    ]
-    if include_structured:
+    subtitle = (
+        f"Best <strong>Small Files</strong> cluster throughput across "
+        f"<strong>{html.escape(current_major)}.x</strong> sub-versions "
+        f"(e.g. 254.6, 254.15, 254.20 — highest cluster GB/hr wins; Large Files excluded)."
+    )
+    sections: List[str] = []
+    un_ds = unstructured_ds_in_scope(ds_scope)
+    st_ds = structured_ds_in_scope(ds_scope)
+    if un_ds:
+        major_line_df = _major_line_comparison_rows(full_df, current_major, un_ds)
         sections.append(
-            _build_cross_ds_group("Current Build Structured DS Comparison", subtitle, current_build_df, STRUCTURED_DS_ORDER, "card-mint")
+            _build_cross_ds_group(
+                "Current Build Unstructured DS Comparison",
+                subtitle,
+                major_line_df,
+                un_ds,
+                "card-sky",
+                show_ols_comparison=True,
+            )
+        )
+    if st_ds:
+        major_line_df = _major_line_comparison_rows(full_df, current_major, st_ds)
+        st_subtitle = (
+            f"Best cluster throughput across <strong>{html.escape(current_major)}.x</strong> sub-versions "
+            f"(highest cluster GB/hr per data source; blank file sets excluded)."
+        )
+        sections.append(
+            _build_cross_ds_group(
+                "Current Build Structured DS Comparison",
+                st_subtitle,
+                major_line_df,
+                st_ds,
+                "card-mint",
+            )
         )
     return "".join(sections)
 
@@ -788,15 +1217,20 @@ def _scenario_label(row: pd.Series) -> str:
 def build_scenario_matrix_section(
     current_build_df: pd.DataFrame,
     current_build: str,
-    include_structured: bool,
+    ds_scope: Sequence[str],
     cur_major_df: Optional[pd.DataFrame] = None,
     prev_major_df: Optional[pd.DataFrame] = None,
     current_major: Optional[str] = None,
     previous_major: Optional[str] = None,
+    previous_build: Optional[str] = None,
 ) -> str:
-    # Use best-of-major-line data when available; fall back to single-build data
+    # Prefer anchor-build rows so Base/ACL/OLS are comparable; fall back within major only when missing.
     work_df = cur_major_df if (cur_major_df is not None and not cur_major_df.empty) else current_build_df
-    label = f"{current_major}.x (best)" if current_major and cur_major_df is not None and not cur_major_df.empty else current_build
+    label = (
+        f"{current_build} (same build per scenario; other {current_major}.x only if missing)"
+        if current_major and str(current_build or "").strip()
+        else current_build
+    )
 
     if work_df is None or work_df.empty or "data_source_type" not in work_df.columns:
         return f"""
@@ -810,10 +1244,10 @@ def build_scenario_matrix_section(
     work["norm_ds"] = work.get("matrix_data_source_type", work["data_source_type"]).map(normalize_ds_name)
     if "matrix_file_set_type" in work.columns:
         work["file_set_type"] = work["matrix_file_set_type"]
-    ds_scope = UNSTRUCTURED_DS_ORDER + (STRUCTURED_DS_ORDER if include_structured else [])
-    work = work[work["norm_ds"].isin(ds_scope)].copy()
+    scope_list = list(ds_scope)
+    work = work[work["norm_ds"].isin(scope_list)].copy()
     if work.empty:
-        scope_text = "S3 / SMB / MSSQL / Postgres" if include_structured else "S3 / SMB"
+        scope_text = ds_scope_label(scope_list)
         return f"""
         <div class="card">
           <div class="section-title">Scenario Matrix</div>
@@ -824,13 +1258,20 @@ def build_scenario_matrix_section(
     work["sort_hours"] = pd.to_numeric(work.get("total_scan_hours"), errors="coerce")
     work["sort_gb"] = pd.to_numeric(work.get("throughput_cluster_gb_hr"), errors="coerce")
 
-    # Deduplicate: keep best throughput row per (ds, file_set, scenario_label).
-    # This prevents duplicate rows when two scan_type values map to the same scenario
-    # (e.g. "ols_scan" and "ols" both → "OLS Scan").
-    dedup_rows: List[pd.Series] = []
-    for _, grp in work.groupby(["norm_ds", "file_set_type", "scenario_label"], dropna=False):
-        dedup_rows.append(select_best_run(grp))
-    work = pd.DataFrame(dedup_rows).reset_index(drop=True) if dedup_rows else work
+    anchor = str(current_build or "").strip()
+
+    def _dedup_with_anchor(frame: pd.DataFrame, anchor_build: str) -> pd.DataFrame:
+        dedup_rows: List[pd.Series] = []
+        for _, grp in frame.groupby(["norm_ds", "file_set_type", "scenario_label"], dropna=False):
+            if anchor_build:
+                anchored = grp[grp["build_version"].astype(str) == anchor_build]
+                if not anchored.empty:
+                    dedup_rows.append(select_best_run(anchored))
+                    continue
+            dedup_rows.append(select_best_run(grp))
+        return pd.DataFrame(dedup_rows).reset_index(drop=True) if dedup_rows else frame
+
+    work = _dedup_with_anchor(work, anchor)
 
     # Build prev-major lookup: (norm_ds, file_set_type, scenario_label) → best GB/hr
     prev_best: Dict[Tuple[str, str, str], float] = {}
@@ -840,11 +1281,8 @@ def build_scenario_matrix_section(
         if "matrix_file_set_type" in pm.columns:
             pm["file_set_type"] = pm["matrix_file_set_type"]
         pm["scenario_label"] = pm.apply(_scenario_label, axis=1)
-        # Deduplicate prev major the same way
-        pm_dedup: List[pd.Series] = []
-        for _, grp in pm.groupby(["norm_ds", "file_set_type", "scenario_label"], dropna=False):
-            pm_dedup.append(select_best_run(grp))
-        pm = pd.DataFrame(pm_dedup).reset_index(drop=True) if pm_dedup else pm
+        prev_anchor = str(previous_build or "").strip()
+        pm = _dedup_with_anchor(pm, prev_anchor)
         for _, r in pm.iterrows():
             tp = _safe_float(r.get("throughput_cluster_gb_hr"))
             if tp and tp > 0:
@@ -913,9 +1351,11 @@ def build_scenario_matrix_section(
             vs_prev_cls = "pos" if vs_prev is not None and vs_prev >= 0 else ("neg" if vs_prev is not None else "")
 
             prev_cell = f"<td class='{vs_prev_cls}'>{html.escape(vs_prev_text)}</td>" if show_prev_col else ""
+            build_ver = str(row.get("build_version") or "").strip()
             rows_html.append(
                 "<tr>"
                 f"<td>{html.escape(scen or '—')}</td>"
+                f"<td>{html.escape(build_ver or '—')}</td>"
                 f"<td>{_fmt_num(row.get('throughput_cluster_gb_hr'), 2)}</td>"
                 f"<td>{_fmt_num(row.get('throughput_cluster_files_hr'), 0)}</td>"
                 f"<td>{_fmt_num(row.get('total_scan_hours'), 2)}</td>"
@@ -927,26 +1367,26 @@ def build_scenario_matrix_section(
         prev_th = f"<th>{html.escape(prev_col_header)}</th>" if show_prev_col else ""
         cards.append(
             f"""
-            <details class="matrix-card" open>
-              <summary class="matrix-summary">{html.escape(ds)} — {html.escape(str(file_set or '—'))} ({len(part)} scenario(s))</summary>
+            <div class="matrix-card" style="border:1px solid #d8dee9;border-radius:14px;margin-bottom:16px;background:#ffffff;overflow:hidden;">
+              <div class="matrix-summary" style="padding:14px 18px;font-size:16px;font-weight:700;color:#374151;background:#fafcff;border-bottom:1px solid #e5e7eb;">{html.escape(ds)} — {html.escape(str(file_set or '—'))} ({len(part)} scenario(s))</div>
               <table class="report-table">
                 <thead>
-                  <tr>
-                    <th>Scenario</th><th>GB/hr</th><th>{"Tables/hr" if _is_structured_ds(ds) else "Files/hr"}</th><th>Scan Hrs</th><th>Objects</th><th>vs Base</th>{prev_th}
+                    <tr>
+                    <th>Scenario</th><th>Build</th><th>GB/hr</th><th>{"Tables/hr" if _is_structured_ds(ds) else "Files/hr"}</th><th>Scan Hrs</th><th>Objects</th><th>vs Base</th>{prev_th}
                   </tr>
                 </thead>
                 <tbody>
                   {''.join(rows_html)}
                 </tbody>
               </table>
-            </details>
+            </div>
             """
         )
     if not cards:
         return f"""
         <div class="card">
           <div class="section-title">Scenario Matrix</div>
-          <div class="muted">No {'S3 / SMB / MSSQL / Postgres' if include_structured else 'S3 / SMB'} rows found for {html.escape(label)}.</div>
+          <div class="muted">No {html.escape(ds_scope_label(scope_list))} rows found for {html.escape(label)}.</div>
         </div>
         """
     return f"""
@@ -962,6 +1402,10 @@ def build_scenario_matrix_section(
 
 
 def load_classifier_detail(engine, current_build: str, previous_build: Optional[str], environment_id: Optional[int]) -> Dict[str, Any]:
+    """
+    Load classifier details comparing current and previous builds.
+    Includes impact analysis on scan performance metrics.
+    """
     params: Dict[str, Any] = {"cur": str(current_build).strip()}
     env_filter = ""
     if environment_id is not None:
@@ -1077,28 +1521,245 @@ def load_classifier_detail(engine, current_build: str, previous_build: Optional[
                 if r and r[0]
             ]
 
-    cur_set = set(cur_names)
-    prev_set = set(prev_names)
+        # Analyze performance impact of classifier changes
+        cur_set = set(cur_names)
+        prev_set = set(prev_names)
+        new_classifiers = sorted(cur_set - prev_set)
+        removed_classifiers = sorted(prev_set - cur_set)
+        
+        # Calculate performance impact metrics
+        perf_impact = _analyze_classifier_impact_on_performance(
+            conn, effective_cur, previous_build, new_classifiers, removed_classifiers, environment_id
+        )
+
     return {
         "current_count": int(cur_count or 0),
         "previous_count": int(prev_count or 0) if prev_count is not None else None,
-        "new_names": sorted(cur_set - prev_set),
-        "missing_names": sorted(prev_set - cur_set),
+        "new_names": new_classifiers,
+        "missing_names": removed_classifiers,
         "sample_current": cur_names[:24],
         "effective_build": effective_cur,
+        "performance_impact": perf_impact,
     }
 
 
+def _analyze_classifier_impact_on_performance(
+    conn, current_build: str, previous_build: Optional[str], 
+    new_classifiers: List[str], removed_classifiers: List[str],
+    environment_id: Optional[int]
+) -> Dict[str, Any]:
+    """
+    Analyze how classifier changes impact scan performance metrics.
+    Compares throughput, classification counts, and scan duration between builds.
+    """
+    impact = {
+        "has_changes": len(new_classifiers) > 0 or len(removed_classifiers) > 0,
+        "new_count": len(new_classifiers),
+        "removed_count": len(removed_classifiers),
+        "throughput_delta": None,
+        "classification_delta": None,
+        "scan_duration_delta": None,
+        "avg_throughput_current": None,
+        "avg_throughput_previous": None,
+    }
+    
+    if not impact["has_changes"] or not previous_build:
+        return impact
+    
+    try:
+        # Query performance metrics for current build
+        env_filter = ""
+        params = {"cur": str(current_build).strip(), "prev": str(previous_build).strip()}
+        if environment_id is not None:
+            env_filter = " AND sp.environment_id = :eid"
+            params["eid"] = int(environment_id)
+        
+        # Get average throughput for current build
+        cur_tp = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(b.throughput_cluster_gb_hr, 0)) as avg_tp
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                WHERE bu.version = :cur {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        # Get average throughput for previous build
+        prev_tp = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(b.throughput_cluster_gb_hr, 0)) as avg_tp
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                WHERE bu.version = :prev {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        if cur_tp and prev_tp:
+            cur_val = float(cur_tp[0] or 0)
+            prev_val = float(prev_tp[0] or 0)
+            impact["avg_throughput_current"] = cur_val
+            impact["avg_throughput_previous"] = prev_val
+            if prev_val > 0:
+                impact["throughput_delta"] = ((cur_val - prev_val) / prev_val) * 100.0
+        
+        # Get average classification counts
+        cur_class = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(si.total_classification, 0)) as avg_class
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
+                WHERE bu.version = :cur {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        prev_class = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(si.total_classification, 0)) as avg_class
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
+                WHERE bu.version = :prev {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        if cur_class and prev_class:
+            cur_val = float(cur_class[0] or 0)
+            prev_val = float(prev_class[0] or 0)
+            if prev_val > 0:
+                impact["classification_delta"] = ((cur_val - prev_val) / prev_val) * 100.0
+        
+        # Get average scan duration
+        cur_dur = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(b.total_scan_hours, 0)) as avg_dur
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                WHERE bu.version = :cur {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        prev_dur = conn.execute(
+            text(f"""
+                SELECT AVG(COALESCE(b.total_scan_hours, 0)) as avg_dur
+                FROM benchmarks b
+                JOIN builds bu ON bu.id = b.build_id
+                LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
+                WHERE bu.version = :prev {env_filter}
+                  AND COALESCE(b.is_active, 1) = 1
+            """),
+            params,
+        ).fetchone()
+        
+        if cur_dur and prev_dur:
+            cur_val = float(cur_dur[0] or 0)
+            prev_val = float(prev_dur[0] or 0)
+            if prev_val > 0:
+                impact["scan_duration_delta"] = ((cur_val - prev_val) / prev_val) * 100.0
+    
+    except Exception as e:
+        print(f"Warning: Could not analyze classifier performance impact: {e}", flush=True)
+    
+    return impact
+
+
 def build_classifier_section(detail: Dict[str, Any]) -> str:
+    """
+    Build HTML section for classifier details with performance impact analysis.
+    Highlights new/removed classifiers and their impact on scan performance.
+    """
     cur = detail.get("current_count")
     prev = detail.get("previous_count")
     new_names = detail.get("new_names") or []
     missing_names = detail.get("missing_names") or []
+    perf_impact = detail.get("performance_impact") or {}
+    
+    # Build performance impact indicator
+    impact_html = ""
+    if perf_impact.get("has_changes"):
+        impact_items = []
+        
+        # Throughput impact
+        tp_delta = perf_impact.get("throughput_delta")
+        if tp_delta is not None:
+            tp_color = "#16a34a" if tp_delta >= 0 else "#dc2626"
+            tp_sign = "+" if tp_delta >= 0 else ""
+            impact_items.append(
+                f"<div style='font-size: 11px; color: {tp_color}; margin-bottom: 4px;'>"
+                f"Throughput: {tp_sign}{tp_delta:.1f}%</div>"
+            )
+        
+        # Classification count impact
+        class_delta = perf_impact.get("classification_delta")
+        if class_delta is not None:
+            class_color = "#16a34a" if class_delta >= 0 else "#dc2626"
+            class_sign = "+" if class_delta >= 0 else ""
+            impact_items.append(
+                f"<div style='font-size: 11px; color: {class_color}; margin-bottom: 4px;'>"
+                f"Classifications: {class_sign}{class_delta:.1f}%</div>"
+            )
+        
+        # Scan duration impact
+        dur_delta = perf_impact.get("scan_duration_delta")
+        if dur_delta is not None:
+            dur_color = "#dc2626" if dur_delta >= 0 else "#16a34a"  # Longer is worse
+            dur_sign = "+" if dur_delta >= 0 else ""
+            impact_items.append(
+                f"<div style='font-size: 11px; color: {dur_color}; margin-bottom: 4px;'>"
+                f"Scan Duration: {dur_sign}{dur_delta:.1f}%</div>"
+            )
+        
+        if impact_items:
+            impact_html = f"""
+            <div style='background: #f3f4f6; border-left: 3px solid #3b82f6; padding: 8px 12px; margin-bottom: 12px; border-radius: 4px;'>
+              <div style='font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>Performance Impact</div>
+              {''.join(impact_items)}
+            </div>
+            """
+    
+    # Build classifier change details
+    new_classifiers_html = ""
+    if new_names:
+        new_list = "<br/>".join(f"• {html.escape(name)}" for name in new_names[:10])
+        more_text = f"<br/>... and {len(new_names) - 10} more" if len(new_names) > 10 else ""
+        new_classifiers_html = f"""
+        <div style='margin-bottom: 12px;'>
+          <div style='font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>New Classifiers ({len(new_names)})</div>
+          <div style='font-size: 10px; color: #16a34a; line-height: 1.5;'>{new_list}{more_text}</div>
+        </div>
+        """
+    
+    removed_classifiers_html = ""
+    if missing_names:
+        removed_list = "<br/>".join(f"• {html.escape(name)}" for name in missing_names[:10])
+        more_text = f"<br/>... and {len(missing_names) - 10} more" if len(missing_names) > 10 else ""
+        removed_classifiers_html = f"""
+        <div style='margin-bottom: 12px;'>
+          <div style='font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>Removed Classifiers ({len(missing_names)})</div>
+          <div style='font-size: 10px; color: #dc2626; line-height: 1.5;'>{removed_list}{more_text}</div>
+        </div>
+        """
+    
     cards = [
-        f"<div style='font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>Current Build</div><div style='font-size: 24px; font-weight: 800; color: #111827;'>{cur:,}</div>",
-        f"<div style='font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>Previous Build</div><div style='font-size: 24px; font-weight: 800; color: #111827;'>{prev:,}</div>" if prev is not None else "",
-        f"<div style='font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>New Classifiers</div><div style='font-size: 24px; font-weight: 800; color: #16a34a;'>{len(new_names):,}</div>",
-        f"<div style='font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>Missing vs Previous</div><div style='font-size: 24px; font-weight: 800; color: #dc2626;'>{len(missing_names):,}</div>",
+        f"<div style='font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;'>Current Build</div><div style='font-size: 16px; font-weight: 800; color: #111827;'>{cur:,}</div>",
+        f"<div style='font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;'>Previous Build</div><div style='font-size: 16px; font-weight: 800; color: #111827;'>{prev:,}</div>" if prev is not None else "",
+        f"<div style='font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;'>New Classifiers</div><div style='font-size: 16px; font-weight: 800; color: #16a34a;'>{len(new_names):,}</div>",
+        f"<div style='font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;'>Missing vs Previous</div><div style='font-size: 16px; font-weight: 800; color: #dc2626;'>{len(missing_names):,}</div>",
     ]
 
     def _pill_list(items: Sequence[str], empty_text: str, cls_name: str) -> str:
@@ -1111,11 +1772,14 @@ def build_classifier_section(detail: Dict[str, Any]) -> str:
     return f"""
     <div class="card">
       <div class="section-title">Total Classifier Details</div>
-      <table style="width: 100%; border-collapse: separate; border-spacing: 14px 0; margin-bottom: 18px; margin-left: -14px;">
+      <table style="width: 100%; border-collapse: separate; border-spacing: 8px 0; margin-bottom: 10px; margin-left: -8px;">
         <tr>
-          {''.join(f"<td style='padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #f8fafc; text-align: left; width: 25%;'>{c}</td>" for c in cards if c)}
+          {''.join(f"<td style='padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f8fafc; text-align: left; width: 25%;'>{c}</td>" for c in cards if c)}
         </tr>
       </table>
+      {impact_html}
+      {new_classifiers_html}
+      {removed_classifiers_html}
       <table style="width: 100%; border-collapse: separate; border-spacing: 20px 0; margin-left: -20px;">
         <tr>
           <td style="width: 50%; vertical-align: top;">
@@ -1501,7 +2165,7 @@ def _time_series_chart_html(df: pd.DataFrame, x_col: str, y_col: str, title: str
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.28, top=0.86)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
 def _group_series_chart_html(df: pd.DataFrame, y_col: str, title: str, y_label: str) -> str:
@@ -1545,7 +2209,7 @@ def _group_series_chart_html(df: pd.DataFrame, y_col: str, title: str, y_label: 
     ax.legend(loc="upper right", frameon=False, fontsize=8.2, ncol=2)
     fig.subplots_adjust(left=0.12, right=0.98, bottom=0.28, top=0.86)
     img = _build_chart_img(fig)
-    return f"<img class='chart-img' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
+    return f"<img class='chart-img' style='width:100%;display:block;border-radius:12px;background:#ffffff;border:1px solid #e5e7eb;' src='data:image/png;base64,{img}' alt='{html.escape(title)}' />"
 
 
 def _build_scanner_env_section(env_data: Dict[str, Any], env_name: str = "") -> str:
@@ -1568,23 +2232,23 @@ def _build_scanner_env_section(env_data: Dict[str, Any], env_name: str = "") -> 
     avg_cpu_label = f"{_fmt_num(avg_cpu_val, 1)}%" if avg_cpu_val is not None else "—"
 
     stat_cards = f"""
-    <table style="width: 100%; border-collapse: separate; border-spacing: 14px 0; margin-bottom: 18px;">
+    <table style="width: 100%; border-collapse: separate; border-spacing: 8px 0; margin-bottom: 10px;">
       <tr>
-        <td style="padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #f8fafc; text-align: left;">
-          <div style="font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;">Benchmark Scans</div>
-          <div style="font-size: 24px; font-weight: 800; color: #111827;">{int(env_data.get('scan_count') or 0):,}</div>
+        <td style="padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f8fafc; text-align: left;">
+          <div style="font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;">Benchmark Scans</div>
+          <div style="font-size: 16px; font-weight: 800; color: #111827;">{int(env_data.get('scan_count') or 0):,}</div>
         </td>
-        <td style="padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #f8fafc; text-align: left;">
-          <div style="font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;">Peak Scanners</div>
-          <div style="font-size: 24px; font-weight: 800; color: #111827;">{max_scanners}</div>
+        <td style="padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f8fafc; text-align: left;">
+          <div style="font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;">Peak Scanners</div>
+          <div style="font-size: 16px; font-weight: 800; color: #111827;">{max_scanners}</div>
         </td>
-        <td style="padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #f8fafc; text-align: left;">
-          <div style="font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;">Avg CPU</div>
-          <div style="font-size: 24px; font-weight: 800; color: #111827;">{avg_cpu_label}</div>
+        <td style="padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f8fafc; text-align: left;">
+          <div style="font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;">Avg CPU</div>
+          <div style="font-size: 16px; font-weight: 800; color: #111827;">{avg_cpu_label}</div>
         </td>
-        <td style="padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #f8fafc; text-align: left;">
-          <div style="font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;">Avg Memory</div>
-          <div style="font-size: 24px; font-weight: 800; color: #111827;">{avg_used_mem} MB</div>
+        <td style="padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #f8fafc; text-align: left;">
+          <div style="font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;">Avg Memory</div>
+          <div style="font-size: 16px; font-weight: 800; color: #111827;">{avg_used_mem} MB</div>
         </td>
       </tr>
     </table>
@@ -1621,12 +2285,12 @@ def _build_scanner_env_section(env_data: Dict[str, Any], env_name: str = "") -> 
 
     display_name = env_name if env_name else f"Environment {env_data.get('env_id', '')}"
     return f"""
-    <details class="env-perf-section" open>
-      <summary class="env-perf-summary">
-        <span class="env-perf-head">{html.escape(display_name)}</span>
-        <span class="env-perf-range">{html.escape(start_label)} → {html.escape(end_label)}</span>
-      </summary>
-      <div class="env-perf-body">
+    <div class="env-perf-section" style="border: 1px solid #bfdbfe; border-radius: 12px; margin-bottom: 14px; overflow: hidden;">
+      <div class="env-perf-summary" style="display: flex; justify-content: space-between; align-items: center; padding: 12px 18px; background: #eff6ff;">
+        <span class="env-perf-head" style="font-weight: 700; font-size: 15px; color: #1e40af;">{html.escape(display_name)}</span>
+        <span class="env-perf-range" style="font-size: 13px; color: #6b7280;">{html.escape(start_label)} → {html.escape(end_label)}</span>
+      </div>
+      <div class="env-perf-body" style="padding: 16px 18px;">
         <div class="section-subtitle" style="margin-top:10px;">Avg scan speed: <strong>{avg_speed} KiB/s</strong></div>
         {stat_cards}
         {summary_table}
@@ -1643,7 +2307,7 @@ def _build_scanner_env_section(env_data: Dict[str, Any], env_name: str = "") -> 
           </table>
         </div>
       </div>
-    </details>
+    </div>
     """
 
 
@@ -1664,11 +2328,12 @@ def load_env_names(engine, env_ids: List[int]) -> Dict[int, str]:
 
 
 def build_scanner_performance_section(perf: Dict[str, Any], engine=None) -> str:
+    section_title = html.escape(str((perf or {}).get("section_title") or "Scanner Performance During Build"))
     if not perf or not perf.get("available"):
         reason = html.escape(str((perf or {}).get("reason") or "No scanner performance data available."))
         return f"""
         <div class="card card-sky">
-          <div class="section-title">Scanner Performance During Build</div>
+          <div class="section-title">{section_title}</div>
           <div class="muted">{reason}</div>
         </div>
         """
@@ -1682,12 +2347,14 @@ def build_scanner_performance_section(perf: Dict[str, Any], engine=None) -> str:
     )
     total_scans = int(perf.get("total_scan_count") or 0)
     env_labels = ", ".join(env_names.get(eid, f"Env {eid}") for eid in env_ids)
+    scope_desc = str((perf or {}).get("scope_desc") or "").strip()
+    scope_clause = f" during the {html.escape(scope_desc)}" if scope_desc else ""
 
     return f"""
     <div class="card card-sky">
-      <div class="section-title">Scanner Performance During Build</div>
+      <div class="section-title">{section_title}</div>
       <div class="section-subtitle">
-        Scanner-group performance during {total_scans:,} benchmark scan(s) across
+        Scanner-group performance{scope_clause} across {total_scans:,} scan(s) in
         environment(s): <strong>{html.escape(env_labels)}</strong>.
         Each environment is shown separately below.
       </div>
@@ -1713,12 +2380,12 @@ def build_overview_cards(current_major: str, previous_major: Optional[str], cur_
     html_cards = []
     for label, value in cards:
         html_cards.append(
-            f"<td style='padding: 14px 16px; border: 1px solid #e5e7eb; border-radius: 14px; background: #ffffff; min-width: 120px; text-align: left;'>"
-            f"<div style='font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px;'>{html.escape(str(label))}</div>"
-            f"<div style='font-size: 24px; font-weight: 800; color: #111827;'>{html.escape(str(value))}</div>"
+            f"<td style='padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 8px; background: #ffffff; min-width: 88px; text-align: left;'>"
+            f"<div style='font-size: 9px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 2px;'>{html.escape(str(label))}</div>"
+            f"<div style='font-size: 16px; font-weight: 800; color: #111827;'>{html.escape(str(value))}</div>"
             f"</td>"
         )
-    return "<table style='width: 100%; border-collapse: separate; border-spacing: 14px 0; margin-top: 22px;'><tr>" + "".join(html_cards) + "</tr></table>"
+    return "<table style='width: 100%; border-collapse: separate; border-spacing: 8px 0; margin-top: 10px;'><tr>" + "".join(html_cards) + "</tr></table>"
 
 
 def build_test_environment_section(include: bool, env_config: Optional[Dict[str, Any]] = None) -> str:
@@ -1734,22 +2401,28 @@ def build_test_environment_section(include: bool, env_config: Optional[Dict[str,
     scanners            = str(cfg.get("scanners")               or "5")
     threads_per_scanner = str(cfg.get("threads_per_scanner")    or "10")
     scan_setting_threads= str(cfg.get("scan_setting_threads")   or "50")
-    ds_lite_mode        = str(cfg.get("ds_lite_mode")           or "True")
-    file_count          = str(cfg.get("file_count")             or "1 M")
-    file_type           = str(cfg.get("file_type")              or "txt")
+    ds_lite_mode            = str(cfg.get("ds_lite_mode")            or "True")
+    scanner_jobs_thresholds = str(cfg.get("scanner_jobs_thresholds") or "false")
+    file_count              = str(cfg.get("file_count")              or "1 M")
+    file_type               = str(cfg.get("file_type")               or "txt")
     extra_notes: List[str] = list(cfg.get("extra_notes") or [])
 
+    # Each bullet is (text, bold)
     bullets = [
-        f"{environments}.",
-        f"{scanners} Scanners, {threads_per_scanner} threads each.",
-        f"{scan_setting_threads} Threads configured in Scan setting in DS.",
-        f"DS_LITE_MODE_ENABLED {ds_lite_mode}.",
-        f"{file_count} {file_type} files.",
+        (f"{environments}.", False),
+        (f"{scanners} Scanners, {threads_per_scanner} threads each.", False),
+        (f"{scan_setting_threads} Threads configured in Scan setting in DS.", False),
+        (f"DS_LITE_MODE_ENABLED {ds_lite_mode}.", True),
+        (f"SCANNER_JOBS_THRESHOLDS_ENABLED {scanner_jobs_thresholds}.", True),
+        (f"{file_count} {file_type} files.", False),
     ]
     for note in extra_notes:
-        bullets.append(str(note))
+        bullets.append((str(note), False))
 
-    items_html = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
+    items_html = "".join(
+        f"<li><b>{html.escape(b)}</b></li>" if bold else f"<li>{html.escape(b)}</li>"
+        for b, bold in bullets
+    )
     return f"""
     <div class="card card-env">
       <div class="section-title">🖥️ Test Environment</div>
@@ -1772,26 +2445,31 @@ def build_html_report(
     classifier_detail: Dict[str, Any],
     error_items: List[Dict[str, Any]],
     scanner_perf: Dict[str, Any],
-    include_structured: bool,
+    ds_scope: Sequence[str],
     include_scanner_performance: bool,
     include_errors: bool,
     include_test_env: bool = False,
     test_env_config: Optional[Dict[str, Any]] = None,
     engine=None,
+    include_trends: bool = False,
+    trend_df: Optional[pd.DataFrame] = None,
+    email_safe: bool = False,
+    email_width: int = EMAIL_SAFE_WIDTH,
 ) -> str:
-    build_comp_html = build_build_comparison_section(cur_df, prev_df, full_df, current_major, previous_major, include_structured)
-    major_release_html = build_major_release_section(full_df, include_structured)
-    # Use major-line best rows (cur_df) so data from all sub-versions (e.g. 253.5 + 253.11)
-    # is considered — ensures OLS and Full Scan runs from any sub-version are included.
-    cross_ds_html = build_cross_ds_section(cur_df, f"{current_major}.x (best)", include_structured)
+    build_comp_html = build_build_comparison_section(
+        cur_df, prev_df, full_df, current_major, previous_major, ds_scope, trend_df=trend_df
+    )
+    major_release_html = build_major_release_section(full_df, ds_scope)
+    cross_ds_html = build_cross_ds_section(full_df, current_major, ds_scope)
     scenario_matrix_html = build_scenario_matrix_section(
         current_build_df,
         current_build,
-        include_structured,
+        ds_scope,
         cur_major_df=filter_major_line(full_df, current_major),    # raw, deduplicated inside
         prev_major_df=filter_major_line(full_df, previous_major),  # raw, deduplicated inside
         current_major=current_major,
         previous_major=previous_major,
+        previous_build=previous_build,
     )
     scanner_perf_html = build_scanner_performance_section(scanner_perf, engine) if include_scanner_performance else ""
     classifier_html = build_classifier_section(classifier_detail)
@@ -1805,9 +2483,17 @@ def build_html_report(
 
     summary_points = [
         f"Current report build is {current_build}; trend comparison is grouped by major line {current_major}.x versus {previous_major + '.x' if previous_major else 'the previous line'}.",
-        "Unstructured DS charts show cluster, per-scanner, and per-thread throughput for S3 and SMB, including Full Scan vs OLS comparison.",
+        f"DS scope for this report: {ds_scope_label(ds_scope)}.",
         f"Cross-DS charts compare the best available result across {current_major}.x (all sub-versions).",
-        f"Scenario Matrix shows best result per scenario across {current_major}.x{f', compared against {previous_major}.x' if previous_major else ''}.",
+        (
+            f"Scenario Matrix uses {current_build} for each scenario when that run exists; otherwise the best other {current_major}.x sub-version"
+            + (
+                f", compared against {previous_build or (str(previous_major) + '.x')}"
+                if previous_major
+                else ""
+            )
+            + "."
+        ),
     ]
     # Classifier highlights in Executive Summary
     new_names = classifier_detail.get("new_names") or []
@@ -1822,8 +2508,12 @@ def build_html_report(
     if missing_names:
         names_str = ", ".join(missing_names[:5]) + (f" (+{len(missing_names)-5} more)" if len(missing_names) > 5 else "")
         summary_points.append(f"{len(missing_names)} classifier(s) removed vs previous: {names_str}.")
-    if include_structured:
-        summary_points.insert(2, "Structured DS sections are enabled and include MSSQL and Postgres.")
+    st_in_scope = structured_ds_in_scope(ds_scope)
+    if st_in_scope:
+        summary_points.insert(2, f"Structured DS sections: {', '.join(st_in_scope)}.")
+    un_in_scope = unstructured_ds_in_scope(ds_scope)
+    if un_in_scope:
+        summary_points.insert(2, f"Unstructured DS sections: {', '.join(un_in_scope)}.")
     if include_scanner_performance:
         summary_points.append(f"Scanner performance covers {total_scans_in_major:,} scan(s) across {current_major}.x, split per environment.")
     if include_errors:
@@ -1853,7 +2543,16 @@ def build_html_report(
         </div>
         """
 
-    return f"""<!DOCTYPE html>
+    if email_safe:
+        email_css = _email_safe_css(email_width)
+        shell_open, shell_close = _email_safe_shell(email_width)
+        body_attr = ' style="margin:0;padding:0;background:#f4f6fb;"'
+    else:
+        email_css = ""
+        shell_open, shell_close = '<div class="page">', "</div>"
+        body_attr = ""
+
+    report_doc = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8" />
@@ -2234,10 +2933,44 @@ def build_html_report(
         grid-template-columns: 1fr;
       }}
     }}
+    /* ===== Compact overrides (tighten vertical space for email paste) ===== */
+    body {{ padding: 8px; }}
+    .page {{ border-radius: 12px; box-shadow: 0 8px 24px rgba(15,23,42,0.06); }}
+    .header {{ padding: 12px 16px 10px 16px; }}
+    .brand {{ font-size: 11px; margin-bottom: 4px; }}
+    .title {{ font-size: 19px; margin: 0 0 4px 0; }}
+    .meta {{ font-size: 11px; line-height: 1.35; }}
+    .content {{ padding: 10px 16px 14px 16px; }}
+    .card {{ padding: 10px 12px 8px 12px; margin-bottom: 10px; border-radius: 10px; }}
+    .section-title {{ font-size: 15px; margin-bottom: 3px; }}
+    .section-subtitle {{ font-size: 11px; margin-bottom: 6px; line-height: 1.3; }}
+    .overview-list {{ font-size: 12px; line-height: 1.35; }}
+    .report-table {{ font-size: 11px; }}
+    .report-table th {{ padding: 4px 6px; font-size: 10px; }}
+    .report-table td {{ padding: 4px 6px; }}
+    .hero-stat, .mini-stat {{ padding: 8px 10px; border-radius: 8px; }}
+    .hero-stat .label, .mini-stat .label {{ font-size: 9px; margin-bottom: 2px; }}
+    .hero-stat .value, .mini-stat .value {{ font-size: 16px; }}
+    .hero-grid {{ margin-top: 10px; gap: 8px; }}
+    .mini-grid {{ gap: 8px; margin-bottom: 8px; }}
+    .chart-band {{ padding: 8px; margin-bottom: 8px; border-radius: 10px; }}
+    .chart-grid, .trend-panel-grid, .split {{ gap: 8px; }}
+    .trend-panel {{ padding: 8px; margin-bottom: 8px; border-radius: 10px; }}
+    .trend-panel-head {{ font-size: 14px; margin-bottom: 6px; }}
+    .matrix-card {{ margin-bottom: 8px; }}
+    .matrix-summary {{ padding: 8px 12px; font-size: 13px; }}
+    .matrix-card .report-table {{ margin: 8px; width: calc(100% - 16px); }}
+    .issue {{ padding: 8px 10px; margin-bottom: 8px; }}
+    .pill {{ padding: 3px 7px; margin: 0 5px 5px 0; }}
+    .env-perf-summary {{ padding: 8px 12px; }}
+    .env-perf-body {{ padding: 10px 12px 8px 12px; }}
+    .env-perf-head {{ font-size: 14px; }}
+    .te-label {{ width: 200px; }}
+    {email_css}
   </style>
 </head>
-<body>
-  <div class="page">
+<body{body_attr}>
+  {shell_open}
     <div class="header">
       <div class="brand">BigID Benchmark Report</div>
       <div class="title-row">
@@ -2268,10 +3001,14 @@ def build_html_report(
       {scenario_matrix_html}
       {error_html}
     </div>
-  </div>
+  {shell_close}
 </body>
 </html>
 """
+
+    if email_safe:
+        report_doc = _email_safe_postprocess(report_doc, email_width)
+    return report_doc
 
 
 def main() -> int:
@@ -2280,7 +3017,19 @@ def main() -> int:
     ap.add_argument("--current-build", help="Optional current build version. If omitted, the latest available build is used.")
     ap.add_argument("--previous-build", help="Optional previous / baseline build version. If omitted, the previous available build is used.")
     ap.add_argument("--environment-id", type=int, help="Optional environment_id filter")
-    ap.add_argument("--structured", action="store_true", help="Include structured DS sections for MSSQL and Postgres")
+    ap.add_argument("--structured", action="store_true", help="(Legacy) Include all structured DS when --structured-ds is omitted")
+    ap.add_argument(
+        "--unstructured-ds",
+        default=None,
+        metavar="LIST",
+        help="Comma-separated unstructured DS (default: S3,SMB). Use empty string for none.",
+    )
+    ap.add_argument(
+        "--structured-ds",
+        default=None,
+        metavar="LIST",
+        help="Comma-separated structured DS (default: none, or all when --structured). Use empty for none.",
+    )
     ap.add_argument("--scanner-performance", action="store_true", help="Include scanner-group CPU, memory, and speed during current-build benchmark scans")
     ap.add_argument("--errors", action="store_true", help="Include Observed Issues / Errors / RCA section")
     ap.add_argument("--test-env", action="store_true", help="Include Test Environment section")
@@ -2294,15 +3043,21 @@ def main() -> int:
                     metavar="N", help="Threads configured in DS scan settings (default: 50)")
     ap.add_argument("--test-env-ds-lite-mode", default="True",
                     metavar="BOOL", help="DS_LITE_MODE_ENABLED value (default: True)")
+    ap.add_argument("--test-env-scanner-jobs-thresholds", default="false",
+                    metavar="BOOL", help="SCANNER_JOBS_THRESHOLDS_ENABLED value (default: false)")
     ap.add_argument("--test-env-file-count", default="1 M",
                     metavar="COUNT", help="Dataset file count (default: '1 M')")
     ap.add_argument("--test-env-file-type", default="txt",
                     metavar="EXT", help="Dataset file type (default: txt)")
+    ap.add_argument("--email-safe", action="store_true",
+                    help="Emit a fixed narrow-width, Gmail/Outlook-safe layout suitable for pasting into an email body")
+    ap.add_argument("--email-width", type=int, default=EMAIL_SAFE_WIDTH, metavar="PX",
+                    help=f"Container width in px for --email-safe (default: {EMAIL_SAFE_WIDTH})")
     ap.add_argument("--out", help="Output HTML file path")
     args = ap.parse_args()
 
     engine = create_engine(
-        DB_CONNECTION_STRING,
+        resolve_benchmark_database_url(),
         connect_args={"connect_timeout": 10},
     )
     # Verify the connection is reachable before doing any work.
@@ -2330,8 +3085,12 @@ def main() -> int:
     df = load_benchmarks(engine, environment_id=args.environment_id)
     if not current_major:
         ap.error("No major-version build lines were found in the database.")
-    cur_df = best_rows_for_major_line(df, current_major)
-    prev_df = best_rows_for_major_line(df, previous_major) if previous_major else pd.DataFrame(columns=df.columns)
+    cur_df = best_rows_for_major_line(df, current_major, anchor_build=current_build)
+    prev_df = (
+        best_rows_for_major_line(df, previous_major, anchor_build=previous_build)
+        if previous_major
+        else pd.DataFrame(columns=df.columns)
+    )
     current_build_df = df[df["build_version"].astype(str) == current_build].copy()
     classifier_detail = load_classifier_detail(engine, current_build, previous_build, args.environment_id)
     error_items = load_error_rca(engine, [
@@ -2348,10 +3107,19 @@ def main() -> int:
         "scanners":             args.test_env_scanners,
         "threads_per_scanner":  args.test_env_threads_per_scanner,
         "scan_setting_threads": args.test_env_scan_setting_threads,
-        "ds_lite_mode":         args.test_env_ds_lite_mode,
-        "file_count":           args.test_env_file_count,
+        "ds_lite_mode":             args.test_env_ds_lite_mode,
+        "scanner_jobs_thresholds":  args.test_env_scanner_jobs_thresholds,
+        "file_count":               args.test_env_file_count,
         "file_type":            args.test_env_file_type,
     } if args.test_env else None
+
+    ds_scope = resolve_ds_scope(
+        args.unstructured_ds,
+        args.structured_ds,
+        include_structured_legacy=bool(args.structured),
+    )
+    if not ds_scope:
+        ap.error("No data sources selected. Pick at least one unstructured or structured DS.")
 
     report_html = build_html_report(
         current_build,
@@ -2366,12 +3134,14 @@ def main() -> int:
         classifier_detail,
         error_items,
         scanner_perf,
-        args.structured,
+        ds_scope,
         args.scanner_performance,
         args.errors,
         args.test_env,
         test_env_config,
         engine,
+        email_safe=args.email_safe,
+        email_width=args.email_width,
     )
 
     if args.out:

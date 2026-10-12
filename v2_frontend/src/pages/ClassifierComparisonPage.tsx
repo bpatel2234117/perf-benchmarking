@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
 import { Loader2, Layers, RefreshCw, ChevronRight, ChevronDown, CheckCircle2, AlertCircle } from 'lucide-react';
 import { API_BASE } from '../apiConfig';
+import { useUserRole } from '../hooks/useUserRole';
 
 interface ClassifierComparisonPageProps { token: string; }
 
@@ -30,6 +31,8 @@ const CLASSIFIER_DETAIL_KEYS = [
 const ClassifierComparisonPage: React.FC<ClassifierComparisonPageProps> = ({ token }) => {
     const queryClient = useQueryClient();
     const authConfig = { headers: { Authorization: `Bearer ${token}` } };
+    // refresh-snapshots triggers BigID API calls — backend gates it to "Manage Classifiers" (Admin/Developer).
+    const canRefresh = ['Admin', 'Developer'].includes(useUserRole(token));
     const [envId, setEnvId] = useState<string>('');
     const [buildA, setBuildA] = useState('');
     const [buildB, setBuildB] = useState('');
@@ -192,8 +195,9 @@ const ClassifierComparisonPage: React.FC<ClassifierComparisonPageProps> = ({ tok
                     <h2 style={{ margin: 0, fontSize: '1.35rem', fontWeight: 700 }}>Classifier Comparison</h2>
                 </div>
                 <div style={{ display: 'flex', gap: '0.75rem' }}>
-                    <button 
-                        className="btn-secondary" 
+                    {canRefresh && (
+                    <button
+                        className="btn-secondary"
                         onClick={() => envId ? refreshMutation.mutate(parseInt(envId)) : alert("Select an environment first")}
                         disabled={refreshMutation.isPending || !envId}
                         style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}
@@ -201,6 +205,7 @@ const ClassifierComparisonPage: React.FC<ClassifierComparisonPageProps> = ({ tok
                         {refreshMutation.isPending ? <Loader2 size={16} className="lucide-spin" /> : <RefreshCw size={16} />}
                         Manual Refresh Snapshots
                     </button>
+                    )}
                 </div>
             </div>
             
@@ -222,7 +227,7 @@ const ClassifierComparisonPage: React.FC<ClassifierComparisonPageProps> = ({ tok
 
             {!isMappingLoading && builds.length === 0 && (
                 <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)' }}>
-                    No build classifier mappings found. Run tracker.py to sync classifiers.
+                    No classifier data found. Use the Environments page to sync classifiers for an environment.
                 </div>
             )}
 

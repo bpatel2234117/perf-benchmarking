@@ -11,6 +11,7 @@ interface GeneratedReportsPageProps {
 interface ReportItem {
   name: string;
   url: string;
+  build?: string;
   size_bytes: number;
   modified_at: number;
 }
@@ -38,6 +39,20 @@ const GeneratedReportsPage: React.FC<GeneratedReportsPageProps> = ({ token }) =>
   });
 
   const reports = data?.items ?? [];
+
+  // /api/reports/file/* requires an Admin bearer token, which the browser never sends on a
+  // plain <a href> — that request 401s and the tab opens blank. Fetch it with the token and
+  // open the resulting blob instead.
+  const openReport = async (report: ReportItem) => {
+    try {
+      const res = await axios.get(`${API_BASE}${report.url}`, { ...authConfig, responseType: 'blob' });
+      const blobUrl = URL.createObjectURL(res.data);
+      window.open(blobUrl, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    } catch (err) {
+      console.error('Failed to open report:', err);
+    }
+  };
 
   return (
     <div className="animate-in" style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
@@ -68,6 +83,7 @@ const GeneratedReportsPage: React.FC<GeneratedReportsPageProps> = ({ token }) =>
               <thead>
                 <tr>
                   <th>Report</th>
+                  <th>Build</th>
                   <th>Modified</th>
                   <th>Size</th>
                   <th>Open</th>
@@ -75,24 +91,40 @@ const GeneratedReportsPage: React.FC<GeneratedReportsPageProps> = ({ token }) =>
               </thead>
               <tbody>
                 {reports.map((report) => {
-                  const href = `${API_BASE}${report.url}`;
                   return (
                     <tr key={report.name}>
                       <td style={{ fontWeight: 600 }}>{report.name}</td>
+                      <td style={{ whiteSpace: 'nowrap' }}>
+                        {report.build ? (
+                          <span style={{
+                            fontSize: '0.78rem',
+                            fontWeight: 600,
+                            color: 'var(--primary-color)',
+                            background: 'var(--bg-secondary)',
+                            border: '1px solid var(--border-color)',
+                            padding: '2px 8px',
+                            borderRadius: 6,
+                          }}>
+                            {report.build}
+                          </span>
+                        ) : (
+                          <span style={{ color: 'var(--text-secondary)' }}>—</span>
+                        )}
+                      </td>
                       <td style={{ color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{formatModified(report.modified_at)}</td>
                       <td style={{ color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{formatBytes(report.size_bytes)}</td>
                       <td>
-                        <a className="btn-secondary" href={href} target="_blank" rel="noreferrer" style={{ display: 'inline-flex' }}>
+                        <button type="button" className="btn-secondary" onClick={() => openReport(report)} style={{ display: 'inline-flex' }}>
                           <ExternalLink size={16} />
                           Open
-                        </a>
+                        </button>
                       </td>
                     </tr>
                   );
                 })}
                 {reports.length === 0 && (
                   <tr>
-                    <td colSpan={4} style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-secondary)' }}>
+                    <td colSpan={5} style={{ textAlign: 'center', padding: '3rem', color: 'var(--text-secondary)' }}>
                       No generated HTML reports found.
                     </td>
                   </tr>

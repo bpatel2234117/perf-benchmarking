@@ -4,6 +4,7 @@ import axios from 'axios';
 import { Loader2, GitBranch } from 'lucide-react';
 import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend } from 'recharts';
 import { API_BASE } from '../apiConfig';
+import { useUserRole } from '../hooks/useUserRole';
 
 interface VersionComparisonPageProps { token: string; }
 interface BuildRow { id: number; version: string; release_milestone: string | null; quarter_label: string | null; }
@@ -24,6 +25,7 @@ const sel: React.CSSProperties = { padding: '0.45rem 0.65rem', borderRadius: 6, 
 
 const VersionComparisonPage: React.FC<VersionComparisonPageProps> = ({ token }) => {
     const authConfig = { headers: { Authorization: `Bearer ${token}` } };
+    const isAdmin = useUserRole(token) === 'Admin';  // tagging a release is Admin-only (backend require_admin)
     const qc = useQueryClient();
     const [banner, setBanner] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
     const [tagBuild, setTagBuild] = useState('');
@@ -153,6 +155,7 @@ const VersionComparisonPage: React.FC<VersionComparisonPageProps> = ({ token }) 
                         </tbody>
                     </table>
                 </div>
+                {isAdmin && (
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'flex-end' }}>
                     <div className="input-group" style={{ margin: 0, minWidth: 180 }}>
                         <label>Build version</label>
@@ -175,6 +178,7 @@ const VersionComparisonPage: React.FC<VersionComparisonPageProps> = ({ token }) 
                         {tagMut.isPending ? <Loader2 size={14} className="lucide-spin" /> : 'Save tag'}
                     </button>
                 </div>
+                )}
             </div>
 
             {/* Classifier count trend */}
@@ -205,7 +209,7 @@ const VersionComparisonPage: React.FC<VersionComparisonPageProps> = ({ token }) 
                         </ResponsiveContainer>
                     </div>
                 ) : (
-                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.88rem' }}>No classifier stats available. Run tracker.py to sync.</p>
+                    <p style={{ color: 'var(--text-secondary)', fontSize: '0.88rem' }}>No classifier stats available. Sync classifiers from the Environments page.</p>
                 )}
             </div>
 

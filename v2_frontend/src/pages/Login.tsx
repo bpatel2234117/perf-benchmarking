@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { LogIn } from 'lucide-react';
 import axios from 'axios';
+import { API_BASE } from '../apiConfig';
 
 interface LoginProps {
   setToken: (token: string) => void;
@@ -14,14 +15,22 @@ const Login: React.FC<LoginProps> = ({ setToken }) => {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     try {
-      const formData = new URLSearchParams();
-      formData.append('username', email);
-      formData.append('password', password);
-
-      const response = await axios.post('http://localhost:8000/api/token', formData);
+      const response = await axios.post(
+        `${API_BASE}/api/token`,
+        { username: email.trim(), password },
+        { headers: { 'Content-Type': 'application/json' } },
+      );
       setToken(response.data.access_token);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Login failed. Ensure you use a @bigid.com email.');
+      let errorMessage = 'Login failed. Ensure you use a @bigid.com email.';
+      if (!err.response) {
+        errorMessage = `Cannot reach API at ${API_BASE}. Check spb_api is running on port 8000.`;
+      } else if (err.response?.data?.detail) {
+        errorMessage = typeof err.response.data.detail === 'string'
+          ? err.response.data.detail
+          : 'Login failed. Please check your credentials.';
+      }
+      setError(errorMessage);
     }
   };
 
@@ -38,21 +47,22 @@ const Login: React.FC<LoginProps> = ({ setToken }) => {
         <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           <div className="input-group">
             <label>Email (@bigid.com)</label>
-            <input 
-              type="email" 
-              value={email} 
-              onChange={(e) => setEmail(e.target.value)} 
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
               placeholder="e.g. bpatel@bigid.com"
-              required 
+              required
             />
           </div>
           <div className="input-group">
-            <label>Password (Admins only)</label>
-            <input 
-              type="password" 
-              value={password} 
-              onChange={(e) => setPassword(e.target.value)} 
-              placeholder="Leave blank if Viewer"
+            <label>Password</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Enter your password"
+              required
             />
           </div>
           <button type="submit" className="btn" style={{ justifyContent: 'center' }}>

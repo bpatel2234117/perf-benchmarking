@@ -44,6 +44,16 @@ def sql_bool_false(engine: Engine) -> str:
     return "FALSE" if is_postgresql(engine) else "0"
 
 
+def sql_truthy(engine: Engine, column_sql: str) -> str:
+    """
+    SQL predicate: boolean/flag column is true (safe for WHERE/JOIN on PG BOOLEAN columns).
+    Never use `column = 1` on PostgreSQL BOOLEAN — it matches zero rows.
+    """
+    if is_postgresql(engine):
+        return f"COALESCE({column_sql}, FALSE) = TRUE"
+    return f"COALESCE({column_sql}, 0) = 1"
+
+
 def sql_on_duplicate_key_update(engine: Engine, updates: str) -> str:
     """
     Return ON CONFLICT ... DO UPDATE or ON DUPLICATE KEY UPDATE based on dialect.

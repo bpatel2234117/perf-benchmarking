@@ -1,0 +1,688 @@
+{
+  "info": {
+    "_postman_id": "9cdb84ec-64d5-45f5-accc-39490814cb9b",
+    "name": "OLS Disable",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "51701174",
+    "_collection_link": "https://go.postman.co/collection/51701174-9cdb84ec-64d5-45f5-accc-39490814cb9b?source=collection_link"
+  },
+  "item": [
+    {
+      "name": "sessions",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "const res = pm.response.json();",
+              "",
+              "// Save token as environment variable",
+              "pm.environment.set(\"access_token\", res.auth_token);",
+              "",
+              "// (Optional) log it for verification",
+              "console.log(\"Token saved:\", res.auth_token);"
+            ],
+            "type": "text/javascript",
+            "packages": {},
+            "requests": {}
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "User-Agent",
+            "value": "loadmill/v9.76.0"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{ \"username\": \"bigid\", \"password\": \"bigid111\"}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/sessions",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "sessions"
+          ]
+        },
+        "description": "Generated from cURL: curl -k  -X POST 'https://ec2-34-198-228-173.compute-1.amazonaws.com/api/v1/sessions' -H \"User-Agent: loadmill/v9.76.0\" -H \"content-type: application/json\" -d \"{ \\\"username\\\": \\\"bigid\\\", \\\"password\\\": \\\"Bigid@111\\\"}\""
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_PARTITIONING -Web",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"name\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_PARTITIONING orchestrator",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"name\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_PARTITIONING orchestrator2",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"name\": \"OBJECT_LEVEL_PARTITIONING\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator2\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_ACTIONS_ENABLED Web",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": ""
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_ACTIONS_ENABLED orchestrator",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": ""
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "OBJECT_LEVEL_ACTIONS_ENABLED orchestrator2",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0{{access_token}}"
+          },
+          {
+            "key": "origin",
+            "value": ""
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator2\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "METADATA_PARTS_ENABLED orchestrator2 - Keep it True",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"METADATA_PARTS_ENABLED\",\n        \"name\": \"METADATA_PARTS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator2\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "METADATA_PARTS_ENABLED orchestrator - Keep it True",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"METADATA_PARTS_ENABLED\",\n        \"name\": \"METADATA_PARTS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "SCANS_QUEUE_ENABLED orchestrator2",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"SCANS_QUEUE_ENABLED\",\n        \"name\": \"SCANS_QUEUE_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator2\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    },
+    {
+      "name": "SCANS_QUEUE_ENABLED orchestrator",
+      "request": {
+        "method": "PUT",
+        "header": [
+          {
+            "key": "accept",
+            "value": "application/json, text/plain, */*"
+          },
+          {
+            "key": "accept-language",
+            "value": "en-GB,en-US;q=0.9,en;q=0.8"
+          },
+          {
+            "key": "authorization",
+            "value": "{{access_token}}"
+          },
+          {
+            "key": "cookie",
+            "value": "_ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0"
+          },
+          {
+            "key": "origin",
+            "value": "https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net"
+          },
+          {
+            "key": "priority",
+            "value": "u=1, i"
+          },
+          {
+            "key": "user-agent",
+            "value": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
+          },
+          {
+            "key": "content-type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n    \"configuration\": {\n        \"id\": \"SCANS_QUEUE_ENABLED\",\n        \"name\": \"SCANS_QUEUE_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"orchestrator\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"false\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "{{HOST}}/api/v1/services-configuration",
+          "host": [
+            "{{HOST}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "services-configuration"
+          ]
+        },
+        "description": "Generated from cURL: curl --location --request PUT 'https://bigid-parvezbashashaik-2.ci.bigid-integrations.net/api/v1/services-configuration' \\\n--header 'accept: application/json, text/plain, */*' \\\n--header 'accept-language: en-GB,en-US;q=0.9,en;q=0.8' \\\n--header 'authorization: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX25hbWUiOiJiaWdpZCIsInR5cGUiOiJhY2Nlc3MtdG9rZW4iLCJyb2xlSWRzIjpbIjY5NjBjYzRjYWI3Y2E4ZjIxMTZlOWNjYSJdLCJpc0FkbWluIjp0cnVlLCJpYXQiOjE3Njc5NTUxNjYsImV4cCI6MTc2ODA0MTU2Nn0.cy3fHcJ0VXhI3Ru762EKm0DHTHYn3LhSG-x5tWp2yFg' \\\n--header 'cookie: _ga=GA1.1.1582078070.1707898710; AMP_cb3efeee6f=JTdCJTIyZGV2aWNlSWQlMjIlM0ElMjIyNzlhYjVlOS02MmRmLTRiZTYtYjIyMS0xMGU0ZDA2NTBkMjAlMjIlMkMlMjJzZXNzaW9uSWQlMjIlM0ExNzMzOTk4MzI3ODYxJTJDJTIyb3B0T3V0JTIyJTNBZmFsc2UlMkMlMjJsYXN0RXZlbnRUaW1lJTIyJTNBMTczMzk5ODMyODc4OCUyQyUyMmxhc3RFdmVudElkJTIyJTNBMjE1JTJDJTIycGFnZUNvdW50ZXIlMjIlM0EwJTdE; _ga_FVWC4GKEYS=GS1.1.1742544563.26.1.1742544626.0.0.0' \\\n--header 'origin: https://bigid-parvezbashashaik-2-tenant1.ci.bigid-integrations.net' \\\n--header 'priority: u=1, i' \\\n--header 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36' \\\n--header 'content-type: application/json' \\\n--data '{\n    \"configuration\": {\n        \"id\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"name\": \"OBJECT_LEVEL_ACTIONS_ENABLED\",\n        \"isEditable\": false,\n        \"isRestartRequired\": true,\n        \"markAsSensitiveKey\": false,\n        \"service\": \"web\",\n        \"services\": [\n            \"orchestrator\",\n            \"orchestrator2\",\n            \"web\"\n        ],\n        \"type\": \"boolean\",\n        \"value\": \"true\",\n        \"hasConflicts\": false,\n        \"isGrouped\": true\n    }\n}'"
+      },
+      "response": []
+    }
+  ]
+}

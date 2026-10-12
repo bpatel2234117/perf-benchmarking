@@ -1,18 +1,22 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import PaginationBar from '../components/Pagination';
-import { Loader2, GitBranch, ChevronDown, ChevronRight } from 'lucide-react';
+import { Loader2, ChevronDown, ChevronRight, RefreshCw } from 'lucide-react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
 import {
   computeProgressEmoji,
   computeStepMetrics,
+  envHasActiveWorkflowStep,
+  findEnvCooldownUntil,
   flagsFromStep,
+  isRunInCooldown,
   workflowIsTransientStepMessage,
   workflowNormStepStatus,
   workflowStepImpliesEnvBusy,
 } from '../utils/workflowProgress';
 import { API_BASE } from '../apiConfig';
+import { useUserRole } from '../hooks/useUserRole';
 
 interface WorkflowProps {
   token: string;
@@ -24,6 +28,13 @@ export interface WorkflowRun {
   status: string | null;
   env1_id: number | null;
   env2_id: number | null;
+  /**
+   * true when Env 1 / Env 2 were chosen at create: the run executes only on those envs and
+   * reserves them. false/absent = no selection, so the run uses all available pool envs.
+   */
+  env_pinned?: boolean;
+  env1_name?: string | null;
+  env2_name?: string | null;
   cooldown_minutes: number | null;
   last_error: string | null;
   next_eligible_at: string | null;
@@ -51,6 +62,11 @@ export interface WorkflowStepRow {
   last_error: string | null;
   started_at: string | null;
   finished_at: string | null;
+  // Canonical scan window from scan_parents (BigID-reported). Preferred for elapsed
+  // time: started_at can be reset when a step is parked/re-picked; these are not.
+  scan_started_at: string | null;
+  scan_completed_at: string | null;
+  scan_status: string | null;
   ds_id: string | null;
   scan_profile_id: string | null;
   scan_profile_name: string | null;
@@ -75,6 +91,8 @@ interface EnvironmentRow {
   base_url: string;
   is_active: boolean;
   is_busy: boolean;
+  version?: string | null;
+  include_in_workflow_runs?: boolean;
   is_default?: boolean;
   auth_module_path?: string | null;
   auth_function_name?: string | null;
@@ -104,20 +122,18 @@ type QuickPreset =
   | 'sharepoint'
   | 'onedrive';
 
-/** First contiguous block of planner `action` rows (e.g. ENABLE OLS FEATURE FLAGS). */
+/** Highlight only pre-flight actions at catalog steps 1–2. Step 17 ENABLE OLS stays in the main grid. */
 function findConsecutiveActionBlock(
   catalog: StepCatalogRow[]
 ): { start: number; end: number } | null {
-  const start = catalog.findIndex((r) => String(r.ds_kind || '').trim().toLowerCase() === 'action');
-  if (start < 0) return null;
-  let end = start;
-  while (
-    end + 1 < catalog.length &&
-    String(catalog[end + 1].ds_kind || '').trim().toLowerCase() === 'action'
-  ) {
-    end++;
-  }
-  return { start, end };
+  if (catalog.length < 2) return null;
+  const k0 = String(catalog[0].ds_kind || '').trim().toLowerCase();
+  const k1 = String(catalog[1].ds_kind || '').trim().toLowerCase();
+  if (k0 !== 'action' || k1 !== 'action') return null;
+  const n0 = String(catalog[0].notes || '').toUpperCase();
+  const n1 = String(catalog[1].notes || '').toUpperCase();
+  if (n0.includes('ENABLE OLS') || n1.includes('ENABLE OLS')) return null;
+  return { start: 0, end: 1 };
 }
 
 function stepMatchesPreset(row: StepCatalogRow, preset: QuickPreset): boolean {
@@ -184,19 +200,34 @@ const PRESET_BTN_STYLE: React.CSSProperties = {
   whiteSpace: 'nowrap',
 };
 
-function utcLabel(): string {
-  return `Workflow ${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+/** Distinct BigID build versions from active workflow-pool environments. */
+function workflowBuildLabel(envs: EnvironmentRow[]): string {
+  const pool = envs.filter((e) => e.is_active && e.include_in_workflow_runs !== false);
+  const versions = [
+    ...new Set(pool.map((e) => String(e.version ?? '').trim()).filter((v) => v.length > 0)),
+  ].sort();
+  if (versions.length === 1) return versions[0];
+  if (versions.length > 1) return versions.slice(0, 3).join('+');
+  return '';
+}
+
+function defaultWorkflowName(envs: EnvironmentRow[]): string {
+  const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
+  const build = workflowBuildLabel(envs);
+  return build ? `Workflow ${build} ${ts} UTC` : `Workflow ${ts} UTC`;
 }
 
 /** Returns a human-readable cooldown label like "⏸ 2m 14s" or "⏸ Starting…". */
 function cooldownLabel(nextEligibleAt: string | null | undefined): string {
   if (!nextEligibleAt) return '⏸ Cooldown';
-  const diff = new Date(nextEligibleAt).getTime() - Date.now();
+  const eligibleMs = parseBackendTs(nextEligibleAt);
+  if (!Number.isFinite(eligibleMs)) return '⏸ Cooldown';
+  const diff = eligibleMs - Date.now();
   if (diff <= 0) return '⏸ Starting…';
   const mins = Math.floor(diff / 60000);
   const secs = Math.floor((diff % 60000) / 1000);
   const timeStr = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-  const utcTime = new Date(nextEligibleAt).toISOString().slice(11, 16);
+  const utcTime = new Date(eligibleMs).toISOString().slice(11, 16);
   return `⏸ Cooldown ${timeStr} (→${utcTime}Z)`;
 }
 
@@ -236,6 +267,57 @@ function fmtCell(v: string | null | undefined): string {
   return t;
 }
 
+/**
+ * Environments a run is bound to. 📌 marks an explicit selection (Env 1 / Env 2 chosen at
+ * create) — that run touches nothing else, and no other run may take those envs. A run with
+ * no selection uses whatever envs are available at the time, so there is nothing to name.
+ */
+function runEnvSlots(
+  run: WorkflowRun,
+  envById: Map<number, EnvironmentRow>
+): { name: string; url: string | null }[] {
+  return [
+    { id: run.env1_id, name: run.env1_name },
+    { id: run.env2_id, name: run.env2_name },
+  ]
+    .filter((slot) => slot.id != null || slot.name)
+    .map((slot) => {
+      const env = slot.id != null ? envById.get(slot.id) : undefined;
+      return { name: slot.name || env?.env_name || `env-${slot.id}`, url: env?.base_url || null };
+    });
+}
+
+/** Elapsed scan time for a step (HH:MM:SS) from its start → finish window.
+ *  Falls back to "now" while a started step is still running. */
+/**
+ * Parse a backend timestamp to epoch ms. Backend stores naive UTC (datetime.utcnow())
+ * with no timezone suffix; Date.parse would treat those as LOCAL time, inflating
+ * elapsed times by the browser's UTC offset (e.g. +5:30 in IST). Append 'Z' when the
+ * string carries no timezone designator so it's always read as UTC.
+ */
+function parseBackendTs(s: string | null | undefined): number {
+  if (!s) return NaN;
+  let str = String(s).trim();
+  if (!str) return NaN;
+  const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(str);
+  if (!hasTz) {
+    str = (str.includes('T') ? str : str.replace(' ', 'T')) + 'Z';
+  }
+  return Date.parse(str);
+}
+
+function fmtScanTime(start: string | null | undefined, finish: string | null | undefined): string {
+  if (!start) return '—';
+  const t0 = parseBackendTs(start);
+  const t1 = finish ? parseBackendTs(finish) : Date.now();
+  if (!Number.isFinite(t0) || !Number.isFinite(t1) || t1 < t0) return '—';
+  const sec = Math.floor((t1 - t0) / 1000);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
 function canAction(status: string | null | undefined, action: string): boolean {
   const r = String(status ?? '').trim().toLowerCase();
   switch (action) {
@@ -258,6 +340,7 @@ const WF_PAGE_SIZE = 25;
 
 const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const authConfig = { headers: { Authorization: `Bearer ${token}` } };
+  const isAdmin = useUserRole(token) === 'Admin';  // clear-busy-locks is Admin-only (backend require_admin)
   const queryClient = useQueryClient();
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [runPage, setRunPage] = useState(0);
@@ -267,6 +350,8 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   const [createEnv2, setCreateEnv2] = useState<string>('');
   const [stepEnabled, setStepEnabled] = useState<boolean[]>([]);
   const [stepsExpanded, setStepsExpanded] = useState(false);
+  const [startAfterCreate, setStartAfterCreate] = useState(true);
+  const [refreshingRunId, setRefreshingRunId] = useState<number | null>(null);
 
   const {
     data: stepCatalogResp,
@@ -285,8 +370,8 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     if (!steps?.length) return;
     setStepEnabled((prev) => {
       if (prev.length === steps.length) return prev;
-      // Default: all steps disabled (none selected)
-      return steps.map(() => false);
+      // Match server catalog defaults (Streamlit: enabled steps are on by default)
+      return steps.map((row) => row.is_enabled !== false);
     });
   }, [stepCatalogResp]);
 
@@ -307,11 +392,12 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       const hasRunning = data?.runs?.some((r: WorkflowRun) =>
         String(r.status || '').trim().toLowerCase() === 'running'
       );
-      return hasRunning ? 10000 : false; // Poll every 10s if running, otherwise stop
+      return hasRunning ? 5000 : false;
     },
   });
 
-  const runs = runsPayload?.runs ?? [];
+  // Memoized: a fresh [] each render would re-run every useMemo that depends on runs.
+  const runs = useMemo(() => runsPayload?.runs ?? [], [runsPayload]);
   const runsTotal = runsPayload?.total ?? 0;
 
   useEffect(() => {
@@ -343,7 +429,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       return res.data as Record<string, WorkflowStepRow[]>;
     },
     enabled: runningRunIdsCsv.length > 0,
-    refetchInterval: hasRunningWorkflows ? 8000 : false, // Poll every 8s if any running, otherwise stop
+    refetchInterval: hasRunningWorkflows ? 5000 : false,
   });
 
   const { data: envChips = [] } = useQuery({
@@ -352,7 +438,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       const res = await axios.get(`${API_BASE}/api/workflow/env-status`, authConfig);
       return res.data as EnvChip[];
     },
-    refetchInterval: hasRunningWorkflows ? 12000 : false, // Poll every 12s if any running, otherwise stop
+    refetchInterval: hasRunningWorkflows ? 8000 : false,
   });
 
   const { data: environments = [] } = useQuery({
@@ -367,6 +453,10 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     () => environments.filter((e) => e.is_active).sort((a, b) => a.env_name.localeCompare(b.env_name)),
     [environments]
   );
+
+  const envById = useMemo(() => new Map(environments.map((e) => [e.id, e])), [environments]);
+
+  const defaultCreateName = useMemo(() => defaultWorkflowName(environments), [environments]);
 
   const stepsSyncedWithCatalog =
     !stepCatalogResp?.steps?.length ||
@@ -405,15 +495,16 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
   };
 
   const createMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (opts?: { startAfter?: boolean }) => {
       const body: Record<string, unknown> = {
-        name: (createName || '').trim() || utcLabel(),
+        name: (createName || '').trim() || defaultCreateName,
         cooldown_minutes: createCooldown,
       };
       const e1 = parseInt(createEnv1, 10);
       const e2 = parseInt(createEnv2, 10);
       if (!Number.isNaN(e1)) body.env1_id = e1;
       if (!Number.isNaN(e2)) body.env2_id = e2;
+      body.auto_start = opts?.startAfter !== false;
       const cat = stepCatalogResp?.steps;
       if (cat?.length && stepEnabled.length === cat.length) {
         body.steps = cat.map((row, idx) => ({
@@ -430,20 +521,28 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           feature_flags: row.feature_flags ?? null,
           notes: row.notes ?? null,
         }));
-        const enabledCount = (body.steps as any[]).filter(s => s.is_enabled).length;
-        console.log(`Creating workflow with ${(body.steps as any[]).length} steps (${enabledCount} enabled)`);
-      } else {
-        console.log('Creating workflow without steps array (will use server defaults)');
       }
       const res = await axios.post(`${API_BASE}/api/workflow/runs`, body, authConfig);
-      return res.data as { id: number };
+      return res.data as { id: number; status?: string };
     },
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['workflowRuns', token] });
       queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
+      queryClient.invalidateQueries({ queryKey: ['workflowEnvStatus', token] });
       setRunPage(0);
       if (data?.id) setExpandedId(data.id);
       setCreateName('');
+    },
+  });
+
+  const clearLocksMutation = useMutation({
+    mutationFn: async () => {
+      const res = await axios.post(`${API_BASE}/api/environments/actions/clear-busy-locks`, {}, authConfig);
+      return res.data as { cleared_rows?: number };
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['workflowEnvStatus', token] });
+      queryClient.invalidateQueries({ queryKey: ['environments', token] });
     },
   });
 
@@ -465,6 +564,13 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       queryClient.invalidateQueries({ queryKey: ['workflowStepsBatch'] });
       queryClient.invalidateQueries({ queryKey: ['workflowEnvStatus', token] });
     },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+        (err as Error)?.message ||
+        'Control action failed';
+      window.alert(detail);
+    },
   });
 
   const deleteMutation = useMutation({
@@ -482,6 +588,42 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
     setExpandedId((cur) => (cur === id ? null : id));
   };
 
+  const refreshWorkflowRun = async (runId: number) => {
+    setRefreshingRunId(runId);
+    try {
+      const [runRes, stepsRes] = await Promise.all([
+        axios.get<WorkflowRun>(`${API_BASE}/api/workflow/runs/${runId}`, authConfig),
+        axios.get<WorkflowStepRow[]>(`${API_BASE}/api/workflow/steps/${runId}`, authConfig),
+      ]);
+      const updated = runRes.data;
+      const steps = stepsRes.data;
+
+      queryClient.setQueryData(
+        ['workflowRuns', token, runPage],
+        (old: { runs: WorkflowRun[]; total: number } | undefined) => {
+          if (!old?.runs) return old;
+          return {
+            ...old,
+            runs: old.runs.map((r) => (r.id === runId ? { ...r, ...updated } : r)),
+          };
+        }
+      );
+
+      const patchSteps = (prev: Record<string | number, WorkflowStepRow[]> | undefined) => ({
+        ...(prev || {}),
+        [runId]: steps,
+        [String(runId)]: steps,
+      });
+
+      queryClient.setQueryData(['workflowStepsBatch', token, runningRunIdsCsv], patchSteps);
+      queryClient.setQueryData(['workflowSteps', token, runId], steps);
+    } catch (err) {
+      console.error('Refresh workflow run failed:', err);
+    } finally {
+      setRefreshingRunId(null);
+    }
+  };
+
   // Fetch steps for expanded workflow if not already loaded (on-demand for completed workflows)
   const { data: expandedSteps } = useQuery({
     queryKey: ['workflowSteps', token, expandedId],
@@ -490,17 +632,83 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
       const res = await axios.get(`${API_BASE}/api/workflow/steps/${expandedId}`, authConfig);
       return res.data as WorkflowStepRow[];
     },
-    enabled: expandedId !== null && !stepsByRun[expandedId],
+    // An empty array [] is truthy, so guard on length: a batch result that returned
+    // no steps for this run must still trigger the on-demand fetch.
+    enabled: expandedId !== null && !stepsByRun[expandedId]?.length,
   });
 
   // Merge batch-loaded steps with on-demand expanded steps
   const allStepsByRun = useMemo(() => {
     const merged = { ...stepsByRun };
-    if (expandedId && expandedSteps && !merged[expandedId]) {
+    if (expandedId && expandedSteps && !merged[expandedId]?.length) {
       merged[expandedId] = expandedSteps;
     }
     return merged;
   }, [stepsByRun, expandedId, expandedSteps]);
+
+  const anyRunInCooldown = useMemo(
+    () => runs.some((r) => isRunInCooldown(r)),
+    [runs]
+  );
+
+  const [cooldownTick, setCooldownTick] = useState(0);
+  useEffect(() => {
+    if (!anyRunInCooldown) return;
+    const id = window.setInterval(() => setCooldownTick((t) => t + 1), 1000);
+    return () => window.clearInterval(id);
+  }, [anyRunInCooldown]);
+
+  const envChipLabels = useMemo(() => {
+    void cooldownTick;
+    return envChips.map((e) => {
+      if (e.busy) {
+        return { ...e, label: `${e.env_name} (busy)`, icon: '🔴' as const };
+      }
+      const until = findEnvCooldownUntil(e.id, runs, allStepsByRun);
+      if (until) {
+        return { ...e, label: `${e.env_name} (${cooldownLabel(until)})`, icon: '🟡' as const };
+      }
+      return { ...e, label: `${e.env_name} (free)`, icon: '🟢' as const };
+    });
+  }, [envChips, runs, allStepsByRun, cooldownTick]);
+
+  /**
+   * Env ids already selected by a still-active run. The backend rejects selecting these
+   * (a selected env belongs to one run only), so mark them in the dropdowns instead of
+   * letting the user pick one and get a 400 back.
+   */
+  const claimedEnvIds = useMemo(() => {
+    const claimed = new Map<number, number>(); // env id -> run id
+    runs.forEach((r) => {
+      const st = String(r.status || '').trim().toLowerCase();
+      if (!['created', 'running', 'paused', 'failed'].includes(st)) return;
+      [r.env1_id, r.env2_id].forEach((eid) => {
+        if (eid != null && !claimed.has(eid)) claimed.set(eid, r.id);
+      });
+    });
+    return claimed;
+  }, [runs]);
+
+  /** Dropdown label for an env: live status + the run holding it, if any. */
+  const envOptionLabel = (env: EnvironmentRow) => {
+    const chip = envChipLabels.find((c) => c.id === env.id);
+    const heldBy = claimedEnvIds.get(env.id);
+    const parts = [chip ? `${chip.icon} ${chip.label}` : env.env_name];
+    if (heldBy != null) parts.push(`— run #${heldBy}`);
+    return parts.join(' ');
+  };
+
+  /** A run owns each selected env end-to-end, so the two slots must be different envs. */
+  const envOptionsFor = (slot: 'e1' | 'e2') => {
+    const other = slot === 'e1' ? createEnv2 : createEnv1;
+    return activeEnvOptions.filter((env) => String(env.id) !== other);
+  };
+
+  const pinnedEnvNames = useMemo(() => {
+    return [createEnv1, createEnv2]
+      .map((v) => activeEnvOptions.find((e) => String(e.id) === v)?.env_name)
+      .filter(Boolean) as string[];
+  }, [createEnv1, createEnv2, activeEnvOptions]);
 
   return (
     <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
@@ -522,7 +730,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
               <input
                 id="wf-create-name"
                 type="text"
-                placeholder={utcLabel()}
+                placeholder={defaultCreateName}
                 value={createName}
                 onChange={(e) => setCreateName(e.target.value)}
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', width: '100%', fontFamily: 'inherit' }}
@@ -540,38 +748,46 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
               />
             </div>
-            <div className="input-group" style={{ margin: 0, minWidth: 160 }}>
-              <label htmlFor="wf-e1">Env 1 (optional)</label>
+            <div className="input-group" style={{ margin: 0, minWidth: 200 }}>
+              <label htmlFor="wf-e1">Env 1</label>
               <select
                 id="wf-e1"
                 value={createEnv1}
                 onChange={(e) => setCreateEnv1(e.target.value)}
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
               >
-                <option value="">—</option>
-                {activeEnvOptions.map((env) => (
+                <option value="">— any available —</option>
+                {envOptionsFor('e1').map((env) => (
                   <option key={env.id} value={String(env.id)}>
-                    {env.env_name}
+                    {envOptionLabel(env)}
                   </option>
                 ))}
               </select>
             </div>
-            <div className="input-group" style={{ margin: 0, minWidth: 160 }}>
-              <label htmlFor="wf-e2">Env 2 (optional)</label>
+            <div className="input-group" style={{ margin: 0, minWidth: 200 }}>
+              <label htmlFor="wf-e2">Env 2</label>
               <select
                 id="wf-e2"
                 value={createEnv2}
                 onChange={(e) => setCreateEnv2(e.target.value)}
                 style={{ padding: '0.5rem 0.75rem', borderRadius: 6, border: '1px solid var(--surface-border)', fontFamily: 'inherit', width: '100%' }}
               >
-                <option value="">—</option>
-                {activeEnvOptions.map((env) => (
+                <option value="">— any available —</option>
+                {envOptionsFor('e2').map((env) => (
                   <option key={env.id} value={String(env.id)}>
-                    {env.env_name}
+                    {envOptionLabel(env)}
                   </option>
                 ))}
               </select>
             </div>
+            <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: '0.85rem', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={startAfterCreate}
+                onChange={(e) => setStartAfterCreate(e.target.checked)}
+              />
+              Start immediately after create
+            </label>
             <button
               type="button"
               className="btn"
@@ -581,12 +797,36 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                 createBlockedUntilSynced ||
                 createBlockedBySteps
               }
-              onClick={() => createMutation.mutate()}
+              onClick={() => createMutation.mutate({ startAfter: startAfterCreate })}
               style={{ fontWeight: 600 }}
             >
-              {createMutation.isPending ? 'Creating…' : 'Create workflow'}
+              {createMutation.isPending
+                ? startAfterCreate
+                  ? 'Creating & starting…'
+                  : 'Creating…'
+                : startAfterCreate
+                ? 'Create & start'
+                : 'Create workflow'}
             </button>
           </div>
+
+          <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', marginTop: '0.65rem', marginBottom: 0, lineHeight: 1.5 }}>
+            {pinnedEnvNames.length > 0 ? (
+              <>
+                📌 This run will execute <strong>only</strong> on {pinnedEnvNames.join(' + ')}
+                {pinnedEnvNames.length === 1 && ' (single env — steps run one at a time)'}, and no
+                other workflow can use {pinnedEnvNames.length === 1 ? 'it' : 'them'} while it runs.
+                The remaining environments stay open for other workflows.
+              </>
+            ) : (
+              <>
+                No selection: this run uses <strong>all available</strong> environments — the whole
+                workflow pool minus any env another run has selected. Pick Env 1 / Env 2 to reserve
+                specific environments instead; every step and pre-flight action then runs only
+                there, and those envs become off-limits to other workflows.
+              </>
+            )}
+          </p>
 
           {catalogLoading && !catalogError && (
             <p style={{ fontSize: '0.82rem', color: 'var(--text-secondary)', marginTop: '0.65rem', marginBottom: 0 }}>
@@ -846,11 +1086,31 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
         {envChips.length > 0 && (
           <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', marginBottom: '10px', lineHeight: 1.6 }}>
             <strong style={{ color: 'var(--text-primary)' }}>Env status:</strong>{' '}
-            {envChips.map((e) => (
+            {envChipLabels.map((e) => (
               <span key={e.id} style={{ marginRight: '0.75rem', whiteSpace: 'nowrap' }}>
-                {e.busy ? '🔴' : '🟢'} {e.env_name} ({e.busy ? 'busy' : 'free'})
+                {e.icon} {e.label}
               </span>
             ))}
+            {isAdmin && (
+            <button
+              type="button"
+              style={{
+                marginLeft: 8,
+                fontSize: '0.78rem',
+                padding: '4px 10px',
+                borderRadius: 6,
+                border: '1px solid var(--surface-border)',
+                background: 'transparent',
+                cursor: clearLocksMutation.isPending ? 'wait' : 'pointer',
+                fontFamily: 'inherit',
+              }}
+              disabled={clearLocksMutation.isPending}
+              onClick={() => clearLocksMutation.mutate()}
+              title="Clear stale is_busy flags left by a stopped workflow"
+            >
+              {clearLocksMutation.isPending ? 'Clearing…' : 'Clear env locks'}
+            </button>
+            )}
           </div>
         )}
 
@@ -872,6 +1132,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Run</th>
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Name</th>
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Status</th>
+                      <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Envs</th>
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Started</th>
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Finished</th>
                       <th style={{ padding: '10px 12px', textAlign: 'left', fontWeight: 600 }}>Last Error</th>
@@ -903,6 +1164,42 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                             </td>
                             <td style={{ padding: '10px 12px', maxWidth: 220 }}>{fmtCell(run.name)}</td>
                             <td style={{ padding: '10px 12px' }}>{statusBadge(run.status)}</td>
+                            <td
+                              style={{ padding: '10px 12px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}
+                              title={
+                                run.env_pinned
+                                  ? 'Selected at create — this run uses only these environments, and no other run may take them'
+                                  : 'No selection — uses every available environment in the workflow pool'
+                              }
+                            >
+                              {(() => {
+                                const slots = runEnvSlots(run, envById);
+                                if (!slots.length) return 'all available';
+                                return (
+                                  <>
+                                    {run.env_pinned ? '📌 ' : ''}
+                                    {slots.map((slot, i) => (
+                                      <React.Fragment key={`${slot.name}-${i}`}>
+                                        {i > 0 ? ', ' : ''}
+                                        {slot.url ? (
+                                          <a
+                                            href={slot.url}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            onClick={(e) => e.stopPropagation()}
+                                            style={{ color: 'var(--primary-color)', textDecoration: 'underline' }}
+                                          >
+                                            {slot.name}
+                                          </a>
+                                        ) : (
+                                          slot.name
+                                        )}
+                                      </React.Fragment>
+                                    ))}
+                                  </>
+                                );
+                              })()}
+                            </td>
                             <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.started_at)}</td>
                             <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }}>{fmtCell(run.finished_at)}</td>
                             <td style={{ padding: '10px 12px', maxWidth: 200, color: 'var(--danger-color)', fontSize: '0.82rem' }}>
@@ -910,6 +1207,27 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                             </td>
                             <td style={{ padding: '10px 12px', whiteSpace: 'nowrap' }} onClick={(e) => e.stopPropagation()}>
                               <span style={{ display: 'inline-flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                                <button
+                                  type="button"
+                                  title="Refresh this run"
+                                  disabled={refreshingRunId === run.id}
+                                  onClick={() => refreshWorkflowRun(run.id)}
+                                  style={{
+                                    background: 'transparent',
+                                    border: 'none',
+                                    cursor: refreshingRunId === run.id ? 'wait' : 'pointer',
+                                    padding: '0 2px',
+                                    lineHeight: 1,
+                                    display: 'inline-flex',
+                                    alignItems: 'center',
+                                    opacity: refreshingRunId === run.id ? 0.5 : 1,
+                                  }}
+                                >
+                                  <RefreshCw
+                                    size={16}
+                                    className={refreshingRunId === run.id ? 'lucide-spin' : undefined}
+                                  />
+                                </button>
                                 {(
                                   [
                                     ['start', '▶️'],
@@ -971,7 +1289,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                           </tr>
                           {isOpen && (
                             <tr>
-                              <td colSpan={7} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
+                              <td colSpan={8} style={{ padding: 0, border: 'none', background: 'var(--surface-bg, #faf8ff)' }}>
                                 <div
                                   style={{
                                     borderLeft: '4px solid var(--primary-color, #6366f1)',
@@ -982,15 +1300,45 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                   <div style={{ fontWeight: 700, fontSize: '0.95rem', color: 'var(--primary-color)', marginBottom: 8 }}>
                                     Step Progress — Run {run.id}
                                   </div>
+                                  {String(runStatus || '').trim().toLowerCase() === 'created' && (
+                                    <div
+                                      style={{
+                                        marginBottom: 12,
+                                        padding: '10px 12px',
+                                        borderRadius: 8,
+                                        background: '#fef3c7',
+                                        border: '1px solid #f59e0b',
+                                        color: '#92400e',
+                                        fontSize: '0.88rem',
+                                      }}
+                                    >
+                                      Workflow is <strong>not started</strong> — the runner only dispatches steps when status is{' '}
+                                      <em>running</em>. Click <strong>▶ Start</strong> in the row above (or use Create &amp; start).
+                                    </div>
+                                  )}
+                                  {isRunInCooldown(run) && (
+                                    <div
+                                      style={{
+                                        marginBottom: 12,
+                                        padding: '10px 12px',
+                                        borderRadius: 8,
+                                        background: '#fffbeb',
+                                        border: '1px solid #fbbf24',
+                                        color: '#92400e',
+                                        fontSize: '0.88rem',
+                                        fontWeight: 600,
+                                      }}
+                                    >
+                                      {cooldownLabel(run.next_eligible_at)} — next step dispatch after cooldown
+                                    </div>
+                                  )}
                                   {stepsLoading && !rawSteps.length ? (
                                     <Loader2 className="lucide-spin" size={22} />
                                   ) : (
                                     <>
                                       {(() => {
-                                        const isCooldown =
-                                          String(runStatus || '').trim().toLowerCase() === 'running' &&
-                                          !!run.next_eligible_at &&
-                                          new Date(run.next_eligible_at).getTime() > Date.now();
+                                        void cooldownTick;
+                                        const isCooldown = isRunInCooldown(run);
                                         const firstPendingStepId = isCooldown
                                           ? (rawSteps.find(
                                               (st) =>
@@ -1023,17 +1371,15 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                 <tr style={{ background: '#e8e3f5' }}>
                                                   <th style={{ padding: '6px 8px', textAlign: 'center' }}>Step</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Env</th>
-                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Type</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>DS Name</th>
-                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan</th>
-                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>File Set</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Status</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Flags</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Progress</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Time</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Scan Id</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>View Progress</th>
                                                   <th style={{ padding: '6px 8px', textAlign: 'left' }}>Open</th>
-                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes</th>
-                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Error</th>
+                                                  <th style={{ padding: '6px 8px', textAlign: 'left' }}>Notes / Error</th>
                                                 </tr>
                                               </thead>
                                               <tbody>
@@ -1047,7 +1393,7 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                     const cStatus = workflowNormStepStatus(st.status);
                                                     let displayErr = String(st.last_error ?? '').trim();
                                                     if (
-                                                      ['scan_waiting', 'scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
+                                                      ['scan_running', 'scan_created', 'ds_created', 'ds_test_ok'].includes(cStatus) &&
                                                       workflowIsTransientStepMessage(displayErr)
                                                     ) {
                                                       displayErr = '';
@@ -1055,8 +1401,22 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                     if (displayErr && displayErr.includes('No free env this tick')) displayErr = '';
 
                                                     const name = String(st.environment_name ?? '').trim();
+                                                    const envId = st.environment_id;
                                                     const busy = workflowStepImpliesEnvBusy(rd, runStatus);
-                                                    const envDisplay = name ? `${busy ? '🔴' : '🟢'} ${name}` : '—';
+                                                    let envDisplay = '—';
+                                                    if (name) {
+                                                      if (busy) {
+                                                        envDisplay = `🔴 ${name}`;
+                                                      } else if (
+                                                        envId != null &&
+                                                        isCooldown &&
+                                                        !envHasActiveWorkflowStep(envId, rawSteps, runStatus)
+                                                      ) {
+                                                        envDisplay = `🟡 ${name} (${cooldownLabel(run.next_eligible_at)})`;
+                                                      } else {
+                                                        envDisplay = `🟢 ${name}`;
+                                                      }
+                                                    }
 
                                                     const isCooldownStep = isCooldown && st.id === firstPendingStepId;
                                                     const progressCell = isCooldownStep ? (
@@ -1080,13 +1440,14 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                       >
                                                         <td style={{ padding: '6px 8px', textAlign: 'center', fontWeight: 600 }}>{st.seq}</td>
                                                         <td style={{ padding: '6px 8px' }}>{envDisplay}</td>
-                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.ds_kind)}</td>
                                                         <td style={{ padding: '6px 8px', fontWeight: 500 }}>{fmtCell(st.ds_name)}</td>
-                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.scan_kind)}</td>
-                                                        <td style={{ padding: '6px 8px' }}>{fmtCell(st.file_set_type)}</td>
+                                                        <td style={{ padding: '6px 8px', whiteSpace: 'nowrap' }}>{fmtCell(st.scan_status)}</td>
                                                         <td style={{ padding: '6px 8px', fontSize: '0.8rem' }}>{flagsFromStep(rd)}</td>
                                                         <td style={{ padding: '6px 8px', fontSize: '0.82rem', whiteSpace: 'nowrap' }}>
                                                           {progressCell}
+                                                        </td>
+                                                        <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.8rem', whiteSpace: 'nowrap' }}>
+                                                          {fmtScanTime(st.scan_started_at ?? st.started_at, st.scan_completed_at ?? st.finished_at)}
                                                         </td>
                                                         <td style={{ padding: '6px 8px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>
                                                           {fmtCell(st.scan_id)}
@@ -1115,12 +1476,9 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
                                                             '—'
                                                           )}
                                                         </td>
-                                                        <td style={{ padding: '6px 8px', fontSize: '0.78rem', maxWidth: 140 }}>
-                                                          {fmtCell(st.notes)}
-                                                        </td>
                                                         <td
-                                                          style={{ padding: '6px 8px', color: '#dc2626', fontSize: '0.78rem', maxWidth: 200 }}
-                                                          title={st.last_error ?? ''}
+                                                          style={{ padding: '6px 8px', color: displayErr ? '#dc2626' : 'inherit', fontSize: '0.78rem', maxWidth: 240 }}
+                                                          title={displayErr || ''}
                                                         >
                                                           {displayErr ? displayErr.slice(0, 200) : ''}
                                                         </td>
@@ -1162,10 +1520,6 @@ const Workflow: React.FC<WorkflowProps> = ({ token }) => {
           )}
         </div>
 
-        <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', maxWidth: '48rem', lineHeight: 1.45 }}>
-          <GitBranch size={14} style={{ verticalAlign: 'middle', display: 'inline' }} /> Orchestrator:{' '}
-          <code style={{ fontSize: '0.85em' }}>workflow_runner.py</code>
-        </p>
       </section>
       <style>{`
         .wf-main-row:hover { background: rgba(99, 102, 241, 0.06) !important; }

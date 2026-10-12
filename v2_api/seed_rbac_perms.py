@@ -4,14 +4,22 @@ import os
 DB_URL = os.getenv('TRACKER_DATABASE_URL', 'postgresql+psycopg2://postgres:bigid111!@10.2.20.89:5432/benchmark_db')
 engine = create_engine(DB_URL)
 
-ALL_PAGES = [
-    "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Data Source Trend Comparison",
-    "Small Files Trend Analysis", "Large Files Trend Analysis", "Small Files OLS Trend", "Large Files OLS Trend",
-    "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)", "Discover File FF On vs Off",
-    "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)", "Edit Records", "Manage Classifiers",
-    "Classifier Changes", "Manage Test Environments", "Version Comparison", "Workflow Automation",
-    "Create Data Source", "Scan Status", "Scan Progress"
-]
+# Single source of truth lives in db_config_pg.RBAC_ALL_PAGES so the seed, the API, and
+# the Manage RBAC UI can't drift. Fall back to a local copy if imported standalone.
+try:
+    from db_config_pg import RBAC_ALL_PAGES as ALL_PAGES
+except ImportError:
+    try:
+        from v2_api.db_config_pg import RBAC_ALL_PAGES as ALL_PAGES
+    except ImportError:
+        ALL_PAGES = [
+            "Overview", "Build Analysis", "Comparison", "Build DS Runs", "Data Source Trend Comparison",
+            "Small Files Trend Analysis", "Large Files Trend Analysis", "Small Files OLS Trend", "Large Files OLS Trend",
+            "OLS vs Full Scan (Small)", "OLS vs Full Scan (Large)", "Discover File FF On vs Off",
+            "ACL ON vs OLS (ACL ON)", "ACL OFF vs OLS (ACL OFF)", "Edit Records", "Manage Classifiers",
+            "Classifier Changes", "Manage Test Environments", "Version Comparison", "Workflow Automation",
+            "Create Data Source", "Scan Status", "Scan Progress",
+        ]
 
 ROLES = {
     1: "Admin",

@@ -8,7 +8,7 @@ from sqlalchemy.exc import OperationalError
 # Ensure parent directory is in path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from v2_api.db_config_pg import DB_CONNECTION_STRING, DDL_STATEMENTS
+from v2_api.db_config_pg import DB_CONNECTION_STRING, DDL_STATEMENTS, COLUMN_DROPS, COLUMN_ADDS, BACKFILL_SQL
 
 # Set database URL env variable for seed_rbac_perms before importing it
 os.environ['TRACKER_DATABASE_URL'] = DB_CONNECTION_STRING
@@ -49,7 +49,27 @@ def init():
             except Exception as e:
                 print(f"  Error creating table '{table_name}': {e}")
                 
-    # 2. Seed Roles
+    # 2. Apply schema migrations (idempotent: add columns, drop columns, backfill FKs)
+    with engine.begin() as conn:
+        for stmt in COLUMN_ADDS:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+    with engine.begin() as conn:
+        for stmt in COLUMN_DROPS:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+    with engine.begin() as conn:
+        for stmt in BACKFILL_SQL:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass
+
+    # 3. Seed Roles
     print("Seeding app_roles...")
     with engine.begin() as conn:
         for role_id, role_name in ROLES.items():
@@ -64,7 +84,7 @@ def init():
             except Exception as e:
                 print(f"  Error seeding role '{role_name}': {e}")
 
-    # 3. Seed Page Permissions
+    # 4. Seed Page Permissions
     print("Seeding app_role_pages...")
     try:
         from v2_api.seed_rbac_perms import seed as seed_perms
@@ -72,7 +92,7 @@ def init():
     except Exception as e:
         print(f"  Error seeding permissions: {e}")
 
-    # 4. Seed Default Admin User if not exists
+    # 5. Seed Default Admin User if not exists
     print("Checking default Admin user...")
     admin_user = "bpatel@bigid.com"
     admin_pass = "Benchmark@2026"

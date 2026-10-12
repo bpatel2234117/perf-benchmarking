@@ -36,22 +36,59 @@ def row_text(row: Mapping[str, Any], *cols: str) -> str:
     return " ".join(str(row.get(c) or "") for c in cols).strip()
 
 
+# Closed set of data-source types (matches the data_source_types reference table).
+# normalize_ds_name() maps any input onto one of these and NEVER returns an unknown
+# string — otherwise resolve_ds_id()/the save path would insert it as a brand-new
+# "type", which is how scan labels (e.g. "244-10 CSV", "Postgres10K") leaked into the
+# Benchmark Data dropdown. Unrecognized values collapse to "Other (custom)".
+CANONICAL_DS_TYPES = (
+    "S3", "SMB", "Postgres", "MSSQL", "MySQL",
+    "OneDrive", "Sharepoint Online", "Oracle", "NFS", "Other (custom)",
+)
+
+
 def normalize_ds_name(value: Any) -> str:
     raw = str(value or "").strip()
+    if not raw:
+        return ""
     low = raw.lower()
-    if low in {"s3", "amazon s3"}:
+    # Exact canonical name (case-insensitive) wins.
+    for c in CANONICAL_DS_TYPES:
+        if low == c.lower():
+            return c
+    # Common aliases.
+    if low in {"amazon s3", "aws s3"}:
         return "S3"
-    if low in {"smb"}:
-        return "SMB"
-    if low in {"mssql", "ms sql", "sql server", "microsoft sql server"}:
-        return "MSSQL"
-    if low in {"postgres", "postgresql"}:
+    if low in {"postgresql", "postgres sql"}:
         return "Postgres"
-    if low in {"file-system", "filesystem", "fs"}:
-        return raw
-    if low in {"other (custom)", "other custom", "other"}:
-        return raw
-    return raw
+    if low in {"ms sql", "sql server", "microsoft sql server", "msql"}:
+        return "MSSQL"
+    if low in {"my sql"}:
+        return "MySQL"
+    if low in {"other custom", "other"}:
+        return "Other (custom)"
+    # Substring inference for labels that embed the source (e.g. "bharat-s3-1m...",
+    # "Postgres10K insurance", "loadmillOnedriveV2..."). MySQL/MSSQL checked before the
+    # bare "sql" forms; CSV scans default to S3 (matches add_benchmark_math).
+    if "mysql" in low or "my sql" in low:
+        return "MySQL"
+    if "mssql" in low or "ms sql" in low or "msql" in low or "sql server" in low:
+        return "MSSQL"
+    if "s3" in low or "amazon s3" in low or "csv" in low:
+        return "S3"
+    if "postgres" in low:
+        return "Postgres"
+    if "onedrive" in low:
+        return "OneDrive"
+    if "sharepoint" in low:
+        return "Sharepoint Online"
+    if "smb" in low:
+        return "SMB"
+    if "oracle" in low:
+        return "Oracle"
+    if re.search(r"\bnfs\b", low):
+        return "NFS"
+    return "Other (custom)"
 
 
 def normalize_file_set(value: Any) -> str:
@@ -68,6 +105,31 @@ def normalize_file_set(value: Any) -> str:
     if "MIXED" in upper:
         return "Mixed Files"
     return text
+
+
+def canonical_combined_file_set(ds_value: Any, file_set_value: Any) -> Optional[str]:
+    """Canonical, data-source-prefixed file-set name (single source of truth for scenarios).
+
+    Returns one of: "S3 Small Files", "S3 Large Files", "S3 CSV Files", "SMB Small Files",
+    "SMB Large Files", "Postgres Tables", "MSSQL Tables", "MySQL Tables" (or "<DS> CSV Files"
+    for an unusual SMB CSV row). Returns None when the data source can't be confidently
+    classified, so callers should leave such rows untouched rather than corrupt them.
+    """
+    ds = normalize_ds_name(ds_value)
+    fs_upper = normalize_file_set(file_set_value).upper()
+    # Relational sources collapse to "<DS> Tables" regardless of the original file-set label.
+    if ds in ("Postgres", "MSSQL", "MySQL"):
+        return f"{ds} Tables"
+    if ds in ("S3", "SMB"):
+        if "CSV" in fs_upper:
+            return f"{ds} CSV Files"
+        if "LARGE" in fs_upper:
+            return f"{ds} Large Files"
+        if "SMALL" in fs_upper:
+            return f"{ds} Small Files"
+        # Unknown size for a known unstructured source → don't guess.
+        return None
+    return None
 
 
 def scenario_flags(row: Mapping[str, Any]) -> Tuple[bool, bool, bool]:
@@ -170,11 +232,16 @@ def normalize_benchmark_dataframe(df: Any) -> Any:
     if pd is None or df is None or getattr(df, "empty", True):
         return df
     out = df.copy()
+    # Preserve DB scan_type before canonical overrides (dashboard trend charts use DB values).
+    if "scan_type" in out.columns:
+        out["scan_type_db"] = out["scan_type"].astype(str).str.strip()
     records = out.to_dict("records")
     canon = [canonical_benchmark_fields(r) for r in records]
     cdf = pd.DataFrame(canon, index=out.index)
-    for col in ["data_source_type", "file_set_type", "scan_type", "is_acl", "is_feature_flags"]:
+    for col in ["data_source_type", "file_set_type", "scan_type", "is_acl", "is_feature_flags", "is_ols"]:
         if col in out.columns and col in cdf.columns:
+            out[col] = cdf[col]
+        elif col in cdf.columns:
             out[col] = cdf[col]
     rename_map = {
         "Data_Source_Type": "data_source_type",

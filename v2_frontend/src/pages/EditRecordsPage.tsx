@@ -4,10 +4,11 @@ import axios from 'axios';
 import { 
     Loader2, Wrench, Trash2, Save, Filter, 
     Database, Activity, ChevronRight, ChevronDown,
-    CheckCircle2, XCircle, AlertCircle
+    CheckCircle2, AlertCircle
 } from 'lucide-react';
 import { API_BASE } from '../apiConfig';
 import PaginationBar from '../components/Pagination';
+import { useUserRole } from '../hooks/useUserRole';
 
 interface EditRecordsPageProps { token: string; }
 
@@ -35,6 +36,7 @@ interface BenchmarkRow {
     is_acl: boolean;
     is_feature_flags: boolean;
     total_catalog_items: number | null;
+    avg_file_size: string | null;
     is_active: boolean;
     is_release: boolean;
 }
@@ -48,8 +50,9 @@ function errMsg(e: unknown): string {
 
 const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
     const authConfig = { headers: { Authorization: `Bearer ${token}` } };
+    const isAdmin = useUserRole(token) === 'Admin';  // delete is Admin-only (backend require_admin)
     const qc = useQueryClient();
-    const [mode, setMode] = useState<'manual' | 'auto'>('manual');
+    const [sourceFilter, setSourceFilter] = useState<'' | 'manual' | 'auto'>('');  // '' = all sources
     const [includeInactive, setIncludeInactive] = useState(false);
     const [search, setSearch] = useState('');
     const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -63,27 +66,47 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
         return () => clearTimeout(t);
     }, [search]);
 
-    // Reset page and selections when mode/inactive toggles
+    // Reset page and selections when source/inactive toggles
     useEffect(() => {
         setPage(0);
         setSelected(new Set());
         setEditing({});
-    }, [mode, includeInactive]);
+    }, [sourceFilter, includeInactive]);
+
+    // Lookup lists for normalized data-source / file-set dropdowns
+    const { data: dstList } = useQuery({
+        queryKey: ['lookup-dst', token],
+        queryFn: async () => {
+            const res = await axios.get<{ id: number; name: string }[]>(
+                `${API_BASE}/api/lookup/data-source-types`, authConfig
+            );
+            return res.data;
+        },
+    });
+    const { data: fstList } = useQuery({
+        queryKey: ['lookup-fst', token],
+        queryFn: async () => {
+            const res = await axios.get<{ id: number; name: string; data_type: string | null; total_files: number | null; total_folders: number | null; total_size_gb: number | null }[]>(
+                `${API_BASE}/api/lookup/file-set-types`, authConfig
+            );
+            return res.data;
+        },
+    });
 
     const { data, isLoading } = useQuery({
-        queryKey: ['editBenchmarks', token, mode, includeInactive, debouncedSearch, page],
+        queryKey: ['editBenchmarks', token, sourceFilter, includeInactive, debouncedSearch, page],
         queryFn: async () => {
             const res = await axios.get<{ items: BenchmarkRow[]; total: number }>(
                 `${API_BASE}/api/benchmarks/list`,
-                { 
-                    ...authConfig, 
-                    params: { 
-                        mode,
+                {
+                    ...authConfig,
+                    params: {
+                        source: sourceFilter || undefined,
                         include_inactive: includeInactive,
-                        search: debouncedSearch || undefined, 
-                        limit: PAGE_SIZE, 
-                        offset: page * PAGE_SIZE 
-                    } 
+                        search: debouncedSearch || undefined,
+                        limit: PAGE_SIZE,
+                        offset: page * PAGE_SIZE
+                    }
                 }
             );
             return res.data;
@@ -95,10 +118,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
 
     const updateMut = useMutation({
         mutationFn: async ({ id, fields }: { id: string | number; fields: Partial<BenchmarkRow> }) => {
-            await axios.put(`${API_BASE}/api/benchmarks/${id}`, fields, {
-                ...authConfig,
-                params: { mode }
-            });
+            await axios.put(`${API_BASE}/api/benchmarks/${id}`, fields, authConfig);
         },
         onSuccess: (_, { id }) => {
             qc.invalidateQueries({ queryKey: ['editBenchmarks'] });
@@ -110,10 +130,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
 
     const deleteMut = useMutation({
         mutationFn: async (id: string | number) => {
-            await axios.delete(`${API_BASE}/api/benchmarks/${id}`, {
-                ...authConfig,
-                params: { mode }
-            });
+            await axios.delete(`${API_BASE}/api/benchmarks/${id}`, authConfig);
         },
         onSuccess: () => { 
             qc.invalidateQueries({ queryKey: ['editBenchmarks'] }); 
@@ -124,10 +141,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
 
     const bulkDeleteMut = useMutation({
         mutationFn: async (ids: (string | number)[]) => {
-            await axios.post(`${API_BASE}/api/benchmarks/bulk-delete`, { ids }, {
-                ...authConfig,
-                params: { mode }
-            });
+            await axios.post(`${API_BASE}/api/benchmarks/bulk-delete`, { ids }, authConfig);
         },
         onSuccess: () => {
             qc.invalidateQueries({ queryKey: ['editBenchmarks'] });
@@ -207,7 +221,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
             </div>
 
             <p style={{ margin: 0, fontSize: '0.88rem', color: 'var(--text-secondary)' }}>
-                Edit benchmarks and auto-scans directly. Use the mode toggle to switch between manual and automatic records.
+                Edit benchmark records directly. Use the Source filter to narrow to manually-saved or auto-captured runs.
             </p>
 
             {banner && (
@@ -229,13 +243,16 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
             )}
 
             <div style={{ display: 'flex', borderBottom: '1px solid var(--surface-border)', gap: '4px' }}>
-                <button style={tabStyle(mode === 'manual')} onClick={() => setMode('manual')}>
-                    <Database size={16} style={{ verticalAlign: 'middle', marginRight: 8 }} />
-                    Manual Benchmarks
+                <button style={tabStyle(sourceFilter === '')} onClick={() => setSourceFilter('')}>
+                    All Records
                 </button>
-                <button style={tabStyle(mode === 'auto')} onClick={() => setMode('auto')}>
+                <button style={tabStyle(sourceFilter === 'manual')} onClick={() => setSourceFilter('manual')}>
+                    <Database size={16} style={{ verticalAlign: 'middle', marginRight: 8 }} />
+                    Manual
+                </button>
+                <button style={tabStyle(sourceFilter === 'auto')} onClick={() => setSourceFilter('auto')}>
                     <Activity size={16} style={{ verticalAlign: 'middle', marginRight: 8 }} />
-                    Auto Scans
+                    Auto
                 </button>
             </div>
 
@@ -253,7 +270,7 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                         Include Inactive Records
                     </label>
                     <div style={{ marginLeft: 'auto', display: 'flex', gap: '0.75rem' }}>
-                        {selected.size > 0 && (
+                        {isAdmin && selected.size > 0 && (
                             <button type="button" className="btn"
                                 style={{ background: '#ef4444', color: '#fff', display: 'inline-flex', alignItems: 'center', gap: 8, padding: '0.65rem 1rem' }}
                                 disabled={bulkDeleteMut.isPending}
@@ -320,9 +337,18 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                                                         <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontWeight: 700 }} 
                                                             value={String(getVal(row, 'scenario_type') ?? '')}
                                                             onChange={e => setField(row.id, 'scenario_type', e.target.value)} />
-                                                        <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }} 
-                                                            value={String(getVal(row, 'data_source_type') ?? '')}
-                                                            onChange={e => setField(row.id, 'data_source_type', e.target.value)} />
+                                                        {dstList ? (
+                                                            <select style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }}
+                                                                value={String(getVal(row, 'data_source_type') ?? '')}
+                                                                onChange={e => setField(row.id, 'data_source_type', e.target.value)}>
+                                                                <option value="">— select —</option>
+                                                                {dstList.map(d => <option key={d.id} value={d.name}>{d.name}</option>)}
+                                                            </select>
+                                                        ) : (
+                                                            <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }} 
+                                                                value={String(getVal(row, 'data_source_type') ?? '')}
+                                                                onChange={e => setField(row.id, 'data_source_type', e.target.value)} />
+                                                        )}
                                                     </div>
                                                 </td>
                                                 <td style={{ padding: '10px' }}>
@@ -330,9 +356,18 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                                                         <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontWeight: 600 }} 
                                                             value={String(getVal(row, 'scan_type') ?? '')}
                                                             onChange={e => setField(row.id, 'scan_type', e.target.value)} />
-                                                        <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }} 
-                                                            value={String(getVal(row, 'file_set_type') ?? '')}
-                                                            onChange={e => setField(row.id, 'file_set_type', e.target.value)} />
+                                                        {fstList ? (
+                                                            <select style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }}
+                                                                value={String(getVal(row, 'file_set_type') ?? '')}
+                                                                onChange={e => setField(row.id, 'file_set_type', e.target.value)}>
+                                                                <option value="">— select —</option>
+                                                                {fstList.map(f => <option key={f.id} value={f.name}>{f.name}</option>)}
+                                                            </select>
+                                                        ) : (
+                                                            <input style={{ ...inp, border: 'none', background: 'transparent', padding: 0, fontSize: '0.75rem', color: '#64748b' }} 
+                                                                value={String(getVal(row, 'file_set_type') ?? '')}
+                                                                onChange={e => setField(row.id, 'file_set_type', e.target.value)} />
+                                                        )}
                                                     </div>
                                                 </td>
                                                 <td style={{ padding: '10px' }}>
@@ -363,12 +398,14 @@ const EditRecordsPage: React.FC<EditRecordsPageProps> = ({ token }) => {
                                                                 {updateMut.isPending ? <Loader2 size={14} className="lucide-spin" /> : <Save size={14} />}
                                                             </button>
                                                         )}
-                                                        <button type="button" 
+                                                        {isAdmin && (
+                                                        <button type="button"
                                                             disabled={deleteMut.isPending}
                                                             onClick={() => { if (window.confirm(`Permanently delete record #${row.id}?`)) deleteMut.mutate(row.id); }}
                                                             style={{ background: 'transparent', border: 'none', color: '#ef4444', padding: '5px', cursor: 'pointer', opacity: 0.7 }}>
                                                             <Trash2 size={16} />
                                                         </button>
+                                                        )}
                                                     </div>
                                                 </td>
                                             </tr>

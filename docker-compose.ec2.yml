@@ -1,0 +1,120 @@
+# EC2 / remote DB only. Start: ./up   Stop: ./up down
+
+services:
+  db-init:
+    profiles: ["db-init"]
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: spb-backend
+    container_name: spb_db_init
+    command: python v2_api/init_db.py
+    network_mode: host
+    environment:
+      - Postgres_host=10.2.20.89
+      - Postgres_port=5432
+      - Postgres_username=postgres
+      - Postgres_password=${Postgres_password:-bigid111!}
+      - DB_NAME=benchmark_db
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: spb-backend
+    container_name: spb_api
+    command: uvicorn v2_api.main:app --host 0.0.0.0 --port 8000
+    network_mode: host
+    environment:
+      - Postgres_host=10.2.20.89
+      - Postgres_port=5432
+      - Postgres_username=postgres
+      - Postgres_password=${Postgres_password:-bigid111!}
+      - DB_NAME=benchmark_db
+      - DISABLE_TRACKER_AUTOSTART=1
+      - DISABLE_WORKFLOW_AUTOSTART=1
+    volumes:
+      - ./v2_api:/app/v2_api
+      - ./scripts:/app/scripts
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  tracker:
+    image: spb-backend
+    container_name: spb_tracker
+    command: python v2_api/tracker.py --interval-seconds 60
+    network_mode: host
+    environment:
+      - Postgres_host=10.2.20.89
+      - Postgres_port=5432
+      - Postgres_username=postgres
+      - Postgres_password=${Postgres_password:-bigid111!}
+      - DB_NAME=benchmark_db
+      - SCAN_TRACKER_NAME=default
+    volumes:
+      - ./v2_api:/app/v2_api
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  workflow-runner:
+    image: spb-backend
+    container_name: spb_workflow
+    command: python v2_api/workflow_runner.py --interval-seconds 30
+    network_mode: host
+    environment:
+      - Postgres_host=10.2.20.89
+      - Postgres_port=5432
+      - Postgres_username=postgres
+      - Postgres_password=${Postgres_password:-bigid111!}
+      - DB_NAME=benchmark_db
+      # A failed step must NOT abort the whole run — other steps keep running on free envs.
+      - WORKFLOW_MARK_RUN_FAILED_ON_STEP_ERROR=0
+    volumes:
+      - ./v2_api:/app/v2_api
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  log-fetcher:
+    image: spb-backend
+    container_name: spb_logs
+    command: python v2_api/ai_log_fetcher.py
+    network_mode: host
+    environment:
+      - Postgres_host=10.2.20.89
+      - Postgres_port=5432
+      - Postgres_username=postgres
+      - Postgres_password=${Postgres_password:-bigid111!}
+      - DB_NAME=benchmark_db
+      # Ollama runs on the host (10.2.20.89), not inside this container. 127.0.0.1 would
+      # resolve to the container itself. Override via OLLAMA_URL env if it moves.
+      - OLLAMA_URL=${OLLAMA_URL:-http://10.2.20.89:11434/api/generate}
+    volumes:
+      - ./v2_api:/app/v2_api
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+      - ./reports:/app/reports
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        # Always empty on EC2: browser → :5174/api/* → nginx → host:8000
+        VITE_API_BASE_URL: ""
+    image: spb-frontend
+    container_name: spb_ui
+    ports:
+      - "5174:5174"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    depends_on:
+      - api

@@ -106,6 +106,81 @@ def load_file_set_type_row(engine: Engine, file_set_name: str) -> Optional[Dict[
     return None
 
 
+# Canonical structured presets when inferred labels (e.g. "Postgres Mixed Tables") have no file_set_types row.
+_STRUCTURED_SIZE_PRESET_NAMES: Dict[str, List[str]] = {
+    "postgres": ["PostgreSQL-10K-Tables-17GB"],
+    "mssql": ["MSSQL-10K-Tables-9GB"],
+}
+
+
+def _structured_ds_key(data_source_type: str) -> str:
+    d = str(data_source_type or "").strip().lower()
+    if d.startswith("postgres"):
+        return "postgres"
+    if d in ("mssql", "sql server", "microsoft sql") or "sql server" in d:
+        return "mssql"
+    return d
+
+
+def resolve_structured_file_set_size_preset(
+    engine: Engine,
+    *,
+    data_source_type: str,
+    data_type: str,
+    total_files: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    """
+    When scan_insights has no total_size_gb, use known file_set_types presets
+    (e.g. PostgreSQL-10K-Tables-17GB → 20 GB for 10K Postgres tables).
+    """
+    if str(data_type or "").strip().lower() != "structured":
+        return None
+    ds_key = _structured_ds_key(data_source_type)
+    for preset_name in _STRUCTURED_SIZE_PRESET_NAMES.get(ds_key, []):
+        row = load_file_set_type_row(engine, preset_name)
+        if not row or row.get("total_size_gb") is None:
+            continue
+        pf = row.get("total_files")
+        if total_files is not None and pf is not None and int(pf) != int(total_files):
+            continue
+        return row
+    if ds_key == "postgres":
+        try:
+            with engine.connect() as conn:
+                params: Dict[str, Any] = {"tf": int(total_files) if total_files is not None else None}
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT name, data_type, total_files, total_folders, total_size_gb
+                        FROM file_set_types
+                        WHERE LOWER(TRIM(COALESCE(data_type, ''))) = 'structured'
+                          AND total_size_gb IS NOT NULL AND total_size_gb > 0
+                          AND (
+                            LOWER(name) LIKE '%postgres%'
+                            OR LOWER(name) LIKE '%postgresql%'
+                          )
+                          AND (:tf IS NULL OR total_files IS NULL OR total_files = :tf)
+                        ORDER BY
+                          CASE WHEN total_files = :tf THEN 0 ELSE 1 END,
+                          id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    params,
+                ).fetchone()
+                if row:
+                    return {
+                        "name": row[0],
+                        "data_type": row[1],
+                        "total_files": row[2],
+                        "total_folders": row[3],
+                        "total_size_gb": float(row[4]),
+                    }
+        except SQLAlchemyError:
+            pass
+    return None
+
+
 def load_findings_prefill_rows(engine: Engine, scan_id: str) -> List[Dict[str, Any]]:
     """
     Mirrors dashboard.get_scan_attribute_findings_prefill (without BigID sync side-effects).
@@ -291,11 +366,27 @@ def build_form_sections_meta(
     if total_folders is None and snap and snap.get("total_parts_scanned") is not None:
         try:
             parts = int(snap["total_parts_scanned"])
-            if parts >= 0:
+            if parts > 0:
                 total_folders = parts
                 insight_captions.append(f"Prefilled from scan_progress: total_parts_scanned = {total_folders:,} (proxy)")
         except Exception:
             pass
+
+    if total_gb is None:
+        size_preset = resolve_structured_file_set_size_preset(
+            engine,
+            data_source_type=ds_hint,
+            data_type=str(shape.get("data_type") or ""),
+            total_files=total_files,
+        )
+        if size_preset and size_preset.get("total_size_gb") is not None:
+            total_gb = float(size_preset["total_size_gb"])
+            if not preset_row or preset_row.get("total_size_gb") is None:
+                preset_row = size_preset
+            insight_captions.append(
+                f"Prefilled from file_set_types preset: {size_preset['name']} "
+                f"(Total Size GB = {total_gb:.4f})"
+            )
 
     display_scenario = str(prefill.get("scenario_type") or "").strip() or shape.get("scenario_type") or ""
 

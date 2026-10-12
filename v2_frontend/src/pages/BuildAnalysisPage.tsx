@@ -2,6 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import axios from 'axios';
 import { Loader2, BarChart2, ChevronRight, ChevronDown } from 'lucide-react';
+import PageHeader from '../components/PageHeader';
 import {
     ResponsiveContainer,
     BarChart,
@@ -108,19 +109,29 @@ function pctDelta(cur: number | null, prev: number | null): number | null {
     return ((cur - prev) / prev) * 100;
 }
 
-// ── Best row per (ds, fileSet, scenario) ─────────────────────────────────────
-function bestRows(rows: BenchmarkRow[]): Map<string, BenchmarkRow> {
-    const m = new Map<string, BenchmarkRow>();
-    for (const r of rows) {
-        const scen = classifyScenario(r);
-        const key = `${r.data_source_type}||${r.file_set_type}||${scen}`;
-        const cur = m.get(key);
-        if (!cur) { m.set(key, r); continue; }
-        const curTp = cur.throughput_cluster_gb_hr ?? -1;
-        const newTp = r.throughput_cluster_gb_hr ?? -1;
-        if (newTp > curTp) m.set(key, r);
+// Best row per (ds, fileSet, scenario). Prefer anchorBuild so Base/ACL/OLS are comparable.
+function bestRows(rows: BenchmarkRow[], anchorBuild?: string): Map<string, BenchmarkRow> {
+    const pick = (subset: BenchmarkRow[]) => {
+        const m = new Map<string, BenchmarkRow>();
+        for (const r of subset) {
+            const scen = classifyScenario(r);
+            const key = `${r.data_source_type}||${r.file_set_type}||${scen}`;
+            const cur = m.get(key);
+            if (!cur) { m.set(key, r); continue; }
+            const curTp = cur.throughput_cluster_gb_hr ?? -1;
+            const newTp = r.throughput_cluster_gb_hr ?? -1;
+            if (newTp > curTp) m.set(key, r);
+        }
+        return m;
+    };
+    const anchor = (anchorBuild || '').trim();
+    if (!anchor) return pick(rows);
+    const anchored = pick(rows.filter(r => r.build_version === anchor));
+    const fallback = pick(rows);
+    for (const [k, v] of fallback) {
+        if (!anchored.has(k)) anchored.set(k, v);
     }
-    return m;
+    return anchored;
 }
 
 // ── Trend chart data ──────────────────────────────────────────────────────────
@@ -135,21 +146,26 @@ function buildTrendData(
         !r.is_acl && !r.is_feature_flags &&
         !(r.scan_type || '').toLowerCase().includes('ols')
     );
-    // Group by major version (e.g. "253" covers "253.5" and "253.11"), pick highest throughput.
-    const byMajor = new Map<string, BenchmarkRow>();
+    // Group by major version (e.g. "253" covers "253.5" and "253.11") and AVERAGE the
+    // throughput across all runs in that major build (matches build_major_averages).
+    const byMajor = new Map<string, BenchmarkRow[]>();
     for (const r of filtered) {
         const major = majorOf(r.build_version);
-        const cur = byMajor.get(major);
-        if (!cur || (r.throughput_cluster_gb_hr ?? -1) > (cur.throughput_cluster_gb_hr ?? -1)) {
-            byMajor.set(major, r);
-        }
+        const arr = byMajor.get(major);
+        if (arr) arr.push(r);
+        else byMajor.set(major, [r]);
     }
+    const mean = (rs: BenchmarkRow[], key: 'throughput_cluster_gb_hr' | 'throughput_cluster_files_hr'): number | null => {
+        const vals = rs.map(r => r[key]).filter((v): v is number => v != null && Number.isFinite(v));
+        if (!vals.length) return null;
+        return vals.reduce((a, b) => a + b, 0) / vals.length;
+    };
     return [...byMajor.entries()]
         .sort((a, b) => sortKey(a[0]) - sortKey(b[0]))
-        .map(([major, r]) => ({
+        .map(([major, rs]) => ({
             build: major,
-            gb: r.throughput_cluster_gb_hr,
-            files: r.throughput_cluster_files_hr,
+            gb: mean(rs, 'throughput_cluster_gb_hr'),
+            files: mean(rs, 'throughput_cluster_files_hr'),
         }));
 }
 
@@ -161,7 +177,12 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
     const [activeTab, setActiveTab] = useState<'matrix' | 'trend' | 'overview'>('matrix');
     const [showOverviewTable, setShowOverviewTable] = useState(false);
 
-    const { data: buildsData, isLoading: buildsLoading } = useQuery({
+    const {
+        data: buildsData,
+        isLoading: buildsLoading,
+        isError: buildsError,
+        error: buildsQueryError,
+    } = useQuery({
         queryKey: ['buildAnalysisBuilds', token],
         queryFn: async () => {
             const res = await axios.get<BuildOption[]>(`${API_BASE}/api/build-analysis/builds`, authConfig);
@@ -175,7 +196,12 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
     const effectiveBuild = selectedBuild || (builds[0]?.version ?? '');
     const currentMajor = majorOf(effectiveBuild);
 
-    const { data: analysisData, isLoading: dataLoading } = useQuery({
+    const {
+        data: analysisData,
+        isLoading: dataLoading,
+        isError: dataError,
+        error: dataQueryError,
+    } = useQuery({
         queryKey: ['buildAnalysisData', token],
         queryFn: async () => {
             const res = await axios.get<{ rows: BenchmarkRow[]; total: number }>(
@@ -184,7 +210,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
             );
             return res.data;
         },
-        enabled: builds.length > 0,
+        enabled: builds.length > 0 && !buildsError,
     });
 
     const allRows = analysisData?.rows ?? [];
@@ -207,8 +233,19 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
     );
 
     // Best rows for current and previous major
-    const curBest = useMemo(() => bestRows(curMajorRows), [curMajorRows]);
-    const prevBest = useMemo(() => bestRows(prevMajorRows), [prevMajorRows]);
+    const prevBuildForMajor = useMemo(() => {
+        if (!prevMajor) return '';
+        const subs = [...new Set(prevMajorRows.map(r => r.build_version).filter(Boolean))].sort(
+            (a, b) => sortKey(b) - sortKey(a),
+        );
+        return subs[0] ?? '';
+    }, [prevMajor, prevMajorRows]);
+
+    const curBest = useMemo(() => bestRows(curMajorRows, effectiveBuild), [curMajorRows, effectiveBuild]);
+    const prevBest = useMemo(
+        () => bestRows(prevMajorRows, prevBuildForMajor || undefined),
+        [prevMajorRows, prevBuildForMajor],
+    );
 
     // Distinct DS types in current major
     const dsTypes = useMemo(() => {
@@ -248,12 +285,26 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
 
     return (
         <div className="animate-in dashboard-root" style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                <BarChart2 size={26} style={{ color: 'var(--primary-color)' }} />
-                <h2 style={{ margin: 0, fontSize: '1.35rem', fontWeight: 700, color: 'var(--text-primary)' }}>
-                    Build Depth Analysis
-                </h2>
-            </div>
+            <PageHeader icon={BarChart2} title="Build Depth Analysis" />
+
+            {(buildsError || dataError) && (
+                <div
+                    className="glass-panel"
+                    style={{
+                        padding: '1rem 1.25rem',
+                        color: 'var(--danger-color)',
+                        fontSize: '0.88rem',
+                        lineHeight: 1.5,
+                    }}
+                >
+                    Build analysis API error:{' '}
+                    {(buildsQueryError as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+                        (dataQueryError as { response?: { data?: { detail?: string } } })?.response?.data?.detail ||
+                        (buildsQueryError as Error)?.message ||
+                        (dataQueryError as Error)?.message ||
+                        'Unknown error'}
+                </div>
+            )}
 
             {/* Build selector */}
             <div className="glass-panel" style={{ padding: '1rem 1.25rem', display: 'flex', flexWrap: 'wrap', gap: '1rem', alignItems: 'flex-end' }}>
@@ -290,7 +341,13 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                 </div>
             )}
 
-            {!loading && effectiveBuild && (
+            {!loading && !buildsError && !dataError && builds.length === 0 && (
+                <div className="glass-panel" style={{ padding: '2rem', textAlign: 'center', color: 'var(--text-secondary)' }}>
+                    No benchmark data found. Add benchmarks via Add Benchmark or import migration data.
+                </div>
+            )}
+
+            {!loading && !buildsError && !dataError && effectiveBuild && (
                 <>
                     {/* Overview KPIs */}
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: '1rem' }}>
@@ -324,8 +381,11 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                             {activeTab === 'matrix' && (
                                 <div>
                                     <p style={{ margin: '0 0 1rem', fontSize: '0.88rem', color: 'var(--text-secondary)' }}>
-                                        Best result per scenario across <strong>{currentMajor}.x</strong>.
-                                        {prevMajor && <> Compared against best of <strong>{prevMajor}.x</strong>.</>}
+                                        Best result per scenario, preferring build <strong>{effectiveBuild}</strong> so Full Scan, ACL, and OLS are comparable.
+                                        Other {currentMajor}.x sub-versions are used only when this build has no run for that scenario.
+                                        {prevMajor && prevBuildForMajor && (
+                                            <> Compared against <strong>{prevBuildForMajor}</strong> ({prevMajor}.x).</>
+                                        )}
                                     </p>
                                     {dsTypes.length === 0 && (
                                         <p style={{ color: 'var(--text-secondary)' }}>No data for this major version.</p>
@@ -360,8 +420,9 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                                     <thead>
                                                                         <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'left' }}>Scenario</th>
+                                                                            <th style={{ padding: '8px 10px', textAlign: 'left' }}>Build</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>GB/hr</th>
-                                                                            <th style={{ padding: '8px 10px', textAlign: 'right' }}>{['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'}</th>
+                                                                            <th style={{ padding: '8px 10px', textAlign: 'right' }}>{['postgres', 'mssql', 'mysql', 'oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'}</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>Scan Hrs</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>Objects</th>
                                                                             <th style={{ padding: '8px 10px', textAlign: 'right' }}>vs Base</th>
@@ -381,6 +442,7 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                                             return (
                                                                                 <tr key={scen} style={{ borderBottom: '1px solid var(--surface-border)' }}>
                                                                                     <td style={{ padding: '8px 10px', fontWeight: scen === 'Base (Full Scan)' ? 700 : 400 }}>{scen}</td>
+                                                                                    <td style={{ padding: '8px 10px', fontFamily: 'ui-monospace, monospace', fontSize: '0.78rem' }}>{row.build_version}</td>
                                                                                     <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmt(tp)}</td>
                                                                                     <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmt(row.throughput_cluster_files_hr, 0)}</td>
                                                                                     <td style={{ padding: '8px 10px', textAlign: 'right' }}>{fmt(row.total_scan_hours)}</td>
@@ -438,15 +500,15 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                                         </div>
                                                     </div>
                                                     <div>
-                                        <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: 6, color: 'var(--text-secondary)' }}>{['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Table Throughput (tables/hr)' : 'File Throughput (files/hr)'}</div>
-                                        <div style={{ height: 220 }}>
-                                            <ResponsiveContainer width="100%" height="100%">
-                                                <BarChart data={trendData} margin={{ top: 4, right: 8, left: 0, bottom: 40 }}>
-                                                    <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
-                                                    <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
-                                                    <YAxis tick={{ fontSize: 10 }} />
-                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
-                                                    <Bar dataKey="files" name={['postgres','mssql','mysql','oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'} fill="#059669" />
+                                                        <div style={{ fontSize: '0.8rem', fontWeight: 600, marginBottom: 6, color: 'var(--text-secondary)' }}>{['postgres', 'mssql', 'mysql', 'oracle'].includes(ds.toLowerCase()) ? 'Table Throughput (tables/hr)' : 'File Throughput (files/hr)'}</div>
+                                                        <div style={{ height: 220 }}>
+                                                            <ResponsiveContainer width="100%" height="100%">
+                                                                <BarChart data={trendData} margin={{ top: 4, right: 8, left: 0, bottom: 40 }}>
+                                                                    <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                                                                    <XAxis dataKey="build" tick={{ fontSize: 10 }} angle={-35} textAnchor="end" height={55} />
+                                                                    <YAxis tick={{ fontSize: 10 }} />
+                                                                    <Tooltip formatter={(v: any) => (typeof v === 'number' ? v.toFixed(2) : v)} />
+                                                                    <Bar dataKey="files" name={['postgres', 'mssql', 'mysql', 'oracle'].includes(ds.toLowerCase()) ? 'Tables/hr' : 'Files/hr'} fill="#059669" />
                                                                 </BarChart>
                                                             </ResponsiveContainer>
                                                         </div>
@@ -461,13 +523,13 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                             {/* ── Overview table ── */}
                             {activeTab === 'overview' && (
                                 <div>
-                                    <div 
+                                    <div
                                         onClick={() => setShowOverviewTable(!showOverviewTable)}
-                                        style={{ 
-                                            display: 'flex', 
-                                            alignItems: 'center', 
-                                            gap: '0.5rem', 
-                                            cursor: 'pointer', 
+                                        style={{
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            gap: '0.5rem',
+                                            cursor: 'pointer',
                                             marginBottom: '1rem',
                                             userSelect: 'none',
                                             padding: '0.5rem 0.75rem',
@@ -490,11 +552,11 @@ const BuildAnalysisPage: React.FC<BuildAnalysisPageProps> = ({ token }) => {
                                             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '0.82rem' }}>
                                                 <thead>
                                                     <tr style={{ background: 'var(--primary-color, #0052cc)', color: '#fff' }}>
-                                        {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr',
-                                          dsTypes.length > 0 && dsTypes.every(d => ['postgres','mssql','mysql','oracle'].includes(d.toLowerCase())) ? 'Tables/hr' : 'Files/hr',
-                                          'Scan Hrs', 'Run Date'].map(h => (
-                                            <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
-                                        ))}
+                                                        {['Build', 'DS Type', 'File Set', 'Scenario', 'GB/hr',
+                                                            dsTypes.length > 0 && dsTypes.every(d => ['postgres', 'mssql', 'mysql', 'oracle'].includes(d.toLowerCase())) ? 'Tables/hr' : 'Files/hr',
+                                                            'Scan Hrs', 'Run Date'].map(h => (
+                                                                <th key={h} style={{ padding: '8px 10px', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
+                                                            ))}
                                                     </tr>
                                                 </thead>
                                                 <tbody>

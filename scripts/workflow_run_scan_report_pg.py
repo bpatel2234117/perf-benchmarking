@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-Build an HTML performance report from Postgres benchmark rows.
+Build a simpler major-line HTML report from Postgres (benchmarks + auto_scan_benchmarks).
 
-The report is version-line based, not workflow-run based:
+NOT used by the UI at /tools/generate-report — that page runs
+`generate_benchmark_email_report_pg.py` (full email-style report with charts,
+scenario matrix, classifiers, optional scanner-performance / test-env sections).
+
+This script is for CLI / ops:
 - find the latest major build line with active benchmark rows, unless --major-line is provided
 - pick the best result per scenario inside that major line for chart/summary use
 - keep all runs in a detail table for supporting report data
@@ -107,10 +111,10 @@ def load_benchmarks(engine) -> pd.DataFrame:
         )
         SELECT
             b.id,
-            'benchmarks' AS source_table,
-            bv.version AS build_version,
-            COALESCE(dst.name, '') AS data_source_type,
-            COALESCE(fst.name, '') AS file_set_type,
+            b.source AS source_table,
+            COALESCE(bv.version, b.build_version, '') AS build_version,
+            COALESCE(dst.name, b.data_source_type, '') AS data_source_type,
+            COALESCE(fst.name, b.file_set_type, '') AS file_set_type,
             COALESCE(b.scenario_type, '') AS scenario_type,
             COALESCE(b.scan_type, '') AS scan_type,
             COALESCE(cfg.is_acl, FALSE) AS is_acl,
@@ -123,73 +127,35 @@ def load_benchmarks(engine) -> pd.DataFrame:
             b.throughput_cluster_files_hr::double precision AS throughput_cluster_files_hr,
             b.throughput_scanner_files_hr::double precision AS throughput_scanner_files_hr,
             b.throughput_thread_files_hr::double precision AS throughput_thread_files_hr,
-            COALESCE(si.objects_scanned, b.total_catalog_items, b.total_files, 0)::bigint AS objects_scanned,
+            COALESCE(si.objects_scanned, b.objects_scanned, b.total_catalog_items, fst.total_files, 0)::bigint AS objects_scanned,
             COALESCE(si.total_size_gb, b.total_size_gb, fst.total_size_gb, 0)::double precision AS total_size_gb,
             COALESCE(si.total_classification, b.total_classification, 0)::bigint AS total_classification,
-            COALESCE(si.new_attributes_count, b.total_catalog_items, 0)::bigint AS new_attributes,
+            COALESCE(si.new_attributes_count, b.new_attributes, 0)::bigint AS new_attributes,
             COALESCE(si.removed_attributes_count, b.removed_attributes, 0)::bigint AS removed_attributes,
             b.scan_id,
-            sp.environment_id,
+            COALESCE(b.environment_id, sp.environment_id) AS environment_id,
             te.env_name,
             COALESCE(sp.scan_status, '') AS scan_status,
             pl.latest_state,
-            b.run_date
-        FROM benchmarks b
-        JOIN builds bv ON bv.id = b.build_id
+            b.run_date::text AS run_date
+        FROM benchmark_runs b
+        LEFT JOIN builds bv ON bv.id = b.build_id
         LEFT JOIN data_source_types dst ON dst.id = b.data_source_type_id
         LEFT JOIN file_set_types fst ON fst.id = b.file_set_type_id
         LEFT JOIN configurations cfg ON cfg.id = b.config_id
         LEFT JOIN scan_insights si ON si.scan_id = b.scan_id
         LEFT JOIN scan_parents sp ON sp.scan_id = b.scan_id
-        LEFT JOIN test_environments te ON te.id = sp.environment_id
+        LEFT JOIN test_environments te ON te.id = COALESCE(b.environment_id, sp.environment_id)
         LEFT JOIN progress_latest pl ON pl.scan_id = b.scan_id
         WHERE COALESCE(b.is_active, TRUE) = TRUE
-        UNION ALL
-        SELECT
-            ab.id,
-            'auto_scan_benchmarks' AS source_table,
-            COALESCE(ab.build_version, ws.build_version, '') AS build_version,
-            COALESCE(NULLIF(ab.data_source_type, ''), ws.ds_kind, '') AS data_source_type,
-            COALESCE(NULLIF(ab.file_set_type, ''), ws.file_set_type, '') AS file_set_type,
-            COALESCE(ab.scenario_type, '') AS scenario_type,
-            COALESCE(ab.scan_type, ws.scan_kind, '') AS scan_type,
-            COALESCE(ws.is_acl, FALSE) AS is_acl,
-            COALESCE(ws.is_structured_ff, FALSE) AS is_feature_flags,
-            COALESCE(ws.feature_flags, '') AS feature_flags,
-            ab.total_scan_hours::double precision AS total_scan_hours,
-            ab.throughput_cluster_gb_hr::double precision AS throughput_cluster_gb_hr,
-            NULL::double precision AS throughput_scanner_gb_hr,
-            NULL::double precision AS throughput_thread_gb_hr,
-            ab.throughput_cluster_files_hr::double precision AS throughput_cluster_files_hr,
-            NULL::double precision AS throughput_scanner_files_hr,
-            NULL::double precision AS throughput_thread_files_hr,
-            COALESCE(si.objects_scanned, ab.objects_scanned, ab.total_files, 0)::bigint AS objects_scanned,
-            COALESCE(si.total_size_gb, ab.total_size_gb, 0)::double precision AS total_size_gb,
-            COALESCE(si.total_classification, ab.total_classification, 0)::bigint AS total_classification,
-            COALESCE(si.new_attributes_count, ab.new_attributes, 0)::bigint AS new_attributes,
-            COALESCE(si.removed_attributes_count, ab.removed_attributes, 0)::bigint AS removed_attributes,
-            ab.scan_id,
-            COALESCE(ab.environment_id, ws.environment_id, sp.environment_id) AS environment_id,
-            te.env_name,
-            COALESCE(sp.scan_status, '') AS scan_status,
-            pl.latest_state,
-            ab.run_date::text AS run_date
-        FROM auto_scan_benchmarks ab
-        LEFT JOIN workflow_steps ws ON ws.scan_id = ab.scan_id
-        LEFT JOIN scan_insights si ON si.scan_id = ab.scan_id
-        LEFT JOIN scan_parents sp ON sp.scan_id = ab.scan_id
-        LEFT JOIN test_environments te ON te.id = COALESCE(ab.environment_id, ws.environment_id, sp.environment_id)
-        LEFT JOIN progress_latest pl ON pl.scan_id = ab.scan_id
-        WHERE COALESCE(ab.is_active, TRUE) = TRUE
-          AND NOT EXISTS (
-              SELECT 1
-              FROM benchmarks b2
-              WHERE NULLIF(b2.scan_id, '') IS NOT NULL
-                AND b2.scan_id = ab.scan_id
-          )
     """
     with engine.connect() as conn:
-        return pd.read_sql(text(query), conn)
+        result = conn.execute(text(query))
+        cols = list(result.keys())
+        rows = result.fetchall()
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows, columns=cols)
 
 
 def pick_latest_major(df: pd.DataFrame) -> str:
@@ -202,20 +168,26 @@ def pick_latest_major(df: pd.DataFrame) -> str:
 
 
 def select_best_run(group: pd.DataFrame) -> pd.Series:
-    """Prefer highest GB/hr, then highest files/hr, then shortest scan hours."""
-    for col, ascending in (
-        ("throughput_cluster_gb_hr", False),
-        ("throughput_cluster_files_hr", False),
-        ("total_scan_hours", True),
-    ):
-        vals = pd.to_numeric(group.get(col), errors="coerce")
-        valid = group[vals.notna()].copy()
-        if valid.empty:
-            continue
-        valid["_sort_value"] = pd.to_numeric(valid[col], errors="coerce")
-        valid = valid.sort_values("_sort_value", ascending=ascending)
-        return valid.iloc[0].drop(labels=["_sort_value"], errors="ignore")
-    return group.iloc[0]
+    """Average the runs in this scenario group (mean throughput / scan-hours / volume).
+
+    Reports use the averaged-per-major-build figure rather than a single cherry-picked
+    run, matching the build_major_averages table and the trend charts.
+    """
+    row = group.iloc[0].copy()
+    numeric_cols = (
+        "throughput_cluster_gb_hr", "throughput_scanner_gb_hr", "throughput_thread_gb_hr",
+        "throughput_cluster_files_hr", "throughput_scanner_files_hr", "throughput_thread_files_hr",
+        "total_scan_hours", "objects_scanned", "total_size_gb", "total_classification",
+        "new_attributes", "removed_attributes",
+    )
+    for col in numeric_cols:
+        if col in group.columns:
+            vals = pd.to_numeric(group[col], errors="coerce")
+            if vals.notna().any():
+                row[col] = vals.mean()
+    if "scan_name" in row.index:
+        row["scan_name"] = f"Average of {len(group)} run(s)"
+    return row
 
 
 def best_rows_for_major(df: pd.DataFrame, major_line: str) -> pd.DataFrame:
@@ -223,11 +195,9 @@ def best_rows_for_major(df: pd.DataFrame, major_line: str) -> pd.DataFrame:
     if work.empty:
         return pd.DataFrame(columns=df.columns)
     work["scenario_label"] = work.apply(_scenario_label, axis=1)
+    work["norm_ds"] = work["data_source_type"].astype(str).str.strip()
     rows: List[pd.Series] = []
-    for _, grp in work.groupby(
-        ["data_source_type", "file_set_type", "scenario_label"],
-        dropna=False,
-    ):
+    for _, grp in work.groupby(["norm_ds", "file_set_type", "scenario_label"], dropna=False):
         rows.append(select_best_run(grp))
     return pd.DataFrame(rows).reset_index(drop=True) if rows else pd.DataFrame(columns=df.columns)
 

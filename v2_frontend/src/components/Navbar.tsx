@@ -6,9 +6,10 @@ import {
   RefreshCw,
   Wrench,
   Loader2,
+  TrendingUp,
 } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import axios from 'axios';
 import { SYSTEM_TOOLS_ENTRIES } from '../navigation/systemToolsConfig';
 import { API_BASE } from '../apiConfig';
@@ -29,7 +30,9 @@ function pathMatches(entry: typeof SYSTEM_TOOLS_ENTRIES[number], pathname: strin
 const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
   const location = useLocation();
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const sidebarRef = useRef<HTMLDivElement>(null);
+  const queryClient = useQueryClient();
 
   const { data: userProfile } = useQuery({
     queryKey: ['me'],
@@ -41,11 +44,14 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
     }
   });
 
-  const userRole = userProfile?.role || 'Viewer';
-  const isAdminOrDev = ['Admin', 'Developer'].includes(userRole);
+  const userRole = (userProfile?.role || 'Viewer').trim();
+  const isAdmin = userRole === 'Admin';
 
   const filteredTools = SYSTEM_TOOLS_ENTRIES.filter(entry => {
-    if (entry.kind === 'app' && entry.path === '/tools/manage-rbac') return isAdminOrDev;
+    // Backend enforces these as Admin-only (RBAC management + generated reports),
+    // so don't show their nav entries to non-Admins.
+    if (entry.kind === 'app' && entry.path === '/tools/manage-rbac') return isAdmin;
+    if (entry.kind === 'app' && entry.path === '/tools/generate-report') return isAdmin;
     return true;
   });
 
@@ -73,10 +79,10 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
 
   return (
     <div className="app-shell">
-      <header className="app-top-header-global">
-        <div className="app-top-header-logo-section">
-          <img src="/logo.png" alt="BigID" className="app-top-header-logo" />
-          <span className="app-top-header-brand">Performance Management</span>
+      <header className="app-top-header-global" style={{ paddingLeft: '20px' }}>
+        <div className="app-top-header-logo-section" style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <img src="/logo.png" alt="BigID" style={{ width: 48, height: 48, flexShrink: 0, objectFit: 'contain' }} />
+          <span className="app-top-header-brand" style={{ fontSize: '1.3rem', fontWeight: 600, color: '#1f2937' }}>Performance Management</span>
         </div>
         <div className="app-top-header-user">
           <span className="app-top-header-username">
@@ -89,8 +95,8 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
       </header>
 
       <aside ref={sidebarRef} className="app-sidebar-purple" aria-label="Main navigation">
-        <Link to="/" className="app-sidebar-brand-white">
-          <img src="/logo.png" alt="BigID" style={{ width: 24, height: 24, borderRadius: 6, objectFit: 'cover' }} />
+        <Link to="/" className="app-sidebar-brand-white" style={{ border: '2px solid rgba(255, 255, 255, 0.3)', borderRadius: '10px', padding: '0.5rem 0.75rem', margin: '0.5rem' }}>
+          <TrendingUp size={18} aria-hidden />
           <span className="app-sidebar-title">BigID Benchmarks</span>
         </Link>
 
@@ -154,8 +160,19 @@ const Navbar: React.FC<NavbarProps> = ({ onLogout, token, children }) => {
               <Loader2 size={12} className="lucide-spin" />
             )}
           </div>
-          <button type="button" className="app-sidebar-refresh-btn" onClick={() => window.location.reload()}>
-            <RefreshCw size={17} aria-hidden /> Refresh
+          <button
+            type="button"
+            className="app-sidebar-refresh-btn"
+            onClick={async () => {
+              setIsRefreshing(true);
+              // Invalidate all queries to trigger refetch
+              await queryClient.invalidateQueries();
+              setIsRefreshing(false);
+            }}
+            disabled={isRefreshing}
+          >
+            <RefreshCw size={17} aria-hidden className={isRefreshing ? 'lucide-spin' : ''} />
+            {isRefreshing ? 'Refreshing...' : 'Refresh'}
           </button>
           <button type="button" className="app-sidebar-logout-btn" onClick={onLogout}>
             <LogOut size={17} aria-hidden /> Logout

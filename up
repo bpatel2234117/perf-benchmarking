@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# One command for EC2 / remote DB (10.2.20.89). Nothing else to remember.
+#
+#   ./up           build images + (re)start all services, picking up code changes
+#   ./up down      stop and remove all services
+#   ./up restart   restart backend services only (fast; picks up volume-mounted code)
+#   ./up build     rebuild images only (no restart)
+#   ./up ps        show service status
+#   ./up logs [svc] follow logs for a service (default: api)
+#
+# Backend services (api, tracker, workflow-runner, log-fetcher) share the spb-backend
+# image AND mount ./v2_api into the container, so a force-recreate is enough to pick up
+# Python code changes — no per-service rebuild needed.
+set -euo pipefail
+cd "$(dirname "$0")"
+FILE=docker-compose.ec2.yml
+
+if docker compose version >/dev/null 2>&1; then
+  dc() { docker compose -f "$FILE" "$@"; }
+else
+  dc() { docker-compose -f "$FILE" "$@"; }
+fi
+
+BACKEND_SVCS="api tracker workflow-runner log-fetcher"
+
+print_endpoints() {
+  echo ""
+  echo "UI:  http://$(curl -s -m1 http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo 127.0.0.1):5174"
+  echo "API: http://127.0.0.1:8000/api/health"
+}
+
+case "${1:-}" in
+  down) dc down --remove-orphans ;;
+  ps)   dc ps ;;
+  logs) dc logs -f "${2:-api}" ;;
+  build)
+    # api builds the shared spb-backend image; frontend builds spb-frontend.
+    dc build api frontend
+    ;;
+  restart)
+    # Fast path: no rebuild, just recreate backend containers so mounted code reloads.
+    dc up -d --force-recreate --no-deps $BACKEND_SVCS
+    dc ps
+    ;;
+  "")
+    # api builds the shared spb-backend image used by tracker/workflow-runner/log-fetcher.
+    dc build api frontend
+    # Force-recreate ALL services so rebuilt images and volume-mounted code both take effect.
+    # db-init stays off (it's behind the "db-init" profile).
+    dc up -d --force-recreate --remove-orphans
+    dc ps
+    print_endpoints
+    ;;
+  *) dc "$@" ;;
+esac
