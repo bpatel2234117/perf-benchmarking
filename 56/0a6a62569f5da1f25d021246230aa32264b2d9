@@ -1,0 +1,16 @@
+test2.py
+  h_9bc63150fb2429 1
+test3.py
+  h_9bc63150fb2429 1-4307
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "560a6a62569f5da1f25d021246230aa32264b2d9",
+  "prompts": {},
+  "humans": {
+    "h_9bc63150fb2429": {
+      "author": "bpatel2234117 <bpatel@bigid.com>"
+    }
+  }
+}
